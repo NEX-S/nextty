@@ -1248,35 +1248,32 @@ impl AgentSession {
         self.selection = None;
     }
 
-    fn selection_checkpoint(&self) -> Option<Vec<(u64, Option<String>, String)>> {
+    fn selection_checkpoint(&self) -> Option<[(u64, Option<String>, String); 2]> {
         let selection = self.selection.as_ref()?;
-        [selection.anchor, selection.head]
-            .into_iter()
-            .map(|point| {
-                let message = self.model.messages.get(point.message)?;
-                let rendered;
-                let text = if point.part == 0 {
-                    &message.role
-                } else if message.role == "Agent" && message.id.is_none() {
-                    if let Some(document) = self.markdown(point.message).filter(|_| {
-                        self.columns != 0
-                            && self.render_from.is_none_or(|first| point.message < first)
-                    }) {
-                        &document.text
-                    } else {
-                        rendered = crate::markdown::Markdown::render(&message.text);
-                        &rendered.text
-                    }
+        let checkpoint = |point: TranscriptPoint| {
+            let message = self.model.messages.get(point.message)?;
+            let rendered;
+            let text = if point.part == 0 {
+                &message.role
+            } else if message.role == "Agent" && message.id.is_none() {
+                if let Some(document) = self.markdown(point.message).filter(|_| {
+                    self.columns != 0 && self.render_from.is_none_or(|first| point.message < first)
+                }) {
+                    &document.text
                 } else {
-                    &message.text
-                };
-                Some((
-                    message.turn,
-                    message.id.clone(),
-                    text.get(..point.offset)?.to_owned(),
-                ))
-            })
-            .collect()
+                    rendered = crate::markdown::Markdown::render(&message.text);
+                    &rendered.text
+                }
+            } else {
+                &message.text
+            };
+            Some((
+                message.turn,
+                message.id.clone(),
+                text.get(..point.offset)?.to_owned(),
+            ))
+        };
+        Some([checkpoint(selection.anchor)?, checkpoint(selection.head)?])
     }
 
     fn selected_range(&self, line: usize) -> Option<Range<usize>> {
