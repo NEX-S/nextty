@@ -2081,12 +2081,7 @@ impl Frontend {
             };
         } else if !mouse.release && mouse.code & 0b1110_0011 == 0 {
             if !self.ui.resources.open || mouse.row == last {
-                self.ui.resources.toggle();
-                self.ui.focus = if self.ui.resources.open {
-                    Focus::Monitor
-                } else {
-                    Focus::Terminal
-                };
+                self.ui.toggle_monitor();
                 return self.resize();
             } else if mouse.row == top {
                 self.ui.resources.dragging = true;
@@ -2353,12 +2348,7 @@ impl Frontend {
                     {
                         self.ui.files_open = false;
                     }
-                    self.ui.resources.toggle();
-                    self.ui.focus = if self.ui.resources.open {
-                        Focus::Monitor
-                    } else {
-                        Focus::Terminal
-                    };
+                    self.ui.toggle_monitor();
                     return self.resize();
                 }
                 _ => (),

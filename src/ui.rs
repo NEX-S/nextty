@@ -465,6 +465,16 @@ impl Ui {
         false
     }
 
+    #[cfg(feature = "monitor")]
+    pub fn toggle_monitor(&mut self) {
+        self.resources.toggle();
+        self.focus = if self.resources.open {
+            Focus::Monitor
+        } else {
+            Focus::Terminal
+        };
+    }
+
     #[cfg(feature = "agent")]
     pub fn toggle_agent(&mut self) {
         self.agent.active_mut().rewind_target = None;

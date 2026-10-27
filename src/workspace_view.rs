@@ -1885,12 +1885,7 @@ impl WorkspaceView {
                 {
                     self.ui.files_open = false;
                 }
-                self.ui.resources.toggle();
-                self.ui.focus = if self.ui.resources.open {
-                    Focus::Monitor
-                } else {
-                    Focus::Terminal
-                };
+                self.ui.toggle_monitor();
                 self.resize()?;
             }
             #[cfg(feature = "monitor")]
