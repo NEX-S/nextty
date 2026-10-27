@@ -1577,7 +1577,7 @@ impl AgentSession {
             config,
             pane,
             client.is_remote(),
-            crate::agent::terminal_context(client, pane)?,
+            crate::agent::terminal_context(client, pane, false)?,
         )?;
         self.rewind_restore = None;
         self.sent_context

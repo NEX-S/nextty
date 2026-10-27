@@ -424,7 +424,7 @@ impl Agent {
                 match marker {
                     Some(marker) if !marker.has_output => Some(Err(io::Error::other("This block is a prompt, not an executing shell command"))),
                     Some(marker) if marker.status.is_none() => None,
-                    Some(marker) => Some(terminal_context(client,request.input["pane"].as_u64().unwrap()).map(|mut context| {
+                    Some(marker) => Some(terminal_context(client,request.input["pane"].as_u64().unwrap(), false).map(|mut context| {
                         context["command_finished"]=serde_json::json!({"block":block,"exit_code":marker.status,"source":"OSC133","output_incomplete":!marker.complete});
                         context.to_string()
                     })),
@@ -484,7 +484,11 @@ impl Agent {
     }
 }
 
-pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<serde_json::Value> {
+pub(crate) fn terminal_context(
+    client: &Client,
+    pane: u64,
+    html: bool,
+) -> io::Result<serde_json::Value> {
     let snapshot = client
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?;
@@ -522,7 +526,11 @@ pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<serde_j
             },
             "symbols": {"availability": "unknown"},
         },
-        "screen": crate::agent_context::shape(screen),
+        "screen": if html {
+            crate::agent_context::html(screen)
+        } else {
+            crate::agent_context::shape(screen)
+        },
         "command_blocks": view.command_blocks.iter().rev().map(|b| serde_json::json!({
             "id":b.id,"has_output":b.has_output,"exit_code":b.status,
             "output_incomplete":!b.complete,
@@ -549,11 +557,7 @@ fn terminal_request(client: &mut Client, request: &TerminalRequest) -> io::Resul
         .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
     match request.name.as_str() {
         "read_terminal" => {
-            let mut context = terminal_context(client, pane)?;
-            if request.input["view"] == "html" {
-                context["screen"] = crate::agent_context::html(&client.screens()[&pane]);
-            }
-            Ok(context.to_string())
+            Ok(terminal_context(client, pane, request.input["view"] == "html")?.to_string())
         }
         "send_terminal" => {
             if !client.can_agent_input() {

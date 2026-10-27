@@ -7,7 +7,6 @@ use std::fmt::Write;
 pub(crate) fn shape(screen: &Screen) -> Value {
     let mut rows = Vec::new();
     let mut omitted = Vec::<Value>::new();
-    let mut wrapped_rows = Vec::new();
     for (index, row) in screen.rows.iter().enumerate() {
         let mut text = String::new();
         for (_, cell, extra) in row.cells_with_extras(0..row.used()) {
@@ -50,11 +49,20 @@ pub(crate) fn shape(screen: &Screen) -> Value {
         } else {
             rows.push(json!([index, text]));
         }
-        // Physical rows stay separate so soft wrapping cannot change coordinates.
-        if row.wrapped {
-            wrapped_rows.push(index);
-        }
     }
+    let mut result = metadata(screen);
+    result["rows"] = json!(rows);
+    result["omitted"] = json!(omitted);
+    result
+}
+
+fn metadata(screen: &Screen) -> Value {
+    let wrapped_rows: Vec<_> = screen
+        .rows
+        .iter()
+        .enumerate()
+        .filter_map(|(index, row)| row.wrapped.then_some(index))
+        .collect();
     let cursor = screen.cursor();
     json!({
         "columns": screen.columns(),
@@ -66,8 +74,6 @@ pub(crate) fn shape(screen: &Screen) -> Value {
             "row": i64::from(cursor.0.line) + screen.display_offset() as i64,
             "column": cursor.0.column,
         },
-        "rows": rows,
-        "omitted": omitted,
         "wrapped_rows": wrapped_rows,
     })
 }
@@ -202,11 +208,8 @@ pub(crate) fn html(screen: &Screen) -> Value {
         html_color(screen, Color::Named(NamedColor::Background), false),
     )
     .unwrap();
-    let mut result = shape(screen);
-    let object = result.as_object_mut().unwrap();
-    object.remove("rows");
-    object.remove("omitted");
-    object.insert("html".into(), Value::String(output));
+    let mut result = metadata(screen);
+    result["html"] = Value::String(output);
     result
 }
 
