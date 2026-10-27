@@ -14,7 +14,7 @@ use crate::{
 #[cfg(feature = "agent")]
 use crate::{
     context::Object,
-    ui::{EditorLines, column_offset},
+    ui::{AgentAction, EditorLines, column_offset},
 };
 use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
@@ -308,14 +308,6 @@ enum GuiAction {
     Resources,
     #[cfg(feature = "monitor")]
     Monitor(crate::monitor::Action),
-    #[cfg(feature = "agent")]
-    Selection,
-    #[cfg(feature = "agent")]
-    Screen,
-    #[cfg(feature = "agent")]
-    Focus,
-    #[cfg(feature = "agent")]
-    Stop,
     NewTab,
     CloseTab(TabId),
     Tab(i32),
@@ -323,20 +315,6 @@ enum GuiAction {
     Minimize,
     Maximize,
     Close,
-    #[cfg(feature = "agent")]
-    Remove(usize),
-    #[cfg(feature = "agent")]
-    ContextMenu,
-    #[cfg(feature = "agent")]
-    InspectContext(usize),
-    #[cfg(feature = "agent")]
-    ClosePreview,
-    #[cfg(feature = "agent")]
-    CopyPreview,
-    #[cfg(feature = "agent")]
-    CopyMessage(usize),
-    #[cfg(feature = "agent")]
-    ToggleTool(usize),
     #[cfg(feature = "agent")]
     Agent(crate::ui::AgentAction),
 }
@@ -686,9 +664,11 @@ impl WorkspaceView {
                     self.control_hits.retain(|hit| {
                         !matches!(
                             hit.action,
-                            GuiAction::CopyMessage(_)
-                                | GuiAction::ToggleTool(_)
-                                | GuiAction::Agent(crate::ui::AgentAction::Rewind(_))
+                            GuiAction::Agent(
+                                AgentAction::Copy(_)
+                                    | AgentAction::Tool(_)
+                                    | AgentAction::Rewind(_)
+                            )
                         )
                     });
                 }
@@ -1476,7 +1456,7 @@ impl WorkspaceView {
         let hit = self
             .control_hits
             .iter()
-            .find(|hit| hit.action == GuiAction::Focus)?;
+            .find(|hit| hit.action == GuiAction::Agent(AgentAction::Editor))?;
         let columns = (((hit.bounds.2 - 12.) / self.cell.0).floor().max(1.) as usize)
             .saturating_sub(self.agent_editor_reserved())
             .max(1);
@@ -1883,37 +1863,22 @@ impl WorkspaceView {
     fn gui_action(&mut self, action: GuiAction) -> Result<()> {
         #[cfg(feature = "agent")]
         if !self.preedit.is_empty()
-            && matches!(
+            && matches!(action, GuiAction::Agent(action) if !matches!(
                 action,
-                GuiAction::Focus
-                    | GuiAction::ContextMenu
-                    | GuiAction::Selection
-                    | GuiAction::Screen
-                    | GuiAction::InspectContext(_)
-                    | GuiAction::CopyMessage(_)
-                    | GuiAction::ToggleTool(_)
-                    | GuiAction::Agent(_)
-            )
+                AgentAction::Stop
+                    | AgentAction::Remove(_)
+                    | AgentAction::ClosePreview
+                    | AgentAction::CopyPreview
+            ))
         {
             self.message("Finish or cancel IME composition first");
             return Ok(());
         }
         #[cfg(feature = "agent")]
-        if action != GuiAction::ContextMenu {
+        if action != GuiAction::Agent(AgentAction::ContextMenu) {
             self.ui.agent.active_mut().context.menu = false;
         }
         match action {
-            #[cfg(feature = "agent")]
-            GuiAction::Agent(action) => {
-                match self.ui.activate_agent(action, &self.client) {
-                    Ok(Some(copy)) => self.window.selection(false, &copy),
-                    Ok(None) => (),
-                    Err(error) => self.message(error.to_string()),
-                }
-                self.selecting_editor = false;
-                self.agent_tool_click = None;
-                self.chat_rows.clear();
-            }
             #[cfg(feature = "monitor")]
             GuiAction::Resources => {
                 #[cfg(feature = "files")]
@@ -1942,28 +1907,30 @@ impl WorkspaceView {
                 }
             }
             #[cfg(feature = "agent")]
-            GuiAction::ContextMenu => {
+            GuiAction::Agent(AgentAction::ContextMenu) => {
                 self.ui.agent.active_mut().rewind_target = None;
                 self.ui.agent.active_mut().context.menu = !self.ui.agent.active().context.menu;
                 self.ui.focus = Focus::Editor;
             }
             #[cfg(feature = "agent")]
-            GuiAction::InspectContext(index) => {
+            GuiAction::Agent(AgentAction::Inspect(index)) => {
                 if let Some(item) = self.ui.agent.active().context.basket.get(index).cloned() {
                     self.ui.agent.active_mut().context.preview = Some((item, 0));
                 }
             }
             #[cfg(feature = "agent")]
-            GuiAction::ClosePreview => self.ui.agent.active_mut().context.preview = None,
+            GuiAction::Agent(AgentAction::ClosePreview) => {
+                self.ui.agent.active_mut().context.preview = None
+            }
             #[cfg(feature = "agent")]
-            GuiAction::CopyPreview => {
+            GuiAction::Agent(AgentAction::CopyPreview) => {
                 if let Some((item, _)) = &self.ui.agent.active().context.preview {
                     self.window.selection(false, &item.snapshot.text);
                     self.message("Copied");
                 }
             }
             #[cfg(feature = "agent")]
-            GuiAction::CopyMessage(index) => {
+            GuiAction::Agent(AgentAction::Copy(index)) => {
                 self.ui.focus = Focus::Output;
                 if let Some(message) = self.ui.agent.active().model.messages.get(index) {
                     self.window.selection(false, &message.text);
@@ -1971,7 +1938,7 @@ impl WorkspaceView {
                 }
             }
             #[cfg(feature = "agent")]
-            GuiAction::ToggleTool(index) => {
+            GuiAction::Agent(AgentAction::Tool(index)) => {
                 self.ui.focus = Focus::Output;
                 self.ui.agent.active_mut().toggle_tool(index);
             }
@@ -2002,21 +1969,21 @@ impl WorkspaceView {
             GuiAction::Maximize => self.window.maximize(!self.maximized),
             GuiAction::Close => self.open_close(),
             #[cfg(feature = "agent")]
-            GuiAction::Focus => {
+            GuiAction::Agent(AgentAction::Editor) => {
                 self.ui.agent.active_mut().rewind_target = None;
                 self.ui.focus = Focus::Editor;
             }
             #[cfg(feature = "agent")]
-            GuiAction::Stop => self.ui.agent.active_mut().model.abort()?,
+            GuiAction::Agent(AgentAction::Stop) => self.ui.agent.active_mut().model.abort()?,
             #[cfg(feature = "agent")]
-            GuiAction::Selection | GuiAction::Screen => {
+            GuiAction::Agent(AgentAction::Selection | AgentAction::Screen) => {
                 let Some(pane) = self.active() else {
                     return Ok(());
                 };
                 if let Err(error) = self.ui.agent.active_mut().attach_screen(
                     &self.client,
                     pane,
-                    matches!(action, GuiAction::Selection),
+                    matches!(action, GuiAction::Agent(AgentAction::Selection)),
                 ) {
                     self.message(error);
                     return Ok(());
@@ -2028,8 +1995,19 @@ impl WorkspaceView {
                 }
             }
             #[cfg(feature = "agent")]
-            GuiAction::Remove(index) => {
+            GuiAction::Agent(AgentAction::Remove(index)) => {
                 self.ui.agent.active_mut().context.basket.remove(index);
+            }
+            #[cfg(feature = "agent")]
+            GuiAction::Agent(action) => {
+                match self.ui.activate_agent(action, &self.client) {
+                    Ok(Some(copy)) => self.window.selection(false, &copy),
+                    Ok(None) => (),
+                    Err(error) => self.message(error.to_string()),
+                }
+                self.selecting_editor = false;
+                self.agent_tool_click = None;
+                self.chat_rows.clear();
             }
         }
         self.control_hits.clear();
@@ -2236,7 +2214,9 @@ impl WorkspaceView {
                         hit.contains(self.pointer)
                             && matches!(
                                 hit.action,
-                                GuiAction::ClosePreview | GuiAction::CopyPreview
+                                GuiAction::Agent(
+                                    AgentAction::ClosePreview | AgentAction::CopyPreview
+                                )
                             )
                     })
                     .map(|hit| hit.action)
@@ -2324,18 +2304,20 @@ impl WorkspaceView {
         {
             match (button, action) {
                 #[cfg(feature = "agent")]
-                (3, GuiAction::CopyMessage(index) | GuiAction::ToggleTool(index)) => {
+                (3, GuiAction::Agent(AgentAction::Copy(index) | AgentAction::Tool(index))) => {
                     if let Some(text) = self.ui.agent.active().selected_text() {
                         self.window.selection(false, &text);
                         self.message("Copied");
                     } else {
-                        self.gui_action(GuiAction::CopyMessage(index))?;
+                        self.gui_action(GuiAction::Agent(AgentAction::Copy(index)))?;
                     }
                 }
                 #[cfg(feature = "agent")]
-                (3, GuiAction::Focus) => self.gui_action(GuiAction::ContextMenu)?,
+                (3, GuiAction::Agent(AgentAction::Editor)) => {
+                    self.gui_action(GuiAction::Agent(AgentAction::ContextMenu))?
+                }
                 #[cfg(feature = "agent")]
-                (1, GuiAction::CopyMessage(_) | GuiAction::ToggleTool(_)) => {
+                (1, GuiAction::Agent(AgentAction::Copy(_) | AgentAction::Tool(_))) => {
                     if self.preedit.is_empty() {
                         self.ui.focus = Focus::Output;
                         if let Some(point) = self.agent_point(false) {
@@ -2344,7 +2326,7 @@ impl WorkspaceView {
                                 .active_mut()
                                 .begin_selection(point, modifiers & native::SHIFT != 0);
                             self.agent_tool_click = match action {
-                                GuiAction::ToggleTool(index) => Some(index),
+                                GuiAction::Agent(AgentAction::Tool(index)) => Some(index),
                                 _ => None,
                             };
                         }
@@ -2354,7 +2336,7 @@ impl WorkspaceView {
                     }
                 }
                 #[cfg(feature = "agent")]
-                (1 | 2, GuiAction::Focus) => {
+                (1 | 2, GuiAction::Agent(AgentAction::Editor)) => {
                     if self.preedit.is_empty() {
                         self.ui.focus = Focus::Editor;
                         self.ui.agent.active_mut().rewind_target = None;
@@ -2763,11 +2745,9 @@ impl WorkspaceView {
         let layout = self.layout();
         #[cfg(feature = "agent")]
         if self.ui.agent.open && self.pointer.0 >= layout.side {
-            if self
-                .control_hits
-                .iter()
-                .any(|hit| hit.action == GuiAction::Focus && hit.contains(self.pointer))
-            {
+            if self.control_hits.iter().any(|hit| {
+                hit.action == GuiAction::Agent(AgentAction::Editor) && hit.contains(self.pointer)
+            }) {
                 if let Some(layout) = self.editor_layout() {
                     let editor = layout.editor;
                     self.ui.agent.active_mut().editor_scroll = Some(if amount > 0. {

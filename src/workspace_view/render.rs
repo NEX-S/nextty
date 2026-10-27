@@ -468,7 +468,7 @@ impl WorkspaceView {
                         width.min((text_width(&message.role) + 4) as f32 * self.cell.0),
                         self.cell.1,
                     );
-                    let action = GuiAction::ToggleTool(*index as usize);
+                    let action = GuiAction::Agent(AgentAction::Tool(*index as usize));
                     self.control_feedback(bounds, action);
                     self.control_hits.push(GuiHit { bounds, action });
                     (
@@ -476,7 +476,9 @@ impl WorkspaceView {
                             "{marker} {}",
                             fit(&message.role, columns.saturating_sub(4))
                         )),
-                        if self.hovered_control == Some(GuiAction::ToggleTool(*index as usize)) {
+                        if self.hovered_control
+                            == Some(GuiAction::Agent(AgentAction::Tool(*index as usize)))
+                        {
                             INK
                         } else {
                             MUTED
@@ -512,7 +514,7 @@ impl WorkspaceView {
                     }
                     self.control_hits.push(GuiHit {
                         bounds: (x - 6., py, width + 12., self.cell.1),
-                        action: GuiAction::CopyMessage(index),
+                        action: GuiAction::Agent(AgentAction::Copy(index)),
                     });
                     (
                         fit(
@@ -684,22 +686,22 @@ impl WorkspaceView {
             let text_cells = cells - 3;
             self.control_feedback(
                 (cx, cy, text_cells as f32 * self.cell.0, self.cell.1),
-                GuiAction::InspectContext(index),
+                GuiAction::Agent(AgentAction::Inspect(index)),
             );
             self.text.draw(&self.renderer, &label, cx, cy, ACCENT)?;
             self.control_hits.push(GuiHit {
                 bounds: (cx, cy, text_cells as f32 * self.cell.0, self.cell.1),
-                action: GuiAction::InspectContext(index),
+                action: GuiAction::Agent(AgentAction::Inspect(index)),
             });
             let remove_x = cx + (text_cells + 1) as f32 * self.cell.0;
             let remove_bounds = (remove_x - self.cell.0, cy, self.cell.0 * 3., self.cell.1);
-            self.control_feedback(remove_bounds, GuiAction::Remove(index));
+            self.control_feedback(remove_bounds, GuiAction::Agent(AgentAction::Remove(index)));
             self.text.draw(
                 &self.renderer,
                 "×",
                 remove_x,
                 cy,
-                if self.hovered_control == Some(GuiAction::Remove(index)) {
+                if self.hovered_control == Some(GuiAction::Agent(AgentAction::Remove(index))) {
                     INK
                 } else {
                     MUTED
@@ -707,7 +709,7 @@ impl WorkspaceView {
             )?;
             self.control_hits.push(GuiHit {
                 bounds: remove_bounds,
-                action: GuiAction::Remove(index),
+                action: GuiAction::Agent(AgentAction::Remove(index)),
             });
         }
         self.renderer.rect(
@@ -720,7 +722,7 @@ impl WorkspaceView {
         );
         self.control_hits.push(GuiHit {
             bounds: (x - 6., editor_y - 6., width + 12., self.cell.1 * 3. + 12.),
-            action: GuiAction::Focus,
+            action: GuiAction::Agent(AgentAction::Editor),
         });
         let editor_columns = columns.saturating_sub(self.agent_editor_reserved()).max(1);
         let editor = self.ui.agent.active().editor_layout(editor_columns, 3);
@@ -824,7 +826,7 @@ impl WorkspaceView {
             let stop_x = x + width - self.cell.0 * 3.;
             self.control_feedback(
                 (stop_x, editor_y, self.cell.0 * 3., self.cell.1),
-                GuiAction::Stop,
+                GuiAction::Agent(AgentAction::Stop),
             );
             self.text.draw(
                 &self.renderer,
@@ -835,7 +837,7 @@ impl WorkspaceView {
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (stop_x, editor_y, self.cell.0 * 3., self.cell.1),
-                action: GuiAction::Stop,
+                action: GuiAction::Agent(AgentAction::Stop),
             });
         }
         if self.ui.agent.active().context.menu {
@@ -855,23 +857,25 @@ impl WorkspaceView {
                 "Selection",
                 x,
                 menu_y + self.cell.1 * 0.7,
-                GuiAction::Selection,
+                GuiAction::Agent(AgentAction::Selection),
             )?;
             self.gui_button(
                 "Visible screen",
                 x,
                 menu_y + self.cell.1 * 2.1,
-                GuiAction::Screen,
+                GuiAction::Agent(AgentAction::Screen),
             )?;
         }
         self.renderer.clip(0., 0., 0., 0.)
     }
     #[cfg(feature = "agent")]
     pub(super) fn draw_context_preview(&mut self, layout: GuiLayout) -> Result<()> {
-        let close_highlighted = self.hovered_control == Some(GuiAction::ClosePreview)
+        let close_highlighted = self.hovered_control
+            == Some(GuiAction::Agent(AgentAction::ClosePreview))
             || self.ui.focus == Focus::Controls
                 && self.ui.agent.keyboard == crate::ui::AgentAction::ClosePreview;
-        let copy_highlighted = self.hovered_control == Some(GuiAction::CopyPreview)
+        let copy_highlighted = self.hovered_control
+            == Some(GuiAction::Agent(AgentAction::CopyPreview))
             || self.ui.focus == Focus::Controls
                 && self.ui.agent.keyboard == crate::ui::AgentAction::CopyPreview;
         let Some((item, scroll)) = &mut self.ui.agent.active_mut().context.preview else {
@@ -918,7 +922,7 @@ impl WorkspaceView {
             "×",
             close_x,
             y + padding,
-            if self.hovered_control == Some(GuiAction::ClosePreview) {
+            if self.hovered_control == Some(GuiAction::Agent(AgentAction::ClosePreview)) {
                 INK
             } else {
                 MUTED
@@ -931,7 +935,7 @@ impl WorkspaceView {
                 self.cell.0 * 3.,
                 self.cell.1,
             ),
-            action: GuiAction::ClosePreview,
+            action: GuiAction::Agent(AgentAction::ClosePreview),
         });
         self.text.draw(
             &self.renderer,
@@ -989,7 +993,7 @@ impl WorkspaceView {
                 self.cell.0 * copy_cells as f32,
                 self.cell.1,
             ),
-            action: GuiAction::CopyPreview,
+            action: GuiAction::Agent(AgentAction::CopyPreview),
         });
         self.text.draw(
             &self.renderer,
@@ -1010,22 +1014,8 @@ impl WorkspaceView {
     fn control_feedback(&self, bounds: (f32, f32, f32, f32), action: GuiAction) {
         let hovered = GuiHit { bounds, action }.contains(self.pointer);
         #[cfg(feature = "agent")]
-        let focused = self.ui.focus == Focus::Controls && {
-            use crate::ui::AgentAction as A;
-            let target = match action {
-                GuiAction::Stop => Some(A::Stop),
-                GuiAction::Selection => Some(A::Selection),
-                GuiAction::Screen => Some(A::Screen),
-                GuiAction::InspectContext(i) => Some(A::Inspect(i)),
-                GuiAction::Remove(i) => Some(A::Remove(i)),
-                GuiAction::ClosePreview => Some(A::ClosePreview),
-                GuiAction::CopyPreview => Some(A::CopyPreview),
-                GuiAction::ToggleTool(i) => Some(A::Tool(i)),
-                GuiAction::Agent(action) => Some(action),
-                _ => None,
-            };
-            target == Some(self.ui.agent.keyboard)
-        };
+        let focused =
+            self.ui.focus == Focus::Controls && action == GuiAction::Agent(self.ui.agent.keyboard);
         #[cfg(not(feature = "agent"))]
         let focused = false;
         if hovered || focused {
@@ -1076,7 +1066,7 @@ impl WorkspaceView {
             let color = match action {
                 GuiAction::Close => 0x633534ff,
                 #[cfg(feature = "agent")]
-                GuiAction::Stop => 0x633534ff,
+                GuiAction::Agent(AgentAction::Stop) => 0x633534ff,
                 _ => 0x353e35ff,
             };
             self.renderer
