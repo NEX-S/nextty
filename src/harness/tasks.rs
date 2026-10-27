@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 
 pub(super) struct Completion {
     pub id: u64,
-    pub name: String,
+    pub name: &'static str,
     pub text: String,
     pub is_error: bool,
 }
@@ -48,7 +48,7 @@ impl Tasks {
 
     pub fn spawn(
         &mut self,
-        name: String,
+        name: &'static str,
         work: impl FnOnce(Arc<AtomicBool>, Arc<OwnedFd>) -> io::Result<(String, bool)> + Send + 'static,
     ) -> io::Result<u64> {
         if self.completed.is_none() {
@@ -183,7 +183,7 @@ mod tests {
         let mut tasks = Tasks::default();
         let parent_wake = crate::eventfd::new().unwrap();
         let id = tasks
-            .spawn("monitor".into(), |canceled, wake| {
+            .spawn("monitor", |canceled, wake| {
                 crate::agent_command::monitor(
                     "sleep 0.05; printf 'finished'; exit 7",
                     None,
@@ -209,7 +209,7 @@ mod tests {
     fn panic_is_a_completion_instead_of_an_infinite_wait() {
         let mut tasks = Tasks::default();
         tasks
-            .spawn("subagent".into(), |_, _| panic!("fixture failure"))
+            .spawn("subagent", |_, _| panic!("fixture failure"))
             .unwrap();
         let wake = crate::eventfd::new().unwrap();
         let results = tasks
@@ -227,7 +227,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let command = format!("printf '%s' $$ > '{}'; exec sleep 120", path.display());
         tasks
-            .spawn("monitor".into(), move |canceled, wake| {
+            .spawn("monitor", move |canceled, wake| {
                 crate::agent_command::monitor(&command, None, wake.as_raw_fd(), &canceled)
             })
             .unwrap();

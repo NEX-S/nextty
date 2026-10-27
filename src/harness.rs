@@ -725,7 +725,7 @@ impl Session {
                 shared,
                 Event::Tool {
                     id: format!("task:{}:{}", prompt.turn, task.id),
-                    name: task.name.clone(),
+                    name: task.name.into(),
                     text: task.text.clone(),
                     done: true,
                     is_error: task.is_error,
@@ -1103,7 +1103,7 @@ impl Session {
                     string(input, "task").and_then(|task| {
                         let task = task.to_owned();
                         let (url, headers, model, cwd, remote) = (self.url.clone(), self.headers.clone(), self.model.clone(), self.cwd.clone(), self.remote);
-                        let id = tasks.spawn(name.into(), move |canceled, wake| {
+                        let id = tasks.spawn("spawn_agent", move |canceled, wake| {
                             let child = Session {
                                 http: Http::new(), url, headers, model, cwd, remote,
                                 history: VecDeque::new(), archive: None, facts: Vec::new(), delegated: true,
@@ -1123,7 +1123,7 @@ impl Session {
                                 .and_then(|command| {
                                     let command = command.to_owned();
                                     let cwd = self.cwd.clone();
-                                    let id = tasks.spawn(name.into(), move |canceled, wake| {
+                                    let id = tasks.spawn("monitor", move |canceled, wake| {
                                         crate::agent_command::monitor(&command, cwd.as_deref(), wake.as_raw_fd(), &canceled)
                                     })?;
                                     Ok((json!({"task_id":id,"status":"running","execution_surface":"independent shell","completion":"will wake parent automatically"}).to_string(),false))
