@@ -552,19 +552,19 @@ fn terminal_request(client: &mut Client, request: &TerminalRequest) -> io::Resul
     let pane = request.input["pane"]
         .as_u64()
         .ok_or_else(|| io::Error::other("Missing pane ID"))?;
-    let snapshot = client
-        .snapshot()
-        .ok_or_else(|| io::Error::other("No workspace"))?;
-    snapshot
-        .panes
-        .iter()
-        .find(|p| p.id == pane)
-        .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
     match request.name.as_str() {
         "read_terminal" => {
             Ok(terminal_context(client, pane, request.input["view"] == "html")?.to_string())
         }
         "send_terminal" => {
+            let snapshot = client
+                .snapshot()
+                .ok_or_else(|| io::Error::other("No workspace"))?;
+            snapshot
+                .panes
+                .iter()
+                .find(|p| p.id == pane)
+                .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
             if !client.can_agent_input() {
                 return Err(io::Error::other("Workspace is read-only"));
             }
