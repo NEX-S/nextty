@@ -1500,18 +1500,7 @@ impl AgentSession {
         if !client.can_agent_input() {
             return Err(io::Error::other("Workspace is read-only"));
         }
-        if self
-            .model
-            .input
-            .trim_start()
-            .strip_prefix("/goal")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .is_some_and(|rest| rest.trim().is_empty())
-        {
-            return Err(io::Error::other(
-                "Use /goal followed by the task to complete",
-            ));
-        }
+        self.model.is_goal()?;
         self.model.pending.push(serde_json::json!({
             "action": "send",
             "input": self.model.input,

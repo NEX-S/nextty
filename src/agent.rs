@@ -185,6 +185,20 @@ impl Agent {
         true
     }
 
+    pub fn is_goal(&self) -> io::Result<bool> {
+        let goal = self
+            .input
+            .trim_start()
+            .strip_prefix("/goal")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+        if goal.is_some_and(|rest| rest.trim().is_empty()) {
+            return Err(io::Error::other(
+                "Use /goal followed by the task to complete",
+            ));
+        }
+        Ok(goal.is_some())
+    }
+
     pub fn send(
         &mut self,
         prompt: String,
@@ -200,16 +214,7 @@ impl Agent {
                 "Agent is still responding",
             ));
         }
-        let goal = self
-            .input
-            .trim_start()
-            .strip_prefix("/goal")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
-        if goal.is_some_and(|rest| rest.trim().is_empty()) {
-            return Err(io::Error::other(
-                "Use /goal followed by the task to complete",
-            ));
-        }
+        let goal = self.is_goal()?;
         if self.runtime.is_none() {
             self.runtime = Some(Harness::start(cwd, remote, config, self.turn)?);
         }
@@ -217,7 +222,7 @@ impl Agent {
             .runtime
             .as_ref()
             .unwrap()
-            .send(prompt, pane, goal.is_some(), target)?;
+            .send(prompt, pane, goal, target)?;
         self.turn = turn;
         self.messages.push(Message {
             turn,
