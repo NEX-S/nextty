@@ -113,7 +113,6 @@ struct NtWindow {
     Transfer *transfers;
     FileSender *file_sender;
     struct xkb_context *xkb_context;
-    struct xkb_compose_table *compose_table;
     struct xkb_compose_state *compose;
     struct wl_display *display;
     struct wl_registry *registry;
@@ -134,7 +133,6 @@ struct NtWindow {
     struct wl_seat *seat;
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
-    struct xkb_keymap *keymap;
     struct xkb_state *key_state;
     struct wl_callback *frame;
     struct wp_cursor_shape_manager_v1 *cursor_manager;
@@ -880,14 +878,12 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
         return;
     }
     struct xkb_state *state = xkb_state_new(keymap);
+    xkb_keymap_unref(keymap);
     if (!state) {
-        xkb_keymap_unref(keymap);
         fail(w, "creating Wayland keyboard state");
         return;
     }
     xkb_state_unref(w->key_state);
-    xkb_keymap_unref(w->keymap);
-    w->keymap = keymap;
     w->key_state = state;
 }
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
@@ -1757,10 +1753,12 @@ NtWindow *nt_window_new(int width, int height) {
         goto failed;
     }
     const char *locale = setlocale(LC_CTYPE, NULL);
-    w->compose_table = xkb_compose_table_new_from_locale(w->xkb_context, locale ? locale : "C",
-                                                         XKB_COMPOSE_COMPILE_NO_FLAGS);
-    if (w->compose_table)
-        w->compose = xkb_compose_state_new(w->compose_table, XKB_COMPOSE_STATE_NO_FLAGS);
+    struct xkb_compose_table *table = xkb_compose_table_new_from_locale(
+        w->xkb_context, locale ? locale : "C", XKB_COMPOSE_COMPILE_NO_FLAGS);
+    if (table) {
+        w->compose = xkb_compose_state_new(table, XKB_COMPOSE_STATE_NO_FLAGS);
+        xkb_compose_table_unref(table);
+    }
     if (!wayland_new(w))
         goto failed;
     return w;
@@ -1971,7 +1969,6 @@ void nt_window_free(NtWindow *w) {
         wl_display_flush(w->display);
         wl_display_disconnect(w->display);
         xkb_state_unref(w->key_state);
-        xkb_keymap_unref(w->keymap);
         free(w->pending_commit);
         free(w->pending_preedit);
     }
@@ -2002,7 +1999,6 @@ void nt_window_free(NtWindow *w) {
         file_sender_release(sender);
     }
     xkb_compose_state_unref(w->compose);
-    xkb_compose_table_unref(w->compose_table);
     xkb_context_unref(w->xkb_context);
     free(w);
 }
