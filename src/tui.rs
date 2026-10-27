@@ -794,29 +794,22 @@ impl Frontend {
             return Ok(());
         }
         if paste.is_none() {
-            let (symbol, shift) = match bytes {
-                b"\x1b[A" | b"\x1bOA" => (0xff52, false),
-                b"\x1b[B" | b"\x1bOB" => (0xff54, false),
-                b"\x1b[C" | b"\x1bOC" => (0xff53, false),
-                b"\x1b[D" | b"\x1bOD" => (0xff51, false),
-                b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => (0xff50, false),
-                b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => (0xff57, false),
-                b"\x1b[1;2A" => (0xff52, true),
-                b"\x1b[1;2B" => (0xff54, true),
-                b"\x1b[1;2C" => (0xff53, true),
-                b"\x1b[1;2D" => (0xff51, true),
-                b"\x1b[1;2H" => (0xff50, true),
-                b"\x1b[1;2F" => (0xff57, true),
-                b"\x1b[3~" => (0xffff, false),
+            let key = match bytes {
+                b"\x1b[1;2A" => Some((0xff52, true)),
+                b"\x1b[1;2B" => Some((0xff54, true)),
+                b"\x1b[1;2C" => Some((0xff53, true)),
+                b"\x1b[1;2D" => Some((0xff51, true)),
+                b"\x1b[1;2H" => Some((0xff50, true)),
+                b"\x1b[1;2F" => Some((0xff57, true)),
                 b"\x1b[13;2u" | b"\x1b[27;2;13~" => {
                     self.insert_agent("\n");
                     self.dirty = true;
                     self.agent_dirty = true;
                     return Ok(());
                 }
-                _ => (0, false),
+                _ => crate::input::editing_key(bytes).map(|symbol| (symbol, false)),
             };
-            if symbol != 0 {
+            if let Some((symbol, shift)) = key {
                 if matches!(symbol, 0xff52 | 0xff54) {
                     self.editor_vertical(symbol == 0xff52, shift);
                 } else {

@@ -2,6 +2,20 @@ use crate::core::Mode;
 #[cfg(feature = "gui")]
 use crate::native::{ALT, CONTROL, SHIFT, SUPER};
 
+#[cfg(feature = "tui")]
+pub(crate) fn editing_key(bytes: &[u8]) -> Option<u32> {
+    Some(match bytes {
+        b"\x1b[A" | b"\x1bOA" => 0xff52,
+        b"\x1b[B" | b"\x1bOB" => 0xff54,
+        b"\x1b[C" | b"\x1bOC" => 0xff53,
+        b"\x1b[D" | b"\x1bOD" => 0xff51,
+        b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => 0xff50,
+        b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => 0xff57,
+        b"\x1b[3~" => 0xffff,
+        _ => return None,
+    })
+}
+
 #[cfg(feature = "gui")]
 pub fn key_bytes(
     symbol: u32,

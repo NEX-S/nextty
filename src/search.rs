@@ -324,15 +324,11 @@ impl Search {
         if !pasted && bytes.first() == Some(&27) {
             let (symbol, shift) = match bytes {
                 b"\x1b" => (0xff1b, false),
-                b"\x1b[A" | b"\x1bOA" => (0xff52, false),
-                b"\x1b[B" | b"\x1bOB" => (0xff54, false),
-                b"\x1b[C" | b"\x1bOC" => (0xff53, false),
-                b"\x1b[D" | b"\x1bOD" => (0xff51, false),
-                b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => (0xff50, false),
-                b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => (0xff57, false),
-                b"\x1b[3~" => (0xffff, false),
                 b"\x1b[13;2u" | b"\x1b[27;2;13~" => (0xff0d, true),
-                _ => return Ok(true),
+                _ => match crate::input::editing_key(bytes) {
+                    Some(symbol) => (symbol, false),
+                    None => return Ok(true),
+                },
             };
             return self.key(client, symbol, shift, false);
         }

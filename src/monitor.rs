@@ -504,17 +504,10 @@ impl Monitor {
         }
         let symbol = match bytes {
             b"\x1b" => Some(0xff1b),
-            b"\x1b[A" | b"\x1bOA" => Some(0xff52),
-            b"\x1b[B" | b"\x1bOB" => Some(0xff54),
-            b"\x1b[C" | b"\x1bOC" => Some(0xff53),
-            b"\x1b[D" | b"\x1bOD" => Some(0xff51),
-            b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => Some(0xff50),
-            b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => Some(0xff57),
-            b"\x1b[3~" => Some(0xffff),
             b"\x1b[5~" => Some(0xff55),
             b"\x1b[6~" => Some(0xff56),
             b"\x1b[Z" => Some(0xfe20),
-            _ => None,
+            _ => crate::input::editing_key(bytes),
         };
         if let Some(symbol) = symbol {
             self.key(symbol, "", false);
