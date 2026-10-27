@@ -2670,7 +2670,6 @@ impl Core {
                 self.damage_all();
             }
             self.active.offset = offset;
-            #[cfg(feature = "tui")]
             if self
                 .history
                 .as_ref()
@@ -2722,7 +2721,6 @@ impl Core {
         if let Some(selection) = selection {
             points.extend([absolute(selection.start), absolute(selection.end)]);
         }
-        #[cfg(feature = "tui")]
         let block_points = self
             .blocks
             .iter()
@@ -2756,7 +2754,6 @@ impl Core {
             history.resizing = Some(PendingResize {
                 size,
                 selection,
-                #[cfg(feature = "tui")]
                 block_points,
                 at_bottom: main.offset == 0,
             });
@@ -2809,7 +2806,6 @@ impl Core {
             selection.end = point(points[3])?;
             Some(selection)
         });
-        #[cfg(feature = "tui")]
         for (id, indices) in pending.block_points {
             if let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) {
                 let convert = |index: Option<usize>| {
@@ -2851,10 +2847,7 @@ impl Core {
         if self.mode.contains(Mode::ALT_SCREEN) {
             self.selection = None;
         }
-        #[cfg(feature = "tui")]
-        {
-            self.block_origin = base;
-        }
+        self.block_origin = base;
         self.size = pending.size;
         self.scroll_top = 0;
         self.scroll_bottom = lines;
