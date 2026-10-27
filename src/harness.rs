@@ -74,7 +74,6 @@ struct Shared {
     state: Mutex<State>,
     wake: OwnedFd,
     notification: OwnedFd,
-    process_id: Mutex<Option<i32>>,
 }
 
 pub(crate) struct Harness {
@@ -118,7 +117,6 @@ impl Harness {
             }),
             wake: crate::eventfd::new()?,
             notification: crate::eventfd::new()?,
-            process_id: Mutex::new(None),
         });
         let worker = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
@@ -234,11 +232,6 @@ impl Drop for Harness {
         state.shutdown = true;
         if let Some(active) = &state.active {
             active.store(true, Ordering::Release);
-        }
-        if let Some(pid) = *self.shared.process_id.lock().unwrap() {
-            unsafe {
-                libc::kill(-pid, libc::SIGKILL);
-            }
         }
         drop(state);
         if let Err(error) = notify(self.shared.wake.as_raw_fd()) {
@@ -695,7 +688,6 @@ impl Session {
             }),
             wake: wake.try_clone()?,
             notification: crate::eventfd::new()?,
-            process_id: Mutex::new(None),
         });
         self.archive = Some(Archive::new()?);
         let prompt = Prompt {
@@ -1136,7 +1128,7 @@ impl Session {
                                     let command = command.to_owned();
                                     let cwd = self.cwd.clone();
                                     let id = tasks.spawn(name.into(), move |canceled, wake| {
-                                        crate::agent_command::monitor(&command, cwd.as_deref(), wake.as_raw_fd(), &canceled, &Mutex::new(None))
+                                        crate::agent_command::monitor(&command, cwd.as_deref(), wake.as_raw_fd(), &canceled)
                                     })?;
                                     Ok((json!({"task_id":id,"status":"running","execution_surface":"independent shell","completion":"will wake parent automatically"}).to_string(),false))
                                 })
@@ -1277,7 +1269,6 @@ fn tool(
             cwd,
             shared.wake.as_raw_fd(),
             &prompt.canceled,
-            &shared.process_id,
         ),
         _ => Err(io::Error::other(format!("Unknown tool: {name}"))),
     }

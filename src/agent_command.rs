@@ -5,37 +5,32 @@ use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, ExitStatus, Stdio};
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 const OUTPUT_LIMIT: usize = 32 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(120);
 
-struct Process<'a> {
+struct Process {
     child: Child,
-    process_id: &'a Mutex<Option<i32>>,
     stopped: bool,
 }
 
-impl Process<'_> {
+impl Process {
     fn stop(&mut self) -> io::Result<ExitStatus> {
-        let mut published = self.process_id.lock().unwrap();
         if unsafe { libc::kill(-(self.child.id() as i32), libc::SIGKILL) } < 0 {
             let error = io::Error::last_os_error();
             if error.raw_os_error() != Some(libc::ESRCH) {
                 return Err(error);
             }
         }
-        *published = None;
-        drop(published);
         let status = self.child.wait()?;
         self.stopped = true;
         Ok(status)
     }
 }
 
-impl Drop for Process<'_> {
+impl Drop for Process {
     fn drop(&mut self) {
         if !self.stopped {
             let _ = self.stop();
@@ -48,9 +43,8 @@ pub(crate) fn run(
     cwd: Option<&Path>,
     wake: RawFd,
     canceled: &AtomicBool,
-    process_id: &Mutex<Option<i32>>,
 ) -> io::Result<(String, bool)> {
-    execute(command, cwd, wake, canceled, process_id, Some(TIMEOUT))
+    execute(command, cwd, wake, canceled, Some(TIMEOUT))
 }
 
 pub(crate) fn monitor(
@@ -58,9 +52,8 @@ pub(crate) fn monitor(
     cwd: Option<&Path>,
     wake: RawFd,
     canceled: &AtomicBool,
-    process_id: &Mutex<Option<i32>>,
 ) -> io::Result<(String, bool)> {
-    execute(command, cwd, wake, canceled, process_id, None)
+    execute(command, cwd, wake, canceled, None)
 }
 
 fn execute(
@@ -68,7 +61,6 @@ fn execute(
     cwd: Option<&Path>,
     wake: RawFd,
     canceled: &AtomicBool,
-    process_id: &Mutex<Option<i32>>,
     timeout: Option<Duration>,
 ) -> io::Result<(String, bool)> {
     if canceled.load(Ordering::Acquire) {
@@ -98,18 +90,14 @@ fn execute(
             Ok(())
         });
     }
-    let mut published = process_id.lock().unwrap();
     if canceled.load(Ordering::Acquire) {
         return Err(io::ErrorKind::Interrupted.into());
     }
     let mut process = Process {
         child: shell.spawn()?,
-        process_id,
         stopped: false,
     };
     let pid = process.child.id() as i32;
-    *published = Some(pid);
-    drop(published);
     if canceled.load(Ordering::Acquire) {
         return Err(io::ErrorKind::Interrupted.into());
     }
@@ -239,7 +227,6 @@ mod tests {
             Some(Path::new("/")),
             wake.as_raw_fd(),
             &canceled,
-            &Mutex::new(None),
         )
         .unwrap();
         assert!(error);
@@ -251,7 +238,6 @@ mod tests {
             None,
             wake.as_raw_fd(),
             &canceled,
-            &Mutex::new(None),
         )
         .unwrap();
         assert!(!error);
@@ -266,7 +252,6 @@ mod tests {
     fn cancellation_wakes_idle_command_and_kills_descendants() {
         let wake = Arc::new(crate::eventfd::new().unwrap());
         let canceled = Arc::new(AtomicBool::new(false));
-        let process_id = Arc::new(Mutex::new(None));
         let path =
             std::env::temp_dir().join(format!("nextty-agent-command-{}", std::process::id()));
         let _ = std::fs::remove_file(&path);
@@ -276,15 +261,8 @@ mod tests {
         );
         let worker_wake = Arc::clone(&wake);
         let worker_canceled = Arc::clone(&canceled);
-        let worker_process_id = Arc::clone(&process_id);
         let worker = std::thread::spawn(move || {
-            monitor(
-                &command,
-                None,
-                worker_wake.as_raw_fd(),
-                &worker_canceled,
-                &worker_process_id,
-            )
+            monitor(&command, None, worker_wake.as_raw_fd(), &worker_canceled)
         });
         let deadline = Instant::now() + Duration::from_secs(3);
         let pids = loop {
@@ -296,10 +274,6 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(5));
         };
-        assert_eq!(
-            process_id.lock().unwrap().unwrap().to_string(),
-            pids.split_whitespace().next().unwrap()
-        );
         let started = Instant::now();
         canceled.store(true, Ordering::Release);
         notify(wake.as_raw_fd()).unwrap();
@@ -308,7 +282,6 @@ mod tests {
             io::ErrorKind::Interrupted
         );
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(*process_id.lock().unwrap(), None);
         for pid in pids.split_whitespace() {
             assert_dead(pid);
         }
@@ -324,7 +297,6 @@ mod tests {
                 None,
                 wake.as_raw_fd(),
                 &AtomicBool::new(false),
-                &Mutex::new(None),
             )
             .unwrap();
             assert_eq!(error, code != 0);
@@ -341,7 +313,6 @@ mod tests {
             None,
             wake.as_raw_fd(),
             &AtomicBool::new(false),
-            &Mutex::new(None),
         )
         .unwrap();
         assert!(!error);

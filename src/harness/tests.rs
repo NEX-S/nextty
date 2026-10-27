@@ -153,50 +153,60 @@ fn stopping_a_goal_waiting_on_monitor_allows_the_next_turn() {
 }
 
 #[test]
-fn dropping_harness_reaps_monitored_descendants_before_returning() {
-    let path = std::env::temp_dir().join(format!("nextty-owner-cleanup-{}", std::process::id()));
-    let _ = std::fs::remove_file(&path);
-    let command = format!(
-        "sleep 120 & printf '%s %s' $$ $! > '{}'; wait",
-        path.display()
-    );
-    let waiting = Arc::new(AtomicBool::new(false));
-    let seen = Arc::clone(&waiting);
-    let server = Server::new(2, move |index, _, stream| {
-        if index == 0 {
-            sse(
-                stream,
-                response("", &[("monitor", "monitor", json!({"command":command}))]),
-            );
-        } else {
-            sse(stream, response("Waiting.", &[]));
-            seen.store(true, Ordering::Release);
+fn dropping_harness_reaps_command_descendants_before_returning() {
+    for tool in ["run_command", "monitor"] {
+        let path =
+            std::env::temp_dir().join(format!("nextty-owner-cleanup-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let command = format!(
+            "sleep 120 & printf '%s %s' $$ $! > '{}'; wait",
+            path.display()
+        );
+        let waiting = Arc::new(AtomicBool::new(false));
+        let seen = Arc::clone(&waiting);
+        let server = Server::new(
+            if tool == "monitor" { 2 } else { 1 },
+            move |index, _, stream| {
+                if index == 0 {
+                    sse(
+                        stream,
+                        response("", &[("command", tool, json!({"command":command}))]),
+                    );
+                } else {
+                    sse(stream, response("Waiting.", &[]));
+                    seen.store(true, Ordering::Release);
+                }
+            },
+        );
+        let worker = Worker::new(server.url.clone(), VecDeque::new());
+        worker
+            .agent()
+            .send("wait".into(), 1, true, json!({}))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let pids = loop {
+            if let Ok(pids) = std::fs::read_to_string(&path)
+                && pids.split_whitespace().count() == 2
+                && (tool == "run_command" || waiting.load(Ordering::Acquire))
+            {
+                break pids;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(2));
+        };
+        worker.finish();
+        for pid in pids.split_whitespace() {
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                assert_eq!(
+                    stat.split_whitespace().nth(2),
+                    Some("Z"),
+                    "live descendant {pid} survived owner shutdown"
+                );
+            }
         }
-    });
-    let worker = Worker::new(server.url.clone(), VecDeque::new());
-    worker
-        .agent()
-        .send("wait".into(), 1, true, json!({}))
-        .unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !waiting.load(Ordering::Acquire) || !path.exists() {
-        assert!(Instant::now() < deadline);
-        thread::sleep(Duration::from_millis(2));
+        server.finish();
+        std::fs::remove_file(path).unwrap();
     }
-    let pids = std::fs::read_to_string(&path).unwrap();
-    assert_eq!(pids.split_whitespace().count(), 2);
-    worker.finish();
-    for pid in pids.split_whitespace() {
-        if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            assert_eq!(
-                stat.split_whitespace().nth(2),
-                Some("Z"),
-                "live descendant {pid} survived owner shutdown"
-            );
-        }
-    }
-    server.finish();
-    std::fs::remove_file(path).unwrap();
 }
 
 struct Worker {
@@ -223,7 +233,6 @@ impl Worker {
             }),
             wake: crate::eventfd::new().unwrap(),
             notification: crate::eventfd::new().unwrap(),
-            process_id: Mutex::new(None),
         });
         let control = Arc::clone(&shared);
         let (done, receiver) = mpsc::sync_channel(1);

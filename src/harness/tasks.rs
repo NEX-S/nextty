@@ -176,7 +176,6 @@ impl Drop for Tasks {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -190,7 +189,6 @@ mod tests {
                     None,
                     wake.as_raw_fd(),
                     &canceled,
-                    &Mutex::new(None),
                 )
             })
             .unwrap();
@@ -225,22 +223,19 @@ mod tests {
     #[test]
     fn cancellation_wakes_parent_and_drop_joins_canceled_command() {
         let mut tasks = Tasks::default();
-        let process_id = Arc::new(Mutex::new(None));
-        let worker_process_id = Arc::clone(&process_id);
+        let path = std::env::temp_dir().join(format!("nextty-task-cancel-{}", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let command = format!("printf '%s' $$ > '{}'; exec sleep 120", path.display());
         tasks
             .spawn("monitor".into(), move |canceled, wake| {
-                crate::agent_command::monitor(
-                    "sleep 120",
-                    None,
-                    wake.as_raw_fd(),
-                    &canceled,
-                    &worker_process_id,
-                )
+                crate::agent_command::monitor(&command, None, wake.as_raw_fd(), &canceled)
             })
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(3);
         let pid = loop {
-            if let Some(pid) = *process_id.lock().unwrap() {
+            if let Ok(pid) = std::fs::read_to_string(&path)
+                && !pid.is_empty()
+            {
                 break pid;
             }
             assert!(Instant::now() < deadline);
@@ -267,9 +262,9 @@ mod tests {
         drop(tasks);
         worker.join().unwrap();
         assert!(started.elapsed() < Duration::from_secs(1));
-        assert_eq!(*process_id.lock().unwrap(), None);
         if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
             assert_eq!(stat.split_whitespace().nth(2), Some("Z"));
         }
+        std::fs::remove_file(path).unwrap();
     }
 }
