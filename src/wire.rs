@@ -992,11 +992,10 @@ impl Encoder {
 }
 struct Decoder<'a> {
     bytes: &'a [u8],
-    offset: usize,
 }
 impl<'a> Decoder<'a> {
     fn new(bytes: &'a [u8]) -> io::Result<Self> {
-        let mut result = Self { bytes, offset: 0 };
+        let mut result = Self { bytes };
         if result.u8()? != VERSION {
             return Err(invalid(
                 "workspace protocol version differs; terminate the old server before upgrading",
@@ -1005,15 +1004,11 @@ impl<'a> Decoder<'a> {
         Ok(result)
     }
     fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
-        let end = self
-            .offset
-            .checked_add(count)
-            .ok_or_else(|| invalid("workspace field length overflow"))?;
-        if end > self.bytes.len() {
-            return Err(invalid("truncated workspace message"));
-        }
-        let bytes = &self.bytes[self.offset..end];
-        self.offset = end;
+        let (bytes, remaining) = self
+            .bytes
+            .split_at_checked(count)
+            .ok_or_else(|| invalid("truncated workspace message"))?;
+        self.bytes = remaining;
         Ok(bytes)
     }
     fn u8(&mut self) -> io::Result<u8> {
@@ -1080,7 +1075,7 @@ impl<'a> Decoder<'a> {
         Ok(Point { line, column })
     }
     fn finish(&self) -> io::Result<()> {
-        if self.offset == self.bytes.len() {
+        if self.bytes.is_empty() {
             Ok(())
         } else {
             Err(invalid("unexpected bytes after workspace message"))

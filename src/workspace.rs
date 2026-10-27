@@ -1434,17 +1434,16 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
         terminals.truncate(terminal_count);
         // Failures and completed resizes may have no further socket or terminal wakeup.
-        let timeout = if !dirty.is_empty()
-            || clients.iter().any(|client| {
-                client.failed
-                    || !client.ending
-                        && match &client.deferred {
-                            Some(action) => {
-                                !matches!(client.action_blocked(action, &workspaces), Ok(true))
-                            }
-                            None => client.peer.buffered_action(),
+        let timeout = if clients.iter().any(|client| {
+            client.failed
+                || !client.ending
+                    && match &client.deferred {
+                        Some(action) => {
+                            !matches!(client.action_blocked(action, &workspaces), Ok(true))
                         }
-            }) {
+                        None => client.peer.buffered_action(),
+                    }
+        }) {
             0
         } else {
             -1
@@ -1754,16 +1753,18 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
         return Ok(());
     }
     let active = workspace.layout();
+    let all_layouts;
     let visible = if clients.iter().any(|client| {
         client.agent && client.workspace.as_deref() == Some(&workspace.name) && !client.failed
     }) {
-        workspace.all_layouts()
+        all_layouts = workspace.all_layouts();
+        &all_layouts
     } else {
-        active.clone()
+        &active
     };
     let mut frames = Vec::with_capacity(visible.len());
     let mut panes = Vec::with_capacity(visible.len());
-    for &(id, rect) in &visible {
+    for &(id, rect) in visible {
         let pane = &workspace.panes[&id];
         let process = pane.terminal.process_metadata();
         let mut core = pane
