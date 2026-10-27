@@ -302,13 +302,12 @@ impl Monitor {
                 .width
                 .saturating_sub(if self.width >= 80 { 15 } else { 11 });
             if body_width >= 26 {
-                controls.push(Action::Sort(0));
-                if body_width >= 34 {
-                    controls.push(Action::Sort(1));
-                }
-                if body_width >= 70 || self.sort == 2 && body_width >= 48 {
-                    controls.push(Action::Sort(2));
-                }
+                controls.extend(
+                    process_columns(body_width, self.sort)
+                        .into_iter()
+                        .filter(|(id, _, _)| *id >= 2)
+                        .map(|(id, _, _)| Action::Sort(id - 2)),
+                );
             }
             let rows = self.processes();
             let pid = match self.focus {
