@@ -1581,11 +1581,11 @@ impl AgentSession {
     ) -> Result<(), &'static str> {
         let screen = client.screens().get(&pane).ok_or("No active pane")?;
         self.add_context(ContextItem {
-            label: object.text.clone(),
+            label: object.text,
             source: context_source(client, pane),
             kind: object.kind.into(),
-            snapshot: context::region_context(screen, &object)
-                .unwrap_or_else(|| context::object_context(screen, &object)),
+            snapshot: context::region_context(screen, object.range.start.line)
+                .unwrap_or_else(|| context::object_context(screen, object.range)),
         })
     }
     pub fn attach_screen(

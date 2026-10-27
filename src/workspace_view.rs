@@ -1950,7 +1950,7 @@ impl WorkspaceView {
             #[cfg(feature = "agent")]
             GuiAction::InspectContext(index) => {
                 if let Some(item) = self.ui.agent.active().context.basket.get(index).cloned() {
-                    self.ui.agent.active_mut().context.preview = Some((item.clone(), 0));
+                    self.ui.agent.active_mut().context.preview = Some((item, 0));
                 }
             }
             #[cfg(feature = "agent")]
