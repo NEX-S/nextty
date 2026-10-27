@@ -136,13 +136,7 @@ impl Drop for TerminalGuard {
 pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
     let terminal = TerminalGuard::enter(libc::STDIN_FILENO, libc::STDOUT_FILENO)?;
     let size = terminal_size(libc::STDOUT_FILENO)?;
-    let mut frontend = Frontend::new(client, size)?;
-    #[cfg(feature = "agent")]
-    {
-        frontend.config = config;
-    }
-    #[cfg(not(feature = "agent"))]
-    let _ = config;
+    let mut frontend = Frontend::new(client, size, config)?;
     let mut output = Output {
         bytes: ENTER.to_vec(),
         written: 0,
@@ -573,7 +567,9 @@ struct Frontend {
 }
 
 impl Frontend {
-    fn new(client: Client, size: WindowSize) -> io::Result<Self> {
+    fn new(client: Client, size: WindowSize, config: crate::config::Config) -> io::Result<Self> {
+        #[cfg(not(feature = "agent"))]
+        let _ = config;
         Ok(Self {
             client,
             size,
@@ -584,7 +580,7 @@ impl Frontend {
             header: Vec::new(),
             ui: Ui::new()?,
             #[cfg(feature = "agent")]
-            config: crate::config::Config::default(),
+            config,
             #[cfg(feature = "agent")]
             agent_hits: Vec::new(),
             #[cfg(feature = "agent")]

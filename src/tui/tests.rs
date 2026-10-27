@@ -15,7 +15,7 @@ fn agent_markdown_renders_and_selects_the_visible_text() {
         cell_width: 0,
         cell_height: 0,
     };
-    let mut frontend = Frontend::new(client, size).unwrap();
+    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
     frontend.ui.agent.open = true;
     let source = "## 标题\n\n**bold** normal _italic_ and `x*y`\n\n> quoted\n\n- first\n- second\n\n```gdb\n  x/4gx $sp\n\n  0x123\n```\n\n[docs](https://example.com)";
     frontend
@@ -108,6 +108,7 @@ fn agent_tabs_keep_drafts_and_drag_selection_copies_across_messages() {
             cell_width: 0,
             cell_height: 0,
         },
+        crate::config::Config::default(),
     )
     .unwrap();
     frontend.input(Input::Alt(b'a')).unwrap();
@@ -534,6 +535,7 @@ fn global_shortcuts_and_layered_escape_keep_focus_and_drafts() {
             cell_width: 0,
             cell_height: 0,
         },
+        crate::config::Config::default(),
     )
     .unwrap();
     frontend.poll().unwrap();
@@ -611,6 +613,7 @@ fn agent_draft_selection_and_captured_paste_never_reach_the_pane() {
             cell_width: 0,
             cell_height: 0,
         },
+        crate::config::Config::default(),
     )
     .unwrap();
     frontend.input(Input::Alt(b'a')).unwrap();
@@ -1053,7 +1056,7 @@ fn metadata_updates_remove_hover_from_unchanged_output_rows() {
         )
         .unwrap();
     server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size).unwrap();
+    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
     frontend.pointer = Some((6, 2));
     frontend.poll().unwrap();
     let mut host = Core::new(size, 0xcccccc, 0x202020);
@@ -1188,7 +1191,7 @@ fn retained_header_updates_titles_status_control_and_full_redraws() {
         .send_response(Response::State(snapshot.clone(), Vec::new()))
         .unwrap();
     server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size).unwrap();
+    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
     frontend.poll().unwrap();
     let mut host = Core::new(size, 0xcccccc, 0x202020);
     let mut parser = crate::vt::Parser::new();
@@ -1299,7 +1302,7 @@ fn file_paste_edits_only_local_query_and_enter_inserts_a_quoted_path() {
         ))
         .unwrap();
     server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size).unwrap();
+    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
     frontend.poll().unwrap();
     frontend.ui.files = Some(crate::files::FileNav::new(directory.clone()).unwrap());
     frontend.ui.files_open = true;
