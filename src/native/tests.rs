@@ -49,7 +49,7 @@ unsafe extern "C" {
     fn FcConfigBuildFonts(config: *mut c_void) -> i32;
     fn FcConfigSetCurrent(config: *mut c_void) -> i32;
     fn FcConfigDestroy(config: *mut c_void);
-    fn cairo_scaled_font_destroy(font: *mut c_void);
+    fn nt_font_glyphs_free(glyphs: *mut Glyph, count: usize);
     fn cairo_image_surface_create(format: i32, width: i32, height: i32) -> *mut c_void;
     fn cairo_image_surface_get_data(surface: *mut c_void) -> *const u8;
     fn cairo_image_surface_get_stride(surface: *mut c_void) -> i32;
@@ -146,17 +146,7 @@ impl Shaped {
 
 impl Drop for Shaped {
     fn drop(&mut self) {
-        let glyphs = self.glyphs();
-        let mut i = 0;
-        while i < glyphs.len() {
-            let font = glyphs[i].font;
-            i += 1;
-            while i < glyphs.len() && glyphs[i].font == font {
-                i += 1;
-            }
-            unsafe { cairo_scaled_font_destroy(font) };
-        }
-        unsafe { libc::free(self.raw.cast()) };
+        unsafe { nt_font_glyphs_free(self.raw, self.count) };
     }
 }
 

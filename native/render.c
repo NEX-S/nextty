@@ -175,13 +175,8 @@ static void free_line_input(NtLine *line) {
 }
 
 static void destroy_line(NtLine *line) {
-    for (size_t i = 0; i < line->count;) {
-        cairo_scaled_font_t *font = line->glyphs[i].font;
-        do ++i; while (i < line->count && line->glyphs[i].font == font);
-        cairo_scaled_font_destroy(font);
-    }
+    nt_font_glyphs_free(line->glyphs, line->count);
     free_line_input(line);
-    free(line->glyphs);
     free(line);
 }
 

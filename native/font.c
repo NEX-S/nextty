@@ -326,7 +326,7 @@ static unsigned color_glyph(Font *font, uint32_t glyph) {
     return 0;
 }
 
-static void release_glyphs(NtFontGlyph *glyphs, size_t count) {
+void nt_font_glyphs_free(NtFontGlyph *glyphs, size_t count) {
     for (size_t i = 0; i < count; ++i)
         if (!i || glyphs[i].font != glyphs[i - 1].font) cairo_scaled_font_destroy(glyphs[i].font);
     free(glyphs);
@@ -491,7 +491,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     *count = used;
     success = 1;
 done:
-    if (!success) release_glyphs(out, used);
+    if (!success) nt_font_glyphs_free(out, used);
     free(chars);
     return success;
 }
