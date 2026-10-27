@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
@@ -2540,12 +2540,7 @@ fn apply_action(
     Ok(())
 }
 fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
-    use std::os::fd::FromRawFd;
-    let fd = unsafe { libc::fcntl(terminal.event_fd(), libc::F_DUPFD_CLOEXEC, 0) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let wake = unsafe { OwnedFd::from_raw_fd(fd) };
+    let wake = unsafe { BorrowedFd::borrow_raw(terminal.event_fd()) }.try_clone_to_owned()?;
     match search
         .core
         .lock()

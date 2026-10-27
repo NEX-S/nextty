@@ -14,7 +14,7 @@ use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{self, Seek, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::net::UnixStream;
@@ -213,11 +213,7 @@ impl Peer {
     }
     pub fn stdio() -> io::Result<Self> {
         let duplicate = |fd| {
-            let copy = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 3) };
-            if copy < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            let copy = unsafe { OwnedFd::from_raw_fd(copy) };
+            let copy = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
             let flags = unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_GETFL) };
             if flags < 0
                 || unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
