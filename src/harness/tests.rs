@@ -224,9 +224,7 @@ impl Worker {
             wake: crate::eventfd::new().unwrap(),
             notification: crate::eventfd::new().unwrap(),
             process_id: Mutex::new(None),
-            worker: Mutex::new(None),
         });
-        let harness = Harness(Arc::clone(&shared));
         let control = Arc::clone(&shared);
         let (done, receiver) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
@@ -245,9 +243,11 @@ impl Worker {
             let result = session.run(&shared).map(|()| session.history);
             done.send(result).unwrap();
         });
-        *control.worker.lock().unwrap() = Some(thread);
         Self {
-            harness: Some(harness),
+            harness: Some(Harness {
+                shared: control,
+                worker: Some(thread),
+            }),
             done: receiver,
         }
     }

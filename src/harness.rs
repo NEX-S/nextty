@@ -75,10 +75,12 @@ struct Shared {
     wake: OwnedFd,
     notification: OwnedFd,
     process_id: Mutex<Option<i32>>,
-    worker: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
-pub(crate) struct Harness(Arc<Shared>);
+pub(crate) struct Harness {
+    shared: Arc<Shared>,
+    worker: Option<std::thread::JoinHandle<()>>,
+}
 
 impl Harness {
     pub fn start(
@@ -117,7 +119,6 @@ impl Harness {
             wake: crate::eventfd::new()?,
             notification: crate::eventfd::new()?,
             process_id: Mutex::new(None),
-            worker: Mutex::new(None),
         });
         let worker = Arc::clone(&shared);
         let handle = std::thread::Builder::new()
@@ -146,19 +147,21 @@ impl Harness {
                     }
                 }
             })?;
-        *shared.worker.lock().unwrap() = Some(handle);
-        Ok(Self(shared))
+        Ok(Self {
+            shared,
+            worker: Some(handle),
+        })
     }
 
     pub fn fd(&self) -> RawFd {
-        self.0.notification.as_raw_fd()
+        self.shared.notification.as_raw_fd()
     }
 
     pub fn send(&self, text: String, pane: u64, goal: bool, target: Value) -> io::Result<u64> {
         if text.len() > CONTEXT_LIMIT {
             return Err(io::Error::other("Agent prompt exceeds 256 KiB"));
         }
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         if state.stopped {
             return Err(io::Error::other("Agent worker stopped"));
         }
@@ -181,12 +184,12 @@ impl Harness {
             canceled,
         });
         drop(state);
-        notify(self.0.wake.as_raw_fd())?;
+        notify(self.shared.wake.as_raw_fd())?;
         Ok(turn)
     }
 
     pub fn rewind(&self, turn: u64) -> io::Result<()> {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         if state.stopped {
             return Err(io::Error::other("Agent worker stopped"));
         }
@@ -201,19 +204,19 @@ impl Harness {
         }
         state.rewind = Some(turn);
         drop(state);
-        notify(self.0.wake.as_raw_fd())
+        notify(self.shared.wake.as_raw_fd())
     }
 
     pub fn abort(&self) -> io::Result<()> {
-        if let Some(active) = &self.0.state.lock().unwrap().active {
+        if let Some(active) = &self.shared.state.lock().unwrap().active {
             active.store(true, Ordering::Release);
         }
-        notify(self.0.wake.as_raw_fd())
+        notify(self.shared.wake.as_raw_fd())
     }
 
     pub fn poll(&self) -> io::Result<Vec<Event>> {
         consume_notification(self.fd())?;
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         state.bytes = 0;
         Ok(std::mem::take(&mut state.events))
     }
@@ -221,28 +224,28 @@ impl Harness {
     pub fn respond(&self, request: TerminalRequest, result: io::Result<String>) -> io::Result<()> {
         // Cancellation can disconnect a request before the UI reaches it.
         let _ = request.reply.send(result);
-        notify(self.0.wake.as_raw_fd())
+        notify(self.shared.wake.as_raw_fd())
     }
 }
 
 impl Drop for Harness {
     fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
+        let mut state = self.shared.state.lock().unwrap();
         state.shutdown = true;
         if let Some(active) = &state.active {
             active.store(true, Ordering::Release);
         }
-        if let Some(pid) = *self.0.process_id.lock().unwrap() {
+        if let Some(pid) = *self.shared.process_id.lock().unwrap() {
             unsafe {
                 libc::kill(-pid, libc::SIGKILL);
             }
         }
         drop(state);
-        if let Err(error) = notify(self.0.wake.as_raw_fd()) {
+        if let Err(error) = notify(self.shared.wake.as_raw_fd()) {
             eprintln!("stop agent: {error}");
         }
         // The owner may exit immediately afterward; descendants must be reaped first.
-        if let Some(worker) = self.0.worker.lock().unwrap().take()
+        if let Some(worker) = self.worker.take()
             && worker.join().is_err()
         {
             eprintln!("Agent worker panicked during shutdown");
@@ -693,7 +696,6 @@ impl Session {
             wake: wake.try_clone()?,
             notification: crate::eventfd::new()?,
             process_id: Mutex::new(None),
-            worker: Mutex::new(None),
         });
         self.archive = Some(Archive::new()?);
         let prompt = Prompt {
