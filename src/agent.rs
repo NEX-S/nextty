@@ -578,13 +578,13 @@ fn terminal_request(client: &mut Client, request: &TerminalRequest) -> io::Resul
             if text.len() > INPUT_LIMIT {
                 return Err(io::Error::other("Terminal input exceeds 64 KiB"));
             }
+            let length = text.len();
             client.send(Action::Input {
                 pane,
-                data: text.as_bytes().to_vec(),
+                data: text.into_bytes(),
             })?;
             Ok(format!(
-                "Queued {} input bytes to pane {pane}; read_terminal to inspect the result",
-                text.len()
+                "Queued {length} input bytes to pane {pane}; read_terminal to inspect the result"
             ))
         }
         _ => Err(io::Error::other("Unknown terminal tool")),
