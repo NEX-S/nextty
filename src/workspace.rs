@@ -1502,6 +1502,10 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     let Some(action) = action else {
                         break;
                     };
+                    if matches!(action, Action::Detach) {
+                        clients[index].failed = true;
+                        break;
+                    }
                     let result = match clients[index].action_blocked(&action, &workspaces) {
                         Ok(true) => {
                             clients[index].deferred = Some(action);
@@ -1518,18 +1522,10 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                         ),
                         Err(error) => Err(error),
                     };
-                    match result {
-                        Ok(detach) => {
-                            if detach {
-                                clients[index].failed = true;
-                                break;
-                            }
-                        }
-                        Err(error) => {
-                            clients[index].respond(Response::Error(error.to_string()));
-                            if clients[index].failed {
-                                break;
-                            }
+                    if let Err(error) = result {
+                        clients[index].respond(Response::Error(error.to_string()));
+                        if clients[index].failed {
+                            break;
                         }
                     }
                     if !clients[index].peer.buffered_action() {
@@ -1865,7 +1861,7 @@ fn apply_action(
     dirty: &mut HashSet<String>,
     history_root: &Path,
     closing: &mut ClosingTerminals,
-) -> io::Result<bool> {
+) -> io::Result<()> {
     let client_id = clients[index].id;
     if clients[index].agent
         && !matches!(
@@ -1909,7 +1905,7 @@ fn apply_action(
                 client.respond(Response::Agent { kind: 2, payload });
             }
             dirty.insert(name);
-            return Ok(false);
+            return Ok(());
         }
         Action::List => {
             let mut list: Vec<_> = workspaces
@@ -1928,7 +1924,7 @@ fn apply_action(
                 .collect();
             list.sort_by(|a, b| a.name.cmp(&b.name));
             clients[index].respond(Response::List(list));
-            return Ok(false);
+            return Ok(());
         }
         Action::Create { mut name, options } => {
             if name.is_empty() {
@@ -1990,7 +1986,7 @@ fn apply_action(
             clients[index].size = options.size;
             clients[index].full = true;
             dirty.insert(name);
-            return Ok(false);
+            return Ok(());
         }
         Action::Attach { name, size } => {
             validate_size(size)?;
@@ -2018,7 +2014,7 @@ fn apply_action(
                 }
             }
             dirty.insert(name);
-            return Ok(false);
+            return Ok(());
         }
         Action::TerminateName(name) => {
             let notify_requester = clients[index].workspace.is_none();
@@ -2039,9 +2035,8 @@ fn apply_action(
             if notify_requester {
                 clients[index].respond(Response::Detached);
             }
-            return Ok(false);
+            return Ok(());
         }
-        Action::Detach => return Ok(true),
         _ => (),
     }
     let name = clients[index].workspace.as_ref().ok_or_else(|| {
@@ -2064,7 +2059,7 @@ fn apply_action(
                 kind: 5,
                 payload: Vec::new(),
             });
-            return Ok(false);
+            return Ok(());
         }
         Action::AgentView(payload) if workspace.controller == Some(client_id) => {
             workspace.agent.view = Some(payload.clone());
@@ -2076,7 +2071,7 @@ fn apply_action(
                     payload: payload.clone(),
                 });
             }
-            return Ok(false);
+            return Ok(());
         }
         Action::AgentRequest(payload) if workspace.controller == Some(client_id) => {
             if let Some(owner) = workspace.agent.owner.and_then(|id| {
@@ -2113,7 +2108,7 @@ fn apply_action(
                     });
                 }
             }
-            return Ok(false);
+            return Ok(());
         }
         Action::AgentUpdate { kind, payload } if clients[index].agent && matches!(kind, 0 | 1) => {
             if *kind == 0 {
@@ -2129,7 +2124,7 @@ fn apply_action(
                     payload: payload.clone(),
                 });
             }
-            return Ok(false);
+            return Ok(());
         }
         Action::AgentView(_) | Action::AgentRequest(_) | Action::AgentUpdate { .. } => {
             return Err(io::Error::new(
@@ -2143,7 +2138,7 @@ fn apply_action(
         validate_size(size)?;
         clients[index].size = size;
         if workspace.controller != Some(client_id) {
-            return Ok(false);
+            return Ok(());
         }
     }
     if workspace.controller != Some(client_id)
@@ -2185,13 +2180,13 @@ fn apply_action(
                 dirty.insert(workspace.name.clone());
             }
         }
-        return Ok(false);
+        return Ok(());
     }
     let name = workspace.name.clone();
     match action {
         Action::Resize(size) => {
             if size == workspace.size {
-                return Ok(false);
+                return Ok(());
             }
             workspace.resize(size)?;
             for client in clients.iter_mut() {
@@ -2215,7 +2210,7 @@ fn apply_action(
                 .root
                 .resize_split(rect, first, second, position)
             {
-                return Ok(false);
+                return Ok(());
             }
             workspace.resize(workspace.size)?;
             for client in clients.iter_mut() {
@@ -2270,7 +2265,7 @@ fn apply_action(
         }
         Action::Focus(pane) => {
             if pane == previous_focus {
-                return Ok(false);
+                return Ok(());
             }
             if !workspace.tabs[workspace.active].root.contains(pane) {
                 return Err(io::Error::new(
@@ -2283,14 +2278,14 @@ fn apply_action(
         Action::Navigate(direction) => {
             workspace.navigate(direction);
             if workspace.focused() == previous_focus {
-                return Ok(false);
+                return Ok(());
             }
         }
         Action::Tab(delta) => {
             let active = (workspace.active as i64 + i64::from(delta))
                 .rem_euclid(workspace.tabs.len() as i64) as usize;
             if active == workspace.active {
-                return Ok(false);
+                return Ok(());
             }
             workspace.active = active;
             for client in clients.iter_mut() {
@@ -2345,7 +2340,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .scroll_display(scroll)
             {
-                return Ok(false);
+                return Ok(());
             }
         }
         Action::SelectionStart {
@@ -2382,7 +2377,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?;
             validate_point(&core, point)?;
             if !core.selection_update(point, side) {
-                return Ok(false);
+                return Ok(());
             }
         }
         Action::SelectionClear { pane } => {
@@ -2393,7 +2388,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .clear_selection()
             {
-                return Ok(false);
+                return Ok(());
             }
         }
         action @ Action::CopySelection { pane, .. } => {
@@ -2412,7 +2407,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .prompt_jump(previous)
             {
-                return Ok(false);
+                return Ok(());
             }
         }
         action @ Action::CopyBlock { pane, .. } => {
@@ -2519,7 +2514,7 @@ fn apply_action(
                     client.finish();
                 }
             }
-            return Ok(false);
+            return Ok(());
         }
         _ => unreachable!(),
     }
@@ -2542,7 +2537,7 @@ fn apply_action(
         }
     }
     dirty.insert(name);
-    Ok(false)
+    Ok(())
 }
 fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
     use std::os::fd::FromRawFd;
