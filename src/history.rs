@@ -545,11 +545,11 @@ impl History {
             })
             .is_ok()
     }
-    pub fn clear(&self) -> io::Result<()> {
+    fn send(&self, request: Request) -> io::Result<()> {
         self.sender
             .as_ref()
             .unwrap()
-            .try_send(Request::Clear)
+            .try_send(request)
             .map_err(|error| match error {
                 mpsc::TrySendError::Full(_) => {
                     io::Error::new(io::ErrorKind::WouldBlock, "history queue is full")
@@ -558,6 +558,9 @@ impl History {
                     io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
                 }
             })
+    }
+    pub fn clear(&self) -> io::Result<()> {
+        self.send(Request::Clear)
     }
     pub fn reflow(&self, request: Reflow) -> Result<(), Reflow> {
         match self
@@ -583,28 +586,17 @@ impl History {
         let (hot_start, hot) = hot;
         let (columns, alternate) = geometry;
         let (sender, receiver) = mpsc::channel();
-        self.sender
-            .as_ref()
-            .unwrap()
-            .try_send(Request::Search(SearchJob {
-                segments: Vec::new(),
-                hot_start,
-                hot,
-                query,
-                columns,
-                alternate,
-                cancelled,
-                wake,
-                sender,
-            }))
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "history queue is full")
-                }
-                mpsc::TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
-                }
-            })?;
+        self.send(Request::Search(SearchJob {
+            segments: Vec::new(),
+            hot_start,
+            hot,
+            query,
+            columns,
+            alternate,
+            cancelled,
+            wake,
+            sender,
+        }))?;
         Ok(receiver)
     }
     pub fn copy(
@@ -617,26 +609,15 @@ impl History {
         incomplete: bool,
     ) -> io::Result<mpsc::Receiver<io::Result<HistoryCopy>>> {
         let (sender, receiver) = mpsc::channel();
-        self.sender
-            .as_ref()
-            .unwrap()
-            .try_send(Request::Copy {
-                start,
-                end,
-                hot_start,
-                hot,
-                kind,
-                incomplete,
-                sender,
-            })
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "history queue is full")
-                }
-                mpsc::TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
-                }
-            })?;
+        self.send(Request::Copy {
+            start,
+            end,
+            hot_start,
+            hot,
+            kind,
+            incomplete,
+            sender,
+        })?;
         Ok(receiver)
     }
 }
