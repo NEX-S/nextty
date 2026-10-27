@@ -1,0 +1,26 @@
+[package]
+name = "nextty"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/NEX-S/nextty"
+description = "A small GPU-accelerated Linux terminal"
+
+[features]
+default = ["gui", "tui", "monitor", "files", "agent"]
+gui = []
+tui = []
+monitor = ["tui"]
+agent = ["tui", "dep:serde_json", "dep:curl", "dep:pulldown-cmark"]
+files = ["tui"]
+
+[dependencies]
+curl = { version = "0.4", default-features = false, optional = true }
+libc = "0.2"
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
+serde_json = { version = "1", optional = true }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

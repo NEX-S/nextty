@@ -1,0 +1,22 @@
+# Copy to ~/.config/nextty/config.toml, or pass --config PATH.
+font_family = "CodeNewRoman Nerd Font Mono"
+font_size_px = 17.0
+foreground = "#cccccc"
+background = "#202020"
+
+# Default terminal background opacity; text and explicit ANSI backgrounds stay opaque.
+background_opacity = 1.0
+
+# GUI tabline background opacity, independent of terminal background opacity.
+# Tabs, text, the active tab's green dot, and controls stay opaque. Does not affect TUI.
+tab_bar_opacity = 0.7
+
+# Shared disk history budget per workspace (tui feature).
+history_limit_bytes = 1_073_741_824
+
+
+# Agent uses the Anthropic Messages API; /v1/messages is appended to base_url.
+# Authentication: ANTHROPIC_AUTH_TOKEN (Bearer) or ANTHROPIC_API_KEY.
+# Set model before sending a message. The default base_url is https://api.anthropic.com.
+# base_url = "https://gateway.example.com/anthropic"
+# model = "deepseek-flash"
