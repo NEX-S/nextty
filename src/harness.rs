@@ -424,7 +424,7 @@ impl Archive {
                     let screen = delta["screen"].as_object_mut().unwrap();
                     screen.remove("rows");
                     screen.insert("base_screen_context_id".into(), json!(base_id));
-                    screen.insert("row_updates".into(), json!(updates));
+                    screen.insert("row_updates".into(), Value::Array(updates));
                     if serde_json::to_vec(&delta)?.len() < serde_json::to_vec(&target)?.len() {
                         target = delta;
                     }

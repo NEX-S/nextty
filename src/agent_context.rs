@@ -51,8 +51,8 @@ pub(crate) fn shape(screen: &Screen) -> Value {
         }
     }
     let mut result = metadata(screen);
-    result["rows"] = json!(rows);
-    result["omitted"] = json!(omitted);
+    result["rows"] = Value::Array(rows);
+    result["omitted"] = Value::Array(omitted);
     result
 }
 
