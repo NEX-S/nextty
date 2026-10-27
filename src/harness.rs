@@ -660,17 +660,13 @@ fn task_tools(remote: bool, goal: bool, delegated: bool) -> Vec<Value> {
         json!({"command":{"type":"string"},"pane":{"type":"integer"},"block":{"type":"integer"}})
     };
     result.push(json!({"name":"monitor","description":"Monitor command execution without repeated model polling. Supply block (and optional pane) to wait for an existing foreground SHELL command's OSC133 exit status; obtain its id from command_blocks. This does not detect completion of an inner GDB/pwndbg command. Alternatively supply command to START an independent local background /bin/sh job in the conversation directory, without the run_command 120-second timeout. It cannot inherit current PTY cd/export or replace an interactive workflow. Background completion automatically wakes this agent; inspect its real exit status and output before reporting success.","input_schema":{"type":"object","properties":properties,"oneOf":if remote {json!([{"required":["block"]}])} else {json!([{"required":["command"]},{"required":["block"]}])},"additionalProperties":false}}));
-    result.push(json!({"name":"spawn_agent","description":"Start an independent subagent using the same model and conversation directory. Provide a self-contained task with necessary context and a checkable result. It has its own context and supporting shell/file access, but cannot control the shared PTY or spawn further agents. Delegate separable work; avoid concurrent edits to the same files. Completion automatically returns a report to the parent; verify claims when necessary.","input_schema":{"type":"object","properties":{"task":{"type":"string"}},"required":["task"],"additionalProperties":false}}));
+    let description = if remote {
+        "Start an independent reasoning subagent using the same model. Supply a self-contained task and all relevant context: remote children cannot execute commands, access the remote filesystem, retrieve the parent's archives or control its PTY. Completion wakes the parent with a report; assess its claims before acting."
+    } else {
+        "Start an independent subagent using the same model and conversation directory. Provide a self-contained task with necessary context and a checkable result. It has its own context and supporting shell/file access, but cannot control the shared PTY or spawn further agents. Delegate separable work; avoid concurrent edits to the same files. Completion automatically returns a report to the parent; verify claims when necessary."
+    };
+    result.push(json!({"name":"spawn_agent","description":description,"input_schema":{"type":"object","properties":{"task":{"type":"string"}},"required":["task"],"additionalProperties":false}}));
     result.push(json!({"name":"wait_tasks","description":"Sleep until a background command or subagent completes, or the user stops you. Completion reports automatically enter context. Use when pending tasks are the only remaining work; do not poll read_terminal or repeatedly call the model to wait.","input_schema":{"type":"object","properties":{},"additionalProperties":false}}));
-    if remote {
-        let child = result
-            .iter_mut()
-            .find(|t| t["name"] == "spawn_agent")
-            .unwrap();
-        child["description"] = json!(
-            "Start an independent reasoning subagent using the same model. Supply a self-contained task and all relevant context: remote children cannot execute commands, access the remote filesystem, retrieve the parent's archives or control its PTY. Completion wakes the parent with a report; assess its claims before acting."
-        );
-    }
     result
 }
 
