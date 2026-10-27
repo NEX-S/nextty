@@ -17,13 +17,13 @@ mod monitor;
 #[cfg(any(feature = "gui", feature = "tui"))]
 pub mod screen;
 #[cfg(feature = "tui")]
-pub mod shell_integration;
+mod shell_integration;
 #[cfg(feature = "monitor")]
 pub mod system_stats;
 #[cfg(feature = "tui")]
 pub mod tui;
 #[cfg(feature = "tui")]
-pub mod wire;
+mod wire;
 #[cfg(feature = "tui")]
 pub mod workspace;
 
