@@ -5,7 +5,7 @@ use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
     native::{
         self, Event, Line, Renderer, Run, Window,
-        trace::{TRACE_BLOCK, Trace, TraceWriter, monotonic},
+        trace::{Trace, monotonic},
     },
     paint::{Frame, LineCache, text_columns},
     screen::{Screen, Update},
@@ -15,7 +15,7 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    io::{BufWriter, Write},
+    io::Write,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -64,15 +64,7 @@ impl Desktop {
         let size = grid_size(width, height, cell);
         let terminal = Terminal::new(shell, directory, size, config.foreground, config.background)?;
         window.title("nextty")?;
-        let trace = std::env::var_os("NEXTTY_TRACE")
-            .map(|path| {
-                TraceWriter::new(path).map(|output| Trace {
-                    output: BufWriter::with_capacity(TRACE_BLOCK, output),
-                    frame: 0,
-                    pending: None,
-                })
-            })
-            .transpose()?;
+        let trace = Trace::from_env()?;
         Ok(Self {
             terminal,
             screen: Screen::default(),
@@ -121,8 +113,8 @@ impl Desktop {
                 }
             }
             let ready = self.renderer.ready()?;
-            if ready {
-                self.finish_trace()?;
+            if ready && let Some(trace) = &mut self.trace {
+                trace.record_swap(self.renderer.swap_time())?;
             }
             if self.running && self.dirty && ready && self.window.ready() {
                 self.draw()?;
@@ -152,22 +144,9 @@ impl Desktop {
             }
         }
         self.renderer.finish()?;
-        self.finish_trace()?;
         if let Some(trace) = &mut self.trace {
+            trace.record_swap(self.renderer.swap_time())?;
             trace.finish()?;
-        }
-        Ok(())
-    }
-
-    fn finish_trace(&mut self) -> Result<()> {
-        if let Some(trace) = &mut self.trace
-            && let Some((prefix, suffix)) = trace.pending.take()
-        {
-            writeln!(
-                trace.output,
-                "{prefix} {:.9}{suffix}",
-                self.renderer.swap_time()
-            )?;
         }
         Ok(())
     }

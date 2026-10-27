@@ -18,13 +18,13 @@ use crate::{
 };
 use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
-    native::trace::{TRACE_BLOCK, Trace, TraceWriter, monotonic},
+    native::trace::{Trace, monotonic},
     native::{self, Event, Line, Renderer, Run, Window},
     paint::{Frame, LineCache, text_columns},
 };
 use std::{
     collections::{HashMap, VecDeque},
-    io::{BufWriter, Write},
+    io::Write,
     time::{Duration, Instant},
 };
 
@@ -438,15 +438,7 @@ impl WorkspaceView {
         let renderer = Renderer::new(&window, &config.font_family, config.font_size_px)?;
         let cell = renderer.metrics();
         let scale = window.size().2;
-        let trace = std::env::var_os("NEXTTY_TRACE")
-            .map(|path| {
-                TraceWriter::new(path).map(|output| Trace {
-                    output: BufWriter::with_capacity(TRACE_BLOCK, output),
-                    frame: 0,
-                    pending: None,
-                })
-            })
-            .transpose()?;
+        let trace = Trace::from_env()?;
         let ui = Ui::new()?;
         let mut view = Self {
             client,
@@ -525,8 +517,8 @@ impl WorkspaceView {
                     .refresh(directory, self.ui.resources.open)?;
             }
             let ready = self.renderer.ready()?;
-            if ready {
-                self.finish_trace()?;
+            if ready && let Some(trace) = &mut self.trace {
+                trace.record_swap(self.renderer.swap_time())?;
             }
             let mut timeout = if self.dirty && ready && self.window.ready() {
                 0
@@ -717,7 +709,9 @@ impl WorkspaceView {
             }
             self.dirty |= self.ui.expire_status();
             if self.running && self.dirty && self.renderer.ready()? && self.window.ready() {
-                self.finish_trace()?;
+                if let Some(trace) = &mut self.trace {
+                    trace.record_swap(self.renderer.swap_time())?;
+                }
                 self.draw()?;
                 self.dirty = false;
             }
@@ -731,24 +725,13 @@ impl WorkspaceView {
             trace.output.get_mut().draining = true;
         }
         self.renderer.finish()?;
-        self.finish_trace()?;
         if let Some(trace) = &mut self.trace {
+            trace.record_swap(self.renderer.swap_time())?;
             trace.finish()?;
         }
         Ok(())
     }
-    fn finish_trace(&mut self) -> Result<()> {
-        if let Some(trace) = &mut self.trace
-            && let Some((prefix, suffix)) = trace.pending.take()
-        {
-            writeln!(
-                trace.output,
-                "{prefix} {:.9}{suffix}",
-                self.renderer.swap_time()
-            )?;
-        }
-        Ok(())
-    }
+
     fn message(&mut self, text: impl Into<String>) {
         self.ui.message(text);
         self.dirty = true;

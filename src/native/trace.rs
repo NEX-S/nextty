@@ -12,7 +12,7 @@ pub(crate) struct Trace {
     pub(crate) frame: u32,
     pub(crate) pending: Option<(String, String)>,
 }
-pub(crate) const TRACE_BLOCK: usize = 8192;
+const TRACE_BLOCK: usize = 8192;
 struct TraceQueue {
     bytes: VecDeque<Vec<u8>>,
     opened: bool,
@@ -29,7 +29,7 @@ pub(crate) struct TraceWriter {
     pub(crate) draining: bool,
 }
 impl TraceWriter {
-    pub(crate) fn new(path: OsString) -> io::Result<Self> {
+    fn new(path: OsString) -> io::Result<Self> {
         let shared = Arc::new(TraceShared {
             queue: Mutex::new(TraceQueue {
                 bytes: VecDeque::new(),
@@ -130,6 +130,25 @@ impl Write for TraceWriter {
     }
 }
 impl Trace {
+    pub(crate) fn from_env() -> io::Result<Option<Self>> {
+        std::env::var_os("NEXTTY_TRACE")
+            .map(|path| {
+                TraceWriter::new(path).map(|output| Self {
+                    output: BufWriter::with_capacity(TRACE_BLOCK, output),
+                    frame: 0,
+                    pending: None,
+                })
+            })
+            .transpose()
+    }
+
+    pub(crate) fn record_swap(&mut self, time: f64) -> io::Result<()> {
+        if let Some((prefix, suffix)) = self.pending.take() {
+            writeln!(self.output, "{prefix} {time:.9}{suffix}")?;
+        }
+        Ok(())
+    }
+
     pub(crate) fn finish(&mut self) -> io::Result<()> {
         if self.output.get_ref().worker.is_none() {
             return Ok(());
