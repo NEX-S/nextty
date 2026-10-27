@@ -7,7 +7,6 @@ use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 #[derive(Clone, Debug)]
 pub struct Screen {
     pub(crate) columns: usize,
-    pub(crate) lines: usize,
     pub(crate) rows: Vec<Row>,
     pub(crate) dirty: Vec<bool>,
     pub(crate) cursor: (Point, CursorShape),
@@ -35,7 +34,6 @@ impl Default for Screen {
     fn default() -> Self {
         Self {
             columns: 0,
-            lines: 0,
             rows: Vec::new(),
             dirty: Vec::new(),
             cursor: (Point::default(), CursorShape::Hidden),
@@ -88,7 +86,7 @@ impl Update {
 
 impl Screen {
     pub(crate) fn apply(&mut self, update: Update) -> std::io::Result<()> {
-        if self.columns != update.columns || self.lines != update.lines {
+        if self.columns != update.columns || self.rows.len() != update.lines {
             if update.palette.is_none()
                 || update.rows.len() != update.lines
                 || update.rows.iter().enumerate().any(|(i, (n, _))| i != *n)
@@ -101,7 +99,6 @@ impl Screen {
             self.rows = update.rows.into_iter().map(|(_, row)| row).collect();
             self.dirty = vec![true; update.lines];
             self.columns = update.columns;
-            self.lines = update.lines;
         } else {
             for (index, row) in update.rows {
                 self.rows[index] = row;
@@ -154,7 +151,8 @@ impl Screen {
         pane: &'a crate::workspace::PaneView,
         row: usize,
     ) -> Option<&'a crate::workspace::BlockMarker> {
-        if pane.blocks.is_empty() || self.mode.contains(Mode::ALT_SCREEN) || row >= self.lines {
+        if pane.blocks.is_empty() || self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len()
+        {
             return None;
         }
         let line = row as i32 - self.offset as i32;
@@ -178,7 +176,7 @@ impl Screen {
         new: &crate::workspace::PaneView,
         row: usize,
     ) -> bool {
-        if self.mode.contains(Mode::ALT_SCREEN) || row >= self.lines {
+        if self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len() {
             return false;
         }
         let line = row as i32 - self.offset as i32;
@@ -198,7 +196,7 @@ impl Screen {
         self.columns
     }
     pub fn screen_lines(&self) -> usize {
-        self.lines
+        self.rows.len()
     }
     pub fn row(&self, index: usize) -> &Row {
         &self.rows[index]

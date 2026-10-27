@@ -1811,11 +1811,11 @@ fn dragging_nested_dividers_resizes_pty_and_preserves_other_splits() {
         rect(c, second).rows == 9
             && c.screens()
                 .get(&second)
-                .is_some_and(|screen| screen.lines == 9)
+                .is_some_and(|screen| screen.screen_lines() == 9)
     });
     assert_eq!(rect(&client, first).cols, 30);
     assert_eq!(rect(&client, third).y, 11);
-    assert_eq!(client.screens()[&second].lines, 9);
+    assert_eq!(client.screens()[&second].screen_lines(), 9);
     client.send(vertical.action(0, 0)).unwrap();
     wait(&mut client, |c, _| {
         rect(c, first).cols == 2
