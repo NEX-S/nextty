@@ -63,15 +63,13 @@ pub fn run() -> io::Result<()> {
         Client::connect(&PathBuf::from(os(&endpoint["local"])?))?
     } else {
         let mut command = Command::new(os(&endpoint["program"])?);
-        let args: Vec<Value> = serde_json::from_value(endpoint["args"].clone())?;
-        for arg in args {
-            command.arg(os(&arg)?);
-        }
-        let env: Vec<(Value, Option<Value>)> = serde_json::from_value(endpoint["env"].clone())?;
+        let args: Vec<Vec<u8>> = serde_json::from_value(endpoint["args"].clone())?;
+        command.args(args.into_iter().map(OsString::from_vec));
+        let env: Vec<(Vec<u8>, Option<Vec<u8>>)> = serde_json::from_value(endpoint["env"].clone())?;
         for (key, value) in env {
-            let key = os(&key)?;
+            let key = OsString::from_vec(key);
             if let Some(value) = value {
-                command.env(key, os(&value)?);
+                command.env(key, OsString::from_vec(value));
             } else {
                 command.env_remove(key);
             }
