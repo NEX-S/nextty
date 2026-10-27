@@ -51,8 +51,9 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
         });
     }
     let mut child = command.spawn()?;
-    serde_json::to_writer(child.stdin.take().unwrap(), &init)?;
+    let stdin = child.stdin.take().unwrap();
     std::thread::spawn(move || child.wait());
+    serde_json::to_writer(stdin, &init)?;
     Ok(())
 }
 
