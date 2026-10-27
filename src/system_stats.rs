@@ -514,7 +514,7 @@ impl Drop for SystemStats {
 fn sample_resources(sampler: Arc<Sampler>) {
     let mut previous_cpu: Option<CpuCounters> = None;
     let mut previous_net: HashMap<String, (u64, u64)> = HashMap::new();
-    let mut previous_disk: Option<(String, [u64; 2], u64)> = None;
+    let mut previous_disk: Option<DiskCounters> = None;
     let mut previous_swap: Option<[u64; 2]> = None;
     let mut previous_processes: HashMap<u32, ProcessCounters> = HashMap::new();
     let mut previous_at: Option<Instant> = None;
@@ -592,16 +592,16 @@ fn sample_resources(sampler: Arc<Sampler>) {
         let disk = directory.as_deref().and_then(disk_counters);
         if let Some(disk) = &disk {
             sample.disk_name = Some(disk.name.clone());
-            if let Some((name, bytes, busy_ms)) = &previous_disk
-                && *name == disk.name
+            if let Some(previous) = &previous_disk
+                && previous.name == disk.name
             {
                 sample.disk_rates =
-                    std::array::from_fn(|i| per_second(disk.bytes[i], bytes[i], elapsed));
-                sample.disk_util =
-                    per_second(disk.busy_ms, *busy_ms, elapsed).map(|v| (v / 10.).min(100.));
+                    std::array::from_fn(|i| per_second(disk.bytes[i], previous.bytes[i], elapsed));
+                sample.disk_util = per_second(disk.busy_ms, previous.busy_ms, elapsed)
+                    .map(|v| (v / 10.).min(100.));
             }
         }
-        previous_disk = disk.map(|disk| (disk.name, disk.bytes, disk.busy_ms));
+        previous_disk = disk;
         if let Ok(text) = fs::read_to_string("/proc/net/dev") {
             sample.networks = network_counters(&text);
             for net in &mut sample.networks {
