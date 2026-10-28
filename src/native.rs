@@ -54,7 +54,7 @@ pub struct Event {
     pub end: i32,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq)]
 #[repr(C)]
 pub struct Run {
     pub start: u32,

@@ -74,11 +74,16 @@ impl CachedRow {
         };
         self.text == row.text
             && self.columns == row.columns
-            && self
+            && (self
                 .runs
-                .chunk_by(connected)
-                .map(shaping)
-                .eq(row.runs.chunk_by(connected).map(shaping))
+                .iter()
+                .map(|run| run.text)
+                .eq(row.runs.iter().map(|run| run.text))
+                || self
+                    .runs
+                    .chunk_by(connected)
+                    .map(shaping)
+                    .eq(row.runs.chunk_by(connected).map(shaping)))
     }
 }
 
