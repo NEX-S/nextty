@@ -1326,12 +1326,12 @@ void nt_renderer_line(NtRenderer *r, const NtLine *line, float x, float y, float
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor) {
     if (!shape_line(r, line)) return 0;
     double inverse_scale = 1. / r->scale;
+    float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
     for (size_t i = 0; i < line->count; ++i) {
         const NtFontGlyph *glyph = &line->glyphs[i];
         if (!(glyph->color & 255)) continue;
         Quad q;
         if (glyph->straight) {
-            float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
             if (glyph->straight == 0x2502) {
                 float left = roundf((x + glyph->x + (r->cell_width - stroke) * 0.5f) * r->scale) / r->scale;
                 q = make_quad(left, y, stroke, r->cell_height, glyph->color, 0);
