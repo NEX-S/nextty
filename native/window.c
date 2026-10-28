@@ -686,13 +686,11 @@ static const struct xdg_wm_base_listener shell_listener = {.ping = shell_ping};
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
     NtWindow *w = data;
     NtEvent event = {.kind = NT_FRAME};
-    if (w->tracing) {
-        struct timespec received;
-        clock_gettime(CLOCK_MONOTONIC, &received);
-        event.code = w->frame_callback_id;
-        event.x = received.tv_sec + received.tv_nsec / 1e9;
-        event.y = time;
-    }
+    struct timespec received;
+    clock_gettime(CLOCK_MONOTONIC, &received);
+    event.code = w->frame_callback_id;
+    event.x = received.tv_sec + received.tv_nsec / 1e9;
+    event.y = time;
     wl_callback_destroy(cb);
     w->frame = NULL;
     emit(w, event);
@@ -1433,27 +1431,24 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *prox
     (void)sequence_lo;
     Feedback *feedback = data;
     NtWindow *w = feedback->window;
-    if (w->tracing) {
-        double seconds =
-            (double)(((uint64_t)seconds_hi << 32) | seconds_lo) + (double)nanoseconds / 1e9;
-        emit(w, (NtEvent){.kind = NT_PRESENTED,
-                          .code = feedback->id,
-                          .modifiers = flags,
-                          .x = seconds,
-                          .y = refresh,
-                          .start = w->presentation_clock});
-    }
+    double seconds =
+        (double)(((uint64_t)seconds_hi << 32) | seconds_lo) + (double)nanoseconds / 1e9;
+    emit(w, (NtEvent){.kind = NT_PRESENTED,
+                      .code = feedback->id,
+                      .modifiers = flags,
+                      .x = seconds,
+                      .y = refresh,
+                      .start = w->presentation_clock});
     (void)proxy;
     feedback_remove(feedback);
 }
 static void feedback_discarded(void *data, struct wp_presentation_feedback *proxy) {
     Feedback *feedback = data;
     NtWindow *w = feedback->window;
-    if (w->tracing)
-        emit(w, (NtEvent){.kind = NT_PRESENTED,
-                          .code = feedback->id,
-                          .start = w->presentation_clock,
-                          .end = 1});
+    emit(w, (NtEvent){.kind = NT_PRESENTED,
+                      .code = feedback->id,
+                      .start = w->presentation_clock,
+                      .end = 1});
     (void)proxy;
     feedback_remove(feedback);
 }
