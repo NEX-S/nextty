@@ -1636,8 +1636,6 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
     w->callback_data = data;
     w->delivered = 0;
     drain_events(w);
-    if (wl_display_dispatch_pending(w->display) < 0)
-        wayland_error(w, "dispatching Wayland events");
     if (w->error[0])
         goto done;
     if (w->delivered)
