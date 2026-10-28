@@ -1755,10 +1755,11 @@ impl Core {
             let point = self.active.cursor.point;
             let available = self.columns() - point.column;
             let bytes = &text.as_bytes()[..available.min(text.len())];
-            let length = bytes
-                .iter()
-                .position(|byte| !byte.is_ascii())
-                .unwrap_or(bytes.len());
+            let length = if bytes.is_ascii() {
+                bytes.len()
+            } else {
+                bytes.iter().position(|byte| !byte.is_ascii()).unwrap()
+            };
             let end = point.column + length;
             let row = self.screen_row_mut(point.line as usize);
             row.prepare_write(point.column, length, template.bg);
