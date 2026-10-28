@@ -1807,18 +1807,22 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
             let bg = decode_color(d)?;
             let flags = Flags::from_bits(d.u16()?).ok_or_else(|| invalid("invalid cell flags"))?;
             if count == 1 {
-                let c = chars
-                    .next()
-                    .ok_or_else(|| invalid("missing screen characters"))?;
+                let c = if ascii {
+                    char::from(text.as_bytes()[cells.len()])
+                } else {
+                    chars
+                        .next()
+                        .ok_or_else(|| invalid("missing screen characters"))?
+                };
                 cells.push(Cell { c, fg, bg, flags });
             } else if ascii {
-                cells.extend(chars.as_str().as_bytes()[..count].iter().map(|&c| Cell {
+                let end = cells.len() + count;
+                cells.extend(text.as_bytes()[cells.len()..end].iter().map(|&c| Cell {
                     c: char::from(c),
                     fg,
                     bg,
                     flags,
                 }));
-                chars = chars.as_str()[count..].chars();
             } else {
                 let end = cells.len() + count;
                 cells.extend((&mut chars).take(count).map(|c| Cell { c, fg, bg, flags }));
@@ -1827,7 +1831,7 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
                 }
             }
         }
-        if chars.next().is_some() {
+        if !ascii && chars.next().is_some() {
             return Err(invalid("screen text exceeds columns"));
         }
         cells.resize(columns, Cell::default());
