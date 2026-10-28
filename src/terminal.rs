@@ -516,7 +516,7 @@ impl PtyLoop {
 
     fn io_loop(&mut self) -> io::Result<()> {
         let mut parser = crate::vt::Parser::new();
-        let mut buffer = [0; 16 * 1024];
+        let mut buffer = [0; 8 * 1024];
         let mut pending = VecDeque::new();
         let mut offset = 0;
         let mut write_open = true;
