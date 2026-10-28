@@ -27,6 +27,7 @@ pub struct HistoryBudget {
     notifications: Mutex<Vec<std::sync::Weak<OwnedFd>>>,
 }
 struct BudgetFiles {
+    open: Option<(PathBuf, File)>,
     files: VecDeque<(PathBuf, u64, u64)>,
     used: u64,
 }
@@ -44,6 +45,7 @@ impl HistoryBudget {
             directory,
             capacity,
             files: Mutex::new(BudgetFiles {
+                open: None,
                 files: VecDeque::new(),
                 used: 0,
             }),
@@ -64,17 +66,27 @@ impl HistoryBudget {
             .files
             .lock()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let mut file = if create {
-            OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o600)
-                .open(path)?
+        let previous = if create || files.open.as_ref().is_none_or(|(open, _)| open != path) {
+            let file = if create {
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?
+            } else {
+                OpenOptions::new().append(true).open(path)?
+            };
+            files.open.replace((path.clone(), file))
         } else {
-            OpenOptions::new().append(true).open(path)?
+            None
         };
+        let file = &mut files.open.as_mut().unwrap().1;
         file.write_all(data)?;
         let metadata = file.metadata()?;
+        if metadata.nlink() == 0 {
+            files.open = None;
+            return Err(io::ErrorKind::NotFound.into());
+        }
         let bytes = (metadata.blocks() * 512).max(4096);
         let end = if files.files.back().is_some_and(|(_, _, age)| *age > order) {
             files.files.partition_point(|(_, _, age)| *age <= order)
@@ -97,6 +109,9 @@ impl HistoryBudget {
         let mut evicted = false;
         while files.used > self.capacity {
             let (path, bytes, _) = files.files.pop_front().unwrap();
+            if files.open.as_ref().is_some_and(|(open, _)| open == &path) {
+                files.open = None;
+            }
             match fs::remove_file(path) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -105,7 +120,9 @@ impl HistoryBudget {
             files.used -= bytes;
             evicted = true;
         }
+        // Replaced handles can close without serializing other archive writers.
         drop(files);
+        drop(previous);
         if evicted {
             self.generation.fetch_add(1, Ordering::Release);
             let mut notifications = self
@@ -155,6 +172,13 @@ impl HistoryBudget {
         }
         files.used -= removed;
         for segment in segments {
+            if files
+                .open
+                .as_ref()
+                .is_some_and(|(open, _)| open == &segment.path)
+            {
+                files.open = None;
+            }
             match fs::remove_file(&segment.path) {
                 Ok(()) => (),
                 Err(e) if e.kind() == io::ErrorKind::NotFound => (),
@@ -1715,6 +1739,44 @@ mod eviction_tests {
             .collect::<Vec<_>>();
         let used = cells.len();
         Row::from_parts(cells, false, used, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn removed_cached_segment_is_replaced_before_publishing_more_rows() {
+        let mut archive = archive(budget());
+        archive.append(0, &[row(0)]).unwrap();
+        fs::remove_file(&archive.segments.back().unwrap().path).unwrap();
+        archive.append(1, &[row(1)]).unwrap();
+        let (start, rows) = archive.page(0, 2).unwrap();
+        assert_eq!(start, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].cells, row(1).cells);
+    }
+
+    #[test]
+    fn evicted_and_cleared_archives_release_open_files() {
+        for evicted in [false, true] {
+            let mut budget = budget();
+            if evicted {
+                Arc::get_mut(&mut budget).unwrap().capacity = 1;
+            }
+            let mut archive = archive(budget.clone());
+            archive
+                .append(0, &(0..BATCH as u64).map(row).collect::<Vec<_>>())
+                .unwrap();
+            if !evicted {
+                archive.clear().unwrap();
+            }
+            let directory = fs::canonicalize(&budget.directory).unwrap();
+            for entry in fs::read_dir("/proc/self/fd").unwrap() {
+                let path = match fs::read_link(entry.unwrap().path()) {
+                    Ok(path) => path,
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                    Err(error) => panic!("{error}"),
+                };
+                assert!(!path.starts_with(&directory), "retained {path:?}");
+            }
+        }
     }
 
     #[test]
