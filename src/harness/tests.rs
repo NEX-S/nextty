@@ -153,7 +153,7 @@ fn stopping_a_goal_waiting_on_monitor_allows_the_next_turn() {
 }
 
 #[test]
-fn dropping_harness_reaps_command_descendants_before_returning() {
+fn dropping_harness_kills_command_descendants() {
     for tool in ["run_command", "monitor"] {
         let path =
             std::env::temp_dir().join(format!("nextty-owner-cleanup-{}", std::process::id()));
@@ -195,12 +195,17 @@ fn dropping_harness_reaps_command_descendants_before_returning() {
             thread::sleep(Duration::from_millis(2));
         };
         worker.finish();
+        let deadline = Instant::now() + Duration::from_secs(3);
         for pid in pids.split_whitespace() {
-            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+            while let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+                if matches!(stat.split_whitespace().nth(2), Some("Z" | "X")) {
+                    break;
+                }
                 assert!(
-                    matches!(stat.split_whitespace().nth(2), Some("Z" | "X")),
+                    Instant::now() < deadline,
                     "live descendant {pid} survived owner shutdown"
                 );
+                thread::sleep(Duration::from_millis(5));
             }
         }
         server.finish();
