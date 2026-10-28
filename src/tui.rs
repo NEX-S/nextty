@@ -2259,13 +2259,13 @@ impl Frontend {
             ClientEvent::Search {
                 pane,
                 request,
-                matches,
+                count,
                 truncated,
             } => {
                 if self
                     .ui
                     .search
-                    .result(&mut self.client, pane, request, matches, truncated)?
+                    .result(&mut self.client, pane, request, count, truncated)?
                 {
                     self.dirty = true;
                     self.full = true;
@@ -2823,9 +2823,15 @@ impl Frontend {
                 let block = current
                     .blocks
                     .iter()
-                    .filter(|block| block.has_output && block.line <= line)
+                    .filter(|block| block.output.is_some() && block.line <= line)
                     .max_by_key(|block| block.line)
-                    .or_else(|| current.blocks.iter().rev().find(|block| block.has_output));
+                    .or_else(|| {
+                        current
+                            .blocks
+                            .iter()
+                            .rev()
+                            .find(|block| block.output.is_some())
+                    });
                 let Some(block) = block else {
                     self.message("No command output block available; enable shell integration");
                     return Ok(true);
@@ -3113,15 +3119,10 @@ impl Frontend {
         if self.full {
             output.write_all(b"\x1b[2J")?;
         }
+        let size = self.view_size();
         let label = self.label();
         let start = output.len();
-        draw_tabs(
-            output,
-            snapshot,
-            self.view_size().num_cols,
-            &label,
-            self.pointer,
-        )?;
+        draw_tabs(output, snapshot, size.num_cols, &label, self.pointer)?;
         if self.full || self.header != output[start..] {
             self.header.clear();
             self.header.extend_from_slice(&output[start..]);
@@ -3134,7 +3135,7 @@ impl Frontend {
                 for row in 0..screen.screen_lines() {
                     if (!self.full && !screen.dirty[row])
                         || row >= usize::from(pane.rect.rows)
-                        || pane.rect.y.saturating_add(row as u16) >= self.view_size().num_lines
+                        || pane.rect.y.saturating_add(row as u16) >= size.num_lines
                     {
                         continue;
                     }
@@ -3144,19 +3145,12 @@ impl Frontend {
                                 .row_output(pane, row)
                                 .is_some_and(|current| current.id == block)
                     });
-                    draw_row(
-                        output,
-                        screen,
-                        pane,
-                        row,
-                        self.view_size().num_cols,
-                        highlight,
-                    )?;
+                    draw_row(output, screen, pane, row, size.num_cols, highlight)?;
                 }
             }
         }
         if self.full {
-            draw_separators(output, snapshot, self.view_size())?;
+            draw_separators(output, snapshot, size)?;
         }
         #[cfg(feature = "files")]
         if self.ui.files_open {
@@ -3283,7 +3277,7 @@ impl Frontend {
             && let Ok(text) = std::str::from_utf8(bytes)
         {
             let files = self.ui.files.as_mut().unwrap();
-            files.set_query([files.query(), text].concat());
+            files.insert_query(text);
             self.dirty = true;
             return Ok(());
         }

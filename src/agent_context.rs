@@ -78,16 +78,14 @@ fn metadata(screen: &Screen) -> Value {
     })
 }
 
-fn html_escape(text: &str, output: &mut String) {
-    for c in text.chars() {
-        match c {
-            '&' => output.push_str("&amp;"),
-            '<' => output.push_str("&lt;"),
-            '>' => output.push_str("&gt;"),
-            '"' => output.push_str("&quot;"),
-            '\'' => output.push_str("&#39;"),
-            _ => output.push(c),
-        }
+fn html_escape(c: char, output: &mut String) {
+    match c {
+        '&' => output.push_str("&amp;"),
+        '<' => output.push_str("&lt;"),
+        '>' => output.push_str("&gt;"),
+        '"' => output.push_str("&quot;"),
+        '\'' => output.push_str("&#39;"),
+        _ => output.push(c),
     }
 }
 
@@ -182,10 +180,10 @@ pub(crate) fn html(screen: &Screen) -> Value {
                     content.push(' ');
                 }
             } else {
-                html_escape(&cell.c.to_string(), &mut content);
+                html_escape(cell.c, &mut content);
                 if let Some(extra) = extra {
                     for c in &extra.zerowidth {
-                        html_escape(&c.to_string(), &mut content);
+                        html_escape(*c, &mut content);
                     }
                 }
             }

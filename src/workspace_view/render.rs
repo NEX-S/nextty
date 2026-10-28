@@ -18,16 +18,16 @@ impl WorkspaceView {
             return Ok(());
         };
         let controller = snapshot.controller;
-        let cell = (self.cell.0 * TAB_SCALE, self.cell.1 * TAB_SCALE);
+        let cell = self.cell;
         self.tab_hits.clear();
         let label = if self.client.is_remote() { "SSH" } else { "" };
         let columns = ((layout.width - self.control_width()) / cell.0).max(0.) as u16;
-        self.text.draw_at(
+        self.text.draw(
             &self.renderer,
             "›",
-            (cell.0, 0., TAB_SCALE),
+            cell.0,
+            0.,
             if controller { 0x9c8fdcff } else { 0xfe9b30ff },
-            0,
         )?;
         let (tabs, label, before, after) = crate::workspace::tab_chrome(snapshot, columns, label);
         let mut end = 3;
@@ -45,19 +45,19 @@ impl WorkspaceView {
             }
             self.renderer
                 .tab((x, 0.), (w, cell.1), cell.0, (background << 8) | 255);
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 "•",
-                (x + cell.0 * 2., 0., TAB_SCALE),
+                x + cell.0 * 2.,
+                0.,
                 if active { 0xafc460ff } else { 0x404040ff },
-                0,
             )?;
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 &fit(&tab.title, usize::from(columns - 8)),
-                (x + cell.0 * 4., 0., TAB_SCALE),
+                x + cell.0 * 4.,
+                0.,
                 if active { 0x949494ff } else { 0x606060ff },
-                0,
             )?;
             let close_x = x + w - cell.0 * 3.;
             let close_hovered = self.pointer.0 >= close_x - cell.0
@@ -67,10 +67,11 @@ impl WorkspaceView {
                 (close_x - cell.0, 0., cell.0 * 3., layout.top),
                 GuiAction::CloseTab(tab.id),
             );
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 "×",
-                (close_x, 0., TAB_SCALE),
+                close_x,
+                0.,
                 if close_hovered {
                     0xe87575ff
                 } else if active {
@@ -78,7 +79,6 @@ impl WorkspaceView {
                 } else {
                     0x404040ff
                 },
-                0,
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (close_x - cell.0, 0., cell.0 * 3., layout.top),
@@ -94,12 +94,12 @@ impl WorkspaceView {
         let label = fit_label(&label, columns.saturating_sub(end + 4));
         let label_x = (f32::from(columns) - text_width(&label) as f32 - 2.) * cell.0;
         self.overflow_hits(label_x, 0., before, after, text_width(&label));
-        self.text.draw_at(
+        self.text.draw(
             &self.renderer,
             &label,
-            (label_x, 0., TAB_SCALE),
+            label_x,
+            0.,
             if controller { 0xb8b8b8ff } else { 0xfe9b30ff },
-            0,
         )?;
         self.renderer.clip(0., 0., 0., 0.)
     }
@@ -186,21 +186,12 @@ impl WorkspaceView {
         if !disabled {
             self.control_feedback(hit.bounds, action);
         }
-        let scale = if action == GuiAction::NewTab {
-            TAB_SCALE
-        } else {
-            1.
-        };
-        self.text.draw_at(
+        self.text.draw(
             &self.renderer,
             label,
-            (
-                x + (w - self.cell.0 * scale) * 0.5,
-                (layout.top - self.cell.1 * scale) * 0.5,
-                scale,
-            ),
+            x + (w - self.cell.0) * 0.5,
+            (layout.top - self.cell.1) * 0.5,
             color,
-            0,
         )?;
         if !disabled {
             self.control_hits.push(hit);
@@ -250,8 +241,8 @@ impl WorkspaceView {
         )?;
         self.renderer.clear(background)?;
         self.chat_rows.clear();
-        let tab_height = (self.cell.1 + 8.) * TAB_SCALE;
-        let tab_cell = self.cell.0 * TAB_SCALE;
+        let tab_height = self.cell.1 + 8.;
+        let tab_cell = self.cell.0;
         let tab_columns = ((layout.width - layout.side) / tab_cell).max(1.) as usize;
         let mut tabline_background = 0;
         for shift in [16, 8, 0] {
@@ -299,15 +290,15 @@ impl WorkspaceView {
                     false,
                 );
             }
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 &fit(
                     self.ui.agent.sessions[index].title(),
                     cells.saturating_sub(4),
                 ),
-                (tx + tab_cell, layout.top + 4. * TAB_SCALE, TAB_SCALE),
+                tx + tab_cell,
+                layout.top + 4.,
                 if active { INK } else { 0x606060ff },
-                0,
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (tx, layout.top, tab_width, tab_height),
@@ -318,10 +309,11 @@ impl WorkspaceView {
                 (cx - tab_cell, layout.top, tab_cell * 3., tab_height),
                 close,
             );
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 "×",
-                (cx, layout.top + 4. * TAB_SCALE, TAB_SCALE),
+                cx,
+                layout.top + 4.,
                 if close_hovered {
                     0xe87575ff
                 } else if active {
@@ -329,7 +321,6 @@ impl WorkspaceView {
                 } else {
                     0x404040ff
                 },
-                0,
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (cx - tab_cell, layout.top, tab_cell * 3., tab_height),
@@ -357,10 +348,11 @@ impl WorkspaceView {
                 (button_x, layout.top, button_width, tab_height),
                 GuiAction::Agent(action),
             );
-            self.text.draw_at(
+            self.text.draw(
                 &self.renderer,
                 label,
-                (button_x + tab_cell, layout.top + 4. * TAB_SCALE, TAB_SCALE),
+                button_x + tab_cell,
+                layout.top + 4.,
                 if self.hovered_control == Some(GuiAction::Agent(action)) {
                     if action == crate::ui::AgentAction::NewSession {
                         ACCENT
@@ -370,7 +362,6 @@ impl WorkspaceView {
                 } else {
                     INK
                 },
-                0,
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (button_x, layout.top, button_width, tab_height),
@@ -1039,8 +1030,7 @@ impl WorkspaceView {
                     )
                 );
             if tab_control {
-                let padding = (self.cell.0 * TAB_SCALE)
-                    .min((bounds.2 - self.cell.0 * TAB_SCALE).max(0.) * 0.5);
+                let padding = self.cell.0.min((bounds.2 - self.cell.0).max(0.) * 0.5);
                 self.renderer.rect(
                     bounds.0 + padding,
                     bounds.1 + bounds.3 - 1.,
@@ -1323,10 +1313,10 @@ impl WorkspaceView {
             let width = count.ilog10() as usize + 2;
             if column + width <= visible {
                 let bounds = (
-                    x + column as f32 * (self.cell.0 * TAB_SCALE),
+                    x + column as f32 * self.cell.0,
                     y,
-                    width as f32 * (self.cell.0 * TAB_SCALE),
-                    (self.cell.1 * TAB_SCALE),
+                    width as f32 * self.cell.0,
+                    self.cell.1,
                 );
                 self.control_feedback(bounds, GuiAction::Tab(direction));
                 self.control_hits.push(GuiHit {

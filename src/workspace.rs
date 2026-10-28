@@ -3,8 +3,7 @@ pub use crate::core::{BlockMarker, CommandBlock};
 use crate::core::{Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryConfig, HistoryCopy};
 use crate::screen::{Screen, Update};
-pub use crate::search::SearchMatch;
-use crate::terminal::{Event, Shell, Terminal};
+use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
 use crate::wire::{Peer, Response};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
@@ -73,7 +72,7 @@ impl Default for CreateOptions {
             background: 0x202020,
             directory: None,
             program: None,
-            history_capacity: 1 << 30,
+            history_capacity: crate::config::DEFAULT_HISTORY_LIMIT,
         }
     }
 }
@@ -361,7 +360,7 @@ pub enum ClientEvent {
     Search {
         pane: PaneId,
         request: u64,
-        matches: Vec<SearchMatch>,
+        count: usize,
         truncated: bool,
     },
     Error(String),
@@ -388,8 +387,7 @@ pub struct Client {
     snapshot: Option<Snapshot>,
     screens: HashMap<PaneId, Screen>,
     write_error: Option<io::Error>,
-    ssh: Option<Child>,
-    remote_target: Option<String>,
+    ssh: Option<(Child, String)>,
 }
 impl Client {
     pub fn connect(path: &Path) -> io::Result<Self> {
@@ -405,7 +403,6 @@ impl Client {
             screens: HashMap::new(),
             write_error: None,
             ssh: None,
-            remote_target: None,
         })
     }
     pub fn connect_remote(mut command: Command, target: String) -> io::Result<Self> {
@@ -435,8 +432,7 @@ impl Client {
             snapshot: None,
             screens: HashMap::new(),
             write_error: None,
-            ssh: Some(child),
-            remote_target: Some(target),
+            ssh: Some((child, target)),
         };
         loop {
             match client.peer.hello() {
@@ -466,7 +462,7 @@ impl Client {
         }
     }
     fn ssh_error(&mut self, error: io::Error) -> io::Result<io::Error> {
-        if let Some(child) = &mut self.ssh
+        if let Some((child, _)) = &mut self.ssh
             && let Some(status) = child.try_wait()?
             && !status.success()
         {
@@ -481,7 +477,7 @@ impl Client {
         self.ssh.is_some()
     }
     pub fn remote_target(&self) -> Option<&str> {
-        self.remote_target.as_deref()
+        self.ssh.as_ref().map(|(_, target)| target.as_str())
     }
     pub fn fd(&self) -> RawFd {
         self.peer.fd()
@@ -579,7 +575,7 @@ impl Client {
         };
         let mut events = Vec::with_capacity(responses.len().min(4));
         for response in responses {
-            match response {
+            let event = match response {
                 Response::State(snapshot, updates) => {
                     self.screens
                         .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
@@ -601,52 +597,53 @@ impl Client {
                         }
                     }
                     self.snapshot = Some(snapshot);
-                    if !matches!(events.last(), Some(ClientEvent::Updated)) {
-                        events.push(ClientEvent::Updated);
-                    }
+                    ClientEvent::Updated
                 }
                 Response::Agent { kind, payload } => {
                     if kind == 4 {
                         self.agent_delegate = true;
                     }
                     self.agent_events.push((kind, payload));
-                    if !matches!(events.last(), Some(ClientEvent::Updated)) {
-                        events.push(ClientEvent::Updated);
-                    }
+                    ClientEvent::Updated
                 }
-                Response::List(list) => events.push(ClientEvent::List(list)),
+                Response::List(list) => ClientEvent::List(list),
                 Response::Clipboard {
                     request,
                     file,
                     incomplete,
-                } => events.push(ClientEvent::Clipboard {
+                } => ClientEvent::Clipboard {
                     request,
                     file,
                     incomplete,
-                }),
+                },
                 Response::ClipboardStore { primary, text } => {
-                    events.push(ClientEvent::ClipboardStore { primary, text })
+                    ClientEvent::ClipboardStore { primary, text }
                 }
                 Response::Search {
                     pane,
                     request,
-                    matches,
+                    count,
                     truncated,
-                } => events.push(ClientEvent::Search {
+                } => ClientEvent::Search {
                     pane,
                     request,
-                    matches: matches.into_owned(),
+                    count: count as usize,
                     truncated,
-                }),
-                Response::Error(error) => events.push(ClientEvent::Error(error)),
+                },
+                Response::Error(error) => ClientEvent::Error(error),
                 Response::Detached => {
                     self.peer.cancel_output();
                     self.write_error = None;
                     self.snapshot = None;
                     self.agent_delegate = false;
                     self.screens.clear();
-                    events.push(ClientEvent::Detached);
+                    ClientEvent::Detached
                 }
+            };
+            if !matches!(event, ClientEvent::Updated)
+                || !matches!(events.last(), Some(ClientEvent::Updated))
+            {
+                events.push(event);
             }
         }
         Ok(events)
@@ -655,7 +652,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some(child) = &mut self.ssh {
+        if let Some((child, _)) = &mut self.ssh {
             // Dropping a frontend ends its SSH bridge, never the detached workspace server.
             let _ = child.kill();
             let _ = child.wait();
@@ -1255,7 +1252,7 @@ impl Connection {
         };
         match (action, pane) {
             (Action::Input { data, .. }, Some(pane)) => {
-                Ok(pane.terminal.input_pending_bytes() + data.len() > 256 * 1024)
+                Ok(pane.terminal.input_pending_bytes() + data.len() > INPUT_CAPACITY)
             }
             (_, Some(pane)) => pane
                 .terminal
@@ -1277,7 +1274,7 @@ impl Connection {
         self.respond(Response::Detached);
     }
 
-    fn respond(&mut self, response: Response<'_>) {
+    fn respond(&mut self, response: Response) {
         if let Err(error) = self.peer.send_response(response) {
             eprintln!("workspace client {}: {error}", self.id);
             self.failed = true;
@@ -1549,7 +1546,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             for event in pane.terminal.events.try_iter() {
                 match event {
                     Event::Title(title) => pane.title = title.unwrap_or_else(|| "shell".into()),
-                    Event::Exit | Event::ChildExit(_) => exit = true,
+                    Event::Exit(_) => exit = true,
                     Event::Error(error) => {
                         eprintln!("workspace {name}: {error}");
                         exit = true;
@@ -1562,7 +1559,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                             controller.respond(Response::ClipboardStore { primary, text });
                         }
                     }
-                    Event::Wakeup | Event::HistoryCleared => (),
+                    Event::Wakeup => (),
                 }
             }
             if exit {
@@ -1646,36 +1643,27 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                 }
                 continue;
             };
-            if search.receiver.is_none()
-                && search.result.is_none()
-                && !search.query.is_empty()
-                && let Err(error) = try_search(search, terminal)
-            {
-                let (pane, request) = (search.pane, search.request);
-                client.respond(Response::Search {
-                    pane,
-                    request,
-                    matches: Default::default(),
-                    truncated: true,
-                });
-                client.respond(Response::Error(error.to_string()));
-                client.search = None;
-                if let Some(name) = &client.workspace {
-                    dirty.insert(name.clone());
-                }
-                continue;
-            }
-            let ready = search
-                .receiver
-                .as_ref()
-                .and_then(|receiver| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "pane search worker stopped",
-                    ))),
-                });
+            let submission_error =
+                if search.receiver.is_none() && search.result.is_none() && !search.query.is_empty()
+                {
+                    try_search(search, terminal).err()
+                } else {
+                    None
+                };
+            let ready = if let Some(error) = submission_error {
+                Some(Err(error))
+            } else {
+                search
+                    .receiver
+                    .as_ref()
+                    .and_then(|receiver| match receiver.try_recv() {
+                        Ok(result) => Some(result),
+                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
+                            io::Error::new(io::ErrorKind::BrokenPipe, "pane search worker stopped"),
+                        )),
+                    })
+            };
             if let Some(result) = ready {
                 search.receiver = None;
                 let (pane, request) = (search.pane, search.request);
@@ -1684,7 +1672,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                         client.respond(Response::Search {
                             pane,
                             request,
-                            matches: result.matches.as_slice().into(),
+                            count: result.matches.len() as u32,
                             truncated: result.truncated,
                         });
                         client.search.as_mut().unwrap().result = Some(result);
@@ -1693,7 +1681,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                         client.respond(Response::Search {
                             pane,
                             request,
-                            matches: Default::default(),
+                            count: 0,
                             truncated: true,
                         });
                         client.respond(Response::Error(error.to_string()));
@@ -1790,7 +1778,7 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
             let delta = (eligible().any(|client| !client.full && client.known.contains_key(&id))
                 && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
             .then(|| Update::capture(&core, false));
-            frames.push((id, full, delta, Arc::clone(&process)));
+            frames.push((id, full, delta));
             core.reset_damage();
         }
         drop(core);
@@ -1807,7 +1795,8 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
             command_blocks,
         });
     }
-    let all_snapshot = workspace.snapshot(panes)?;
+    let mut all_snapshot = workspace.snapshot(panes)?;
+    let mut active_snapshot = None;
     let mut updates = Vec::new();
     for client in clients {
         if client.workspace.as_deref() != Some(&workspace.name) || client.failed {
@@ -1817,14 +1806,19 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
             client.full = true;
             continue;
         }
-        let mut snapshot = all_snapshot.clone();
-        if !client.agent {
-            snapshot
-                .panes
-                .retain(|pane| active.iter().any(|(id, _)| *id == pane.id));
-        }
+        let snapshot = if client.agent || visible.len() == active.len() {
+            &mut all_snapshot
+        } else {
+            active_snapshot.get_or_insert_with(|| {
+                let mut snapshot = all_snapshot.clone();
+                snapshot
+                    .panes
+                    .retain(|pane| active.iter().any(|(id, _)| *id == pane.id));
+                snapshot
+            })
+        };
         updates.clear();
-        updates.extend(frames.iter().filter_map(|(id, full, delta, _)| {
+        updates.extend(frames.iter().filter_map(|(id, full, delta)| {
             if !client.agent && !active.iter().any(|(pane, _)| pane == id) {
                 return None;
             }
@@ -1836,7 +1830,7 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
             Some((*id, update))
         }));
         snapshot.controller = workspace.controller == Some(client.id);
-        if let Err(error) = client.peer.send_state(&snapshot, &updates, &client.known) {
+        if let Err(error) = client.peer.send_state(snapshot, &updates, &client.known) {
             eprintln!("workspace client {}: {error}", client.id);
             client.failed = true;
         } else {
@@ -1844,10 +1838,11 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
                 .known
                 .retain(|id, _| snapshot.panes.iter().any(|pane| *id == pane.id));
             client.known.extend(
-                frames
+                snapshot
+                    .panes
                     .iter()
-                    .filter(|(id, _, _, _)| snapshot.panes.iter().any(|pane| pane.id == *id))
-                    .map(|(id, _, _, process)| (*id, Arc::clone(process))),
+                    .filter(|pane| frames.iter().any(|(id, _, _)| *id == pane.id))
+                    .map(|pane| (pane.id, Arc::clone(&pane.process))),
             );
         }
         client.full = false;
@@ -2046,7 +2041,7 @@ fn apply_action(
     let workspace = workspaces
         .get_mut(name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workspace does not exist"))?;
-    match &action {
+    let action = match action {
         Action::AgentOpen => {
             for (kind, payload) in [(0, &workspace.agent.view), (1, &workspace.agent.models)] {
                 if let Some(payload) = payload {
@@ -2063,7 +2058,6 @@ fn apply_action(
             return Ok(());
         }
         Action::AgentView(payload) if workspace.controller == Some(client_id) => {
-            workspace.agent.view = Some(payload.clone());
             for client in clients.iter_mut().filter(|client| {
                 client.id != client_id && client.workspace.as_deref() == Some(&workspace.name)
             }) {
@@ -2072,6 +2066,7 @@ fn apply_action(
                     payload: payload.clone(),
                 });
             }
+            workspace.agent.view = Some(payload);
             return Ok(());
         }
         Action::AgentRequest(payload) if workspace.controller == Some(client_id) => {
@@ -2080,10 +2075,7 @@ fn apply_action(
                     .iter_mut()
                     .find(|client| client.id == id && !client.failed)
             }) {
-                owner.respond(Response::Agent {
-                    kind: 2,
-                    payload: payload.clone(),
-                });
+                owner.respond(Response::Agent { kind: 2, payload });
             } else {
                 let bytes: usize = workspace
                     .agent
@@ -2097,7 +2089,7 @@ fn apply_action(
                         "agent command queue is full",
                     ));
                 }
-                workspace.agent.pending.push(payload.clone());
+                workspace.agent.pending.push(payload);
                 if workspace.agent.token.is_none() {
                     use std::io::Read;
                     let mut token = vec![0; 32];
@@ -2112,18 +2104,18 @@ fn apply_action(
             return Ok(());
         }
         Action::AgentUpdate { kind, payload } if clients[index].agent && matches!(kind, 0 | 1) => {
-            if *kind == 0 {
-                workspace.agent.view = Some(payload.clone());
-            } else {
-                workspace.agent.models = Some(payload.clone());
-            }
             for client in clients.iter_mut().filter(|client| {
                 !client.agent && client.workspace.as_deref() == Some(&workspace.name)
             }) {
                 client.respond(Response::Agent {
-                    kind: *kind,
+                    kind,
                     payload: payload.clone(),
                 });
+            }
+            if kind == 0 {
+                workspace.agent.view = Some(payload);
+            } else {
+                workspace.agent.models = Some(payload);
             }
             return Ok(());
         }
@@ -2133,8 +2125,8 @@ fn apply_action(
                 "agent action is not authorized",
             ));
         }
-        _ => (),
-    }
+        action => action,
+    };
     if let Action::Resize(size) = action {
         validate_size(size)?;
         clients[index].size = size;
@@ -2468,7 +2460,7 @@ fn apply_action(
                 clients[index].respond(Response::Search {
                     pane,
                     request,
-                    matches: Default::default(),
+                    count: 0,
                     truncated: false,
                 });
             } else {

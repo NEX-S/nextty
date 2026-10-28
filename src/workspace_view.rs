@@ -75,34 +75,6 @@ fn close_layout(width: f32, height: f32, cell: (f32, f32)) -> [(f32, f32, f32, f
     ]
 }
 
-impl PasteTarget {
-    fn apply(
-        self,
-        text: String,
-        #[cfg(feature = "files")] files: &mut Option<FileNav>,
-    ) -> Option<Action> {
-        match self {
-            Self::Search => unreachable!("search paste is handled by its query"),
-            #[cfg(feature = "monitor")]
-            Self::Monitor => unreachable!("monitor paste is handled by its filter"),
-            #[cfg(feature = "agent")]
-            Self::Agent(_) => unreachable!("agent paste is handled by the chat editor"),
-            Self::Pane { pane, bracketed } => Some(Action::Input {
-                pane,
-                data: paste_bytes(text, bracketed),
-            }),
-            #[cfg(feature = "files")]
-            Self::Files => {
-                if let Some(files) = files {
-                    files.focus_list();
-                    files.set_query(format!("{}{}", files.query(), text));
-                }
-                None
-            }
-        }
-    }
-}
-
 #[cfg(feature = "files")]
 struct FileLayout {
     x: f32,
@@ -184,7 +156,6 @@ const MUTED: u32 = 0x889391ff;
 const ACCENT: u32 = 0xb5d2a2ff;
 const PADDING: f32 = 16.;
 const TERMINAL_PADDING: f32 = 4.;
-const TAB_SCALE: f32 = 1.0;
 
 #[derive(Clone, Copy)]
 struct GuiLayout {
@@ -199,7 +170,7 @@ impl GuiLayout {
     fn new(width: f32, height: f32, cell: (f32, f32), agent_width: Option<f32>) -> Self {
         let side_width = agent_width.map_or(0., |width_px| width_px.min(width * 0.62));
         Self {
-            top: cell.1 * TAB_SCALE,
+            top: cell.1,
             footer: height - cell.1 - 12.,
             side: width - side_width,
             width,
@@ -628,14 +599,14 @@ impl WorkspaceView {
                     ClientEvent::Search {
                         pane,
                         request,
-                        matches,
+                        count,
                         truncated,
                     } => {
                         self.dirty |= self.ui.search.result(
                             &mut self.client,
                             pane,
                             request,
-                            matches,
+                            count,
                             truncated,
                         )?;
                     }
@@ -917,7 +888,7 @@ impl WorkspaceView {
                         if self.paste.is_some() {
                             self.deferred.push_back(DeferredInput::FileText(event.text));
                         } else {
-                            PasteTarget::Files.apply(event.text, &mut self.ui.files);
+                            files.insert_query(&event.text);
                         }
                     }
                     self.dirty = true;
@@ -1525,7 +1496,7 @@ impl WorkspaceView {
                 .blocks
                 .iter()
                 .rev()
-                .find(|b| b.has_output)
+                .find(|b| b.output.is_some())
                 .map(|b| b.id)
         });
         if let Some(block) = block {
@@ -1603,16 +1574,16 @@ impl WorkspaceView {
                 }
                 self.dirty = true;
             }
-            target => {
-                if let Some(action) = target.apply(
-                    text,
-                    #[cfg(feature = "files")]
-                    &mut self.ui.files,
-                ) {
-                    self.action(action)?;
-                } else {
-                    self.dirty = true;
+            PasteTarget::Pane { pane, bracketed } => self.action(Action::Input {
+                pane,
+                data: paste_bytes(text, bracketed),
+            })?,
+            #[cfg(feature = "files")]
+            PasteTarget::Files => {
+                if let Some(files) = &mut self.ui.files {
+                    files.insert_query(&text);
                 }
+                self.dirty = true;
             }
         }
         while let Some(input) = self.deferred.pop_front() {
@@ -1640,7 +1611,9 @@ impl WorkspaceView {
                 }
                 #[cfg(feature = "files")]
                 DeferredInput::FileText(text) => {
-                    PasteTarget::Files.apply(text, &mut self.ui.files);
+                    if let Some(files) = &mut self.ui.files {
+                        files.insert_query(&text);
+                    }
                     self.dirty = true;
                 }
             }
@@ -3309,7 +3282,7 @@ mod layout_tests {
         let layout = GuiLayout::new(1200., 768., cell, Some(392.));
         let size = layout.size(cell);
         assert_eq!((size.num_cols, size.num_lines), (80, 33));
-        assert_eq!(layout.top, cell.1 * TAB_SCALE);
+        assert_eq!(layout.top, cell.1);
         let (x, y) = layout.origin(cell);
         assert!(layout.terminal_contains((x, y + cell.1)));
         assert!(!layout.terminal_contains((x, layout.top - 1.)));
@@ -3324,54 +3297,5 @@ mod layout_tests {
         assert_eq!(closed.origin(cell), layout.origin(cell));
         assert_eq!(closed.size(cell).num_lines, size.num_lines);
         assert_eq!(closed.size(cell).num_cols, 119);
-    }
-}
-
-#[cfg(all(test, feature = "files"))]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn clipboard_destination_keeps_file_queries_out_of_the_shell() {
-        let path = std::env::current_dir()
-            .unwrap()
-            .join("target/runtime-gui")
-            .join(format!(
-                "paste-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-        std::fs::create_dir_all(&path).unwrap();
-        let mut files = Some(FileNav::new(path.clone()).unwrap());
-        let payload = "中文\nrm -rf example\r\n\x1b";
-        assert!(
-            PasteTarget::Files
-                .apply(payload.to_string(), &mut files)
-                .is_none()
-        );
-        assert!(
-            PasteTarget::Files
-                .apply(" tail".into(), &mut files)
-                .is_none()
-        );
-        assert_eq!(files.as_ref().unwrap().query(), format!("{payload} tail"));
-        assert_eq!(files.as_ref().unwrap().focus(), FileFocus::List);
-        let action = PasteTarget::Pane {
-            pane: 42,
-            bracketed: true,
-        }
-        .apply("hello\nworld\x1b".into(), &mut files)
-        .unwrap();
-        let Action::Input { pane, data } = action else {
-            panic!("pane paste must remain input");
-        };
-        assert_eq!(pane, 42);
-        assert_eq!(data, b"\x1b[200~hello\nworld\x1b[201~");
-        assert_eq!(files.as_ref().unwrap().query(), format!("{payload} tail"));
-        drop(files);
-        std::fs::remove_dir_all(path).unwrap();
     }
 }

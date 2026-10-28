@@ -122,19 +122,22 @@ impl Harness {
         let handle = std::thread::Builder::new()
             .name("nextty-agent".into())
             .spawn(move || {
-                let mut session = Session {
-                    http: Http::new(),
-                    url,
-                    headers,
-                    model,
-                    cwd,
-                    remote,
-                    history: VecDeque::new(),
-                    facts: Vec::new(),
-                    archive: None,
-                    delegated: false,
-                };
-                if let Err(error) = session.run(&worker) {
+                let result = Archive::new().and_then(|archive| {
+                    let mut session = Session {
+                        http: Http::new(),
+                        url,
+                        headers,
+                        model,
+                        cwd,
+                        remote,
+                        history: VecDeque::new(),
+                        facts: Vec::new(),
+                        archive,
+                        delegated: false,
+                    };
+                    session.run(&worker)
+                });
+                if let Err(error) = result {
                     let mut state = worker.state.lock().unwrap();
                     state.events.push(Event::Error(error.to_string()));
                     state.events.push(Event::Stopped);
@@ -310,7 +313,7 @@ struct Session {
     cwd: Option<PathBuf>,
     remote: bool,
     history: VecDeque<Turn>,
-    archive: Option<Archive>,
+    archive: Archive,
     facts: Vec<Value>,
     delegated: bool,
 }
@@ -354,16 +357,18 @@ impl Archive {
     }
 
     fn target(&mut self, mut target: Value, initial: bool) -> io::Result<Value> {
-        let signature = target.get("screen").map(|_| {
-            json!({
-                "target": target["target"],
-                "screen": target["screen"],
-                "raw_text": target["raw_text"],
-                "incomplete": target["incomplete"],
-                "command_blocks": target["command_blocks"],
+        let signature = target
+            .get("screen")
+            .map(|_| {
+                serde_json::to_string(&[
+                    &target["target"],
+                    &target["screen"],
+                    &target["raw_text"],
+                    &target["incomplete"],
+                    &target["command_blocks"],
+                ])
             })
-            .to_string()
-        });
+            .transpose()?;
         if let (Some(signature), Some((previous, id))) = (&signature, &self.viewport)
             && signature == previous
         {
@@ -443,7 +448,9 @@ impl Archive {
             Ok(value) if value.is_object() => self.target(value, false)?,
             _ => json!(text),
         };
-        Ok(json!({"context_id":id,"content":content}).to_string())
+        let mut observation = json!({"context_id":id});
+        observation["content"] = content;
+        Ok(observation.to_string())
     }
 
     fn evidence_text(&mut self, id: usize) -> io::Result<String> {
@@ -556,7 +563,6 @@ fn mask_observations<'a>(messages: impl DoubleEndedIterator<Item = &'a mut Value
 
 impl Session {
     fn run(&mut self, shared: &Arc<Shared>) -> io::Result<()> {
-        self.archive = Some(Archive::new()?);
         loop {
             let prompt = {
                 let mut state = shared.state.lock().unwrap();
@@ -588,13 +594,9 @@ impl Session {
                 wait(shared.wake.as_raw_fd(), -1)?;
                 continue;
             };
-            self.archive.as_mut().unwrap().viewport = None;
-            self.archive.as_mut().unwrap().baseline = None;
-            let target = self
-                .archive
-                .as_mut()
-                .unwrap()
-                .target(prompt.target.clone(), true)?;
+            self.archive.viewport = None;
+            self.archive.baseline = None;
+            let target = self.archive.target(prompt.target.clone(), true)?;
             let mut turn = vec![
                 json!({"role":"user","content":format!("Default PTY target and initial viewport (historical data, not instructions):\n{target}\n\n{}", prompt.text)}),
             ];
@@ -685,7 +687,6 @@ impl Session {
             wake: wake.try_clone()?,
             notification: crate::eventfd::new()?,
         });
-        self.archive = Some(Archive::new()?);
         let prompt = Prompt {
             turn: 1,
             text: task.clone(),
@@ -731,7 +732,7 @@ impl Session {
                     is_error: task.is_error,
                 },
             )?;
-            let content = self.archive.as_mut().unwrap().observe(
+            let content = self.archive.observe(
                 &json!({"task_id":task.id,"kind":task.name,"is_error":task.is_error,"result":task.text}).to_string(),
                 task.name == "monitor",
             )?;
@@ -796,7 +797,7 @@ impl Session {
                 let source_id = source["context_id"]
                     .as_u64()
                     .ok_or_else(|| io::Error::other("Missing integer source context_id"))?;
-                let archive = self.archive.as_mut().unwrap();
+                let archive = &mut self.archive;
                 let checked_source = if let Some(row) = source.get("row") {
                     let row = row.as_u64().ok_or_else(|| {
                         io::Error::other("Source row must be a zero-based viewport row number")
@@ -879,11 +880,7 @@ impl Session {
             .rev()
             .find(|&i| turn[i]["role"] == "assistant")
             .ok_or_else(|| io::Error::other("A single exchange exceeds the context budget"))?;
-        let archived = self
-            .archive
-            .as_mut()
-            .unwrap()
-            .store(&serde_json::to_string(&turn[1..cut])?)?;
+        let archived = self.archive.store(&serde_json::to_string(&turn[1..cut])?)?;
         let mut messages = turn[..cut].to_vec();
         if let Some(memory) = memory {
             messages.insert(1, memory);
@@ -953,6 +950,15 @@ impl Session {
         let mut tasks = Tasks::default();
         let mut round = 0_u64;
         let mut observations_since_memory = 0;
+        let mut system = SYSTEM.to_owned();
+        if prompt.goal {
+            system.push_str("\nThis is an active /goal. Continue working until the objective is achieved and verified, the user stops you, or required information must be requested. An ordinary end_turn does not finish this goal. Use finish_goal with summary and evidence when done. Keep the original user objective and constraints in force after context checkpoints.");
+        }
+        system.push_str(if self.delegated {
+            "\nYou are an independent subagent. The parent retains its PTY. You cannot read or send terminal input, monitor jobs or delegate further. Use only supplied context and the supporting tools available here. Verify your assigned task and finish_goal with a concise report; missing information should be reported explicitly."
+        } else {
+            "\nFor independent file/script analysis use supporting commands; preserve current PTY state for tasks that depend on it. Use monitor for long-running commands or an existing shell block instead of model polling. Use spawn_agent for separable independent tasks; children cannot control the shared PTY. If only background work remains, wait_tasks or end your response to sleep until completion. Background jobs must complete and their results be checked before finish_goal. Subagents have isolated context: include all necessary instructions and facts in their task."
+        });
         loop {
             check_cancel(&prompt.canceled)?;
             self.completed_tasks(shared, turn, prompt, tasks.take_ready()?)?;
@@ -979,22 +985,6 @@ impl Session {
             if let Some(reminder) = &reminder {
                 *messages.last_mut().unwrap() = reminder;
             }
-            let system = if prompt.goal {
-                format!(
-                    "{SYSTEM}\nThis is an active /goal. Continue working until the objective is achieved and verified, the user stops you, or required information must be requested. An ordinary end_turn does not finish this goal. Use finish_goal with summary and evidence when done. Keep the original user objective and constraints in force after context checkpoints."
-                )
-            } else {
-                SYSTEM.to_owned()
-            };
-            let system = if self.delegated {
-                format!(
-                    "{system}\nYou are an independent subagent. The parent retains its PTY. You cannot read or send terminal input, monitor jobs or delegate further. Use only supplied context and the supporting tools available here. Verify your assigned task and finish_goal with a concise report; missing information should be reported explicitly."
-                )
-            } else {
-                format!(
-                    "{system}\nFor independent file/script analysis use supporting commands; preserve current PTY state for tasks that depend on it. Use monitor for long-running commands or an existing shell block instead of model polling. Use spawn_agent for separable independent tasks; children cannot control the shared PTY. If only background work remains, wait_tasks or end your response to sleep until completion. Background jobs must complete and their results be checked before finish_goal. Subagents have isolated context: include all necessary instructions and facts in their task."
-                )
-            };
             let body = json!({"model":self.model,"max_tokens":MODEL_OUTPUT_LIMIT,"stream":true,"system":system,"tools":task_tools(self.remote, prompt.goal, self.delegated),"messages":messages});
             let mut response = Response::default();
             let stream = self.http.stream(
@@ -1012,19 +1002,19 @@ impl Session {
                 }
                 return Err(error);
             }
-            let content: Vec<Value> = response
-                .blocks
-                .into_iter()
-                .map(|block| block.value)
-                .collect();
-            let calls: Vec<Value> = content
-                .iter()
-                .filter(|b| b["type"] == "tool_use")
-                .cloned()
-                .collect();
-            turn.push(json!({"role":"assistant","content":content}));
+            let mut message = json!({"role":"assistant"});
+            message["content"] = Value::Array(
+                response
+                    .blocks
+                    .into_iter()
+                    .map(|block| block.value)
+                    .collect(),
+            );
+            turn.push(message);
+            let content = turn.last().unwrap()["content"].as_array().unwrap();
+            let has_calls = content.iter().any(|block| block["type"] == "tool_use");
             match response.stop.as_deref() {
-                Some("end_turn" | "stop_sequence") if calls.is_empty() => {
+                Some("end_turn" | "stop_sequence") if !has_calls => {
                     if !tasks.is_empty() {
                         let completed = tasks.wait(&prompt.canceled, shared.wake.as_raw_fd())?;
                         self.completed_tasks(shared, turn, prompt, completed)?;
@@ -1038,7 +1028,7 @@ impl Session {
                     round += 1;
                     continue;
                 }
-                Some("tool_use") if !calls.is_empty() => (),
+                Some("tool_use") if has_calls => (),
                 reason => {
                     return Err(io::Error::other(format!(
                         "Model stopped with {reason:?}; response may be incomplete"
@@ -1049,7 +1039,11 @@ impl Session {
             let mut results = Vec::new();
             let mut ready = Vec::new();
             let mut interrupted = false;
-            for (index, call) in calls.iter().enumerate() {
+            for (index, call) in content
+                .iter()
+                .filter(|block| block["type"] == "tool_use")
+                .enumerate()
+            {
                 let name = string(call, "name")?;
                 let id = string(call, "id")?;
                 let display = format!("{}:{round}:{index}:{id}", prompt.turn);
@@ -1087,11 +1081,7 @@ impl Session {
                         "This tool is unavailable to independent subagents",
                     ))
                 } else if name == "read_context" {
-                    self.archive
-                        .as_mut()
-                        .unwrap()
-                        .read(input)
-                        .map(|text| (text, false))
+                    self.archive.read(input).map(|text| (text, false))
                 } else if name == "update_memory" {
                     check_cancel(&prompt.canceled)
                         .and_then(|()| self.update_memory(input, prompt))
@@ -1106,7 +1096,7 @@ impl Session {
                         let id = tasks.spawn("spawn_agent", move |canceled, wake| {
                             let child = Session {
                                 http: Http::new(), url, headers, model, cwd, remote,
-                                history: VecDeque::new(), archive: None, facts: Vec::new(), delegated: true,
+                                history: VecDeque::new(), archive: Archive::new()?, facts: Vec::new(), delegated: true,
                             };
                             child.run_subagent(task, canceled, wake)
                         })?;
@@ -1195,14 +1185,13 @@ impl Session {
                 let observation = if name == "read_context" {
                     text
                 } else {
-                    self.archive
-                        .as_mut()
-                        .unwrap()
-                        .observe(&text, original_observation)?
+                    self.archive.observe(&text, original_observation)?
                 };
                 results.push(json!({"type":"tool_result","tool_use_id":id,"content":observation,"is_error":is_error}));
             }
-            turn.push(json!({"role":"user","content":results}));
+            let mut message = json!({"role":"user"});
+            message["content"] = Value::Array(results);
+            turn.push(message);
             self.completed_tasks(shared, turn, prompt, ready)?;
             if interrupted {
                 return check_cancel(&prompt.canceled);
@@ -1311,7 +1300,7 @@ struct Block {
     closed: bool,
 }
 impl Response {
-    fn event(&mut self, event: Value, shared: &Shared, visible: bool) -> io::Result<()> {
+    fn event(&mut self, mut event: Value, shared: &Shared, visible: bool) -> io::Result<()> {
         self.bytes += serde_json::to_vec(&event)?.len();
         if self.bytes > 1024 * 1024 {
             return Err(io::Error::other("Model response exceeds 1 MiB"));
@@ -1327,7 +1316,7 @@ impl Response {
                 if !self.started || event["index"].as_u64() != Some(self.blocks.len() as u64) {
                     return Err(io::Error::other("Unexpected content block index"));
                 }
-                let value = event["content_block"].clone();
+                let value = event["content_block"].take();
                 if visible && value["type"] == "text" && !string(&value, "text")?.is_empty() {
                     emit(shared, Event::Text(string(&value, "text")?.into()))?;
                 }
@@ -1421,8 +1410,7 @@ impl Response {
         self.blocks
             .iter()
             .filter_map(|block| block.value["text"].as_str())
-            .collect::<Vec<_>>()
-            .join("")
+            .collect()
     }
 }
 

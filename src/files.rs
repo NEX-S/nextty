@@ -51,13 +51,11 @@ pub struct FileNav {
     wakeup: Arc<OwnedFd>,
     directory: PathBuf,
     query: Option<String>,
-    entries: Vec<FileEntry>,
+    scan: Scan,
     selection: usize,
     generation: Arc<AtomicU64>,
     scan_pending: bool,
     worker: Option<Worker>,
-    error: Option<io::Error>,
-    truncated: bool,
     restore_selection: Option<PathBuf>,
     directory_selection: BTreeMap<PathBuf, PathBuf>,
     focus: FileFocus,
@@ -84,7 +82,7 @@ struct Preview {
 
 struct Worker {
     generation: u64,
-    updates: Receiver<Update>,
+    updates: Receiver<Scan>,
     result: Receiver<Scan>,
     handle: JoinHandle<()>,
 }
@@ -104,11 +102,6 @@ impl Drop for WakeOnDrop {
     fn drop(&mut self) {
         self.notify();
     }
-}
-
-struct Update {
-    entries: Vec<FileEntry>,
-    truncated: bool,
 }
 
 #[derive(Default)]
@@ -138,13 +131,11 @@ impl FileNav {
             wakeup: Arc::new(crate::eventfd::new()?),
             directory,
             query: None,
-            entries: Vec::new(),
+            scan: Scan::default(),
             selection: 0,
             generation: Arc::new(AtomicU64::new(0)),
             scan_pending: false,
             worker: None,
-            error: None,
-            truncated: false,
             restore_selection: None,
             directory_selection: BTreeMap::new(),
             focus: FileFocus::List,
@@ -180,7 +171,7 @@ impl FileNav {
     }
 
     pub fn entries(&self) -> &[FileEntry] {
-        &self.entries
+        &self.scan.entries
     }
 
     pub fn selection(&self) -> usize {
@@ -188,7 +179,7 @@ impl FileNav {
     }
 
     pub fn selected(&self) -> Option<&FileEntry> {
-        self.entries.get(self.selection)
+        self.scan.entries.get(self.selection)
     }
 
     /// Whether a directory load, recursive search or preview is still running.
@@ -242,19 +233,19 @@ impl FileNav {
 
     /// Search retains the best SEARCH_LIMIT matches and still scans for better ones.
     pub fn truncated(&self) -> bool {
-        self.truncated
+        self.scan.truncated
     }
 
     /// Partial results remain usable when an inaccessible descendant is encountered.
     pub fn error(&self) -> Option<&io::Error> {
-        self.error.as_ref()
+        self.scan.error.as_ref()
     }
 
     pub fn move_selection(&mut self, delta: isize) {
         self.selection = self
             .selection
             .saturating_add_signed(delta)
-            .min(self.entries.len().saturating_sub(1));
+            .min(self.scan.entries.len().saturating_sub(1));
         self.restore_selection = None;
         self.update_preview();
     }
@@ -272,6 +263,11 @@ impl FileNav {
             self.restore_selection = None;
             self.request_scan();
         }
+    }
+
+    pub(crate) fn insert_query(&mut self, text: &str) {
+        self.focus_list();
+        self.set_query([self.query(), text].concat());
     }
 
     pub fn stop_search(&mut self) {
@@ -349,16 +345,14 @@ impl FileNav {
             }
             _ => None,
         };
-        let mut previous = Vec::new();
+        let mut previous = Scan::default();
         if let Some(scan) = scan {
             let worker = self.worker.take().unwrap();
             if worker.generation == generation {
-                self.publish_entries(scan.entries);
-                self.truncated = scan.truncated;
-                self.error = scan.error;
+                self.publish_scan(scan);
                 self.restore_selection = None;
             } else {
-                previous = scan.entries;
+                previous = scan;
             }
             changed = true;
         } else {
@@ -367,8 +361,7 @@ impl FileNav {
                     break;
                 };
                 if worker.generation == generation {
-                    self.publish_entries(update.entries);
-                    self.truncated = update.truncated;
+                    self.publish_scan(update);
                     changed = true;
                 }
             }
@@ -415,15 +408,15 @@ impl FileNav {
         }
     }
 
-    fn publish_entries(&mut self, entries: Vec<FileEntry>) {
+    fn publish_scan(&mut self, scan: Scan) {
         let selected = self
             .restore_selection
             .as_deref()
             .or_else(|| self.selected().map(|entry| entry.path.as_path()));
         self.selection = selected
-            .and_then(|path| entries.iter().position(|entry| entry.path == path))
-            .unwrap_or_else(|| self.selection.min(entries.len().saturating_sub(1)));
-        self.entries = entries;
+            .and_then(|path| scan.entries.iter().position(|entry| entry.path == path))
+            .unwrap_or_else(|| self.selection.min(scan.entries.len().saturating_sub(1)));
+        self.scan = scan;
     }
 
     fn update_preview(&mut self) {
@@ -477,19 +470,17 @@ impl FileNav {
     fn request_scan(&mut self) {
         self.generation.fetch_add(1, Ordering::Relaxed);
         let previous = (
-            std::mem::take(&mut self.entries),
+            std::mem::take(&mut self.scan),
             std::mem::take(&mut self.preview),
         );
         self.selection = 0;
         self.focus = FileFocus::List;
         self.update_preview();
-        self.error = None;
-        self.truncated = false;
         self.scan_pending = true;
         self.start_pending(previous);
     }
 
-    fn start_pending(&mut self, previous: (Vec<FileEntry>, Preview)) -> bool {
+    fn start_pending(&mut self, previous: (Scan, Preview)) -> bool {
         if self.worker.is_some() || !self.scan_pending {
             return false;
         }
@@ -525,7 +516,7 @@ impl FileNav {
                     handle,
                 });
             }
-            Err(error) => self.error = Some(error),
+            Err(error) => self.scan.error = Some(error),
         }
         true
     }
@@ -700,7 +691,7 @@ fn scan(
     directory: &Path,
     query: Option<&str>,
     cancelled: &impl Fn() -> bool,
-    updates: SyncSender<Update>,
+    updates: SyncSender<Scan>,
     wake: &WakeOnDrop,
 ) -> Scan {
     if cancelled() {
@@ -766,7 +757,7 @@ fn search_directory(
     directory: &Path,
     query: &str,
     cancelled: &impl Fn() -> bool,
-    updates: SyncSender<Update>,
+    updates: SyncSender<Scan>,
     wake: &WakeOnDrop,
 ) -> Scan {
     let pattern: Vec<char> = query.to_lowercase().chars().collect();
@@ -851,9 +842,10 @@ fn search_directory(
             }
         }
         if dirty && last_update.elapsed() >= Duration::from_millis(40) {
-            let update = Update {
+            let update = Scan {
                 entries: matches.iter().map(|(_, entry)| entry.clone()).collect(),
                 truncated: scan.truncated,
+                ..Scan::default()
             };
             // A slow front end retains at most one snapshot. The joined result is final.
             if updates.try_send(update).is_ok() {
@@ -1073,12 +1065,12 @@ mod tests {
         }
         let (sender, updates) = mpsc::sync_channel(1);
         sender
-            .send(Update {
+            .send(Scan {
                 entries: vec![FileEntry {
                     path: partial,
                     is_dir: false,
                 }],
-                truncated: false,
+                ..Scan::default()
             })
             .unwrap();
         nav.worker.as_mut().unwrap().updates = updates;

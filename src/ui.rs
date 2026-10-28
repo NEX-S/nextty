@@ -784,7 +784,7 @@ impl AgentPanel {
             match kind {
                 0 => {
                     self.restore_view_state(
-                        &serde_json::from_slice(&payload).map_err(io::Error::other)?,
+                        serde_json::from_slice(&payload).map_err(io::Error::other)?,
                     )?;
                     self.last_view = Some(self.view_state());
                     changed = true;
@@ -864,10 +864,10 @@ impl AgentPanel {
         view
     }
 
-    pub fn restore_view_state(&mut self, value: &serde_json::Value) -> io::Result<()> {
+    pub fn restore_view_state(&mut self, mut value: serde_json::Value) -> io::Result<()> {
         macro_rules! read {
             ($value:expr) => {
-                serde_json::from_value($value.clone()).map_err(io::Error::other)?
+                serde_json::from_value($value.take()).map_err(io::Error::other)?
             };
         }
         let open = read!(value["open"]);
@@ -879,7 +879,7 @@ impl AgentPanel {
         let values: Vec<serde_json::Value> = read!(value["sessions"]);
         let mut sessions = Vec::with_capacity(values.len());
         let mut ids = HashSet::new();
-        for value in values {
+        for mut value in values {
             let mut session = AgentSession {
                 id: read!(value["id"]),
                 model: Agent::mirror(),
@@ -1511,11 +1511,12 @@ impl AgentSession {
             return Err(io::Error::other("Workspace is read-only"));
         }
         self.model.is_goal()?;
-        self.model.pending.push(serde_json::json!({
+        let mut request = serde_json::json!({
             "action": "send",
-            "input": self.model.input,
             "basket": self.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
-        }));
+        });
+        request["input"] = serde_json::Value::String(std::mem::take(&mut self.model.input));
+        self.model.pending.push(request);
         self.model.clear_input();
         self.model.busy = true;
         self.model.scroll = 0;
@@ -1949,7 +1950,7 @@ mod tests {
         let canonical = owner.model_snapshot();
         view["sessions"][0]["input"] = serde_json::json!("typing");
         view["sessions"][0]["cursor"] = serde_json::json!(6);
-        owner.restore_view_state(&view).unwrap();
+        owner.restore_view_state(view.clone()).unwrap();
         assert_eq!(owner.model_snapshot(), canonical);
         assert!(canonical[0][1].get("sent_context").is_none());
         assert_eq!(
@@ -1964,7 +1965,7 @@ mod tests {
         assert_eq!(frontend.active().model.input, "next draft");
         assert!(frontend.active().sent_context.is_empty());
         let canonical = frontend.model_snapshot();
-        frontend.restore_view_state(&view).unwrap();
+        frontend.restore_view_state(view.clone()).unwrap();
         assert_eq!(frontend.model_snapshot(), canonical);
         owner.active_mut().rewind_restore = Some((4, "earlier".into(), vec![item]));
         let models = owner.model_snapshot();
@@ -1976,7 +1977,7 @@ mod tests {
         assert_eq!(frontend.active().model.input, "earlier edited");
         let view = frontend.view_state();
         let mut attached = AgentPanel::default();
-        attached.restore_view_state(&view).unwrap();
+        attached.restore_view_state(view).unwrap();
         attached.restore_models(models).unwrap();
         assert_eq!(attached.active().model.input, "earlier edited");
         assert_eq!(attached.active().context.basket.len(), 1);
@@ -2046,7 +2047,7 @@ mod tests {
             session.layout(40);
         }
         restored.sessions.swap(0, 1);
-        restored.restore_view_state(&view).unwrap();
+        restored.restore_view_state(view.clone()).unwrap();
         assert_eq!(restored.view_state(), view);
         for session in &restored.sessions {
             assert_eq!(
@@ -2063,7 +2064,7 @@ mod tests {
         }
         let mut invalid = view.clone();
         invalid["sessions"][0]["cursor"] = serde_json::json!(1);
-        assert!(restored.restore_view_state(&invalid).is_err());
+        assert!(restored.restore_view_state(invalid).is_err());
         assert_eq!(restored.view_state(), view);
         restored.new_session();
         assert_eq!(restored.active().id, 2);

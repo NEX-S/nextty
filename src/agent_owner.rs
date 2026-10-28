@@ -12,8 +12,8 @@ use std::process::{Command, Stdio};
 fn bytes(value: &OsStr) -> Value {
     json!(value.as_bytes())
 }
-fn os(value: &Value) -> io::Result<OsString> {
-    Ok(OsString::from_vec(serde_json::from_value(value.clone())?))
+fn os(value: Value) -> io::Result<OsString> {
+    Ok(OsString::from_vec(serde_json::from_value(value)?))
 }
 
 pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Result<()> {
@@ -58,15 +58,15 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
 }
 
 pub fn run() -> io::Result<()> {
-    let init: Value = serde_json::from_reader(io::stdin().lock())?;
-    let endpoint = &init["endpoint"];
+    let mut init: Value = serde_json::from_reader(io::stdin().lock())?;
+    let endpoint = &mut init["endpoint"];
     let mut client = if !endpoint["local"].is_null() {
-        Client::connect(&PathBuf::from(os(&endpoint["local"])?))?
+        Client::connect(&PathBuf::from(os(endpoint["local"].take())?))?
     } else {
-        let mut command = Command::new(os(&endpoint["program"])?);
-        let args: Vec<Vec<u8>> = serde_json::from_value(endpoint["args"].clone())?;
+        let mut command = Command::new(os(endpoint["program"].take())?);
+        let args: Vec<Vec<u8>> = serde_json::from_value(endpoint["args"].take())?;
         command.args(args.into_iter().map(OsString::from_vec));
-        let env: Vec<(Vec<u8>, Option<Vec<u8>>)> = serde_json::from_value(endpoint["env"].clone())?;
+        let env: Vec<(Vec<u8>, Option<Vec<u8>>)> = serde_json::from_value(endpoint["env"].take())?;
         for (key, value) in env {
             let key = OsString::from_vec(key);
             if let Some(value) = value {
@@ -76,18 +76,18 @@ pub fn run() -> io::Result<()> {
             }
         }
         if !endpoint["directory"].is_null() {
-            command.current_dir(os(&endpoint["directory"])?);
+            command.current_dir(os(endpoint["directory"].take())?);
         }
-        Client::connect_remote(command, serde_json::from_value(endpoint["target"].clone())?)?
+        Client::connect_remote(command, serde_json::from_value(endpoint["target"].take())?)?
     };
     let config = Config {
-        base_url: serde_json::from_value(init["base_url"].clone())?,
-        model: serde_json::from_value(init["model"].clone())?,
+        base_url: serde_json::from_value(init["base_url"].take())?,
+        model: serde_json::from_value(init["model"].take())?,
         ..Config::default()
     };
     client.send(Action::AgentAttach {
-        name: serde_json::from_value(init["name"].clone())?,
-        token: serde_json::from_value(init["token"].clone())?,
+        name: serde_json::from_value(init["name"].take())?,
+        token: serde_json::from_value(init["token"].take())?,
     })?;
     let mut panel = AgentPanel::default();
     panel.set_local();
@@ -150,7 +150,7 @@ pub fn run() -> io::Result<()> {
         for (kind, payload) in pending.drain(..) {
             match kind {
                 0 => {
-                    panel.restore_view_state(&serde_json::from_slice(&payload)?)?;
+                    panel.restore_view_state(serde_json::from_slice(&payload)?)?;
                     panel.set_local();
                 }
                 2 => {

@@ -979,7 +979,11 @@ impl Parser {
                 while let (Some(index), Some(value)) = (parts.next(), parts.next()) {
                     if let Some(index) = decimal(index).filter(|i| *i < 256) {
                         if value == b"?" {
-                            core.dynamic_color_sequence(format!("4;{index}"), index, terminator);
+                            core.dynamic_color_sequence(
+                                format_args!("4;{index}"),
+                                index,
+                                terminator,
+                            );
                         } else if let Some(color) = parse_color(value) {
                             core.set_color(index, color);
                         }
@@ -994,7 +998,7 @@ impl Parser {
                     }
                     let index = command + 246;
                     if value == b"?" {
-                        core.dynamic_color_sequence(command.to_string(), index, terminator);
+                        core.dynamic_color_sequence(command, index, terminator);
                     } else if let Some(color) = parse_color(value) {
                         core.set_color(index, color);
                     }

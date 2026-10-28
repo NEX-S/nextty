@@ -17,14 +17,14 @@ use crate::error::{Error, Result};
 
 use crate::core::{Core, Event as CoreEvent, WindowSize};
 
+pub(crate) const INPUT_CAPACITY: usize = 256 * 1024;
+
 #[derive(Debug)]
 pub enum Event {
     Wakeup,
     Title(Option<String>),
     ClipboardStore { primary: bool, text: String },
-    ChildExit(ExitStatus),
-    HistoryCleared,
-    Exit,
+    Exit(ExitStatus),
     Error(io::Error),
 }
 
@@ -144,20 +144,6 @@ impl Terminal {
         #[cfg(feature = "tui")] history: Option<crate::history::HistoryConfig>,
     ) -> Result<Self> {
         let pty_size = winsize(size)?;
-        if let Some(directory) = &working_directory {
-            let metadata = std::fs::metadata(directory).map_err(|error| {
-                Error::context(
-                    format!("cannot open working directory {}", directory.display()),
-                    error,
-                )
-            })?;
-            if !metadata.is_dir() {
-                return Err(Error::msg(format!(
-                    "working directory is not a directory: {}",
-                    directory.display()
-                )));
-            }
-        }
         let terminal_core = Core::new(size, foreground, background);
         #[cfg(feature = "tui")]
         let mut terminal_core = terminal_core;
@@ -339,7 +325,7 @@ impl Terminal {
         if length == 0 {
             return Ok(());
         }
-        if length > 256 * 1024 {
+        if length > INPUT_CAPACITY {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "input chunk exceeds 256 KiB",
@@ -349,7 +335,7 @@ impl Terminal {
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |bytes| {
                 bytes
                     .checked_add(length)
-                    .filter(|bytes| *bytes <= 256 * 1024)
+                    .filter(|bytes| *bytes <= INPUT_CAPACITY)
             })
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "PTY input queue is full"))?;
         if let Err(error) = self.send(Message::Input(data)) {
@@ -457,10 +443,9 @@ impl PtyLoop {
             self.proxy.send(Event::Error(error));
         }
         match terminate_child(&mut self.process.child, self.process.pidfd.as_raw_fd()) {
-            Ok(status) => self.proxy.send(Event::ChildExit(status)),
+            Ok(status) => self.proxy.send(Event::Exit(status)),
             Err(error) => self.proxy.send(Event::Error(error)),
         }
-        self.proxy.send(Event::Exit);
         // Keep Core owned here until its frontend drops, even after natural EOF.
         // Async shutdown drops the frontend Core before disconnecting this channel.
         while self.receiver.recv().is_ok() {}
@@ -573,7 +558,8 @@ impl PtyLoop {
             };
             if consumed != 0 {
                 let queued = self.input_bytes.fetch_sub(consumed, Ordering::AcqRel);
-                if queued > 192 * 1024 && queued - consumed <= 192 * 1024 {
+                let low_watermark = INPUT_CAPACITY * 3 / 4;
+                if queued > low_watermark && queued - consumed <= low_watermark {
                     self.proxy.send(Event::Wakeup);
                 }
             }
@@ -828,7 +814,7 @@ impl PtyLoop {
                 CoreEvent::ClipboardStore { primary, text } => {
                     self.proxy.send(Event::ClipboardStore { primary, text })
                 }
-                CoreEvent::HistoryCleared => self.proxy.send(Event::HistoryCleared),
+                CoreEvent::HistoryCleared => self.proxy.send(Event::Wakeup),
                 #[cfg(feature = "tui")]
                 CoreEvent::HistoryError(error) => self.proxy.send(Event::Error(error)),
             }
@@ -897,7 +883,8 @@ fn flush(
     pending: &mut VecDeque<Cow<'static, [u8]>>,
     offset: &mut usize,
 ) -> io::Result<(bool, usize)> {
-    let mut budget = 64 * 1024;
+    const BUDGET: usize = 64 * 1024;
+    let mut budget = BUDGET;
     while budget != 0 {
         let Some(data) = pending.front() else { break };
         let count = if pending.len() == 1 {
@@ -931,7 +918,7 @@ fn flush(
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => break,
                 _ if error.raw_os_error() == Some(libc::EIO) => {
-                    return Ok((false, 64 * 1024 - budget));
+                    return Ok((false, BUDGET - budget));
                 }
                 _ => return Err(error),
             }
@@ -952,7 +939,7 @@ fn flush(
             pending.pop_front();
         }
     }
-    Ok((true, 64 * 1024 - budget))
+    Ok((true, BUDGET - budget))
 }
 
 fn fd(value: i32) -> io::Result<OwnedFd> {
@@ -1123,7 +1110,7 @@ mod tests {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             match terminal.events.try_recv() {
-                Ok(Event::ChildExit(status)) => return status,
+                Ok(Event::Exit(status)) => return status,
                 Ok(Event::Error(error)) => panic!("PTY error: {error}"),
                 _ => (),
             }
@@ -1415,7 +1402,7 @@ for count in range(1, 65):
             {
                 Event::Title(Some(title)) if title == "READY" => break,
                 Event::Error(error) => panic!("PTY error: {error}"),
-                Event::Exit => panic!("continuous output child exited before input"),
+                Event::Exit(_) => panic!("continuous output child exited before input"),
                 _ => (),
             }
         }
@@ -1599,7 +1586,7 @@ mod history_pty_tests {
             terminal.drain_notification().unwrap();
             terminal.acknowledge_wakeup();
             for event in terminal.events.try_iter() {
-                assert!(!matches!(event, Event::Error(_) | Event::Exit));
+                assert!(!matches!(event, Event::Error(_) | Event::Exit(_)));
             }
             if terminal.core.lock().unwrap().row(0).cells[0].c == 'R' {
                 break;
@@ -1617,7 +1604,7 @@ mod history_pty_tests {
             terminal.acknowledge_wakeup();
             let mut woke = false;
             for event in terminal.events.try_iter() {
-                assert!(!matches!(event, Event::Error(_) | Event::Exit));
+                assert!(!matches!(event, Event::Error(_) | Event::Exit(_)));
                 woke |= matches!(event, Event::Wakeup);
             }
             assert!(woke);
@@ -1724,7 +1711,7 @@ mod history_pty_tests {
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap()
             {
-                Event::Exit => break,
+                Event::Exit(_) => break,
                 Event::Error(error) => panic!("{error}"),
                 _ => (),
             }

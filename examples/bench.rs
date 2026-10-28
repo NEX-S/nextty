@@ -53,11 +53,10 @@ fn wait_for(terminal: &terminal::Terminal, expected: char) -> Result<()> {
                     return Ok(());
                 }
             }
-            Ok(Event::ChildExit(status)) => {
+            Ok(Event::Exit(status)) => {
                 return Err(Error::msg(format!("echo child exited: {status}")));
             }
             Ok(Event::Error(error)) => return Err(Error::context("echo PTY reader", error)),
-            Ok(Event::Exit) => return Err(Error::msg("echo terminal exited before reply")),
             Ok(_) => (),
             Err(std::sync::mpsc::TryRecvError::Disconnected) => {
                 return Err(Error::msg("terminal event channel closed"));

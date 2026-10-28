@@ -98,15 +98,14 @@ impl Desktop {
             self.terminal.drain_notification()?;
             while let Ok(event) = self.terminal.events.try_recv() {
                 match event {
-                    TerminalEvent::Wakeup | TerminalEvent::HistoryCleared => self.dirty = true,
+                    TerminalEvent::Wakeup => self.dirty = true,
                     TerminalEvent::Title(title) => {
                         self.window.title(title.as_deref().unwrap_or("nextty"))?
                     }
                     TerminalEvent::ClipboardStore { primary, text } => {
                         self.window.selection(primary, &text)
                     }
-                    TerminalEvent::ChildExit(_) => (),
-                    TerminalEvent::Exit => self.running = false,
+                    TerminalEvent::Exit(_) => self.running = false,
                     TerminalEvent::Error(error) => {
                         return Err(Error::context("terminal IO", error));
                     }
@@ -602,11 +601,10 @@ impl Desktop {
         let y = PADDING + row as f32 * self.cell.1;
         if !self.preedit.is_empty() && (0..self.screen.screen_lines() as i32).contains(&row) {
             if self.preedit_line.is_none() {
-                let rgb = self.screen.color(Color::Named(NamedColor::Foreground));
-                let color = (u32::from(rgb.r) << 24)
-                    | (u32::from(rgb.g) << 16)
-                    | (u32::from(rgb.b) << 8)
-                    | 255;
+                let color = self
+                    .screen
+                    .color(Color::Named(NamedColor::Foreground))
+                    .rgba();
                 self.preedit_line = Some(self.renderer.shape(
                     &self.preedit,
                     &[Run {

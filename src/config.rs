@@ -1,6 +1,8 @@
 use crate::error::{Error, Result};
 use std::{io::ErrorKind, path::PathBuf};
 
+pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
     pub font_family: String,
@@ -23,7 +25,7 @@ impl Default for Config {
             background: 0x202020,
             background_opacity: 1.,
             tab_bar_opacity: 0.7,
-            history_limit_bytes: 1 << 30,
+            history_limit_bytes: DEFAULT_HISTORY_LIMIT,
             base_url: String::new(),
             model: String::new(),
         }
@@ -75,33 +77,27 @@ impl Config {
             parser.space();
             parser.expect('=')?;
             parser.space();
-            let field = match key.as_str() {
-                "font_family" => 0,
-                "font_size_px" => 1,
-                "foreground" => 2,
-                "background" => 3,
-                "background_opacity" => 4,
-                "history_limit_bytes" => 5,
-                "tab_bar_opacity" => 6,
-                "base_url" => 7,
-                "model" => 8,
-                _ => return parser.fail(format!("unknown configuration field {key:?}")),
-            };
-            if seen & (1 << field) != 0 {
-                return parser.fail(format!("duplicate configuration field {key:?}"));
+            macro_rules! field {
+                ($index:expr, $name:ident, $value:expr) => {{
+                    let bit = 1 << $index;
+                    if seen & bit != 0 {
+                        return parser.fail(format!("duplicate configuration field {key:?}"));
+                    }
+                    seen |= bit;
+                    config.$name = $value?;
+                }};
             }
-            seen |= 1 << field;
-            match field {
-                0 => config.font_family = parser.string(true)?,
-                1 => config.font_size_px = parser.number()?,
-                2 => config.foreground = parser.color()?,
-                3 => config.background = parser.color()?,
-                4 => config.background_opacity = parser.number()?,
-                5 => config.history_limit_bytes = parser.integer()?,
-                6 => config.tab_bar_opacity = parser.number()?,
-                7 => config.base_url = parser.string(true)?,
-                8 => config.model = parser.string(true)?,
-                _ => unreachable!(),
+            match key.as_str() {
+                "font_family" => field!(0, font_family, parser.string(true)),
+                "font_size_px" => field!(1, font_size_px, parser.number()),
+                "foreground" => field!(2, foreground, parser.color()),
+                "background" => field!(3, background, parser.color()),
+                "background_opacity" => field!(4, background_opacity, parser.number()),
+                "history_limit_bytes" => field!(5, history_limit_bytes, parser.integer()),
+                "tab_bar_opacity" => field!(6, tab_bar_opacity, parser.number()),
+                "base_url" => field!(7, base_url, parser.string(true)),
+                "model" => field!(8, model, parser.string(true)),
+                _ => return parser.fail(format!("unknown configuration field {key:?}")),
             }
             parser.space();
             parser.comment()?;

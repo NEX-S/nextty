@@ -7,7 +7,7 @@ use std::io;
 const MATCH_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct SearchMatch {
+pub(crate) struct SearchMatch {
     pub start: (u64, u16),
     pub end: (u64, u16),
 }
@@ -141,7 +141,7 @@ pub(crate) struct Search {
     pub cursor: usize,
     pub index: usize,
     pub pending: bool,
-    pub matches: Vec<SearchMatch>,
+    pub count: usize,
     pub truncated: bool,
     controller: bool,
     request: u64,
@@ -179,7 +179,7 @@ impl Search {
         }
         self.request += 1;
         self.index = 0;
-        self.matches = Vec::new();
+        self.count = 0;
         self.truncated = false;
         self.pending = !self.query.is_empty();
         client.send(Action::Search {
@@ -204,7 +204,7 @@ impl Search {
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
         self.open = false;
         self.pending = false;
-        self.matches = Vec::new();
+        self.count = 0;
         self.utf8.clear();
         client.send(Action::SearchCancel {
             pane: self.pane,
@@ -213,13 +213,13 @@ impl Search {
     }
     pub fn next(&mut self, client: &mut Client, previous: bool) -> io::Result<()> {
         self.observe(client)?;
-        if !self.open || !self.controller || self.pending || self.matches.is_empty() {
+        if !self.open || !self.controller || self.pending || self.count == 0 {
             return Ok(());
         }
         self.index = if previous {
-            (self.index + self.matches.len() - 1) % self.matches.len()
+            (self.index + self.count - 1) % self.count
         } else {
-            (self.index + 1) % self.matches.len()
+            (self.index + 1) % self.count
         };
         client.send(Action::SearchSelect {
             pane: self.pane,
@@ -232,7 +232,7 @@ impl Search {
         client: &mut Client,
         pane: PaneId,
         request: u64,
-        matches: Vec<SearchMatch>,
+        count: usize,
         truncated: bool,
     ) -> io::Result<bool> {
         self.observe(client)?;
@@ -240,10 +240,10 @@ impl Search {
             return Ok(false);
         }
         self.pending = false;
-        self.index = matches.len().saturating_sub(1);
-        self.matches = matches;
+        self.index = count.saturating_sub(1);
+        self.count = count;
         self.truncated = truncated;
-        if self.controller && !self.matches.is_empty() {
+        if self.controller && self.count != 0 {
             client.send(Action::SearchSelect {
                 pane,
                 request,
@@ -406,12 +406,8 @@ impl Search {
         if self.pending {
             label.push_str("searching");
         } else {
-            let index = if self.matches.is_empty() {
-                0
-            } else {
-                self.index + 1
-            };
-            write!(label, "{index}/{}", self.matches.len()).unwrap();
+            let index = if self.count == 0 { 0 } else { self.index + 1 };
+            write!(label, "{index}/{}", self.count).unwrap();
         }
         if self.truncated {
             label.push_str("+ (partial)");

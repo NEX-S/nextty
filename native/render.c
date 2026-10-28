@@ -68,8 +68,6 @@ typedef struct {
 
 enum { ATLAS_MAX = 2048, GLYPH_SLOTS = 8192 };
 
-typedef NtFontGlyph LineGlyph;
-
 struct NtLine {
     NtRenderer *renderer;
     NtLine *retired_next;
@@ -80,7 +78,7 @@ struct NtLine {
     size_t run_count;
     uint16_t *columns;
     /* Each contiguous font group owns one reference. */
-    LineGlyph *glyphs;
+    NtFontGlyph *glyphs;
     size_t count;
 };
 
@@ -235,13 +233,6 @@ static int set_scale(NtRenderer *r, double scale) {
     if (!reset_atlases(r) || !nt_fonts_scale(r->fonts, scale)) return 0;
     r->scale = scale;
     return 1;
-}
-
-static int font_init(NtRenderer *r, const char *family) {
-    r->fonts = nt_fonts_new(family, r->font_size, r->error, sizeof r->error);
-    if (!r->fonts) return 0;
-    nt_fonts_metrics(r->fonts, &r->cell_width, &r->cell_height);
-    return set_scale(r, r->frame.scale);
 }
 
 static int64_t submission_time(void) {
@@ -975,7 +966,12 @@ static void *submit(void *data) {
     NtRenderer *r = data;
     Swap *s = &r->swap;
     /* Publish metrics first; GPU setup is the initial pending job. */
-    int initialized = font_init(r, s->family);
+    r->fonts = nt_fonts_new(s->family, r->font_size, r->error, sizeof r->error);
+    int initialized = r->fonts != NULL;
+    if (initialized) {
+        nt_fonts_metrics(r->fonts, &r->cell_width, &r->cell_height);
+        initialized = set_scale(r, r->frame.scale);
+    }
     pthread_mutex_lock(&s->lock);
     s->initialized = initialized ? 1 : -1;
     pthread_cond_broadcast(&s->changed);
@@ -1193,7 +1189,7 @@ static int append_quad(NtRenderer *r, Quad q) {
     return 1;
 }
 
-static CachedGlyph *cached_glyph(NtRenderer *r, const LineGlyph *glyph) {
+static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
     size_t hash = (((uintptr_t)glyph->font >> 4) ^ ((size_t)glyph->glyph * 2654435761u) ^ glyph->color_glyph) & (GLYPH_SLOTS - 1);
     size_t slot = hash;
     while (r->glyphs[slot].font) {
@@ -1331,7 +1327,7 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
     if (!shape_line(r, line)) return 0;
     double inverse_scale = 1. / r->scale;
     for (size_t i = 0; i < line->count; ++i) {
-        const LineGlyph *glyph = &line->glyphs[i];
+        const NtFontGlyph *glyph = &line->glyphs[i];
         if (!(glyph->color & 255)) continue;
         Quad q;
         if (glyph->straight) {

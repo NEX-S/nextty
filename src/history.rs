@@ -10,11 +10,10 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection};
+use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection, semantic_group};
 use crate::eventfd::{consume_notification, notify};
 use crate::vt::{Color, NamedColor, Rgb};
 
-pub const DEFAULT_CAPACITY: u64 = 1 << 30;
 pub const HOT_ROWS: usize = 512;
 const BATCH: usize = 32;
 const SEGMENT_BYTES: u64 = 64 * 1024;
@@ -750,30 +749,27 @@ impl Archive {
         hot_start: u64,
         hot: &[Row],
         kind: Option<SelectionType>,
-        mut incomplete: bool,
+        incomplete: bool,
     ) -> io::Result<HistoryCopy> {
-        let first = self.first()?.min(hot_start);
-        if let Some(kind) = kind {
+        if let Some(kind) = kind
+            && kind != SelectionType::Simple
+        {
+            let first = self.first()?.min(hot_start);
             self.expand_selection(&mut start, &mut end, first, hot_start, hot, kind)?;
         }
-        let path = self
-            .budget
-            .directory
-            .join(format!("{}.copy", NEXT.fetch_add(1, Ordering::Relaxed)));
         let file = OpenOptions::new()
             .read(true)
             .write(true)
-            .create_new(true)
+            .custom_flags(libc::O_TMPFILE)
             .mode(0o600)
-            .open(&path)?;
-        fs::remove_file(path)?;
+            .open(&self.budget.directory)?;
         let mut file = BufWriter::new(file);
-        incomplete = self.write_copy(
+        let incomplete = self.write_copy(
             &mut file,
             start,
             end,
             (hot_start, hot),
-            incomplete || start.0 < first,
+            incomplete,
             kind.is_some(),
         )?;
         let mut file = file.into_inner()?;
@@ -962,15 +958,6 @@ impl Archive {
             start.1 = 0;
             end.1 = source_row(end.0)?.map_or(0, |row| row.cells.len());
         } else if matches!(kind, SelectionType::Semantic) {
-            let group = |c: char| {
-                if c.is_whitespace() {
-                    0
-                } else if ",│`|:\"' ()[]{}<>\t".contains(c) {
-                    1
-                } else {
-                    2
-                }
-            };
             if let Some(mut row) = source_row(start.0)? {
                 if start.1 > 0
                     && row
@@ -980,7 +967,7 @@ impl Archive {
                 {
                     start.1 -= 1;
                 }
-                let class = group(row.cells[start.1.min(row.cells.len() - 1)].c);
+                let class = semantic_group(row.cells[start.1.min(row.cells.len() - 1)].c);
                 loop {
                     let mut previous = *start;
                     if previous.1 > 0 {
@@ -1005,7 +992,7 @@ impl Archive {
                     {
                         previous.1 -= 1;
                     }
-                    if group(row.cells[previous.1].c) != class {
+                    if semantic_group(row.cells[previous.1].c) != class {
                         break;
                     }
                     *start = previous;
@@ -1020,7 +1007,7 @@ impl Archive {
                 if end.1 > 0 && row.cells[end.1].flags.contains(Flags::WIDE_CHAR_SPACER) {
                     end.1 -= 1;
                 }
-                let class = group(row.cells[end.1].c);
+                let class = semantic_group(row.cells[end.1].c);
                 loop {
                     let mut next = *end;
                     next.1 += if row.cells[end.1].flags.contains(Flags::WIDE_CHAR) {
@@ -1032,14 +1019,15 @@ impl Archive {
                         let Some(next_row) = source_row(next.0 + 1)? else {
                             break;
                         };
-                        if group(next_row.cells[0].c) != class {
+                        if semantic_group(next_row.cells[0].c) != class {
                             break;
                         }
                         next.0 += 1;
                         next.1 = 0;
                         row = next_row;
                     } else {
-                        if next.1 >= row.cells.len() || group(row.cells[next.1].c) != class {
+                        if next.1 >= row.cells.len() || semantic_group(row.cells[next.1].c) != class
+                        {
                             break;
                         }
                     }
@@ -1813,7 +1801,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                 .recv_timeout(deadline.saturating_duration_since(Instant::now()))
                 .unwrap()
             {
-                Event::Exit => break,
+                Event::Exit(_) => break,
                 Event::Error(error) => panic!("{error}"),
                 _ => (),
             }
@@ -1878,7 +1866,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                     .unwrap();
                 match event {
                     Event::Error(error) => panic!("{error}"),
-                    Event::Exit if exited => break,
+                    Event::Exit(_) if exited => break,
                     Event::Wakeup => {
                         terminal.acknowledge_wakeup();
                         let core = terminal.core.lock().unwrap();

@@ -11,18 +11,18 @@ fn finish_search(client: &mut Client, search: &mut crate::search::Search) {
                 if let ClientEvent::Search {
                     pane,
                     request,
-                    matches,
+                    count,
                     truncated,
                 } = event
                 {
-                    found = Some((*pane, *request, matches.clone(), *truncated));
+                    found = Some((*pane, *request, *count, *truncated));
                 }
             }
             found.is_some()
         });
-        let (pane, request, matches, truncated) = found.unwrap();
+        let (pane, request, count, truncated) = found.unwrap();
         search
-            .result(client, pane, request, matches, truncated)
+            .result(client, pane, request, count, truncated)
             .unwrap();
     }
 }
@@ -99,7 +99,7 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
                 .contains("NEEDLE")
         })
     });
-    assert_eq!(search.matches.len(), 1);
+    assert_eq!(search.count, 1);
     assert!(client.screens()[&pane].display_offset() > 2500);
     for symbol in [0xff50, 0xff08, 0xff57, 0xffff] {
         search.key(&mut client, symbol, false, false).unwrap();
@@ -111,7 +111,7 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
     }
     search.edit(&mut client, "\n\t").unwrap();
     assert!(!search.pending);
-    assert_eq!(search.matches.len(), 1);
+    assert_eq!(search.count, 1);
     search
         .key(&mut client, u32::from('u'), false, true)
         .unwrap();
@@ -121,7 +121,7 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
         .unwrap();
     search.edit(&mut client, "NEEDLE").unwrap();
     finish_search(&mut client, &mut search);
-    assert_eq!(search.matches.len(), 1);
+    assert_eq!(search.count, 1);
     search.close(&mut client).unwrap();
     wait(&mut client, |client, _| {
         client.screens()[&pane].display_offset() == 0
@@ -139,7 +139,7 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
     search.begin(&mut client, pane).unwrap();
     search.edit(&mut client, "normal-only").unwrap();
     finish_search(&mut client, &mut search);
-    assert!(search.matches.is_empty());
+    assert_eq!(search.count, 0);
     search.close(&mut client).unwrap();
     search
         .bytes(&mut client, "late paste".as_bytes(), true)
@@ -214,8 +214,8 @@ fn independent_clients_search_without_cancelling_each_other_or_selecting_read_on
         .unwrap();
     finish_search(&mut viewer, &mut viewer_search);
     finish_search(&mut controller, &mut controller_search);
-    assert_eq!(viewer_search.matches.len(), 3000);
-    assert_eq!(controller_search.matches, viewer_search.matches);
+    assert_eq!(viewer_search.count, 3000);
+    assert_eq!(controller_search.count, viewer_search.count);
     assert!(viewer_search.label("").contains("read-only"));
     let index = viewer_search.index;
     viewer_search.next(&mut viewer, false).unwrap();
@@ -229,13 +229,13 @@ fn independent_clients_search_without_cancelling_each_other_or_selecting_read_on
         .unwrap();
     finish_search(&mut viewer, &mut viewer_search);
     assert_eq!(viewer_search.query.len(), 6000);
-    assert!(viewer_search.matches.is_empty());
+    assert_eq!(viewer_search.count, 0);
     viewer_search
         .key(&mut viewer, u32::from('u'), false, true)
         .unwrap();
     viewer_search.edit(&mut viewer, "INDEPENDENT").unwrap();
     finish_search(&mut viewer, &mut viewer_search);
-    assert_eq!(viewer_search.matches.len(), 3000);
+    assert_eq!(viewer_search.count, 3000);
     controller_search.close(&mut controller).unwrap();
     controller
         .send(Action::Split {
@@ -533,7 +533,7 @@ fn dropping_remote_frontend_reaps_its_transport() {
     ));
     let client = Client::connect_remote(command, "test-host".into()).unwrap();
     assert!(client.is_remote());
-    let pid = client.ssh.as_ref().unwrap().id();
+    let pid = client.ssh.as_ref().unwrap().0.id();
     drop(client);
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
@@ -1346,7 +1346,6 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
             screens: HashMap::new(),
             write_error: None,
             ssh: None,
-            remote_target: None,
         });
     }
     let mut workspaces = HashMap::new();
@@ -2348,7 +2347,7 @@ fn command_copy_streams_full_output_across_cold_history() {
     let block = pane
         .blocks
         .iter()
-        .filter(|block| block.has_output)
+        .filter(|block| block.output.is_some())
         .max_by_key(|block| block.id)
         .unwrap()
         .id;
@@ -2595,7 +2594,6 @@ fn detached_behind_a_large_response_supersedes_a_known_write_failure() {
         screens: HashMap::new(),
         write_error: None,
         ssh: None,
-        remote_target: None,
     };
     client.peer.send_input(1, b"pending-input").unwrap();
     client.flush().unwrap();
@@ -2627,7 +2625,6 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
         screens: HashMap::new(),
         write_error: None,
         ssh: None,
-        remote_target: None,
     };
     let size = WindowSize {
         num_cols: 2,
@@ -2701,7 +2698,6 @@ fn write_failure_without_detached_still_reports_the_original_error() {
         screens: HashMap::new(),
         write_error: None,
         ssh: None,
-        remote_target: None,
     };
     client.peer.send_input(1, b"input").unwrap();
     client.flush().unwrap();

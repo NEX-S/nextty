@@ -197,9 +197,8 @@ fn dropping_harness_reaps_command_descendants_before_returning() {
         worker.finish();
         for pid in pids.split_whitespace() {
             if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-                assert_eq!(
-                    stat.split_whitespace().nth(2),
-                    Some("Z"),
+                assert!(
+                    matches!(stat.split_whitespace().nth(2), Some("Z" | "X")),
                     "live descendant {pid} survived owner shutdown"
                 );
             }
@@ -245,7 +244,7 @@ impl Worker {
                 cwd: None,
                 remote: false,
                 history,
-                archive: None,
+                archive: Archive::new().unwrap(),
                 facts: Vec::new(),
                 delegated: false,
             };

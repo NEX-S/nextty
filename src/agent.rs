@@ -27,7 +27,7 @@ pub(crate) struct Agent {
     pub remote: bool,
     pub pending: Vec<serde_json::Value>,
     turn: u64,
-    rewind: Option<(u64, String)>,
+    rewind: Option<String>,
     runtime: Option<Harness>,
     response: Option<usize>,
     monitors: Vec<(u64, TerminalRequest)>,
@@ -47,7 +47,6 @@ impl Agent {
             "busy": self.busy,
             "revision": self.revision,
             "turn": self.turn,
-            "rewound": self.rewound,
         })
     }
 
@@ -62,7 +61,6 @@ impl Agent {
         let revision =
             serde_json::from_value(value["revision"].clone()).map_err(io::Error::other)?;
         let turn = serde_json::from_value(value["turn"].clone()).map_err(io::Error::other)?;
-        let rewound = serde_json::from_value(value["rewound"].clone()).map_err(io::Error::other)?;
         let messages: Vec<_> = messages
             .into_iter()
             .map(|(role, text, id, turn)| Message {
@@ -85,7 +83,6 @@ impl Agent {
         self.busy = busy;
         self.revision = revision;
         self.turn = turn;
-        self.rewound = rewound;
         Ok(first_changed)
     }
 
@@ -267,7 +264,7 @@ impl Agent {
             io::Error::other("This conversation is no longer available in model context")
         })?;
         runtime.rewind(message.turn)?;
-        self.rewind = Some((message.turn, message.text.clone()));
+        self.rewind = Some(message.text.clone());
         self.busy = true;
         self.response = None;
         Ok(())
@@ -375,7 +372,7 @@ impl Agent {
                     });
                 }
                 Event::Rewound { turn, error } => {
-                    let (_, text) = self.rewind.take().unwrap();
+                    let text = self.rewind.take().unwrap();
                     self.busy = false;
                     self.response = None;
                     if let Some(error) = error {

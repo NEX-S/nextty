@@ -16,7 +16,6 @@ pub struct BlockMarker {
     pub line: i32,
     pub complete: bool,
     pub status: Option<i32>,
-    pub has_output: bool,
     pub output: Option<(Point, Point)>,
 }
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -547,6 +546,16 @@ pub enum SelectionType {
     Semantic,
     Lines,
     Object,
+}
+
+pub(crate) fn semantic_group(c: char) -> u8 {
+    if c.is_whitespace() {
+        0
+    } else if ",│`|:\"'()[]{}<>".contains(c) {
+        1
+    } else {
+        2
+    }
 }
 
 pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
@@ -1235,15 +1244,6 @@ impl Core {
                 end.column = columns - 1;
             }
             SelectionType::Semantic => {
-                let group = |c: char| {
-                    if c.is_whitespace() {
-                        0
-                    } else if ",│`|:\"' ()[]{}<>\t".contains(c) {
-                        1
-                    } else {
-                        2
-                    }
-                };
                 if let Some(row) = self.absolute_row(start.line) {
                     if row.cells[start.column]
                         .flags
@@ -1252,7 +1252,7 @@ impl Core {
                     {
                         start.column -= 1;
                     }
-                    let class = group(row.cells[start.column].c);
+                    let class = semantic_group(row.cells[start.column].c);
                     loop {
                         let mut previous = start;
                         if previous.column > 0 {
@@ -1274,7 +1274,7 @@ impl Core {
                         {
                             previous.column -= 1;
                         }
-                        if group(row.cells[previous.column].c) != class {
+                        if semantic_group(row.cells[previous.column].c) != class {
                             break;
                         }
                         start = previous;
@@ -1288,7 +1288,7 @@ impl Core {
                     {
                         end.column -= 1;
                     }
-                    let class = group(row.cells[end.column].c);
+                    let class = semantic_group(row.cells[end.column].c);
                     loop {
                         let row = self.absolute_row(end.line).unwrap();
                         let mut next = end;
@@ -1309,7 +1309,7 @@ impl Core {
                         let Some(row) = self.absolute_row(next.line) else {
                             break;
                         };
-                        if group(row.cells[next.column].c) != class {
+                        if semantic_group(row.cells[next.column].c) != class {
                             break;
                         }
                         end = next;
@@ -2402,7 +2402,7 @@ impl Core {
     }
     pub(crate) fn dynamic_color_sequence(
         &mut self,
-        prefix: String,
+        prefix: impl std::fmt::Display,
         index: usize,
         terminator: &str,
     ) {
@@ -3035,10 +3035,11 @@ impl Core {
         let low = self.block_origin + top as u64;
         let high = self.block_origin + bottom as u64;
         for block in &mut self.blocks {
-            for point in [&mut block.command, &mut block.output, &mut block.end]
-                .into_iter()
-                .flatten()
-            {
+            for point in std::iter::once(&mut block.prompt).chain(
+                [&mut block.command, &mut block.output, &mut block.end]
+                    .into_iter()
+                    .flatten(),
+            ) {
                 if point.row >= low && point.row < high {
                     let moved = point.row.saturating_add_signed(i64::from(delta));
                     if moved < low || moved >= high {
@@ -3046,13 +3047,6 @@ impl Core {
                     }
                     point.row = moved.clamp(low, high - 1);
                 }
-            }
-            if block.prompt.row >= low && block.prompt.row < high {
-                let moved = block.prompt.row.saturating_add_signed(i64::from(delta));
-                if moved < low || moved >= high {
-                    block.incomplete = true;
-                }
-                block.prompt.row = moved.clamp(low, high - 1);
             }
         }
     }
@@ -3127,7 +3121,6 @@ impl Core {
                     line: (block.prompt.row.max(top) as i64 - self.block_origin as i64) as i32,
                     complete: block.end.is_some() && !incomplete,
                     status: block.status,
-                    has_output: block.output.is_some(),
                     output: block.output.map(|start| {
                         let end = block.end.unwrap_or(BlockPoint {
                             row: self.block_origin + self.active.cursor.point.line as u64,

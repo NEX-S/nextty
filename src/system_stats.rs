@@ -531,7 +531,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
         let processes_enabled = state.processes_enabled;
         drop(state);
         let mut sample = Sample {
-            directory: directory.clone(),
+            directory,
             ..Sample::default()
         };
         let cpu = fs::File::open("/proc/stat").ok().and_then(|file| {
@@ -552,15 +552,16 @@ fn sample_resources(sampler: Arc<Sampler>) {
             _ => None,
         };
         if let Ok(text) = fs::read_to_string("/proc/loadavg") {
-            let fields: Vec<_> = text.split_whitespace().collect();
+            let mut fields = text.split_whitespace();
+            let load = [fields.next(), fields.next(), fields.next()];
             sample.load = (|| {
                 Some([
-                    fields.first()?.parse().ok()?,
-                    fields.get(1)?.parse().ok()?,
-                    fields.get(2)?.parse().ok()?,
+                    load[0]?.parse().ok()?,
+                    load[1]?.parse().ok()?,
+                    load[2]?.parse().ok()?,
                 ])
             })();
-            sample.tasks = fields.get(3).map(|text| text.to_string());
+            sample.tasks = fields.next().map(str::to_owned);
         }
         sample.uptime = fs::read_to_string("/proc/uptime").ok().and_then(|text| {
             text.split_whitespace()
@@ -581,15 +582,18 @@ fn sample_resources(sampler: Arc<Sampler>) {
         }
         let swap = fs::read_to_string("/proc/vmstat")
             .ok()
-            .and_then(|text| vm_swap(&text));
+            .and_then(|text| counter_pair(&text, ["pswpin", "pswpout"]));
         if let Some((old, new)) = previous_swap.zip(swap) {
             sample.swap_rates = std::array::from_fn(|i| {
                 per_second(new[i], old[i], elapsed).map(|v| v * page_size as f64)
             });
         }
         previous_swap = swap;
-        sample.disk = directory.as_deref().and_then(|path| disk_usage(path).ok());
-        let disk = directory.as_deref().and_then(disk_counters);
+        sample.disk = sample
+            .directory
+            .as_deref()
+            .and_then(|path| disk_usage(path).ok());
+        let disk = sample.directory.as_deref().and_then(disk_counters);
         if let Some(disk) = &disk {
             sample.disk_name = Some(disk.name.clone());
             if let Some(previous) = &previous_disk
@@ -758,7 +762,7 @@ fn pressure(text: &str) -> Option<f32> {
         .split_whitespace()
         .find_map(|field| field.strip_prefix("avg10=")?.parse().ok())
 }
-fn vm_swap(text: &str) -> Option<[u64; 2]> {
+fn counter_pair(text: &str, names: [&str; 2]) -> Option<[u64; 2]> {
     let value = |name| {
         text.lines().find_map(|line| {
             let mut fields = line.split_whitespace();
@@ -767,7 +771,7 @@ fn vm_swap(text: &str) -> Option<[u64; 2]> {
                 .flatten()
         })
     };
-    Some([value("pswpin")?, value("pswpout")?])
+    Some([value(names[0])?, value(names[1])?])
 }
 fn network_counters(text: &str) -> Vec<Network> {
     let mut result: Vec<_> = text
@@ -919,18 +923,6 @@ fn process_stat(text: &str, page_size: u64) -> Option<(Process, ProcessCounters)
         counters,
     ))
 }
-fn process_io(text: &str) -> Option<[u64; 2]> {
-    let value = |name| {
-        text.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()? == name)
-                .then(|| fields.next()?.parse().ok())
-                .flatten()
-        })
-    };
-    Some([value("read_bytes:")?, value("write_bytes:")?])
-}
-
 fn sample_processes(
     previous: &HashMap<u32, ProcessCounters>,
     elapsed: Option<f64>,
@@ -959,7 +951,7 @@ fn sample_processes(
         };
         current.io = fs::read_to_string(path.join("io"))
             .ok()
-            .and_then(|text| process_io(&text));
+            .and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
         if let Some(old) = previous.get(&pid).filter(|old| old.start == current.start) {
             process.cpu = per_second(current.ticks, old.ticks, elapsed)
                 .map(|v| (v * 100. / ticks_per_second) as f32);
@@ -1046,7 +1038,10 @@ mod tests {
         assert_eq!(process.name, "name ) with spaces");
         assert_eq!((counters.start, counters.ticks), (900, 50));
         assert_eq!(
-            process_io("read_bytes: 42\nwrite_bytes: 84\n"),
+            counter_pair(
+                "read_bytes: 42\nwrite_bytes: 84\n",
+                ["read_bytes:", "write_bytes:"]
+            ),
             Some([42, 84])
         );
         assert_eq!(

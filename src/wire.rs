@@ -10,21 +10,20 @@ use crate::workspace::{
     Action, Axis, BlockMarker, CommandBlock, CreateOptions, Direction, PaneView, Snapshot, TabView,
     WorkspaceInfo,
 };
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, Write};
 use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 10;
+pub(crate) const VERSION: u8 = 12;
 
-pub(crate) enum Response<'a> {
+pub(crate) enum Response {
     Agent {
         kind: u8,
         payload: Vec<u8>,
@@ -44,7 +43,7 @@ pub(crate) enum Response<'a> {
     Search {
         pane: u64,
         request: u64,
-        matches: Cow<'a, [crate::search::SearchMatch]>,
+        count: u32,
         truncated: bool,
     },
     Detached,
@@ -341,7 +340,7 @@ impl Peer {
         }
         self.queue(encoder.0, None)
     }
-    pub fn send_response(&mut self, response: Response<'_>) -> io::Result<()> {
+    pub fn send_response(&mut self, response: Response) -> io::Result<()> {
         let mut encoder = Encoder::new();
         let file = match response {
             Response::Agent { kind, payload } => {
@@ -395,21 +394,15 @@ impl Peer {
             Response::Search {
                 pane,
                 request,
-                matches,
+                count,
                 truncated,
             } => {
-                encoder.0.reserve(22 + 20 * matches.len());
+                encoder.0.reserve(22);
                 encoder.u8(11);
                 encoder.u64(pane);
                 encoder.u64(request);
                 encoder.bool(truncated);
-                encoder.u32(matches.len() as u32);
-                for found in matches.iter() {
-                    encoder.u64(found.start.0);
-                    encoder.u16(found.start.1);
-                    encoder.u64(found.end.0);
-                    encoder.u16(found.end.1);
-                }
+                encoder.u32(count);
                 None
             }
             Response::Detached => {
@@ -634,7 +627,7 @@ impl Peer {
             .ok_or_else(|| invalid("clipboard response has no file descriptor"))?;
         Ok((request, File::from(file), incomplete))
     }
-    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response<'static>>> {
+    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let result = self.receive_responses(previous);
         if result.is_err() {
             self.copy = None;
@@ -642,10 +635,7 @@ impl Peer {
         }
         result
     }
-    fn receive_responses(
-        &mut self,
-        previous: Option<&Snapshot>,
-    ) -> io::Result<Vec<Response<'static>>> {
+    fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let mut result = Vec::new();
         if let Some(receiver) = &self.receiver
             && let Some(ready) = receiver.take()?
@@ -729,20 +719,10 @@ impl Peer {
                     let request = d.u64()?;
                     let truncated = d.bool()?;
                     let count = d.u32()?;
-                    if count > 10_000 {
-                        return Err(invalid("too many search results"));
-                    }
-                    let mut matches = Vec::with_capacity(count as usize);
-                    for _ in 0..count {
-                        matches.push(crate::search::SearchMatch {
-                            start: (d.u64()?, d.u16()?),
-                            end: (d.u64()?, d.u16()?),
-                        });
-                    }
                     Some(Response::Search {
                         pane,
                         request,
-                        matches: matches.into(),
+                        count,
                         truncated,
                     })
                 }
@@ -846,17 +826,12 @@ fn clipboard_file() -> io::Result<File> {
             "remote clipboard directory must be owned and private",
         ));
     }
-    let mut path = directory.join("copy-XXXXXX").into_os_string().into_vec();
-    path.push(0);
-    let fd = unsafe { libc::mkostemp(path.as_mut_ptr().cast(), libc::O_CLOEXEC) };
-    if fd < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    let file = unsafe { File::from_raw_fd(fd) };
-    if unsafe { libc::unlink(path.as_ptr().cast()) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(file)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_TMPFILE)
+        .mode(0o600)
+        .open(directory)
 }
 
 fn packet(input: &[u8]) -> io::Result<Option<&[u8]>> {
@@ -1540,7 +1515,6 @@ fn encode_snapshot(
             e.u64(block.id);
             e.i32(block.line);
             e.bool(block.complete);
-            e.bool(block.has_output);
             e.bool(block.output.is_some());
             if let Some((start, end)) = block.output {
                 e.point(start);
@@ -1603,7 +1577,6 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
             let id = d.u64()?;
             let line = d.i32()?;
             let complete = d.bool()?;
-            let has_output = d.bool()?;
             let output = if d.bool()? {
                 Some((d.point()?, d.point()?))
             } else {
@@ -1614,7 +1587,6 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
                 id,
                 line,
                 complete,
-                has_output,
                 status,
                 output,
             });
@@ -2038,24 +2010,26 @@ mod tests {
         sender.send_hello(1).unwrap();
         sender.flush().unwrap();
         assert_eq!(receiver.hello().unwrap(), Some(1));
-        let expected = crate::search::SearchMatch {
-            start: (123, 2),
-            end: (124, 7),
-        };
         sender
             .send_response(Response::Search {
                 pane: 3,
                 request: 4,
-                matches: std::slice::from_ref(&expected).into(),
+                count: 10_000,
                 truncated: true,
             })
             .unwrap();
         sender.flush().unwrap();
         receiver.read().unwrap();
         let responses = receiver.responses(None).unwrap();
-        assert!(
-            matches!(&responses[..],[Response::Search{pane:3,request:4,matches,truncated:true}] if matches.as_ref()==[expected])
-        );
+        assert!(matches!(
+            &responses[..],
+            [Response::Search {
+                pane: 3,
+                request: 4,
+                count: 10_000,
+                truncated: true
+            }]
+        ));
     }
     #[test]
     fn bulk_receive_storage_is_reused_until_small_messages_resume() {
@@ -2454,7 +2428,7 @@ mod tests {
         ];
         assert!(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 5000) } > 0);
     }
-    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response<'static>>> {
+    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response>> {
         loop {
             let responses = receiver.responses(None)?;
             if !responses.is_empty() {

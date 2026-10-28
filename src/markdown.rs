@@ -70,7 +70,9 @@ impl Markdown {
     fn content(&mut self, text: &str, style: u8, quote_depth: usize) {
         for part in text.split_inclusive('\n') {
             if quote_depth > 0 && (self.text.ends_with('\n') || self.text.is_empty()) {
-                self.push(&"│ ".repeat(quote_depth), QUOTE);
+                for _ in 0..quote_depth {
+                    self.push("│ ", QUOTE);
+                }
             }
             self.push(part, style);
         }
@@ -110,8 +112,9 @@ impl Markdown {
                         }
                         Tag::Item => {
                             output.newline(1);
-                            let indent = "  ".repeat(lists.len().saturating_sub(1));
-                            output.push(&indent, 0);
+                            for _ in 1..lists.len() {
+                                output.push("  ", 0);
+                            }
                             if let Some(Some(number)) = lists.last_mut() {
                                 output.push(&format!("{number}. "), 0);
                                 *number += 1;
@@ -144,7 +147,9 @@ impl Markdown {
                         TagEnd::Link | TagEnd::Image => {
                             let (start, destination) = links.pop().unwrap();
                             if output.text[start..] != *destination {
-                                output.push(&format!(" ({destination})"), LINK);
+                                output.push(" (", LINK);
+                                output.push(&destination, LINK);
+                                output.push(")", LINK);
                             }
                         }
                         _ => (),

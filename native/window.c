@@ -93,7 +93,7 @@ struct Feedback {
     uint32_t id;
 };
 struct NtWindow {
-    int width, height, failed, tracing;
+    int width, height, tracing;
     int frame_fd;
     int64_t frame_interval_ns, last_frame_ns, frame_deadline_ns;
     double scale, mouse_x, mouse_y;
@@ -163,13 +163,12 @@ static int64_t now_ms(void) {
     return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
 }
 static void fail(NtWindow *w, const char *format, ...) {
-    if (w->failed)
+    if (w->error[0])
         return;
     va_list ap;
     va_start(ap, format);
     vsnprintf(w->error, sizeof w->error, format, ap);
     va_end(ap);
-    w->failed = 1;
 }
 static void emit(NtWindow *w, NtEvent event);
 static int64_t now_ns(void) {
@@ -1540,7 +1539,7 @@ static int wayland_new(NtWindow *w) {
         wayland_error(w, "reading Wayland globals");
         return 0;
     }
-    if (w->failed)
+    if (w->error[0])
         return 0;
     if (!w->compositor || !w->shell || !w->seat || !w->cursor_manager ||
         !w->data_manager || !w->primary_manager || !w->text_manager ||
@@ -1570,12 +1569,12 @@ static int wayland_new(NtWindow *w) {
         wp_fractional_scale_manager_v1_get_fractional_scale(w->scale_manager, w->surface);
     wp_fractional_scale_v1_add_listener(w->fractional_scale, &fractional_listener, w);
     wl_surface_commit(w->surface);
-    while (!w->configured && !w->failed)
+    while (!w->configured && !w->error[0])
         if (wl_display_dispatch(w->display) < 0) {
             wayland_error(w, "waiting for Wayland configure");
             return 0;
         }
-    if (w->failed)
+    if (w->error[0])
         return 0;
     return 1;
 }
@@ -1644,7 +1643,7 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
     drain_events(w);
     if (wl_display_dispatch_pending(w->display) < 0)
         wayland_error(w, "dispatching Wayland events");
-    if (w->failed)
+    if (w->error[0])
         goto done;
     if (w->delivered)
         timeout_ms = 0;
@@ -1653,12 +1652,12 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
             wayland_error(w, "dispatching queued Wayland events");
             break;
         }
-        if (w->failed)
+        if (w->error[0])
             goto done;
         if (w->delivered)
             timeout_ms = 0;
     }
-    if (w->failed)
+    if (w->error[0])
         goto done;
     timeout_ms = poll_timeout(w, timeout_ms);
     int count = 2 + (int)source_count;
@@ -1704,7 +1703,7 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
     if (status > 0 && (fds[0].revents & POLLOUT) && wl_display_flush(w->display) < 0 &&
         errno != EAGAIN)
         wayland_error(w, "flushing Wayland display");
-    if (!w->failed && wl_display_dispatch_pending(w->display) < 0)
+    if (!w->error[0] && wl_display_dispatch_pending(w->display) < 0)
         wayland_error(w, "dispatching Wayland display");
     if (fds[1].revents & POLLIN) {
         uint64_t expirations;
@@ -1722,7 +1721,7 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
 done:
     w->callback = NULL;
     w->callback_data = NULL;
-    return w->failed ? -1 : (int)w->delivered;
+    return w->error[0] ? -1 : (int)w->delivered;
 }
 
 NtWindow *nt_window_new(int width, int height) {

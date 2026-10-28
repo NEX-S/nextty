@@ -32,37 +32,26 @@ pub fn key_bytes(
         + 2 * u8::from(modifiers & ALT != 0)
         + 4 * u8::from(modifiers & CONTROL != 0);
 
-    let cursor = match symbol {
-        0xff52 | 0xff97 => Some(b'A'),
-        0xff54 | 0xff99 => Some(b'B'),
-        0xff53 | 0xff98 => Some(b'C'),
-        0xff51 | 0xff96 => Some(b'D'),
-        0xff50 | 0xff95 => Some(b'H'),
-        0xff57 | 0xff9c => Some(b'F'),
+    let special = match symbol {
+        0xff52 | 0xff97 => Some((b'A', true)),
+        0xff54 | 0xff99 => Some((b'B', true)),
+        0xff53 | 0xff98 => Some((b'C', true)),
+        0xff51 | 0xff96 => Some((b'D', true)),
+        0xff50 | 0xff95 => Some((b'H', true)),
+        0xff57 | 0xff9c => Some((b'F', true)),
+        0xffbe | 0xff91 => Some((b'P', false)),
+        0xffbf | 0xff92 => Some((b'Q', false)),
+        0xffc0 | 0xff93 => Some((b'R', false)),
+        0xffc1 | 0xff94 => Some((b'S', false)),
         _ => None,
     };
-    if let Some(final_byte) = cursor {
+    if let Some((final_byte, cursor)) = special {
         return Some(if modifier != 1 {
             vec![0x1b, b'[', b'1', b';', b'0' + modifier, final_byte]
-        } else if mode().contains(Mode::APP_CURSOR) {
+        } else if !cursor || mode().contains(Mode::APP_CURSOR) {
             vec![0x1b, b'O', final_byte]
         } else {
             vec![0x1b, b'[', final_byte]
-        });
-    }
-
-    let function = match symbol {
-        0xffbe | 0xff91 => Some(b'P'),
-        0xffbf | 0xff92 => Some(b'Q'),
-        0xffc0 | 0xff93 => Some(b'R'),
-        0xffc1 | 0xff94 => Some(b'S'),
-        _ => None,
-    };
-    if let Some(final_byte) = function {
-        return Some(if modifier == 1 {
-            vec![0x1b, b'O', final_byte]
-        } else {
-            vec![0x1b, b'[', b'1', b';', b'0' + modifier, final_byte]
         });
     }
 
@@ -315,7 +304,7 @@ mod tests {
 
     #[test]
     fn text_and_mode_independent_keys_do_not_read_terminal_state() {
-        for value in ["a", "ctrl-c", "ctrl-left", "enter"] {
+        for value in ["a", "ctrl-c", "ctrl-left", "enter", "f1", "shift-f4"] {
             let (symbol, modifiers) = key(value);
             assert_eq!(
                 key_bytes(symbol, modifiers, "", || panic!("unexpected mode read")),
