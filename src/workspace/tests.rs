@@ -1340,6 +1340,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
             peer: Peer::new(receiver).unwrap(),
             #[cfg(feature = "agent")]
             endpoint: ClientEndpoint::Local(PathBuf::new()),
+            screen_flow: ScreenFlow::Streaming,
             agent_events: Vec::new(),
             agent_delegate: false,
             snapshot: None,
@@ -1383,7 +1384,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
         }
         parser.advance(&mut core, b"\x1b]4;1;#112233\x07");
     }
-    broadcast(workspace, &mut clients).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
     clients[0].peer.flush().unwrap();
     wait(&mut frontends[0], |client, _| {
         client.screens().contains_key(&pane)
@@ -1396,7 +1397,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
         parser.advance(&mut core, b"\x1b[1;1Hmixed-update");
         assert!(core.dirty_rows().count() < core.screen_lines());
     }
-    broadcast(workspace, &mut clients).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
     for client in &mut clients {
         client.peer.flush().unwrap();
     }
@@ -1411,7 +1412,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
         let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
         parser.advance(&mut core, b"\x1b[1;1Hlatest-grid!\x1b]4;1;#445566\x07");
     }
-    broadcast(workspace, &mut clients).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
     assert!(
         clients[1].full && clients[1].peer.pending(),
         "a skipped pending frontend must request the latest full capture"
@@ -1425,7 +1426,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
             frontend.poll().unwrap();
         }
         if clients[1].full && !clients[1].peer.pending() {
-            broadcast(workspace, &mut clients).unwrap();
+            broadcast(workspace, &mut clients, true).unwrap();
         }
         if !clients[1].full
             && !clients[1].peer.pending()
@@ -1453,7 +1454,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
         let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
         parser.advance(&mut core, b"\x1b]4;1;#778899\x07");
     }
-    broadcast(workspace, &mut clients).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
     for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
         wait(frontend, |client, _| {
             connection.peer.flush().unwrap();
@@ -2588,6 +2589,7 @@ fn detached_behind_a_large_response_supersedes_a_known_write_failure() {
         peer: Peer::new(right).unwrap(),
         #[cfg(feature = "agent")]
         endpoint: ClientEndpoint::Local(PathBuf::new()),
+        screen_flow: ScreenFlow::Streaming,
         agent_events: Vec::new(),
         agent_delegate: false,
         snapshot: None,
@@ -2619,6 +2621,7 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
         peer: Peer::new(right).unwrap(),
         #[cfg(feature = "agent")]
         endpoint: ClientEndpoint::Local(PathBuf::new()),
+        screen_flow: ScreenFlow::Streaming,
         agent_events: Vec::new(),
         agent_delegate: false,
         snapshot: None,
@@ -2692,6 +2695,7 @@ fn write_failure_without_detached_still_reports_the_original_error() {
         peer: Peer::new(right).unwrap(),
         #[cfg(feature = "agent")]
         endpoint: ClientEndpoint::Local(PathBuf::new()),
+        screen_flow: ScreenFlow::Streaming,
         agent_events: Vec::new(),
         agent_delegate: false,
         snapshot: None,
@@ -2718,4 +2722,311 @@ fn a_complete_control_request_is_processed_even_if_its_socket_closes() {
             .any(|event| matches!(event, ClientEvent::Detached))
     });
     assert!(!client.wants_write());
+}
+
+#[test]
+fn demand_screen_retains_damage_and_recovers_after_other_consumers_and_pending_output() {
+    use crate::vt::{Color, Parser, Rgb};
+    let server = TestServer::start();
+    let mut clients = Vec::new();
+    let mut frontends = Vec::new();
+    for id in 1..=2 {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        let limit: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    sender.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&limit as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&limit) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        clients.push(Connection::new(id, sender).unwrap());
+        frontends.push(Client {
+            peer: Peer::new(receiver).unwrap(),
+            #[cfg(feature = "agent")]
+            endpoint: ClientEndpoint::Local(PathBuf::new()),
+            screen_flow: ScreenFlow::Streaming,
+            agent_events: Vec::new(),
+            agent_delegate: false,
+            snapshot: None,
+            screens: HashMap::new(),
+            write_error: None,
+            ssh: None,
+        });
+    }
+    frontends[0].enable_screen_requests().unwrap();
+    let request = clients[0].peer.next_action().unwrap().unwrap();
+    let mut workspaces = HashMap::new();
+    let mut dirty = HashSet::new();
+    let mut closing = ClosingTerminals::default();
+    apply_action(
+        0,
+        request,
+        &mut clients,
+        &mut workspaces,
+        &mut dirty,
+        &server.directory.join("history"),
+        &mut closing,
+    )
+    .unwrap();
+    assert!(dirty.is_empty());
+    apply_action(
+        0,
+        Action::Create {
+            name: "demand".into(),
+            options: CreateOptions {
+                size: WindowSize {
+                    num_cols: 30,
+                    num_lines: 6,
+                    cell_width: 0,
+                    cell_height: 0,
+                },
+                directory: Some(server.directory.join("home")),
+                program: Some(Shell::new("/bin/sleep".into(), vec!["30".into()])),
+                ..CreateOptions::default()
+            },
+        },
+        &mut clients,
+        &mut workspaces,
+        &mut dirty,
+        &server.directory.join("history"),
+        &mut closing,
+    )
+    .unwrap();
+    let workspace = workspaces.get_mut("demand").unwrap();
+    let pane = workspace.focused();
+    broadcast(workspace, &mut clients, true).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| client.snapshot().is_some());
+    assert!(!frontends[0].screen_drawn());
+    assert_eq!(clients[0].screen_flow, ScreenFlow::Clean);
+    assert!(!clients[0].full);
+    let mut parser = Parser::new();
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[1;1Hretained");
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| {
+        client.screen_flow == ScreenFlow::Dirty
+    });
+    assert!(!clients[0].full);
+    assert!(
+        workspace.panes[&pane]
+            .terminal
+            .core
+            .lock()
+            .unwrap()
+            .dirty_rows()
+            .count()
+            > 0
+    );
+    assert!(!frontends[0].prepare_screen().unwrap());
+    assert!(matches!(
+        clients[0].peer.next_action().unwrap(),
+        Some(Action::ScreenRequest)
+    ));
+    clients[0].screen_flow = ScreenFlow::Requested;
+    broadcast(workspace, &mut clients, false).unwrap();
+    // A second notification must not replace the accepted frame before it is drawn.
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[2;1Hafter-state");
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| {
+        matches!(
+            client.screen_flow,
+            ScreenFlow::Received { dirty_again: true }
+        )
+    });
+    assert!(grid_contains(&frontends[0], "retained"));
+    assert!(!grid_contains(&frontends[0], "after-state"));
+    assert!(frontends[0].prepare_screen().unwrap());
+    assert!(frontends[0].screen_drawn());
+    assert_eq!(frontends[0].screen_flow, ScreenFlow::Dirty);
+    // The streaming peer consumes damage; the idle demand peer must recover a full palette/grid.
+    clients[1].workspace = Some("demand".into());
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b]4;1;#123456\x07\x1b[3;1Hstream-capture");
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    assert!(clients[0].full);
+    assert_eq!(
+        workspace.panes[&pane]
+            .terminal
+            .core
+            .lock()
+            .unwrap()
+            .dirty_rows()
+            .count(),
+        0
+    );
+    clients[1].peer.flush().unwrap();
+    wait(&mut frontends[1], |client, _| {
+        grid_contains(client, "stream-capture")
+    });
+    clients[1].workspace = None;
+    // Ordinary output can block a request; its final screen change survives until output drains.
+    clients[0].respond(Response::ClipboardStore {
+        primary: false,
+        text: "x".repeat(600_000),
+    });
+    clients[0].peer.flush().unwrap();
+    assert!(clients[0].peer.pending());
+    assert!(!frontends[0].prepare_screen().unwrap());
+    assert!(matches!(
+        clients[0].peer.next_action().unwrap(),
+        Some(Action::ScreenRequest)
+    ));
+    clients[0].screen_flow = ScreenFlow::Requested;
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[4;1Hfinal-change");
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    assert!(
+        workspace.panes[&pane]
+            .terminal
+            .core
+            .lock()
+            .unwrap()
+            .dirty_rows()
+            .count()
+            > 0
+    );
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut clipboard = false;
+    while clients[0].peer.pending() {
+        for event in frontends[0].poll().unwrap() {
+            clipboard |= matches!(event, ClientEvent::ClipboardStore { .. });
+        }
+        clients[0].peer.flush().unwrap();
+        assert!(Instant::now() < deadline);
+    }
+    assert!(clients[0].screen_retry());
+    broadcast(workspace, &mut clients, false).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, events| {
+        clipboard |= events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::ClipboardStore { .. }));
+        grid_contains(client, "final-change")
+    });
+    assert!(clipboard);
+    assert!(grid_contains(&frontends[0], "after-state"));
+    assert!(grid_contains(&frontends[0], "stream-capture"));
+    assert_eq!(
+        frontends[0].screens()[&pane].color(Color::Indexed(1)),
+        Rgb {
+            r: 0x12,
+            g: 0x34,
+            b: 0x56
+        }
+    );
+    assert!(!frontends[0].screen_drawn());
+    assert!(!clients[0].screen_retry());
+    broadcast(workspace, &mut clients, false).unwrap();
+    assert_eq!(clients[0].screen_flow, ScreenFlow::Clean);
+
+    // A metadata-only response during sync must preserve the full screen owed to this GUI.
+    clients[1].workspace = Some("demand".into());
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[1;1Hsync-row-A\x1b]4;1;#654321\x07");
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    for client in &mut clients {
+        client.peer.flush().unwrap();
+    }
+    wait(&mut frontends[1], |client, _| {
+        grid_contains(client, "sync-row-A")
+    });
+    wait(&mut frontends[0], |client, _| {
+        client.screen_flow == ScreenFlow::Dirty
+    });
+    assert!(clients[0].full);
+    clients[1].workspace = None;
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[?2026h");
+        assert!(core.mode().contains(Mode::SYNC_UPDATE));
+    }
+    assert!(!frontends[0].prepare_screen().unwrap());
+    assert!(matches!(
+        clients[0].peer.next_action().unwrap(),
+        Some(Action::ScreenRequest)
+    ));
+    clients[0].screen_flow = ScreenFlow::Requested;
+    broadcast(workspace, &mut clients, false).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| {
+        matches!(client.screen_flow, ScreenFlow::Received { .. })
+    });
+    assert!(clients[0].full);
+    assert!(!clients[0].screen_retry());
+    assert!(!grid_contains(&frontends[0], "sync-row-A"));
+    assert!(!frontends[0].screen_drawn());
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[2;1Hsync-row-B\x1b[?2026l");
+        assert!(!core.mode().contains(Mode::SYNC_UPDATE));
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| {
+        client.screen_flow == ScreenFlow::Dirty
+    });
+    assert!(!frontends[0].prepare_screen().unwrap());
+    assert!(matches!(
+        clients[0].peer.next_action().unwrap(),
+        Some(Action::ScreenRequest)
+    ));
+    clients[0].screen_flow = ScreenFlow::Requested;
+    broadcast(workspace, &mut clients, false).unwrap();
+    clients[0].peer.flush().unwrap();
+    wait(&mut frontends[0], |client, _| {
+        grid_contains(client, "sync-row-B")
+    });
+    assert!(grid_contains(&frontends[0], "sync-row-A"));
+    assert_eq!(
+        frontends[0].screens()[&pane].color(Color::Indexed(1)),
+        Rgb {
+            r: 0x65,
+            g: 0x43,
+            b: 0x21
+        }
+    );
+    assert!(!clients[0].full);
+}
+
+#[test]
+fn initial_demand_attach_error_can_draw_without_a_snapshot() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    client.enable_screen_requests().unwrap();
+    assert!(client.screen_waiting());
+    client
+        .send(Action::Attach {
+            name: "missing".into(),
+            size: CreateOptions::default().size,
+        })
+        .unwrap();
+    wait(&mut client, |_, events| {
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Error(_)))
+    });
+    assert!(client.snapshot().is_none());
+    assert!(!client.screen_waiting());
+    assert!(client.prepare_screen().unwrap());
 }

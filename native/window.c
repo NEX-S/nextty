@@ -1869,7 +1869,11 @@ int nt_window_frame_ready(NtWindow *w) {
     return 0;
 }
 void nt_window_prepare_frame(NtWindow *w) {
-    w->last_frame_ns = now_ns();
+    int64_t now = now_ns(), elapsed = now - w->last_frame_ns;
+    /* Preparation time must not accumulate into the refresh period. */
+    w->last_frame_ns = w->last_frame_ns && w->frame_interval_ns &&
+        elapsed >= w->frame_interval_ns && elapsed < 2 * w->frame_interval_ns
+        ? w->last_frame_ns + w->frame_interval_ns : now;
     schedule_frame(w, 0);
     if (w->tracing)
         w->frame_id++;

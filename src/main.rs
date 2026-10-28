@@ -240,6 +240,10 @@ fn workspace(
     }
     let mut client =
         connect().map_err(|error| Error::context("connect workspace server", error))?;
+    #[cfg(feature = "gui")]
+    if gui && !client.is_remote() {
+        client.enable_screen_requests()?;
+    }
     client.send(action)?;
     #[cfg(feature = "gui")]
     if gui {

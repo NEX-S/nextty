@@ -78,6 +78,7 @@ impl Default for CreateOptions {
 }
 #[derive(Clone, Debug)]
 pub enum Action {
+    ScreenRequest,
     AgentOpen,
     AgentView(Vec<u8>),
     AgentRequest(Vec<u8>),
@@ -378,7 +379,17 @@ pub(crate) enum ClientEndpoint {
         target: String,
     },
 }
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ScreenFlow {
+    Streaming,
+    Clean,
+    Dirty,
+    Requested,
+    Received { dirty_again: bool },
+}
+
 pub struct Client {
+    screen_flow: ScreenFlow,
     #[cfg(feature = "agent")]
     endpoint: ClientEndpoint,
     agent_events: Vec<(u8, Vec<u8>)>,
@@ -397,6 +408,7 @@ impl Client {
             peer: Peer::new(stream)?,
             #[cfg(feature = "agent")]
             endpoint: ClientEndpoint::Local(path.to_path_buf()),
+            screen_flow: ScreenFlow::Streaming,
             agent_events: Vec::new(),
             agent_delegate: false,
             snapshot: None,
@@ -427,6 +439,7 @@ impl Client {
             peer,
             #[cfg(feature = "agent")]
             endpoint,
+            screen_flow: ScreenFlow::Streaming,
             agent_events: Vec::new(),
             agent_delegate: false,
             snapshot: None,
@@ -488,6 +501,35 @@ impl Client {
             action => self.peer.send_action(&action)?,
         }
         self.flush()
+    }
+    pub fn enable_screen_requests(&mut self) -> io::Result<()> {
+        self.screen_flow = ScreenFlow::Requested;
+        self.send(Action::ScreenRequest)
+    }
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn screen_waiting(&self) -> bool {
+        self.screen_flow == ScreenFlow::Requested
+    }
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn prepare_screen(&mut self) -> io::Result<bool> {
+        if self.screen_flow == ScreenFlow::Dirty {
+            self.screen_flow = ScreenFlow::Requested;
+            self.send(Action::ScreenRequest)?;
+        }
+        Ok(!self.screen_waiting())
+    }
+    #[cfg(any(feature = "gui", test))]
+    pub(crate) fn screen_drawn(&mut self) -> bool {
+        if let ScreenFlow::Received { dirty_again } = self.screen_flow {
+            self.screen_flow = if dirty_again {
+                ScreenFlow::Dirty
+            } else {
+                ScreenFlow::Clean
+            };
+            dirty_again
+        } else {
+            false
+        }
     }
     pub fn scroll_to(&mut self, pane: PaneId, mut offset: usize) -> io::Result<()> {
         // Queue both actions before flushing: live output must not skew a drag delta.
@@ -597,6 +639,17 @@ impl Client {
                         }
                     }
                     self.snapshot = Some(snapshot);
+                    if self.screen_flow != ScreenFlow::Streaming {
+                        self.screen_flow = ScreenFlow::Received { dirty_again: false };
+                    }
+                    ClientEvent::Updated
+                }
+                Response::ScreenDirty => {
+                    self.screen_flow = match self.screen_flow {
+                        ScreenFlow::Received { .. } => ScreenFlow::Received { dirty_again: true },
+                        ScreenFlow::Clean => ScreenFlow::Dirty,
+                        flow => flow,
+                    };
                     ClientEvent::Updated
                 }
                 Response::Agent { kind, payload } => {
@@ -630,7 +683,12 @@ impl Client {
                     count: count as usize,
                     truncated,
                 },
-                Response::Error(error) => ClientEvent::Error(error),
+                Response::Error(error) => {
+                    if self.snapshot.is_none() && self.screen_flow == ScreenFlow::Requested {
+                        self.screen_flow = ScreenFlow::Clean;
+                    }
+                    ClientEvent::Error(error)
+                }
                 Response::Detached => {
                     self.peer.cancel_output();
                     self.write_error = None;
@@ -1200,6 +1258,7 @@ impl Drop for PaneSearch {
     }
 }
 struct Connection {
+    screen_flow: ScreenFlow,
     agent: bool,
     id: u64,
     peer: Peer,
@@ -1216,9 +1275,20 @@ struct Connection {
 }
 
 impl Connection {
+    fn screen_eligible(&self) -> bool {
+        matches!(
+            self.screen_flow,
+            ScreenFlow::Streaming | ScreenFlow::Requested
+        )
+    }
+    fn screen_retry(&self) -> bool {
+        self.screen_eligible() && (self.full || self.screen_flow == ScreenFlow::Requested)
+    }
+
     fn new(id: u64, stream: UnixStream) -> io::Result<Self> {
         Ok(Self {
             id,
+            screen_flow: ScreenFlow::Streaming,
             agent: false,
             peer: Peer::new(stream)?,
             workspace: None,
@@ -1355,12 +1425,16 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         closing.reap();
         had_workspace |= !workspaces.is_empty();
         clients.retain(|client| !client.failed);
-        dirty.extend(
-            clients
-                .iter()
-                .filter(|client| client.full && !client.peer.pending())
-                .filter_map(|client| client.workspace.clone()),
-        );
+        let requested: HashSet<_> = clients
+            .iter()
+            .filter(|client| client.screen_retry() && !client.peer.pending())
+            .filter_map(|client| client.workspace.clone())
+            .collect();
+        for name in requested {
+            if let Some(workspace) = workspaces.get_mut(&name) {
+                broadcast(workspace, &mut clients, false)?;
+            }
+        }
         for (name, workspace) in &mut workspaces {
             if workspace
                 .agent
@@ -1388,7 +1462,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
         for name in dirty.drain() {
             if let Some(workspace) = workspaces.get_mut(&name) {
-                broadcast(workspace, &mut clients)?;
+                broadcast(workspace, &mut clients, true)?;
             }
         }
         fds.clear();
@@ -1466,17 +1540,9 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                 clients[index].failed = true;
                 continue;
             }
-            if revents & libc::POLLOUT != 0 {
-                if clients[index].peer.flush().is_err() {
-                    clients[index].failed = true;
-                    continue;
-                }
-                if clients[index].full
-                    && !clients[index].peer.pending()
-                    && let Some(name) = &clients[index].workspace
-                {
-                    dirty.insert(name.clone());
-                }
+            if revents & libc::POLLOUT != 0 && clients[index].peer.flush().is_err() {
+                clients[index].failed = true;
+                continue;
             }
             if !clients[index].ending
                 && (revents & (libc::POLLIN | libc::POLLHUP) != 0
@@ -1583,7 +1649,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
         for name in dirty.drain() {
             if let Some(workspace) = workspaces.get_mut(&name) {
-                broadcast(workspace, &mut clients)?;
+                broadcast(workspace, &mut clients, true)?;
             }
         }
         for client in &mut clients {
@@ -1727,14 +1793,31 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
     }
 }
-fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Result<()> {
+fn broadcast(
+    workspace: &mut Workspace,
+    clients: &mut [Connection],
+    changed: bool,
+) -> io::Result<()> {
+    for client in clients.iter_mut() {
+        if client.workspace.as_deref() == Some(&workspace.name)
+            && !client.failed
+            && changed
+            && client.screen_flow == ScreenFlow::Clean
+        {
+            client.screen_flow = ScreenFlow::Dirty;
+            client.respond(Response::ScreenDirty);
+        }
+    }
     if !clients.iter().any(|client| {
         client.workspace.as_deref() == Some(&workspace.name)
+            && client.screen_eligible()
             && !client.peer.pending()
             && !client.failed
     }) {
         for client in clients {
-            if client.workspace.as_deref() == Some(&workspace.name) {
+            if client.workspace.as_deref() == Some(&workspace.name)
+                && client.screen_flow == ScreenFlow::Streaming
+            {
                 client.full = true;
             }
         }
@@ -1767,6 +1850,7 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
             let eligible = || {
                 clients.iter().filter(|client| {
                     client.workspace.as_deref() == Some(&workspace.name)
+                        && client.screen_eligible()
                         && !client.peer.pending()
                         && !client.failed
                         && (client.agent || active.iter().any(|(pane, _)| *pane == id))
@@ -1802,7 +1886,7 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
         if client.workspace.as_deref() != Some(&workspace.name) || client.failed {
             continue;
         }
-        if client.peer.pending() {
+        if !client.screen_eligible() || client.peer.pending() {
             client.full = true;
             continue;
         }
@@ -1845,7 +1929,12 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection]) -> io::Resul
                     .map(|pane| (pane.id, Arc::clone(&pane.process))),
             );
         }
-        client.full = false;
+        client.full = client.full
+            && client.screen_flow != ScreenFlow::Streaming
+            && updates.len() < snapshot.panes.len();
+        if client.screen_flow == ScreenFlow::Requested {
+            client.screen_flow = ScreenFlow::Clean;
+        }
     }
     Ok(())
 }
@@ -1862,7 +1951,10 @@ fn apply_action(
     if clients[index].agent
         && !matches!(
             action,
-            Action::Input { .. } | Action::AgentUpdate { .. } | Action::Detach
+            Action::Input { .. }
+                | Action::AgentUpdate { .. }
+                | Action::Detach
+                | Action::ScreenRequest
         )
     {
         return Err(io::Error::new(
@@ -1871,6 +1963,10 @@ fn apply_action(
         ));
     }
     match action {
+        Action::ScreenRequest => {
+            clients[index].screen_flow = ScreenFlow::Requested;
+            return Ok(());
+        }
         Action::AgentAttach { name, token } => {
             let workspace = workspaces.get_mut(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")

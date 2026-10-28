@@ -21,9 +21,10 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 12;
+pub(crate) const VERSION: u8 = 13;
 
 pub(crate) enum Response {
+    ScreenDirty,
     Agent {
         kind: u8,
         payload: Vec<u8>,
@@ -343,6 +344,10 @@ impl Peer {
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
         let mut encoder = Encoder::new();
         let file = match response {
+            Response::ScreenDirty => {
+                encoder.u8(13);
+                None
+            }
             Response::Agent { kind, payload } => {
                 encoder.u8(12);
                 encoder.u8(kind);
@@ -656,6 +661,7 @@ impl Peer {
         while let Some(packet) = packet(&self.input[self.consumed..])? {
             let mut d = Decoder::new(packet)?;
             let response = match d.u8()? {
+                13 => Some(Response::ScreenDirty),
                 12 => Some(Response::Agent {
                     kind: d.u8()?,
                     payload: d.bytes(MAX_FRAME)?.to_vec(),
@@ -1102,6 +1108,7 @@ fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
 }
 fn encode_action(e: &mut Encoder, action: &Action) {
     match action {
+        Action::ScreenRequest => e.u8(32),
         Action::AgentOpen => e.u8(27),
         Action::AgentView(payload) => {
             e.u8(28);
@@ -1297,6 +1304,7 @@ fn decode_side(d: &mut Decoder<'_>) -> io::Result<Side> {
 }
 fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
     Ok(match d.u8()? {
+        32 => Action::ScreenRequest,
         27 => Action::AgentOpen,
         28 => Action::AgentView(d.bytes(MAX_FRAME)?.to_vec()),
         29 => Action::AgentRequest(d.bytes(MAX_FRAME)?.to_vec()),

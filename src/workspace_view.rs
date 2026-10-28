@@ -469,11 +469,12 @@ impl WorkspaceView {
             if ready && let Some(trace) = &mut self.trace {
                 trace.record_swap(self.renderer.swap_time())?;
             }
-            let mut timeout = if self.dirty && ready && self.window.ready() {
-                0
-            } else {
-                -1
-            };
+            let mut timeout =
+                if self.dirty && !self.client.screen_waiting() && ready && self.window.ready() {
+                    0
+                } else {
+                    -1
+                };
             if let Some((_, until)) = &self.ui.status {
                 let remaining = until
                     .saturating_duration_since(Instant::now())
@@ -659,12 +660,17 @@ impl WorkspaceView {
                 self.dirty |= files.poll();
             }
             self.dirty |= self.ui.expire_status();
-            if self.running && self.dirty && self.renderer.ready()? && self.window.ready() {
+            if self.running
+                && self.dirty
+                && self.renderer.ready()?
+                && self.window.ready()
+                && self.client.prepare_screen()?
+            {
                 if let Some(trace) = &mut self.trace {
                     trace.record_swap(self.renderer.swap_time())?;
                 }
                 self.draw()?;
-                self.dirty = false;
+                self.dirty = self.client.screen_drawn();
             }
         }
         #[cfg(feature = "agent")]
