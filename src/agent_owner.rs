@@ -37,7 +37,8 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
         .name;
     let init = json!({"endpoint":endpoint,"name":name,"token":token,
         "base_url":config.base_url,"model":config.model});
-    let mut command = Command::new(std::env::current_exe()?);
+    // Keep using the running binary even if an upgrade has unlinked it.
+    let mut command = Command::new("/proc/self/exe");
     command
         .arg("--agent-owner")
         .stdin(Stdio::piped())

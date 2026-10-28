@@ -36,8 +36,10 @@ impl WorkspaceView {
             let active = tab.id == snapshot.active_tab;
             let x = f32::from(column) * cell.0;
             let w = f32::from(columns) * cell.0;
+            let hovered =
+                (x..x + w).contains(&self.pointer.0) && (0. ..layout.top).contains(&self.pointer.1);
             let mut background = self.config.background;
-            if !active {
+            if !active && !hovered {
                 background = 0;
                 for shift in [16, 8, 0] {
                     background |= ((self.config.background >> shift & 255) * 4 / 5) << shift;

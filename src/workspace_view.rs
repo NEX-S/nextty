@@ -2934,8 +2934,6 @@ impl WorkspaceView {
                             let y = origin.1 + row as f32 * self.cell.1;
                             let w = last.saturating_sub(first) as f32 * self.cell.0;
                             self.renderer.rect(x, y, w, self.cell.1, 0x45605266, false);
-                            self.renderer
-                                .rect(x, y + self.cell.1 - 1., w, 1., ACCENT, false);
                         }
                     }
                     if pane.id == snapshot.focused && terminal_input {
