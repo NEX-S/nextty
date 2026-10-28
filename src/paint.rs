@@ -43,6 +43,14 @@ struct StyleRun {
     strike: bool,
 }
 
+fn text_runs(runs: &[StyleRun]) -> impl Iterator<Item = Run> + '_ {
+    runs.chunk_by(|a, b| a.text.color == b.text.color && a.text.flags == b.text.flags)
+        .map(|runs| Run {
+            end: runs.last().unwrap().text.end,
+            ..runs[0].text
+        })
+}
+
 struct Row {
     index: usize,
     text: String,
@@ -59,19 +67,6 @@ struct CachedRow {
 
 impl CachedRow {
     fn matches(&self, row: &Row) -> bool {
-        // Native shaping merges adjacent runs with the same foreground and font.
-        let connected = |a: &StyleRun, b: &StyleRun| {
-            a.text.color == b.text.color && a.text.flags == b.text.flags
-        };
-        let shaping = |runs: &[StyleRun]| {
-            let first = runs[0].text;
-            (
-                first.start,
-                runs.last().unwrap().text.end,
-                first.color,
-                first.flags,
-            )
-        };
         self.text == row.text
             && self.columns == row.columns
             && (self
@@ -79,11 +74,7 @@ impl CachedRow {
                 .iter()
                 .map(|run| run.text)
                 .eq(row.runs.iter().map(|run| run.text))
-                || self
-                    .runs
-                    .chunk_by(connected)
-                    .map(shaping)
-                    .eq(row.runs.chunk_by(connected).map(shaping)))
+                || text_runs(&self.runs).eq(text_runs(&row.runs)))
     }
 }
 
@@ -368,7 +359,7 @@ impl Frame {
                 continue;
             }
             native_runs.clear();
-            native_runs.extend(row.runs.iter().map(|run| run.text));
+            native_runs.extend(text_runs(&row.runs));
             let line = (!row.text.is_empty())
                 .then(|| renderer.shape(&row.text, &native_runs, &row.columns))
                 .transpose()?;
