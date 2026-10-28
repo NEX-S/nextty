@@ -327,6 +327,32 @@ pub struct Parser {
     streaming: bool,
 }
 
+#[inline]
+fn text_prefix(bytes: &[u8]) -> usize {
+    // The caller classified the first byte; short styled text often ends right after it.
+    if bytes.get(1).is_none_or(|b| *b < 0x20 || *b == 0x7f) {
+        return 1;
+    }
+    let mut rest = bytes;
+    while let Some((word, tail)) = rest.split_first_chunk::<8>() {
+        let word = u64::from_ne_bytes(*word);
+        let c0 = word.wrapping_sub(0x2020_2020_2020_2020) & !word;
+        let del = word ^ 0x7f7f_7f7f_7f7f_7f7f;
+        let controls =
+            (c0 | (del.wrapping_sub(0x0101_0101_0101_0101) & !del)) & 0x8080_8080_8080_8080;
+        if controls != 0 {
+            break;
+        }
+        rest = tail;
+    }
+    // Borrowing can mark neighbouring bytes; locate the exact boundary below.
+    bytes.len() - rest.len()
+        + rest
+            .iter()
+            .position(|b| *b < 0x20 || *b == 0x7f)
+            .unwrap_or(rest.len())
+}
+
 impl Parser {
     pub fn new() -> Self {
         Self::default()
@@ -348,10 +374,7 @@ impl Parser {
                 // Scan only framing while the actual core and its UTF-8/REP state remain untouched.
                 if self.state == State::Ground && bytes[position] >= 0x20 && bytes[position] != 0x7f
                 {
-                    let length = bytes[position..]
-                        .iter()
-                        .position(|b| *b < 0x20 || *b == 0x7f)
-                        .unwrap_or(bytes.len() - position);
+                    let length = text_prefix(&bytes[position..]);
                     let length = length.min(SYNC_LIMIT - self.sync.len());
                     self.sync
                         .extend_from_slice(&bytes[position..position + length]);
@@ -380,10 +403,7 @@ impl Parser {
                 && bytes[position] >= 0x20
                 && bytes[position] != 0x7f
             {
-                let length = bytes[position..]
-                    .iter()
-                    .position(|b| *b < 0x20 || *b == 0x7f)
-                    .unwrap_or(bytes.len() - position);
+                let length = text_prefix(&bytes[position..]);
                 self.text(core, &bytes[position..position + length]);
                 position += length;
                 committed = true;
@@ -1159,6 +1179,32 @@ mod tests {
             })
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn bulk_text_scanning_preserves_utf8_and_control_boundaries() {
+        let mut input = "0123456789abcdef中文λ→\x7fG\r\n\x1b[31mabcdefghijklmnop\tZ\x08Q\x1b[0m\r\ncombining e\u{301}".as_bytes().to_vec();
+        input.extend_from_slice(b"\xfftail\0\x1b[6n");
+        let (mut expected, mut scalar) = terminal();
+        for byte in &input {
+            scalar.advance(&mut expected, std::slice::from_ref(byte));
+        }
+        let expected_replies = replies(&mut expected);
+        for width in [7, 8, 9, input.len()] {
+            let (mut core, mut parser) = terminal();
+            for chunk in input.chunks(width) {
+                parser.advance(&mut core, chunk);
+            }
+            for row in 0..core.screen_lines() {
+                assert_eq!(core.row(row).cells, expected.row(row).cells);
+                assert_eq!(core.row(row).extras(), expected.row(row).extras());
+                assert_eq!(core.row(row).wrapped, expected.row(row).wrapped);
+            }
+            assert_eq!(core.cursor(), expected.cursor());
+            assert_eq!(core.mode(), expected.mode());
+            assert_eq!(core.history_size(), expected.history_size());
+            assert_eq!(replies(&mut core), expected_replies);
+        }
     }
 
     #[test]
