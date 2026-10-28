@@ -1327,6 +1327,8 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
     if (!shape_line(r, line)) return 0;
     double inverse_scale = 1. / r->scale;
     float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
+    float top = 0;
+    int top_ready = 0;
     for (size_t i = 0; i < line->count; ++i) {
         const NtFontGlyph *glyph = &line->glyphs[i];
         if (!(glyph->color & 255)) continue;
@@ -1336,7 +1338,10 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
                 float left = roundf((x + glyph->x + (r->cell_width - stroke) * 0.5f) * r->scale) / r->scale;
                 q = make_quad(left, y, stroke, r->cell_height, glyph->color, 0);
             } else {
-                float top = roundf((y + (r->cell_height - stroke) * 0.5f) * r->scale) / r->scale;
+                if (!top_ready) {
+                    top = roundf((y + (r->cell_height - stroke) * 0.5f) * r->scale) / r->scale;
+                    top_ready = 1;
+                }
                 q = make_quad(x + glyph->x, top, r->cell_width, stroke, glyph->color, 0);
             }
         } else {
