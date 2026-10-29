@@ -1656,10 +1656,14 @@ impl AgentSession {
             &prefix_lines
         };
         let width = caret.last().map_or(0, |range| {
-            prefix[range.clone()]
-                .chars()
-                .map(|c| usize::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2)))
-                .sum::<usize>()
+            let text = &prefix[range.clone()];
+            if text.is_ascii() {
+                text.len()
+            } else {
+                text.chars()
+                    .map(|c| usize::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2)))
+                    .sum::<usize>()
+            }
         });
         let caret_row = caret.len().saturating_sub(1) + usize::from(width >= columns);
         if lines.is_empty() {
