@@ -1051,7 +1051,8 @@ fn receive(
 struct Encoder(Vec<u8>);
 impl Encoder {
     fn new() -> Self {
-        Self::with_capacity(5)
+        // Skip the first growth from the five-byte frame header to ten bytes.
+        Self::with_capacity(10)
     }
     fn with_capacity(capacity: usize) -> Self {
         // Fill the frame length in place after encoding, without copying the payload.
