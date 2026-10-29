@@ -502,13 +502,13 @@ impl History {
                             });
                             match setup {
                                 Ok(()) => {
+                                    let begin = archive
+                                        .segments
+                                        .partition_point(|segment| segment.end <= read.cursor.row);
                                     let segments = archive
                                         .segments
-                                        .iter()
-                                        .filter(|segment| {
-                                            segment.end > read.cursor.row
-                                                && segment.start <= read.end.0
-                                        })
+                                        .range(begin..)
+                                        .take_while(|segment| segment.start <= read.end.0)
                                         .map(|segment| {
                                             (segment.path.clone(), segment.start, segment.end)
                                         })
