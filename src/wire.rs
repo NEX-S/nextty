@@ -507,7 +507,7 @@ impl Peer {
         let mut budget: usize = 256 * 1024;
         let output_fd = self.output_fd();
         while budget > 0 {
-            let Some(packet) = self.output.front_mut() else {
+            let Some(packet) = self.output.front() else {
                 break;
             };
             let bytes = &packet.bytes[packet.offset..];
@@ -518,8 +518,34 @@ impl Peer {
                     file.as_raw_fd(),
                 )
             } else {
-                let bytes = &bytes[..bytes.len().min(budget)];
-                let count = unsafe { libc::write(output_fd, bytes.as_ptr().cast(), bytes.len()) };
+                let count = if self.output.len() > 1 && bytes.len() < 64 * 1024 {
+                    let mut vectors = [libc::iovec {
+                        iov_base: std::ptr::null_mut(),
+                        iov_len: 0,
+                    }; 64];
+                    let mut remaining = budget.min(64 * 1024);
+                    let mut count = 0;
+                    for packet in self.output.iter().take(vectors.len()) {
+                        if packet.file.is_some() {
+                            break;
+                        }
+                        let bytes = &packet.bytes[packet.offset..];
+                        let length = bytes.len().min(remaining);
+                        vectors[count] = libc::iovec {
+                            iov_base: bytes.as_ptr().cast_mut().cast(),
+                            iov_len: length,
+                        };
+                        count += 1;
+                        remaining -= length;
+                        if remaining == 0 {
+                            break;
+                        }
+                    }
+                    unsafe { libc::writev(output_fd, vectors.as_ptr(), count as libc::c_int) }
+                } else {
+                    let bytes = &bytes[..bytes.len().min(budget)];
+                    unsafe { libc::write(output_fd, bytes.as_ptr().cast(), bytes.len()) }
+                };
                 if count < 0 {
                     Err(io::Error::last_os_error())
                 } else {
@@ -534,12 +560,18 @@ impl Peer {
                     ));
                 }
                 Ok(count) => {
-                    packet.offset += count;
                     self.queued -= count;
                     budget -= count;
-                    packet.file = None;
-                    if packet.offset == packet.bytes.len() {
-                        self.output.pop_front();
+                    let mut remaining = count;
+                    while remaining != 0 {
+                        let packet = self.output.front_mut().unwrap();
+                        let sent = remaining.min(packet.bytes.len() - packet.offset);
+                        packet.offset += sent;
+                        packet.file = None;
+                        remaining -= sent;
+                        if packet.offset == packet.bytes.len() {
+                            self.output.pop_front();
+                        }
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
@@ -3067,5 +3099,85 @@ mod tests {
         assert_eq!(received, data);
         assert!(sender.send_input(9, &vec![0; MAX_PENDING]).is_err());
         assert!(!sender.pending());
+    }
+    #[test]
+    fn queued_frames_preserve_order_and_descriptors_across_short_writes() {
+        use std::io::Read;
+        use std::time::{Duration, Instant};
+        let (left, right) = UnixStream::pair().unwrap();
+        let capacity: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    left.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&capacity as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let mut sender = Peer::new(left).unwrap();
+        let mut receiver = Peer::new(right).unwrap();
+        for index in 0..80 {
+            sender
+                .send_response(Response::Error(format!(
+                    "{index}:{}",
+                    "x".repeat(12000 + index)
+                )))
+                .unwrap();
+            if matches!(index, 20 | 60) {
+                sender
+                    .send_response(Response::Clipboard {
+                        request: index as u64,
+                        file: File::open(if index == 20 {
+                            "/dev/zero"
+                        } else {
+                            "/dev/null"
+                        })
+                        .unwrap(),
+                        incomplete: false,
+                    })
+                    .unwrap();
+            }
+        }
+        sender.flush().unwrap();
+        assert!(
+            sender.pending(),
+            "small socket must backpressure the sender"
+        );
+        let mut responses = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sender.pending() || responses.len() < 82 {
+            assert!(Instant::now() < deadline, "queued responses did not drain");
+            responses.extend(receiver.responses(None).unwrap());
+            sender.flush().unwrap();
+        }
+        let mut responses = responses.into_iter();
+        for index in 0..80 {
+            assert!(matches!(responses.next(), Some(Response::Error(text))
+                if text == format!("{index}:{}", "x".repeat(12000 + index))));
+            if matches!(index, 20 | 60) {
+                let Some(Response::Clipboard {
+                    request,
+                    mut file,
+                    incomplete,
+                }) = responses.next()
+                else {
+                    panic!("missing clipboard descriptor");
+                };
+                assert_eq!(request, index as u64);
+                assert!(!incomplete);
+                let mut byte = [9];
+                if index == 20 {
+                    assert_eq!(file.read(&mut byte).unwrap(), 1);
+                    assert_eq!(byte, [0]);
+                } else {
+                    assert_eq!(file.read(&mut byte).unwrap(), 0);
+                }
+            }
+        }
+        assert!(responses.next().is_none());
     }
 }
