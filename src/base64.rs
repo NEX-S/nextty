@@ -1,5 +1,7 @@
 //! Padded RFC 4648 Base64 for OSC 52 clipboard text.
 
+const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(4) {
         return None;
@@ -32,7 +34,6 @@ pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
 
 #[cfg(feature = "tui")]
 pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
-    const DIGITS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let start = output.len();
     output.resize(start + bytes.len().div_ceil(3) * 4, b'=');
     let (chunks, tail) = bytes.as_chunks::<3>();
@@ -61,14 +62,17 @@ pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
 }
 
 fn digit(byte: u8) -> Option<u8> {
-    match byte {
-        b'A'..=b'Z' => Some(byte - b'A'),
-        b'a'..=b'z' => Some(byte - b'a' + 26),
-        b'0'..=b'9' => Some(byte - b'0' + 52),
-        b'+' => Some(62),
-        b'/' => Some(63),
-        _ => None,
-    }
+    const TABLE: [u8; 256] = {
+        let mut table = [u8::MAX; 256];
+        let mut index = 0;
+        while index < DIGITS.len() {
+            table[DIGITS[index] as usize] = index as u8;
+            index += 1;
+        }
+        table
+    };
+    let value = TABLE[byte as usize];
+    (value != u8::MAX).then_some(value)
 }
 
 #[cfg(test)]
