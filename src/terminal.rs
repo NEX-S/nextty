@@ -286,13 +286,15 @@ impl Terminal {
         &self,
         block: Option<u64>,
         cursor: Option<crate::history::HistoryCursor>,
-        query: Option<String>,
-        cancelled: Arc<AtomicBool>,
-    ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryPage>>> {
+        query: Option<&str>,
+    ) -> io::Result<(
+        mpsc::Receiver<io::Result<crate::history::HistoryPage>>,
+        Arc<AtomicBool>,
+    )> {
         self.core
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?
-            .read_history(block, cursor, query, cancelled)
+            .read_history(block, cursor, query)
     }
 
     pub fn process_metadata(&self) -> Arc<ProcessMetadata> {

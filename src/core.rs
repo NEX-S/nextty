@@ -3399,9 +3399,11 @@ impl Core {
         &mut self,
         block: Option<u64>,
         cursor: Option<HistoryCursor>,
-        query: Option<String>,
-        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<HistoryPage>>> {
+        query: Option<&str>,
+    ) -> std::io::Result<(
+        std::sync::mpsc::Receiver<std::io::Result<HistoryPage>>,
+        Arc<std::sync::atomic::AtomicBool>,
+    )> {
         self.flush_history(true);
         self.require_history_ready_for_copy()?;
         let history = self.history.as_ref().ok_or_else(|| {
@@ -3471,17 +3473,19 @@ impl Core {
             ));
         }
         let (hot_start, hot) = Self::copy_rows(&main.rows, history.hot_start, cursor.row, end.0);
-        history.io.read(HistoryRead {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let receiver = history.io.read(HistoryRead {
             start,
             end,
             hot_start,
             hot,
             cursor,
-            query,
+            query: query.map(str::to_owned),
             incomplete,
             command,
-            cancelled,
-        })
+            cancelled: Arc::clone(&cancelled),
+        })?;
+        Ok((receiver, cancelled))
     }
 }
 

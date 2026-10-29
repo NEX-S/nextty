@@ -2878,9 +2878,8 @@ fn queue_read(client: &mut Connection, name: &str, terminal: &Terminal, action: 
     else {
         unreachable!()
     };
-    let cancelled = Arc::new(AtomicBool::new(false));
-    match terminal.read_history(block, cursor, query.clone(), Arc::clone(&cancelled)) {
-        Ok(receiver) => client.reads.push(PendingRead {
+    match terminal.read_history(block, cursor, query.as_deref()) {
+        Ok((receiver, cancelled)) => client.reads.push(PendingRead {
             request,
             pane,
             receiver,

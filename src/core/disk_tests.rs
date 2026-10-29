@@ -511,8 +511,9 @@ fn history_and_command_reads_keep_main_screen_contents_while_alternate_is_active
     assert!(command.starts_with("line-0000 中\n"));
     assert!(command.ends_with("line-0699 中\n"));
     let all = core
-        .read_history(None, None, None, Default::default())
+        .read_history(None, None, None)
         .unwrap()
+        .0
         .recv()
         .unwrap()
         .unwrap();
@@ -547,8 +548,9 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
         b"\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07",
     );
     let first = core
-        .read_history(Some(block), None, None, Default::default())
+        .read_history(Some(block), None, None)
         .unwrap()
+        .0
         .recv()
         .unwrap()
         .unwrap();
@@ -560,8 +562,9 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
     settle(&mut core);
     let offset = core.display_offset();
     let next = core
-        .read_history(Some(block), Some(cursor), None, Default::default())
+        .read_history(Some(block), Some(cursor), None)
         .unwrap()
+        .0
         .recv()
         .unwrap()
         .unwrap();
@@ -572,13 +575,9 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
     );
     assert_eq!(core.display_offset(), offset);
     let found = core
-        .read_history(
-            Some(block),
-            None,
-            Some("x中😀boundary-proof".into()),
-            Default::default(),
-        )
+        .read_history(Some(block), None, Some("x中😀boundary-proof"))
         .unwrap()
+        .0
         .recv()
         .unwrap()
         .unwrap();
@@ -590,7 +589,7 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
     });
     settle(&mut core);
     let error = core
-        .read_history(Some(block), Some(cursor), None, Default::default())
+        .read_history(Some(block), Some(cursor), None)
         .unwrap_err();
     assert!(error.to_string().contains("stale"));
 }
@@ -610,8 +609,9 @@ fn history_query_cursor_skips_ascii_and_unicode_prefixes_without_repeating_resul
         feed(&mut core, &mut parser, format!("{prefix}{tail}").as_bytes());
         feed(&mut core, &mut parser, b"\x1b]133;D;0\x07");
         let mut page = core
-            .read_history(Some(block), None, Some("MATCH".into()), Default::default())
+            .read_history(Some(block), None, Some("MATCH"))
             .unwrap()
+            .0
             .recv()
             .unwrap()
             .unwrap();
@@ -619,8 +619,9 @@ fn history_query_cursor_skips_ascii_and_unicode_prefixes_without_repeating_resul
         let mut text = page.text;
         while let Some(cursor) = page.next {
             page = core
-                .read_history(Some(block), Some(cursor), None, Default::default())
+                .read_history(Some(block), Some(cursor), None)
                 .unwrap()
+                .0
                 .recv()
                 .unwrap()
                 .unwrap();
