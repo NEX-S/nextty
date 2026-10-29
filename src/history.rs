@@ -382,7 +382,7 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
                 id += empty as u64;
                 continue;
             }
-            let row = read_row::<true>(&mut reader, cells)?;
+            let row = read_row::<false>(&mut reader, cells)?;
             matcher.row(id, &row);
             cells = row.cells;
             id += 1;
@@ -1138,7 +1138,7 @@ impl Archive {
                 if id > end.0 {
                     break;
                 }
-                let row = read_row::<true>(&mut reader, cells)?;
+                let row = read_row::<false>(&mut reader, cells)?;
                 write(id, &row)?;
                 next = id + 1;
                 cells = row.cells;
