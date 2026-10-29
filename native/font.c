@@ -453,6 +453,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         /* The terminal column map uses UTF-8 byte offsets. */
         if (!printable_ascii)
             for (unsigned j = 0; j < shaped; ++j) info[j].cluster = chars[info[j].cluster].byte;
+        hb_codepoint_t blank_glyph = HB_CODEPOINT_INVALID;
         for (unsigned j = 0; j < shaped; ++j) {
             size_t offset = info[j].cluster;
             size_t column = columns ? columns[offset] : offset;
@@ -470,8 +471,10 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
                 (!columns || offset + 3 == length || columns[offset + 3] != column))
                 straight = (unsigned char)text[offset + 2] == 0x80 ? 0x2500 : 0x2502;
             hb_glyph_extents_t extents;
-            int blank = text[offset] == ' ' && hb_font_get_glyph_extents(font->hb, info[j].codepoint, &extents) &&
-                        (!extents.width || !extents.height);
+            int blank = text[offset] == ' ' && (info[j].codepoint == blank_glyph ||
+                        (hb_font_get_glyph_extents(font->hb, info[j].codepoint, &extents) &&
+                         (!extents.width || !extents.height)));
+            if (blank) blank_glyph = info[j].codepoint;
             if (!blank) {
                 if (used == capacity) {
                     size_t needed = used + shaped - j;
