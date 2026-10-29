@@ -6,29 +6,34 @@ pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
     if !input.len().is_multiple_of(4) {
         return None;
     }
-    let mut output = Vec::with_capacity(input.len() / 4 * 3);
-    for (index, quartet) in input.chunks_exact(4).enumerate() {
-        let last = index + 1 == input.len() / 4;
+    let (quartets, _) = input.as_chunks::<4>();
+    let mut output = vec![0; quartets.len() * 3];
+    let mut length = output.len();
+    let (decoded, _) = output.as_chunks_mut::<3>();
+    for (index, (quartet, bytes)) in quartets.iter().zip(decoded.iter_mut()).enumerate() {
+        let last = index + 1 == quartets.len();
         let a = digit(quartet[0])?;
         let b = digit(quartet[1])?;
-        output.push(a << 2 | b >> 4);
+        bytes[0] = a << 2 | b >> 4;
         match (quartet[2], quartet[3]) {
-            (b'=', b'=') if last && b & 15 == 0 => {}
+            (b'=', b'=') if last && b & 15 == 0 => length -= 2,
             (c, b'=') if last => {
                 let c = digit(c)?;
                 if c & 3 != 0 {
                     return None;
                 }
-                output.push(b << 4 | c >> 2);
+                bytes[1] = b << 4 | c >> 2;
+                length -= 1;
             }
             (c, d) => {
                 let c = digit(c)?;
                 let d = digit(d)?;
-                output.push(b << 4 | c >> 2);
-                output.push(c << 6 | d);
+                bytes[1] = b << 4 | c >> 2;
+                bytes[2] = c << 6 | d;
             }
         }
     }
+    output.truncate(length);
     String::from_utf8(output).ok()
 }
 
