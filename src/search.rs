@@ -60,8 +60,9 @@ impl Matcher {
         if character == self.pattern[self.matched] {
             self.matched += 1;
             // Retain the matched suffix after fallback or an overlapping match.
-            while self.positions.len() >= self.matched {
-                self.positions.pop_front();
+            if self.positions.len() >= self.matched {
+                self.positions
+                    .drain(..self.positions.len() - self.matched + 1);
             }
             self.positions.push_back(start);
         } else {
