@@ -141,7 +141,7 @@ fn chinese_combining_csi_osc_and_replies_survive_every_split() {
         let row = terminal.core.row(0);
         assert!(row.cells[1].flags.contains(Flags::WIDE_CHAR));
         assert!(row.cells[2].flags.contains(Flags::WIDE_CHAR_SPACER));
-        assert_eq!(row.extra(5).unwrap().zerowidth, ['\u{301}']);
+        assert_eq!(row.extra(5).unwrap().zerowidth.as_slice(), &['\u{301}']);
         for cell in &row.cells[..6] {
             assert_eq!(
                 cell.fg,

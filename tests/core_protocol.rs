@@ -61,7 +61,7 @@ fn utf8_and_escape_sequences_can_cross_every_byte_boundary() {
     assert_eq!(row.cells[1].c, '中');
     assert_eq!(row.cells[3].c, '文');
     assert_eq!(row.cells[5].c, 'e');
-    assert_eq!(row.extra(5).unwrap().zerowidth, ['\u{301}']);
+    assert_eq!(row.extra(5).unwrap().zerowidth.as_slice(), &['\u{301}']);
     assert_eq!(terminal.core.cursor().0, point(0, 6));
 }
 
@@ -88,8 +88,8 @@ fn overwriting_half_a_wide_cell_and_erasing_combining_text_leaves_no_ghost() {
     terminal.write("\x1b[1;3Hx");
     assert_eq!(terminal.line(0), "A xeZ   ");
     assert_eq!(
-        terminal.core.row(0).extra(3).unwrap().zerowidth,
-        ['\u{301}']
+        terminal.core.row(0).extra(3).unwrap().zerowidth.as_slice(),
+        &['\u{301}']
     );
     terminal.write("\x1b[1;4H\x1b[X");
     assert_eq!(terminal.line(0), "A x Z   ");

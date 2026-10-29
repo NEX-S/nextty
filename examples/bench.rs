@@ -46,27 +46,37 @@ fn parser() {
 fn wait_for(terminal: &terminal::Terminal, expected: char) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match terminal.events.try_recv() {
-            Ok(Event::Wakeup) => {
-                terminal.acknowledge_wakeup();
-                if terminal.core.lock().unwrap().row(0).cells[0].c == expected {
-                    return Ok(());
-                }
-            }
-            Ok(Event::Exit(status)) => {
-                return Err(Error::msg(format!("echo child exited: {status}")));
-            }
-            Ok(Event::Error(error)) => return Err(Error::context("echo PTY reader", error)),
-            Ok(_) => (),
-            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                return Err(Error::msg("terminal event channel closed"));
-            }
-            Err(std::sync::mpsc::TryRecvError::Empty) => std::thread::yield_now(),
-        }
-        if Instant::now() >= deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
             return Err(Error::msg(format!(
                 "timed out waiting for echo {expected:?}"
             )));
+        }
+        let mut fd = libc::pollfd {
+            fd: terminal.event_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        if unsafe { libc::poll(&mut fd, 1, remaining.as_millis().max(1) as i32) } < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(error.into());
+        }
+        terminal.drain_notification()?;
+        terminal.acknowledge_wakeup();
+        for event in terminal.events.try_iter() {
+            match event {
+                Event::Exit(status) => {
+                    return Err(Error::msg(format!("echo child exited: {status}")));
+                }
+                Event::Error(error) => return Err(Error::context("echo PTY reader", error)),
+                _ => (),
+            }
+        }
+        if terminal.core.lock().unwrap().row(0).cells[0].c == expected {
+            return Ok(());
         }
     }
 }
@@ -106,7 +116,7 @@ fn pty() -> Result<()> {
     samples.sort_by(f64::total_cmp);
     println!("raw PTY echo to parsed grid (no GUI/display latency)");
     println!("  path: Terminal::write → PTY → raw /bin/cat → event loop → grid observation");
-    println!("  observer: event polling + yield_now; 100 warmups, 2000 samples, two bytes/input");
+    println!("  observer: eventfd poll; 100 warmups, 2000 samples, two bytes/input");
     println!(
         "  microseconds: p50 {:.2}, p95 {:.2}, p99 {:.2}, min {:.2}, max {:.2}",
         percentile(&samples, 0.50),
