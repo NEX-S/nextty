@@ -2728,7 +2728,6 @@ fn apply_action(
             search
                 .cancelled
                 .store(true, std::sync::atomic::Ordering::Relaxed);
-            search.cancelled = Default::default();
             search.request = request;
             search.query = query;
             search.receiver = None;
@@ -2750,6 +2749,7 @@ fn apply_action(
                     truncated: false,
                 });
             } else {
+                search.cancelled = Default::default();
                 try_search(search, terminal)?;
             }
         }
