@@ -1262,15 +1262,48 @@ impl AgentPanel {
     }
 
     pub fn controls(&self) -> Vec<AgentAction> {
-        let mut actions = self.active().controls();
-        if self.active().context.preview.is_none() && !self.active().context.menu {
-            actions.push(AgentAction::NewSession);
-            for index in 0..self.sessions.len() {
-                actions.push(AgentAction::Session(index));
-            }
-            actions.push(AgentAction::CloseSession(self.current));
-            actions.push(AgentAction::ClosePanel);
+        let session = self.active();
+        if session.context.preview.is_some() {
+            return vec![AgentAction::CopyPreview, AgentAction::ClosePreview];
         }
+        if session.context.menu {
+            return vec![
+                AgentAction::Selection,
+                AgentAction::Screen,
+                AgentAction::ContextMenu,
+            ];
+        }
+        let capacity = (6
+            + self.sessions.len()
+            + usize::from(session.model.busy)
+            + session.context.basket.len() * 2
+            + session.model.messages.len())
+        .next_power_of_two();
+        let mut actions = Vec::with_capacity(capacity);
+        actions.extend([AgentAction::Editor, AgentAction::Output]);
+        if session.model.busy {
+            actions.push(AgentAction::Stop);
+        }
+        actions.push(AgentAction::ContextMenu);
+        for index in 0..session.context.basket.len() {
+            actions.extend([AgentAction::Inspect(index), AgentAction::Remove(index)]);
+        }
+        for (index, message) in session.model.messages.iter().enumerate().rev() {
+            if message.role == "You" {
+                actions.push(AgentAction::Rewind(index));
+            }
+            actions.push(if message.id.is_some() {
+                AgentAction::Tool(index)
+            } else {
+                AgentAction::Copy(index)
+            });
+        }
+        actions.push(AgentAction::NewSession);
+        actions.extend((0..self.sessions.len()).map(AgentAction::Session));
+        actions.extend([
+            AgentAction::CloseSession(self.current),
+            AgentAction::ClosePanel,
+        ]);
         actions
     }
 
@@ -1628,38 +1661,6 @@ impl AgentSession {
             previous = Some(point);
         }
         (!output.is_empty()).then_some(output)
-    }
-
-    pub fn controls(&self) -> Vec<AgentAction> {
-        if self.context.preview.is_some() {
-            return vec![AgentAction::CopyPreview, AgentAction::ClosePreview];
-        }
-        if self.context.menu {
-            return vec![
-                AgentAction::Selection,
-                AgentAction::Screen,
-                AgentAction::ContextMenu,
-            ];
-        }
-        let mut actions = vec![AgentAction::Editor, AgentAction::Output];
-        if self.model.busy {
-            actions.push(AgentAction::Stop);
-        }
-        actions.push(AgentAction::ContextMenu);
-        for index in 0..self.context.basket.len() {
-            actions.extend([AgentAction::Inspect(index), AgentAction::Remove(index)]);
-        }
-        for (index, message) in self.model.messages.iter().enumerate().rev() {
-            if message.role == "You" {
-                actions.push(AgentAction::Rewind(index));
-            }
-            actions.push(if message.id.is_some() {
-                AgentAction::Tool(index)
-            } else {
-                AgentAction::Copy(index)
-            });
-        }
-        actions
     }
 
     pub fn editor_layout(&self, columns: usize, rows: usize) -> EditorLines {
