@@ -1220,7 +1220,7 @@ impl Archive {
                     skip_rows(file, skip)?;
                     *next += skip;
                 }
-                rows.push_back(read_row::<true>(file, cells)?);
+                rows.push_back(read_row::<false>(file, cells)?);
                 *next += 1;
             }
             Ok(rows.back().cloned().map(Cow::Owned))
