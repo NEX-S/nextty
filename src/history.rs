@@ -770,12 +770,12 @@ struct ReadText<'a> {
     found: bool,
 }
 impl ReadText<'_> {
-    fn append(&mut self, text: &str) -> usize {
-        let mut count = (READ_LIMIT - self.text.len()).min(text.len());
+    fn append(output: &mut String, text: &str) -> usize {
+        let mut count = (READ_LIMIT - output.len()).min(text.len());
         while !text.is_char_boundary(count) {
             count -= 1;
         }
-        self.text.push_str(&text[..count]);
+        output.push_str(&text[..count]);
         count
     }
     fn row(&mut self, id: u64, row: &Row, bytes: &mut Vec<u8>) -> io::Result<bool> {
@@ -813,19 +813,17 @@ impl ReadText<'_> {
         self.cursor.row = id;
         self.cursor.offset = offset as u64;
         let consumed = if self.found {
-            self.append(input)
+            Self::append(&mut self.text, input)
         } else {
             let prefix = self.carry.len();
             self.carry.push_str(input);
             let query = self.read.query.as_deref().unwrap();
             if let Some(found) = self.carry.find(query) {
                 self.found = true;
-                let matched = self.carry[found..].to_owned();
+                let appended = Self::append(&mut self.text, &self.carry[found..]);
                 self.carry.clear();
                 (found.saturating_sub(prefix)
-                    + self
-                        .append(&matched)
-                        .saturating_sub(prefix.saturating_sub(found)))
+                    + appended.saturating_sub(prefix.saturating_sub(found)))
                 .min(input.len())
             } else {
                 let mut keep = self
