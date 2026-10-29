@@ -206,6 +206,7 @@ static int add_op(NtRenderer *r, Op op) {
 static int flush_quads(NtRenderer *r);
 
 static void clear_glyphs(NtRenderer *r) {
+    if (!r->glyph_count) return;
     /* Font marks occupancy; leave empty slots' zero pages untouched. */
     for (size_t i = 0; i < GLYPH_SLOTS; ++i) {
         if (!r->glyphs[i].font) continue;
