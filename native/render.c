@@ -241,7 +241,7 @@ static int64_t submission_time(void) {
     return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
 }
 
-static int append_quad(NtRenderer *r, Quad q);
+static int reserve_quads(NtRenderer *r, size_t count);
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor);
 
 #define VK_CHECK(call) do { \
@@ -884,7 +884,8 @@ static int replay(NtRenderer *r) {
             break;
         }
         case OP_QUAD:
-            if (!append_quad(r, op->quad)) return 0;
+            if (!reserve_quads(r, r->quad_count + 1)) return 0;
+            r->quads[r->quad_count++] = op->quad;
             break;
         case OP_LINE:
             if (!draw_line(r, op->line.line, op->line.x, op->line.y, op->line.factor)) return 0;
@@ -1175,9 +1176,10 @@ static Quad make_quad(float x, float y, float width, float height, uint32_t colo
         (unsigned char)(color >> 8), (unsigned char)color}, .mode = mode };
 }
 
-static int append_quad(NtRenderer *r, Quad q) {
-    if (r->quad_count == r->quad_capacity) {
+static int reserve_quads(NtRenderer *r, size_t count) {
+    if (count > r->quad_capacity) {
         size_t capacity = r->quad_capacity ? r->quad_capacity * 2 : 1024;
+        if (capacity < count) capacity = count;
         if (capacity < r->quad_capacity || capacity > SIZE_MAX / sizeof(Quad))
             return fail(r, "GPU rectangle batch is too large");
         Quad *quads = realloc(r->quads, capacity * sizeof *quads);
@@ -1185,7 +1187,6 @@ static int append_quad(NtRenderer *r, Quad q) {
         r->quads = quads;
         r->quad_capacity = capacity;
     }
-    r->quads[r->quad_count++] = q;
     return 1;
 }
 
@@ -1324,7 +1325,7 @@ void nt_renderer_line(NtRenderer *r, const NtLine *line, float x, float y, float
 }
 
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor) {
-    if (!shape_line(r, line)) return 0;
+    if (!shape_line(r, line) || !reserve_quads(r, r->quad_count + line->count)) return 0;
     double inverse_scale = 1. / r->scale;
     float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
     float top = 0;
@@ -1365,7 +1366,7 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
             q.rect[2] *= factor;
             q.rect[3] *= factor;
         }
-        if (!append_quad(r, q)) return 0;
+        r->quads[r->quad_count++] = q;
     }
     return 1;
 }
