@@ -1144,6 +1144,14 @@ impl<'a> Decoder<'a> {
         String::from_utf8(self.bytes(limit)?.to_vec())
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
     }
+    fn strings(&mut self, limit: usize) -> io::Result<Vec<String>> {
+        let count = self.count(limit)?;
+        let mut strings = Vec::with_capacity(count);
+        for _ in 0..count {
+            strings.push(self.string(65536)?);
+        }
+        Ok(strings)
+    }
     fn path(&mut self) -> io::Result<Option<PathBuf>> {
         if self.bool()? {
             Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
@@ -1626,30 +1634,19 @@ fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
     }
 }
 fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMetadata> {
-    let count = d.count(65536)?;
-    let launch_argv = (0..count)
-        .map(|_| d.string(65536))
-        .collect::<io::Result<Vec<_>>>()?;
+    let launch_argv = d.strings(65536)?;
     let child_pid = d.u32()?;
     let foreground_pgid = if d.bool()? { Some(d.u32()?) } else { None };
     let foreground_pid = if d.bool()? { Some(d.u32()?) } else { None };
     let foreground_executable = d.path()?;
     let foreground_argv = if d.bool()? {
-        let count = d.count(65536)?;
-        Some(
-            (0..count)
-                .map(|_| d.string(65536))
-                .collect::<io::Result<Vec<_>>>()?,
-        )
+        Some(d.strings(65536)?)
     } else {
         None
     };
     let foreground_cwd = d.path()?;
     let sampled_at_ms = if d.bool()? { Some(d.u64()?) } else { None };
-    let count = d.count(16)?;
-    let unavailable = (0..count)
-        .map(|_| d.string(65536))
-        .collect::<io::Result<Vec<_>>>()?;
+    let unavailable = d.strings(16)?;
     Ok(crate::terminal::ProcessMetadata {
         launch_argv,
         child_pid,
