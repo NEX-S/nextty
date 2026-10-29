@@ -223,7 +223,6 @@ NtFonts *nt_fonts_new(const char *family, float size, char *error, size_t error_
     f->options = cairo_font_options_create();
     cairo_font_options_set_antialias(f->options, CAIRO_ANTIALIAS_GRAY);
     cairo_font_options_set_hint_style(f->options, CAIRO_HINT_STYLE_SLIGHT);
-    cairo_font_options_set_hint_metrics(f->options, CAIRO_HINT_METRICS_OFF);
     Style *s = style(f, 0);
     if (!s) goto failed;
     Font *font = NULL;
