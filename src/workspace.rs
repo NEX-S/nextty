@@ -1754,7 +1754,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     .ok_or_else(|| {
                         io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
                     })
-                    .and_then(|pane| queue_copy(client, &name, &pane.terminal, action));
+                    .and_then(|pane| queue_copy(client, Cow::Owned(name), &pane.terminal, action));
                 match result {
                     Ok(true) => (),
                     Ok(false) => break,
@@ -1808,7 +1808,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     .get(&name)
                     .and_then(|workspace| workspace.panes.get(&pane))
                 {
-                    Some(pane) => queue_read(client, &name, &pane.terminal, action),
+                    Some(pane) => queue_read(client, Cow::Owned(name), &pane.terminal, action),
                     None => client.respond(Response::History {
                         request,
                         result: Err("history source pane no longer exists".into()),
@@ -2681,9 +2681,14 @@ fn apply_action(
         }
         action @ (Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. }) => {
             let request = copy_request(&action);
-            if let Err(error) = pane_ref(pane)
-                .and_then(|pane| queue_copy(&mut clients[index], &name, &pane.terminal, action))
-            {
+            if let Err(error) = pane_ref(pane).and_then(|pane| {
+                queue_copy(
+                    &mut clients[index],
+                    Cow::Borrowed(&name),
+                    &pane.terminal,
+                    action,
+                )
+            }) {
                 clients[index].respond(Response::CopyError {
                     request,
                     error: error.to_string(),
@@ -2691,7 +2696,12 @@ fn apply_action(
             }
         }
         action @ Action::ReadHistory { pane, request, .. } => match pane_ref(pane) {
-            Ok(pane) => queue_read(&mut clients[index], &name, &pane.terminal, action),
+            Ok(pane) => queue_read(
+                &mut clients[index],
+                Cow::Borrowed(&name),
+                &pane.terminal,
+                action,
+            ),
             Err(error) => clients[index].respond(Response::History {
                 request,
                 result: Err(error.to_string()),
@@ -2834,12 +2844,12 @@ fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
 }
 fn queue_copy(
     client: &mut Connection,
-    name: &str,
+    name: Cow<'_, str>,
     terminal: &Terminal,
     action: Action,
 ) -> io::Result<bool> {
     if client.copy.is_some() {
-        client.copy_requests.push_back((name.to_owned(), action));
+        client.copy_requests.push_back((name.into_owned(), action));
         return Ok(false);
     }
     let (request, result) = match action {
@@ -2853,7 +2863,7 @@ fn queue_copy(
             true
         }
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            client.copy_requests.push_back((name.to_owned(), action));
+            client.copy_requests.push_back((name.into_owned(), action));
             false
         }
         Err(error) => {
@@ -2866,7 +2876,7 @@ fn queue_copy(
     };
     Ok(progressed)
 }
-fn queue_read(client: &mut Connection, name: &str, terminal: &Terminal, action: Action) {
+fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, action: Action) {
     let Action::ReadHistory {
         pane,
         request,
@@ -2886,7 +2896,7 @@ fn queue_read(client: &mut Connection, name: &str, terminal: &Terminal, action: 
             cancelled,
         }),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            client.read_requests.push_back((name.to_owned(), action))
+            client.read_requests.push_back((name.into_owned(), action))
         }
         Err(error) => client.respond(Response::History {
             request,
