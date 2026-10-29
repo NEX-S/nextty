@@ -95,10 +95,9 @@ impl Desktop {
     pub fn run(mut self) -> Result<()> {
         let mut events = Vec::new();
         while self.running {
-            self.terminal.drain_notification()?;
+            self.dirty |= self.terminal.drain_notification()?;
             while let Ok(event) = self.terminal.events.try_recv() {
                 match event {
-                    TerminalEvent::Wakeup => self.dirty = true,
                     TerminalEvent::Title(title) => {
                         self.window.title(title.as_deref().unwrap_or("nextty"))?
                     }

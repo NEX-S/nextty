@@ -1681,7 +1681,6 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                             controller.respond(Response::ClipboardStore { primary, text });
                         }
                     }
-                    Event::Wakeup => (),
                 }
             }
             if exit {

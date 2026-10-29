@@ -2243,21 +2243,27 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
             .unwrap();
             let deadline = Instant::now() + Duration::from_secs(3);
             loop {
-                let event = terminal
-                    .events
-                    .recv_timeout(deadline.saturating_duration_since(Instant::now()))
-                    .unwrap();
-                match event {
-                    Event::Error(error) => panic!("{error}"),
-                    Event::Exit(_) if exited => break,
-                    Event::Wakeup => {
-                        terminal.acknowledge_wakeup();
-                        let core = terminal.core.lock().unwrap();
-                        if !exited && core.row(2).cells[0].c == 'R' {
-                            break;
-                        }
+                let mut fd = libc::pollfd {
+                    fd: terminal.event_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                let timeout = deadline
+                    .saturating_duration_since(Instant::now())
+                    .as_millis() as i32;
+                assert!(unsafe { libc::poll(&mut fd, 1, timeout) } > 0);
+                terminal.drain_notification().unwrap();
+                terminal.acknowledge_wakeup();
+                let mut finished = false;
+                for event in terminal.events.try_iter() {
+                    match event {
+                        Event::Error(error) => panic!("{error}"),
+                        Event::Exit(_) if exited => finished = true,
+                        _ => (),
                     }
-                    _ => (),
+                }
+                if finished || !exited && terminal.core.lock().unwrap().row(2).cells[0].c == 'R' {
+                    break;
                 }
             }
             let pid = fs::read_to_string(pid_file).unwrap();

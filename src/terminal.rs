@@ -21,7 +21,6 @@ pub(crate) const INPUT_CAPACITY: usize = 256 * 1024;
 
 #[derive(Debug)]
 pub enum Event {
-    Wakeup,
     Title(Option<String>),
     ClipboardStore { primary: bool, text: String },
     Exit(ExitStatus),
@@ -60,10 +59,15 @@ struct EventProxy {
 }
 
 impl EventProxy {
-    fn send(&self, event: Event) {
-        if matches!(event, Event::Wakeup) && self.wakeup.pending.swap(true, Ordering::AcqRel) {
-            return;
+    fn wakeup(&self) {
+        if !self.wakeup.pending.swap(true, Ordering::AcqRel)
+            && let Err(error) = notify(self.wakeup.fd.as_raw_fd())
+        {
+            eprintln!("notify terminal UI: {error}");
         }
+    }
+
+    fn send(&self, event: Event) {
         if self.sender.send(event).is_ok()
             && let Err(error) = notify(self.wakeup.fd.as_raw_fd())
         {
@@ -391,8 +395,9 @@ impl Terminal {
         self.event_wakeup.fd.as_raw_fd()
     }
 
-    pub fn drain_notification(&self) -> io::Result<()> {
-        consume_notification(self.event_fd()).map(|_| ())
+    pub fn drain_notification(&self) -> io::Result<bool> {
+        consume_notification(self.event_fd())?;
+        Ok(self.event_wakeup.pending.load(Ordering::Acquire))
     }
 
     #[cfg(all(test, feature = "tui"))]
@@ -524,7 +529,7 @@ impl PtyLoop {
         let metadata = Arc::new(metadata);
         *self.process_metadata.lock().unwrap() = metadata;
         if changed {
-            self.proxy.send(Event::Wakeup);
+            self.proxy.wakeup();
         }
     }
 
@@ -555,7 +560,7 @@ impl PtyLoop {
             }
             if let Some(size) = resize {
                 set_size(self.master.as_raw_fd(), size)?;
-                self.proxy.send(Event::Wakeup);
+                self.proxy.wakeup();
             }
             let consumed = if write_open && write_ready {
                 let (open, consumed) = flush(self.master.as_raw_fd(), &mut pending, &mut offset)?;
@@ -574,7 +579,7 @@ impl PtyLoop {
                 let queued = self.input_bytes.fetch_sub(consumed, Ordering::AcqRel);
                 let low_watermark = INPUT_CAPACITY * 3 / 4;
                 if queued > low_watermark && queued - consumed <= low_watermark {
-                    self.proxy.send(Event::Wakeup);
+                    self.proxy.wakeup();
                 }
             }
             #[cfg(feature = "tui")]
@@ -584,7 +589,7 @@ impl PtyLoop {
                     .lock()
                     .map_err(|error| io::Error::other(error.to_string()))?;
                 if core.poll_history(history_notified)? {
-                    self.proxy.send(Event::Wakeup);
+                    self.proxy.wakeup();
                 }
                 history_notified = false;
                 let ready = core.history_read_ready();
@@ -594,7 +599,7 @@ impl PtyLoop {
                     drop(core);
                     self.dispatch(events, &mut pending);
                     if committed {
-                        self.proxy.send(Event::Wakeup);
+                        self.proxy.wakeup();
                     }
                     continue;
                 }
@@ -730,7 +735,7 @@ impl PtyLoop {
                 self.dispatch(events, &mut pending);
                 // Bytes held entirely in the sync buffer have not changed the core.
                 if committed {
-                    self.proxy.send(Event::Wakeup);
+                    self.proxy.wakeup();
                 }
             }
         }
@@ -763,7 +768,7 @@ impl PtyLoop {
             };
             self.dispatch(events, &mut pending);
             if committed {
-                self.proxy.send(Event::Wakeup);
+                self.proxy.wakeup();
             }
             if !ready {
                 let mut fds = [
@@ -811,7 +816,7 @@ impl PtyLoop {
                 core.take_events()
             };
             self.dispatch(events, pending);
-            self.proxy.send(Event::Wakeup);
+            self.proxy.wakeup();
         }
         Ok(())
     }
@@ -828,7 +833,7 @@ impl PtyLoop {
                 CoreEvent::ClipboardStore { primary, text } => {
                     self.proxy.send(Event::ClipboardStore { primary, text })
                 }
-                CoreEvent::HistoryCleared => self.proxy.send(Event::Wakeup),
+                CoreEvent::HistoryCleared => self.proxy.wakeup(),
                 #[cfg(feature = "tui")]
                 CoreEvent::HistoryError(error) => self.proxy.send(Event::Error(error)),
             }
@@ -1148,15 +1153,28 @@ mod tests {
             }),
         };
         for _ in 0..100 {
-            proxy.send(Event::Wakeup);
+            proxy.wakeup();
         }
+        let mut count = 0u64;
+        assert_eq!(
+            unsafe {
+                libc::read(
+                    proxy.wakeup.fd.as_raw_fd(),
+                    (&mut count as *mut u64).cast(),
+                    8,
+                )
+            },
+            8
+        );
+        assert_eq!(count, 1);
         proxy.send(Event::Title(Some("shell".into())));
-        assert!(matches!(receiver.try_recv(), Ok(Event::Wakeup)));
         assert!(matches!(receiver.try_recv(), Ok(Event::Title(Some(title))) if title == "shell"));
         assert!(receiver.try_recv().is_err());
+        assert!(consume_notification(proxy.wakeup.fd.as_raw_fd()).unwrap());
         proxy.wakeup.pending.store(false, Ordering::Release);
-        proxy.send(Event::Wakeup);
-        assert!(matches!(receiver.try_recv(), Ok(Event::Wakeup)));
+        proxy.wakeup();
+        assert!(consume_notification(proxy.wakeup.fd.as_raw_fd()).unwrap());
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -1614,14 +1632,11 @@ mod history_pty_tests {
             };
             assert_eq!(unsafe { libc::poll(&mut fd, 1, 1000) }, 1);
             assert_ne!(fd.revents & libc::POLLIN, 0);
-            terminal.drain_notification().unwrap();
+            assert!(terminal.drain_notification().unwrap());
             terminal.acknowledge_wakeup();
-            let mut woke = false;
             for event in terminal.events.try_iter() {
                 assert!(!matches!(event, Event::Error(_) | Event::Exit(_)));
-                woke |= matches!(event, Event::Wakeup);
             }
-            assert!(woke);
         };
         {
             let mut core = terminal.core.lock().unwrap();
