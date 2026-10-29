@@ -3695,7 +3695,7 @@ fn cursor_bytes(mut bytes: Vec<u8>, mode: Mode) -> Vec<u8> {
 }
 
 fn draw_row(
-    output: &mut impl Write,
+    output: &mut Vec<u8>,
     screen: &Screen,
     pane: &PaneView,
     row: usize,
@@ -3813,7 +3813,11 @@ fn draw_row(
                 output.write_all(b" ")?;
             }
         } else {
-            output.write_all(cell.c.encode_utf8(&mut [0; 4]).as_bytes())?;
+            if cell.c.is_ascii() {
+                output.push(cell.c as u8);
+            } else {
+                output.write_all(cell.c.encode_utf8(&mut [0; 4]).as_bytes())?;
+            }
             if let Some(extra) = extra {
                 for ch in &extra.zerowidth {
                     if !ch.is_control() {
