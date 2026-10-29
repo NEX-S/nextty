@@ -80,7 +80,8 @@ impl Markdown {
 
     pub fn render(source: &str) -> Self {
         let mut output = Self::default();
-        let mut styles = vec![0];
+        let mut styles = Vec::with_capacity(8);
+        styles.push(0);
         let mut lists = Vec::new();
         let mut links = Vec::new();
         let mut quote_depth = 0;
