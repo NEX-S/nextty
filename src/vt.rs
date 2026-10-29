@@ -1069,25 +1069,7 @@ impl Parser {
 }
 
 fn ansi_color(index: u16) -> Color {
-    const NAMES: [NamedColor; 16] = [
-        NamedColor::Black,
-        NamedColor::Red,
-        NamedColor::Green,
-        NamedColor::Yellow,
-        NamedColor::Blue,
-        NamedColor::Magenta,
-        NamedColor::Cyan,
-        NamedColor::White,
-        NamedColor::BrightBlack,
-        NamedColor::BrightRed,
-        NamedColor::BrightGreen,
-        NamedColor::BrightYellow,
-        NamedColor::BrightBlue,
-        NamedColor::BrightMagenta,
-        NamedColor::BrightCyan,
-        NamedColor::BrightWhite,
-    ];
-    Color::Named(NAMES[usize::from(index)])
+    Color::Named(NamedColor::from_index(index).unwrap())
 }
 
 fn decimal(bytes: &[u8]) -> Option<usize> {

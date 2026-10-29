@@ -57,9 +57,19 @@ impl Update {
                 .map(|index| (index, core.row(index).clone()))
                 .collect()
         };
+        Self::from_rows(core, rows, core.display_offset())
+    }
+    #[cfg(feature = "tui")]
+    pub fn capture_live(core: &Core) -> Self {
+        let rows = (0..core.screen_lines())
+            .map(|index| (index, core.screen_row(index).clone()))
+            .collect();
+        Self::from_rows(core, rows, 0)
+    }
+    fn from_rows(core: &Core, rows: Vec<(usize, Row)>, offset: usize) -> Self {
         // Every Core palette mutation damages all rows. Sparse updates can reuse
         // the frontend's existing palette, without a second palette or revision.
-        let palette = (full || rows.len() == core.screen_lines()).then(|| {
+        let palette = (rows.len() == core.screen_lines()).then(|| {
             let mut palette = [Rgb::default(); 269];
             for (index, color) in palette.iter_mut().enumerate() {
                 *color = if index < 256 {
@@ -78,13 +88,43 @@ impl Update {
             mode: core.mode(),
             palette,
             selection: core.selection_range(),
-            offset: core.display_offset(),
+            offset,
             history: core.history_size(),
         }
     }
 }
 
 impl Screen {
+    #[cfg(feature = "tui")]
+    pub(crate) fn changes_activity(&self, update: &Update) -> bool {
+        self.columns != update.columns
+            || self.rows.len() != update.lines
+            || self.cursor.0 != update.cursor.0
+            || (self.cursor.1 == CursorShape::Hidden) != (update.cursor.1 == CursorShape::Hidden)
+            || self.mode.contains(Mode::ALT_SCREEN) != update.mode.contains(Mode::ALT_SCREEN)
+            || self.offset != update.offset
+            || self.history != update.history
+            || update.rows.iter().any(|(index, row)| {
+                let previous = &self.rows[*index];
+                previous.used() != row.used()
+                    || previous.wrapped != row.wrapped
+                    || previous
+                        .cells_with_extras(0..previous.used())
+                        .zip(row.cells_with_extras(0..row.used()))
+                        .any(|((_, old, old_extra), (_, new, new_extra))| {
+                            let flags = Flags::HIDDEN | Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
+                            old.flags & flags != new.flags & flags
+                                || (!old.flags.contains(Flags::HIDDEN)
+                                    && (old.c != new.c
+                                        || old_extra
+                                            .map_or(&[][..], |extra| extra.zerowidth.as_slice())
+                                            != new_extra.map_or(&[][..], |extra| {
+                                                extra.zerowidth.as_slice()
+                                            })))
+                        })
+            })
+    }
+
     pub(crate) fn apply(&mut self, update: Update) -> std::io::Result<()> {
         if self.columns != update.columns || self.rows.len() != update.lines {
             if update.palette.is_none()

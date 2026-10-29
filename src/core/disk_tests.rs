@@ -557,7 +557,8 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
     assert_eq!(first.text.len(), 16 * 1024 - 1);
     assert!(!first.incomplete);
     assert_eq!(first.command.as_ref().unwrap().status, Some(7));
-    let cursor = first.next.unwrap();
+    assert!(first.has_more);
+    let cursor = first.cursor;
     core.scroll_display(Scroll::Top);
     settle(&mut core);
     let offset = core.display_offset();
@@ -581,7 +582,8 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
         .recv()
         .unwrap()
         .unwrap();
-    assert!(found.text.starts_with("x中😀boundary-proof\n"));
+    assert_eq!(found.matched, Some(true));
+    assert!(found.text.contains("x中😀boundary-proof\n"));
     assert!(found.text.contains("end-proof"));
     core.resize(WindowSize {
         num_cols: 80,
@@ -595,7 +597,7 @@ fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
 }
 
 #[test]
-fn history_query_cursor_skips_ascii_and_unicode_prefixes_without_repeating_results() {
+fn history_queries_return_one_matching_excerpt_and_resume_after_its_context() {
     for prefix in ["prefix ", "中😀 "] {
         let mut core = core(80, 4, budget(8 * 1024 * 1024));
         let mut parser = Parser::new();
@@ -605,28 +607,123 @@ fn history_query_cursor_skips_ascii_and_unicode_prefixes_without_repeating_resul
             b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07",
         );
         let block = core.blocks.back().unwrap().id;
-        let tail = format!("MATCH {}\r\nend-proof\r\n", "z".repeat(20 * 1024));
-        feed(&mut core, &mut parser, format!("{prefix}{tail}").as_bytes());
+        let source = format!(
+            "before\r\n{prefix}MATCH\r\nafter\r\n{}\r\nMATCH later\r\nlast\r\n",
+            "z".repeat(20 * 1024)
+        );
+        feed(&mut core, &mut parser, source.as_bytes());
         feed(&mut core, &mut parser, b"\x1b]133;D;0\x07");
-        let mut page = core
+        let first = core
             .read_history(Some(block), None, Some("MATCH"))
             .unwrap()
             .0
             .recv()
             .unwrap()
             .unwrap();
-        assert_eq!(page.text.len(), 16 * 1024);
-        let mut text = page.text;
-        while let Some(cursor) = page.next {
-            page = core
-                .read_history(Some(block), Some(cursor), None)
-                .unwrap()
-                .0
-                .recv()
-                .unwrap()
-                .unwrap();
-            text.push_str(&page.text);
-        }
-        assert_eq!(text, tail.replace("\r\n", "\n"));
+        assert_eq!(first.text, format!("before\n{prefix}MATCH\nafter\n"));
+        assert_eq!(first.matched, Some(true));
+        assert!(first.has_more);
+        let second = core
+            .read_history(Some(block), Some(first.cursor), Some("MATCH"))
+            .unwrap()
+            .0
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.matched, Some(true));
+        assert!(second.text.ends_with("MATCH later\nlast\n"));
+        assert!(!second.text.contains(prefix));
+        assert!(second.text.len() < 200);
+        let absent = core
+            .read_history(Some(block), Some(second.cursor), Some("MATCH"))
+            .unwrap()
+            .0
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(absent.matched, Some(false));
+        assert_eq!(absent.text, "");
+        assert!(!absent.has_more);
     }
+}
+
+#[test]
+fn history_eof_cursor_keeps_appends_newlines_and_unicode_soft_wraps() {
+    let mut core = core(8, 5, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    let mut cursor = None;
+    let mut combined = String::new();
+    for (input, expected) in [
+        ("ab中", "ab中"),
+        ("😀\u{301}", "😀\u{301}"),
+        ("\r\nnext", "\nnext"),
+        ("12中😀Z", "12中😀Z"),
+    ] {
+        feed(&mut core, &mut parser, input.as_bytes());
+        let page = core
+            .read_history(None, cursor, None)
+            .unwrap()
+            .0
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.text, expected);
+        assert!(!page.has_more);
+        assert!(!page.incomplete);
+        assert_eq!(page.matched, None);
+        combined.push_str(&page.text);
+        cursor = Some(page.cursor);
+        let again = core
+            .read_history(None, cursor, None)
+            .unwrap()
+            .0
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.text, "");
+        assert!(!again.has_more);
+        assert_eq!(again.cursor, page.cursor);
+    }
+    assert_eq!(combined, "ab中😀\u{301}\nnext12中😀Z");
+}
+
+#[test]
+fn command_eof_cursor_remains_usable_after_completion_without_a_newline() {
+    let mut core = core(40, 5, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    feed(
+        &mut core,
+        &mut parser,
+        "\x1b]133;A\x07$ \x1b]133;B\x07run\r\n\x1b]133;C\x07中😀".as_bytes(),
+    );
+    let block = core.blocks.back().unwrap().id;
+    let first = core
+        .read_history(Some(block), None, None)
+        .unwrap()
+        .0
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text, "中😀");
+    assert_eq!(first.cursor.offset, "中😀".len() as u64);
+    assert!(!first.has_more);
+    assert!(!first.command.unwrap().complete);
+    feed(
+        &mut core,
+        &mut parser,
+        b"\x1b]133;D;7\x07\r\n\x1b]133;A\x07$ ",
+    );
+    let finished = core
+        .read_history(Some(block), Some(first.cursor), None)
+        .unwrap()
+        .0
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(finished.text, "");
+    assert_eq!(finished.cursor, first.cursor);
+    assert!(!finished.has_more);
+    let command = finished.command.unwrap();
+    assert!(command.complete);
+    assert_eq!(command.status, Some(7));
 }

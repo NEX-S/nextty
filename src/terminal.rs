@@ -111,14 +111,11 @@ impl Terminal {
         foreground: u32,
         background: u32,
     ) -> Result<Self> {
-        Self::new_inner(
+        Self::spawn(
             shell,
             working_directory,
-            size,
-            foreground,
-            background,
-            #[cfg(feature = "tui")]
-            None,
+            winsize(size)?,
+            Core::new(size, foreground, background),
         )
     }
 
@@ -131,34 +128,20 @@ impl Terminal {
         background: u32,
         history: crate::history::HistoryConfig,
     ) -> Result<Self> {
-        Self::new_inner(
-            shell,
-            working_directory,
-            size,
-            foreground,
-            background,
-            Some(history),
-        )
+        let pty_size = winsize(size)?;
+        let mut core = Core::new(size, foreground, background);
+        core.enable_history(history)?;
+        Self::spawn(shell, working_directory, pty_size, core)
     }
 
-    fn new_inner(
+    fn spawn(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
-        size: WindowSize,
-        foreground: u32,
-        background: u32,
-        #[cfg(feature = "tui")] history: Option<crate::history::HistoryConfig>,
+        size: libc::winsize,
+        core: Core,
     ) -> Result<Self> {
-        let pty_size = winsize(size)?;
-        let terminal_core = Core::new(size, foreground, background);
-        #[cfg(feature = "tui")]
-        let mut terminal_core = terminal_core;
-        #[cfg(feature = "tui")]
-        if let Some(history) = history {
-            terminal_core.enable_history(history)?;
-        }
         let (master, slave) =
-            open_pty(pty_size).map_err(|error| Error::context("cannot create PTY", error))?;
+            open_pty(size).map_err(|error| Error::context("cannot create PTY", error))?;
         let wakeup = Arc::new(Wakeup {
             fd: crate::eventfd::new()?,
             pending: AtomicBool::new(false),
@@ -227,7 +210,7 @@ impl Terminal {
                 return Err(Error::context("cannot monitor terminal child", error));
             }
         };
-        let core = Arc::new(Mutex::new(terminal_core));
+        let core = Arc::new(Mutex::new(core));
         let (sender, receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
         let input_bytes = Arc::new(AtomicUsize::new(0));

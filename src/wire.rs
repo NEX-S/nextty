@@ -366,7 +366,14 @@ impl Peer {
                 match result {
                     Ok(page) => {
                         encoder.string(&page.text);
-                        encode_cursor(&mut encoder, page.next);
+                        encoder.u64(page.cursor.epoch);
+                        encoder.u64(page.cursor.row);
+                        encoder.u64(page.cursor.offset);
+                        encoder.bool(page.has_more);
+                        encoder.bool(page.matched.is_some());
+                        if let Some(matched) = page.matched {
+                            encoder.bool(matched);
+                        }
                         encoder.bool(page.incomplete);
                         encoder.bool(page.command.is_some());
                         if let Some(command) = page.command {
@@ -752,7 +759,13 @@ impl Peer {
                     let result = if d.bool()? {
                         Ok(HistoryPage {
                             text: d.string(crate::history::READ_LIMIT)?,
-                            next: decode_cursor(&mut d)?,
+                            cursor: HistoryCursor {
+                                epoch: d.u64()?,
+                                row: d.u64()?,
+                                offset: d.u64()?,
+                            },
+                            has_more: d.bool()?,
+                            matched: if d.bool()? { Some(d.bool()?) } else { None },
                             incomplete: d.bool()?,
                             command: if d.bool()? {
                                 Some(decode_command(&mut d)?)
@@ -2228,6 +2241,54 @@ mod tests {
         assert_eq!(snapshot.panes[0].command_blocks, command_blocks);
     }
 
+    #[test]
+    fn history_response_preserves_eof_cursor_search_and_command_facts() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut sender = Peer::new(left).unwrap();
+        let mut receiver = Peer::remote(right).unwrap();
+        let cursor = HistoryCursor {
+            epoch: 7,
+            row: 21,
+            offset: 5,
+        };
+        for (request, matched) in [None, Some(false), Some(true)].into_iter().enumerate() {
+            sender
+                .send_response(Response::History {
+                    request: request as u64,
+                    result: Ok(HistoryPage {
+                        text: "中ab".into(),
+                        cursor,
+                        has_more: false,
+                        matched,
+                        incomplete: true,
+                        command: Some(CommandBlock {
+                            id: 9,
+                            complete: true,
+                            status: Some(7),
+                            has_output: true,
+                        }),
+                    }),
+                })
+                .unwrap();
+        }
+        sender.flush().unwrap();
+        let responses = receiver.responses(None).unwrap();
+        assert_eq!(responses.len(), 3);
+        for (response, matched) in responses.iter().zip([None, Some(false), Some(true)]) {
+            let Response::History {
+                result: Ok(page), ..
+            } = response
+            else {
+                panic!("history page not delivered")
+            };
+            assert_eq!(page.text, "中ab");
+            assert_eq!(page.cursor, cursor);
+            assert!(!page.has_more);
+            assert_eq!(page.matched, matched);
+            assert!(page.incomplete);
+            assert_eq!(page.command.as_ref().unwrap().status, Some(7));
+        }
+    }
     #[test]
     fn search_results_follow_remote_greeting_without_clipboard_state() {
         let (left, right) = UnixStream::pair().unwrap();

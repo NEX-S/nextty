@@ -142,6 +142,8 @@ In the file browser, use `hjkl` or arrows to navigate, `/` to search, and Tab to
 
 ## Agent
 
+The responsibility boundary and observation contract are documented in [Agent design](docs/agent-design.md).
+
 The Agent uses the Anthropic Messages API format. Configure a model and, if needed, an endpoint:
 
 ```toml
@@ -155,11 +157,13 @@ Open the panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab move
 
 Each conversation has its own draft, attachments, transcript, and worker. A local background owner keeps these conversations alive when a frontend detaches. Closing a conversation cancels it; terminating the workspace ends the owner. Conversation state does not survive a machine restart.
 
-A submission includes the focused pane's current viewport and backend process metadata. Selection and visible-screen attachments are immutable snapshots. They do not read process memory or issue debugger commands. Context is sent when you submit a message.
+A submission includes the focused pane's live application screen and backend process metadata, captured by the Agent owner independently of the user's scroll position. Selection and visible-screen attachments are immutable historical snapshots. They do not read process memory or issue debugger commands.
 
 The Agent works in the selected pane's existing PTY. It has three tools: `shell` submits a command at an untouched integrated shell prompt, `input` operates the current foreground program, and `read` retrieves the screen, command output, or terminal history. Shell submissions preserve the user's current directory, environment, aliases, functions, and job control. They require Bash/Zsh shell integration; if the foreground program or input state is unclear, the Agent must inspect it rather than start another shell. Input versions prevent a delayed Agent action from overwriting intervening user input.
 
-Reads do not scroll the window or alter selections. Command output and history are read asynchronously from the existing history store, including retained disk history. Results are bounded to 16 KiB and return cursors for subsequent pages; a read does not export or duplicate the entire history. Search runs away from the owner event loop. Alternate-screen reads show the current TUI, while history reads refer to the main terminal's retained text. Repainted TUI frames and evicted history cannot be recovered. Shell completion is reported by OSC 133, not inferred from a screen refresh or a quiet interval.
+Reads do not scroll the window or alter selections. Screen reads show the live application even while the user is viewing older output. They omit blank lines and decorative horizontal rules while retaining original row and column positions, titles, debugger markers and cursor visibility. A literal `query` selects matching content with neighboring rows; a screen query also retains the visible input row. Selected rows preserve their original text, including titles and layout marks. Command output and history are read asynchronously from the existing history store, including retained disk history. Text pages are bounded to 16 KiB. Every text result returns a `cursor`, including at the current end, so later reads can retrieve appends to the same unfinished line. `has_more` reports unread content in the current snapshot; `incomplete` reports missing retained content. A text query returns one matching excerpt with neighboring rows and a `matched` flag, rather than a whole page of unrelated text after the match. Pass the returned cursor to continue reading or searching the remaining range. A read does not export or duplicate the entire history. Search runs away from the owner event loop. History reads refer to the main terminal's retained text; repainted TUI frames and evicted history cannot be recovered.
+
+`read` with `wait: true` observes for at most five seconds. Its `outcome` distinguishes an immediate read (`current`), command completion (`completed`), screen/history activity (`changed`) and an elapsed observation window (`timeout`). Command waits do not return for every output line. If the command is still running at timeout, the result includes its live screen so the Agent can respond to interactive prompts. A timeout does not stop the program. Shell completion is reported by OSC 133, not inferred from a screen refresh or a quiet interval.
 
 Stopping a reply cancels model requests and waits; it does not send Ctrl+C or terminate programs already running in the user's terminal. Interrupting a foreground program is an explicit `input` action. The Agent runs locally, including for SSH workspaces, and credentials stay local. There is no independent command shell, subagent spawning, or `/goal` command. Long conversations retain recent complete exchanges and one rolling summary; older terminal output remains available through the history tools while retained.
 

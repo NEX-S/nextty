@@ -63,12 +63,14 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
 struct Session {
     id: u64,
     model: Agent,
+    serialized: Vec<u8>,
     sent_context: Vec<(u64, Vec<Value>)>,
     rewind_restore: Option<(u64, String, Vec<Value>)>,
 }
 
 impl Session {
-    fn request(&mut self, mut request: Value, config: &Config) -> io::Result<()> {
+    fn request(&mut self, mut request: Value, config: &Config, client: &Client) -> io::Result<()> {
+        self.serialized.clear();
         match request["action"].as_str() {
             Some("send") => {
                 let input: String = serde_json::from_value(request["input"].take())?;
@@ -82,9 +84,15 @@ impl Session {
                     )
                 };
                 let pane = serde_json::from_value(request["pane"].take())?;
-                let target = request["target"].take();
+                let target = crate::agent::terminal_context(client, pane)?;
                 self.model.input = input;
-                let turn = self.model.send(prompt, config, pane, target)?;
+                let turn = self.model.send(
+                    prompt,
+                    config,
+                    pane,
+                    target,
+                    client.terminal_revision(pane)?,
+                )?;
                 self.sent_context.push((turn, basket));
                 self.rewind_restore = None;
                 Ok(())
@@ -101,6 +109,7 @@ impl Session {
         if !self.model.poll(client)? {
             return Ok(false);
         }
+        self.serialized.clear();
         if let Some(turn) = self.model.rewound.take() {
             let items = self
                 .sent_context
@@ -120,10 +129,13 @@ impl Session {
         Ok(true)
     }
 
-    fn snapshot(&self) -> Value {
-        let mut model = self.model.snapshot();
-        model["rewind_restore"] = json!(self.rewind_restore);
-        json!([self.id, model])
+    fn snapshot(&mut self) -> io::Result<&[u8]> {
+        if self.serialized.is_empty() {
+            let mut model = self.model.snapshot();
+            model["rewind_restore"] = json!(self.rewind_restore);
+            serde_json::to_writer(&mut self.serialized, &json!([self.id, model]))?;
+        }
+        Ok(&self.serialized)
     }
 }
 
@@ -255,7 +267,7 @@ pub fn run() -> io::Result<()> {
                     let request: Value = serde_json::from_slice(&payload)?;
                     let id: u64 = serde_json::from_value(request["session"].clone())?;
                     if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
-                        if let Err(error) = session.request(request, &config) {
+                        if let Err(error) = session.request(request, &config, &client) {
                             session.model.messages.push(crate::agent::Message {
                                 turn: 0,
                                 role: "Error".into(),
@@ -277,12 +289,22 @@ pub fn run() -> io::Result<()> {
             && publish_models
             && (Instant::now() >= publish_at || sessions.iter().all(|session| !session.model.busy))
         {
-            client.send(Action::AgentUpdate {
-                kind: 1,
-                payload: serde_json::to_vec(
-                    &sessions.iter().map(Session::snapshot).collect::<Vec<_>>(),
-                )?,
-            })?;
+            let snapshots = sessions
+                .iter_mut()
+                .map(Session::snapshot)
+                .collect::<Result<Vec<_>, _>>()?;
+            let mut payload = Vec::with_capacity(
+                2 + snapshots.len() + snapshots.iter().map(|bytes| bytes.len()).sum::<usize>(),
+            );
+            payload.push(b'[');
+            for (index, snapshot) in snapshots.iter().enumerate() {
+                if index != 0 {
+                    payload.push(b',');
+                }
+                payload.extend_from_slice(snapshot);
+            }
+            payload.push(b']');
+            client.send(Action::AgentUpdate { kind: 1, payload })?;
             publish_models = false;
             publish_at = Instant::now() + Duration::from_millis(16);
         }

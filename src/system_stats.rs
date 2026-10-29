@@ -21,6 +21,7 @@ pub(crate) const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 pub struct SystemStats {
     sampler: Arc<Sampler>,
     sample: Sample,
+    process_revision: u64,
     directory: Option<PathBuf>,
     text: String,
 }
@@ -49,6 +50,7 @@ pub struct Network {
 
 pub struct Process {
     pub pid: u32,
+    pub(crate) start: u64,
     pub name: String,
     pub uid: u32,
     pub state: char,
@@ -60,6 +62,12 @@ pub struct Process {
     pub parent: u32,
     pub command: String,
     pub directory: Option<PathBuf>,
+}
+
+struct ProcessDetails {
+    identity: (u32, u64),
+    command: String,
+    directory: Option<PathBuf>,
 }
 
 struct TrendPoint {
@@ -78,6 +86,8 @@ struct Sampler {
 struct State {
     directory: Option<PathBuf>,
     processes_enabled: bool,
+    process_detail: Option<(u32, u64)>,
+    detail_result: Option<ProcessDetails>,
     result: Option<Sample>,
     history: VecDeque<TrendPoint>,
     initialized: bool,
@@ -184,6 +194,7 @@ impl SystemStats {
         Ok(Self {
             sampler,
             sample: Sample::default(),
+            process_revision: 0,
             directory: None,
             text: "CPU —  MEM —  DSK —".into(),
         })
@@ -201,6 +212,18 @@ impl SystemStats {
         }
     }
 
+    pub(crate) fn process_revision(&self) -> u64 {
+        self.process_revision
+    }
+
+    pub(crate) fn set_process_detail(&mut self, identity: Option<(u32, u64)>) {
+        let mut state = self.sampler.state.lock().unwrap();
+        if state.process_detail != identity {
+            state.process_detail = identity;
+            self.sampler.changed.notify_one();
+        }
+    }
+
     pub fn refresh(&mut self, directory: Option<&Path>, expanded: bool) -> io::Result<bool> {
         let mut state = self.sampler.state.lock().unwrap();
         let directory_changed = state.directory.as_deref() != directory;
@@ -212,17 +235,29 @@ impl SystemStats {
             state.initialized = true;
             self.sampler.changed.notify_one();
         }
-        if state.result.is_some() {
+        if state.result.is_some() || state.detail_result.is_some() {
             crate::eventfd::consume_notification(self.fd())?;
         }
         let result = state.result.take();
+        let detail = state.detail_result.take();
         drop(state);
-        if result.is_none() && !directory_changed {
+        if result.is_none() && detail.is_none() && !directory_changed {
             return Ok(false);
         }
-        let sampled = result.is_some();
+        let sampled = result.is_some() || detail.is_some();
         if let Some(sample) = result {
             self.sample = sample;
+            self.process_revision += 1;
+        }
+        if let Some(detail) = detail
+            && let Some(process) = self
+                .sample
+                .processes
+                .iter_mut()
+                .find(|p| (p.pid, p.start) == detail.identity)
+        {
+            process.command = detail.command;
+            process.directory = detail.directory;
         }
         let disk = self
             .disk()
@@ -529,6 +564,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
         let elapsed = previous_at.map(|at| start.duration_since(at).as_secs_f64());
         let directory = state.directory.clone();
         let processes_enabled = state.processes_enabled;
+        let mut process_detail = state.process_detail;
         drop(state);
         let mut sample = Sample {
             directory,
@@ -623,8 +659,13 @@ fn sample_resources(sampler: Arc<Sampler>) {
             previous_net.clear();
         }
         if processes_enabled {
-            let (processes, counters) =
-                sample_processes(&previous_processes, elapsed, ticks_per_second, page_size);
+            let (processes, counters) = sample_processes(
+                &previous_processes,
+                elapsed,
+                ticks_per_second,
+                page_size,
+                process_detail,
+            );
             sample.processes = processes;
             previous_processes = counters;
         } else {
@@ -653,6 +694,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
             return;
         }
         record_history(&mut state.history, point);
+        state.detail_result = None;
         let previous = state.result.replace(sample);
         if let Err(error) = crate::eventfd::notify(sampler.wakeup.as_raw_fd()) {
             eprintln!("notify system statistics: {error}");
@@ -665,6 +707,21 @@ fn sample_resources(sampler: Arc<Sampler>) {
             let remaining = (start + SAMPLE_INTERVAL).saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 break;
+            }
+            if state.process_detail != process_detail {
+                process_detail = state.process_detail;
+                drop(state);
+                let detail =
+                    process_detail.and_then(|identity| process_details(identity, page_size));
+                state = sampler.state.lock().unwrap();
+                if let Some(detail) = detail {
+                    state.detail_result = Some(detail);
+                    if let Err(error) = crate::eventfd::notify(sampler.wakeup.as_raw_fd()) {
+                        eprintln!("notify system statistics: {error}");
+                        return;
+                    }
+                }
+                continue;
             }
             state = sampler.changed.wait_timeout(state, remaining).unwrap().0;
         }
@@ -908,6 +965,7 @@ fn process_stat(text: &str, page_size: u64) -> Option<(Process, ProcessCounters)
     Some((
         Process {
             pid: pid.parse().ok()?,
+            start: counters.start,
             name: name.into(),
             uid: 0,
             state: fields.first()?.chars().next()?,
@@ -928,6 +986,7 @@ fn sample_processes(
     elapsed: Option<f64>,
     ticks_per_second: f64,
     page_size: u64,
+    detail: Option<(u32, u64)>,
 ) -> (Vec<Process>, HashMap<u32, ProcessCounters>) {
     let mut processes = Vec::new();
     let mut counters = HashMap::new();
@@ -960,21 +1019,41 @@ fn sample_processes(
                 process.write = per_second(new[1], old[1], elapsed);
             }
         }
-        process.command = fs::read(path.join("cmdline"))
-            .ok()
-            .map(|v| {
-                String::from_utf8_lossy(&v)
-                    .trim_end_matches('\0')
-                    .replace('\0', " ")
-            })
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| format!("[{}]", process.name));
-        process.directory = fs::read_link(path.join("cwd")).ok();
+        if detail == Some((pid, current.start))
+            && let Some(detail) = process_details((pid, current.start), page_size)
+        {
+            process.command = detail.command;
+            process.directory = detail.directory;
+        }
         processes.push(process);
         counters.insert(pid, current);
     }
     processes.sort_by_key(|p| p.pid);
     (processes, counters)
+}
+
+fn process_details(identity: (u32, u64), page_size: u64) -> Option<ProcessDetails> {
+    let path = PathBuf::from(format!("/proc/{}", identity.0));
+    let (process, _) = process_stat(&fs::read_to_string(path.join("stat")).ok()?, page_size)?;
+    if process.start != identity.1 {
+        return None;
+    }
+    let command = fs::read(path.join("cmdline"))
+        .ok()
+        .map(|v| {
+            String::from_utf8_lossy(&v)
+                .trim_end_matches('\0')
+                .replace('\0', " ")
+        })
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| format!("[{}]", process.name));
+    let directory = fs::read_link(path.join("cwd")).ok();
+    let (current, _) = process_stat(&fs::read_to_string(path.join("stat")).ok()?, page_size)?;
+    (current.start == identity.1).then_some(ProcessDetails {
+        identity,
+        command,
+        directory,
+    })
 }
 
 #[cfg(test)]
@@ -1083,6 +1162,7 @@ mod tests {
         monitor.stats.sample.processes = (1..=200)
             .map(|pid| Process {
                 pid,
+                start: 0,
                 name: format!("p{pid}"),
                 uid: 1000,
                 state: 'S',
@@ -1140,6 +1220,61 @@ mod tests {
                     .any(|hit| hit.action == Action::Process(pid))
             );
         }
+        monitor.bytes(&[21]);
+        monitor.stats.sample.processes.truncate(3);
+        monitor.stats.sample.processes[0].rss = 30;
+        monitor.stats.sample.processes[1].rss = 20;
+        monitor.stats.sample.processes[2].rss = 10;
+        monitor.action(Action::Sort(1));
+        monitor.action(Action::Process(2));
+        let view = monitor.view(80, 20);
+        assert!(
+            view.texts
+                .iter()
+                .any(|t| t.selected && t.text.contains("p2"))
+        );
+        let mut processes = std::mem::take(&mut monitor.stats.sample.processes);
+        processes[2].rss = 40;
+        processes[1].start += 1;
+        let mut state = monitor.stats.sampler.state.lock().unwrap();
+        state.result = Some(Sample {
+            processes,
+            ..Sample::default()
+        });
+        state.detail_result = Some(ProcessDetails {
+            identity: (2, 0),
+            command: "stale".into(),
+            directory: None,
+        });
+        drop(state);
+        monitor.stats.refresh(None, true).unwrap();
+        assert!(monitor.stats.processes()[1].command.is_empty());
+        let view = monitor.view(80, 20);
+        assert_eq!(
+            view.hits
+                .iter()
+                .filter_map(|hit| match hit.action {
+                    Action::Process(pid) => Some(pid),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [3, 1, 2]
+        );
+        assert!(!view.texts.iter().any(|t| t.selected));
+        monitor.key(0xff52, "", false);
+        assert_eq!(monitor.focus, Action::Process(1));
+        monitor.action(Action::Sort(1));
+        let view = monitor.view(80, 20);
+        assert_eq!(
+            view.hits
+                .iter()
+                .filter_map(|hit| match hit.action {
+                    Action::Process(pid) => Some(pid),
+                    _ => None,
+                })
+                .collect::<Vec<_>>(),
+            [2, 1, 3]
+        );
     }
     #[test]
     fn trend_windows_keep_recent_ring_order_and_network_gaps() {
@@ -1224,6 +1359,34 @@ mod tests {
                 .iter()
                 .any(|p| p.pid == std::process::id())
         );
+        assert!(
+            stats
+                .processes()
+                .iter()
+                .all(|p| p.command.is_empty() && p.directory.is_none())
+        );
+        let process = stats
+            .processes()
+            .iter()
+            .find(|p| p.pid == std::process::id())
+            .unwrap();
+        let identity = (process.pid, process.start);
+        let revision = stats.process_revision();
+        stats.set_process_detail(Some(identity));
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 10000) }, 1);
+        stats.refresh(Some(Path::new("/")), true).unwrap();
+        assert_eq!(stats.process_revision(), revision);
+        let process = stats
+            .processes()
+            .iter()
+            .find(|p| p.pid == identity.0)
+            .unwrap();
+        assert!(!process.command.is_empty());
+        assert_eq!(
+            process.directory.as_deref(),
+            Some(std::env::current_dir().unwrap().as_path())
+        );
+        assert!(process_details((identity.0, identity.1 + 1), 4096).is_none());
         assert!(stats.refresh(None, true).unwrap());
         assert!(stats.disk().is_none());
         assert_eq!(

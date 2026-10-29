@@ -352,8 +352,6 @@ pub struct WorkspaceView {
     next_copy: u64,
     closing: Option<CloseChoice>,
     #[cfg(feature = "agent")]
-    agent_width: f32,
-    #[cfg(feature = "agent")]
     agent_drag: Option<f32>,
     #[cfg(feature = "agent")]
     divider_hover: bool,
@@ -389,6 +387,12 @@ impl WorkspaceView {
         let scale = window.size().2;
         let trace = Trace::from_env()?;
         let ui = Ui::new()?;
+        #[cfg(feature = "agent")]
+        let ui = {
+            let mut ui = ui;
+            ui.agent.width = Some(cell.0 * 36. + PADDING * 2.);
+            ui
+        };
         let mut view = Self {
             client,
             ui,
@@ -414,8 +418,6 @@ impl WorkspaceView {
             deferred: VecDeque::new(),
             next_copy: 1,
             closing: None,
-            #[cfg(feature = "agent")]
-            agent_width: cell.0 * 36. + PADDING * 2.,
             #[cfg(feature = "agent")]
             agent_drag: None,
             #[cfg(feature = "agent")]
@@ -622,15 +624,16 @@ impl WorkspaceView {
             #[cfg(feature = "agent")]
             {
                 let revision = self.ui.agent.active().model.revision;
-                self.ui.agent.width = Some(self.agent_width);
+                let previous_width = self.ui.agent.width;
                 let (changed, messages_changed) =
                     self.ui.poll_agent(&mut self.client, &self.config)?;
                 let layout_changed = pollfds
                     .iter()
                     .any(|source| source.fd == self.ui.agent.layout_fd() && source.revents != 0)
                     && self.ui.agent.poll_layout()?;
-                if let Some(width) = self.ui.agent.width {
-                    self.agent_width = width;
+                if self.ui.agent.width.is_none() && previous_width.is_some() {
+                    self.ui.agent.width = previous_width;
+                    self.ui.agent.view_dirty = true;
                 }
                 if revision != self.ui.agent.active().model.revision {
                     self.chat_rows.clear();
@@ -679,7 +682,6 @@ impl WorkspaceView {
         }
         #[cfg(feature = "agent")]
         if self.client.snapshot().is_some() {
-            self.ui.agent.width = Some(self.agent_width);
             self.ui.poll_agent(&mut self.client, &self.config)?;
         }
         if let Some(trace) = &mut self.trace {
@@ -772,6 +774,18 @@ impl WorkspaceView {
         Ok(())
     }
     fn event(&mut self, event: Event) -> Result<()> {
+        #[cfg(feature = "agent")]
+        if matches!(
+            event.kind,
+            native::KEY
+                | native::TEXT
+                | native::MOTION
+                | native::BUTTON
+                | native::SCROLL
+                | native::PASTE
+        ) {
+            self.ui.agent.view_dirty = true;
+        }
         if matches!(event.kind, native::KEY | native::TEXT | native::PREEDIT)
             && let Some(trace) = &mut self.trace
         {
@@ -1176,7 +1190,9 @@ impl WorkspaceView {
                     Ok(None) => (),
                     Err(error) => self.message(error.to_string()),
                 }
-            } else if let Some((_, scroll)) = &mut self.ui.agent.active_mut().context.preview {
+            } else if let Some(crate::ui::ContextPreview { scroll, .. }) =
+                &mut self.ui.agent.active_mut().context.preview
+            {
                 match symbol {
                     0xff1b => self.ui.agent.active_mut().context.preview = None,
                     0xff52 => *scroll = scroll.saturating_sub(1),
@@ -1633,7 +1649,12 @@ impl WorkspaceView {
     fn layout(&self) -> GuiLayout {
         let (width, height, _) = self.window.size();
         #[cfg(feature = "agent")]
-        let agent_width = self.ui.agent.open.then_some(self.agent_width);
+        let agent_width = self.ui.agent.open.then(|| {
+            self.ui
+                .agent
+                .width
+                .unwrap_or(self.cell.0 * 36. + PADDING * 2.)
+        });
         #[cfg(not(feature = "agent"))]
         let agent_width = None;
         let mut layout = GuiLayout::new(width as f32, height as f32, self.cell, agent_width);
@@ -1893,7 +1914,8 @@ impl WorkspaceView {
             #[cfg(feature = "agent")]
             GuiAction::Agent(AgentAction::Inspect(index)) => {
                 if let Some(item) = self.ui.agent.active().context.basket.get(index).cloned() {
-                    self.ui.agent.active_mut().context.preview = Some((item, 0));
+                    self.ui.agent.active_mut().context.preview =
+                        Some(crate::ui::ContextPreview::new(item, 0));
                 }
             }
             #[cfg(feature = "agent")]
@@ -1902,7 +1924,9 @@ impl WorkspaceView {
             }
             #[cfg(feature = "agent")]
             GuiAction::Agent(AgentAction::CopyPreview) => {
-                if let Some((item, _)) = &self.ui.agent.active().context.preview {
+                if let Some(crate::ui::ContextPreview { item, .. }) =
+                    &self.ui.agent.active().context.preview
+                {
                     self.window.selection(false, &item.snapshot.text);
                     self.message("Copied");
                 }
@@ -2588,9 +2612,9 @@ impl WorkspaceView {
             let minimum = self.cell.0 * 24. + PADDING * 2.;
             let agent_width = (width as f32 - self.pointer.0 + grab)
                 .clamp(minimum, (width as f32 * 0.62).max(minimum));
-            if agent_width != self.agent_width {
+            if Some(agent_width) != self.ui.agent.width {
                 let previous = self.layout().size(self.cell);
-                self.agent_width = agent_width;
+                self.ui.agent.width = Some(agent_width);
                 if self.layout().size(self.cell) != previous {
                     self.resize()?;
                 }
@@ -2677,7 +2701,9 @@ impl WorkspaceView {
             }
             #[cfg(feature = "agent")]
             ScrollTarget::Preview => {
-                if let Some((_, scroll)) = &mut self.ui.agent.active_mut().context.preview {
+                if let Some(crate::ui::ContextPreview { scroll, .. }) =
+                    &mut self.ui.agent.active_mut().context.preview
+                {
                     *scroll = drag.bar.maximum() - offset;
                 }
             }
@@ -2700,7 +2726,9 @@ impl WorkspaceView {
             return Ok(());
         }
         #[cfg(feature = "agent")]
-        if let Some((_, scroll)) = &mut self.ui.agent.active_mut().context.preview {
+        if let Some(crate::ui::ContextPreview { scroll, .. }) =
+            &mut self.ui.agent.active_mut().context.preview
+        {
             *scroll = if amount > 0. {
                 scroll.saturating_sub(3)
             } else {

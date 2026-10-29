@@ -268,55 +268,49 @@ impl Search {
             0xff0d | 0xff8d => self.next(client, shift)?,
             0xff52 => self.next(client, true)?,
             0xff54 => self.next(client, false)?,
-            0xff51 => {
-                self.cursor = self.query[..self.cursor]
-                    .char_indices()
-                    .next_back()
-                    .map_or(0, |(index, _)| index)
-            }
-            0xff53 => {
-                self.cursor += self.query[self.cursor..]
-                    .chars()
-                    .next()
-                    .map_or(0, char::len_utf8)
-            }
+            0xff51 => self.cursor = self.previous(),
+            0xff53 => self.cursor = self.following(),
             0xff50 => self.cursor = 0,
             0xff57 => self.cursor = self.query.len(),
             0xff08 => {
-                let start = self.query[..self.cursor]
-                    .char_indices()
-                    .next_back()
-                    .map_or(0, |(index, _)| index);
-                self.utf8.clear();
-                if start != self.cursor {
-                    self.query.replace_range(start..self.cursor, "");
-                    self.cursor = start;
+                if self.delete(self.previous()..self.cursor) {
                     self.submit(client)?;
                 }
             }
             0xffff => {
-                let end = self.cursor
-                    + self.query[self.cursor..]
-                        .chars()
-                        .next()
-                        .map_or(0, char::len_utf8);
-                self.utf8.clear();
-                if end != self.cursor {
-                    self.query.replace_range(self.cursor..end, "");
+                if self.delete(self.cursor..self.following()) {
                     self.submit(client)?;
                 }
             }
-            _ if control && matches!(char::from_u32(symbol), Some('a' | 'A' | 'u' | 'U')) => {
-                self.utf8.clear();
-                if !self.query.is_empty() {
-                    self.query.clear();
-                    self.cursor = 0;
-                    self.submit(client)?;
-                }
+            _ if control
+                && matches!(char::from_u32(symbol), Some('a' | 'A' | 'u' | 'U'))
+                && self.delete(0..self.query.len()) =>
+            {
+                self.submit(client)?;
             }
             _ => (),
         }
         Ok(true)
+    }
+    fn previous(&self) -> usize {
+        self.query[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index)
+    }
+    fn following(&self) -> usize {
+        self.cursor
+            + self.query[self.cursor..]
+                .chars()
+                .next()
+                .map_or(0, char::len_utf8)
+    }
+    fn delete(&mut self, range: std::ops::Range<usize>) -> bool {
+        self.utf8.clear();
+        self.cursor = range.start;
+        let changed = !range.is_empty();
+        self.query.replace_range(range, "");
+        changed
     }
     pub fn bytes(&mut self, client: &mut Client, bytes: &[u8], pasted: bool) -> io::Result<bool> {
         if !self.open && !pasted {
@@ -349,21 +343,11 @@ impl Search {
             if !pasted {
                 match byte {
                     8 | 127 => {
-                        let start = self.query[..self.cursor]
-                            .char_indices()
-                            .next_back()
-                            .map_or(0, |(index, _)| index);
-                        changed |= start != self.cursor;
-                        self.query.replace_range(start..self.cursor, "");
-                        self.cursor = start;
-                        self.utf8.clear();
+                        changed |= self.delete(self.previous()..self.cursor);
                         continue;
                     }
                     1 | 21 => {
-                        changed |= !self.query.is_empty();
-                        self.query.clear();
-                        self.cursor = 0;
-                        self.utf8.clear();
+                        changed |= self.delete(0..self.query.len());
                         continue;
                     }
                     13 | 10 => {

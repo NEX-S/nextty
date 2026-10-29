@@ -399,6 +399,7 @@ impl WorkspaceView {
         self.ui.agent.prepare_layout(columns)?;
         let top = layout.top + tab_height + padding;
         let rows = ((chat_end - top) / self.cell.1).max(0.) as usize;
+        let previous_scroll = self.ui.agent.active().model.scroll;
         if let Some(target) = self.ui.agent.active().rewind_index()
             && let Some(line) = self.ui.agent.active().lines.iter().position(|line| {
                 matches!(line, AgentLine::Text { message, .. } if *message as usize == target)
@@ -419,6 +420,7 @@ impl WorkspaceView {
             .model
             .scroll
             .min(self.ui.agent.active().lines.len().saturating_sub(rows));
+        self.ui.agent.view_dirty |= previous_scroll != self.ui.agent.active().model.scroll;
         let start = self
             .ui
             .agent
@@ -790,8 +792,15 @@ impl WorkspaceView {
                 INK,
             )?;
         }
-        if self.ui.agent.active().editor_scroll.is_some() {
+        if self
+            .ui
+            .agent
+            .active()
+            .editor_scroll
+            .is_some_and(|scroll| scroll != first)
+        {
             self.ui.agent.active_mut().editor_scroll = Some(first);
+            self.ui.agent.view_dirty = true;
         }
         if (self.ui.focus == Focus::Editor) && (first..first + 3).contains(&caret_row) {
             let cx = x + (caret_width % editor_columns) as f32 * self.cell.0;
@@ -871,7 +880,7 @@ impl WorkspaceView {
             == Some(GuiAction::Agent(AgentAction::CopyPreview))
             || self.ui.focus == Focus::Controls
                 && self.ui.agent.keyboard == crate::ui::AgentAction::CopyPreview;
-        let Some((item, scroll)) = &mut self.ui.agent.active_mut().context.preview else {
+        let Some(preview) = &mut self.ui.agent.active_mut().context.preview else {
             return Ok(());
         };
         let padding = 16.;
@@ -880,6 +889,13 @@ impl WorkspaceView {
         let x = (layout.width - w) * 0.5;
         let y = layout.top + (layout.footer - layout.top - h) * 0.5;
         let columns = ((w - padding * 2.) / self.cell.0).max(1.) as usize;
+        preview.prepare(columns);
+        let crate::ui::ContextPreview {
+            item,
+            scroll,
+            lines,
+            ..
+        } = preview;
         self.renderer.rect(
             0.,
             layout.top,
@@ -940,8 +956,9 @@ impl WorkspaceView {
         let top = y + padding + self.cell.1 * 3.;
         let bottom = y + h - padding - self.cell.1 * 2.;
         let rows = ((bottom - top) / self.cell.1).max(1.) as usize;
-        let lines = wrap_context(&item.snapshot.text, columns);
+        let previous_scroll = *scroll;
         *scroll = (*scroll).min(lines.len().saturating_sub(rows));
+        let scroll_changed = previous_scroll != *scroll;
         if let Some(bar) = Scrollbar::new(
             ScrollTarget::Preview,
             (x + w - 3., top, 3., (bottom - top).max(0.)),
@@ -1002,6 +1019,7 @@ impl WorkspaceView {
             by,
             MUTED,
         )?;
+        self.ui.agent.view_dirty |= scroll_changed;
         self.renderer.clip(0., 0., 0., 0.)
     }
     fn control_feedback(&self, bounds: (f32, f32, f32, f32), action: GuiAction) {

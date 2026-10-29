@@ -8,6 +8,7 @@ use std::{io, ops::Range};
 
 const INPUT_LIMIT: usize = 64 * 1024;
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
+const READ_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct Message {
@@ -35,7 +36,7 @@ pub(crate) struct Agent {
     response: Option<usize>,
     operation: Option<Operation>,
     observed_input: Option<(u64, u64)>,
-    observed_activity: Option<(u64, Value)>,
+    observed_activity: Option<(u64, u64)>,
 }
 
 impl Agent {
@@ -56,16 +57,11 @@ impl Agent {
     }
 
     pub fn restore(&mut self, mut value: serde_json::Value) -> io::Result<bool> {
-        let messages: Vec<(String, String, Option<String>, u64)> = serde_json::from_value(
-            value
-                .get_mut("messages")
-                .map_or(serde_json::Value::Null, serde_json::Value::take),
-        )
-        .map_err(io::Error::other)?;
-        let busy = serde_json::from_value(value["busy"].clone()).map_err(io::Error::other)?;
-        let revision =
-            serde_json::from_value(value["revision"].clone()).map_err(io::Error::other)?;
-        let turn = serde_json::from_value(value["turn"].clone()).map_err(io::Error::other)?;
+        let messages: Vec<(String, String, Option<String>, u64)> =
+            serde_json::from_value(value["messages"].take())?;
+        let busy = serde_json::from_value(value["busy"].take())?;
+        let revision = serde_json::from_value(value["revision"].take())?;
+        let turn = serde_json::from_value(value["turn"].take())?;
         let messages: Vec<_> = messages
             .into_iter()
             .map(|(role, text, id, turn)| Message {
@@ -195,6 +191,7 @@ impl Agent {
         config: &crate::config::Config,
         pane: u64,
         target: serde_json::Value,
+        activity: u64,
     ) -> io::Result<u64> {
         if self.busy {
             return Err(io::Error::new(
@@ -206,7 +203,6 @@ impl Agent {
             self.runtime = Some(Harness::start(config, self.turn)?);
         }
         let generation = target["input_generation"].as_u64();
-        let activity = observation(&target);
         let turn = self.runtime.as_ref().unwrap().send(prompt, pane, target)?;
         self.turn = turn;
         self.observed_input = generation.map(|generation| (pane, generation));
@@ -440,7 +436,26 @@ impl Agent {
     }
 }
 
-pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<serde_json::Value> {
+pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> {
+    let mut context = terminal_observation(client, pane, None)?;
+    let snapshot = client.snapshot().unwrap();
+    let view = snapshot.panes.iter().find(|view| view.id == pane).unwrap();
+    context["target"] = json!({
+        "workspace": snapshot.name,
+        "pane": pane,
+        "tab": snapshot.active_tab,
+        "connection": if client.is_remote() { "ssh" } else { "local" },
+        "ssh_target": client.remote_target(),
+        "writable": client.can_agent_input(),
+        "title": view.title,
+        "cwd": view.cwd,
+        "launch_argv": view.process.launch_argv,
+        "child_pid": view.process.child_pid,
+    });
+    Ok(context)
+}
+
+fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::Result<Value> {
     let snapshot = client
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?;
@@ -453,32 +468,20 @@ pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<serde_j
         .screens()
         .get(&pane)
         .ok_or_else(|| io::Error::other("No screen for pane"))?;
-    Ok(serde_json::json!({
-        "target": {
-            "workspace": snapshot.name,
-            "pane": pane,
-            "tab": snapshot.active_tab,
-            "connection": if client.is_remote() { "ssh" } else { "local" },
-            "ssh_target": client.remote_target(),
-            "writable": client.can_agent_input(),
-            "title": view.title,
-            "cwd": view.cwd,
-            "process": {
-                "launch_argv": view.process.launch_argv,
-                "child_pid": view.process.child_pid,
-                "foreground_pgid": view.process.foreground_pgid,
-                "foreground_pid": view.process.foreground_pid,
-                "foreground_scope": "pty_process_group_leader",
-                "foreground_executable": view.process.foreground_executable,
-                "foreground_argv": view.process.foreground_argv,
-                "foreground_cwd": view.process.foreground_cwd,
-                "sampled_at_ms": view.process.sampled_at_ms,
-                "unavailable": view.process.unavailable,
-            },
-            "symbols": {"availability": "unknown"},
+    Ok(json!({
+        "pane": pane,
+        "process": {
+            "foreground_pgid": view.process.foreground_pgid,
+            "foreground_pid": view.process.foreground_pid,
+            "foreground_scope": "pty_process_group_leader",
+            "foreground_executable": view.process.foreground_executable,
+            "foreground_argv": view.process.foreground_argv,
+            "foreground_cwd": view.process.foreground_cwd,
+            "sampled_at_ms": view.process.sampled_at_ms,
+            "unavailable": view.process.unavailable,
         },
-        "screen": crate::agent_context::shape(screen),
-        "command_blocks": view.command_blocks.iter().rev().map(|b| serde_json::json!({
+        "screen": crate::agent_context::shape(screen, query),
+        "command_blocks": view.command_blocks.iter().rev().map(|b| json!({
             "id":b.id,"has_output":b.has_output,"exit_code":b.status,
             "output_incomplete":!b.complete,
         })).collect::<Vec<_>>(),
@@ -502,14 +505,15 @@ enum Stage {
     },
     Command {
         command: u64,
-        until: Option<Instant>,
+        until: Instant,
     },
     Read {
         id: u64,
-        before: Value,
+        before: u64,
+        outcome: &'static str,
     },
     Change {
-        before: Value,
+        until: Instant,
     },
 }
 
@@ -518,7 +522,7 @@ impl Agent {
         self.operation
             .as_ref()
             .and_then(|operation| match operation.stage {
-                Stage::Command { until, .. } => until,
+                Stage::Command { until, .. } | Stage::Change { until, .. } => Some(until),
                 _ => None,
             })
     }
@@ -583,40 +587,42 @@ impl Agent {
                     Ok(Stage::Input { id, generation })
                 }
                 "read" => {
-                    let source = request.input["source"].as_str().unwrap_or("screen");
-                    if source == "command" && request.input["wait"] == true {
-                        let command = request.input["command"]
-                            .as_u64()
-                            .ok_or_else(|| io::Error::other("Missing command ID"))?;
+                    let source = request.input["source"]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other("Missing read source"))?;
+                    let command = match source {
+                        "command" => Some(
+                            request.input["command"]
+                                .as_u64()
+                                .ok_or_else(|| io::Error::other("Missing command ID"))?,
+                        ),
+                        "screen" | "history" => {
+                            if request.input.get("command").is_some() {
+                                return Err(io::Error::other(
+                                    "command is only available for source command",
+                                ));
+                            }
+                            if source == "screen" && request.input.get("cursor").is_some() {
+                                return Err(io::Error::other(
+                                    "cursor is only available for history or command output",
+                                ));
+                            }
+                            None
+                        }
+                        _ => return Err(io::Error::other("Unknown terminal read source")),
+                    };
+                    let wait = request.input["wait"] == true;
+                    if wait && let Some(command) = command {
                         Ok(Stage::Command {
                             command,
-                            until: None,
+                            until: Instant::now() + READ_WAIT,
                         })
-                    } else if request.input["wait"] == true {
+                    } else if wait || source == "screen" {
                         Ok(Stage::Change {
-                            before: self
-                                .observed_activity
-                                .as_ref()
-                                .filter(|(target, _)| *target == pane)
-                                .map_or(Value::Null, |(_, before)| before.clone()),
-                        })
-                    } else if source == "screen" {
-                        Ok(Stage::Change {
-                            before: Value::Null,
+                            until: Instant::now() + if wait { READ_WAIT } else { Duration::ZERO },
                         })
                     } else {
-                        let command = if source == "command" {
-                            Some(
-                                request.input["command"]
-                                    .as_u64()
-                                    .ok_or_else(|| io::Error::other("Missing command ID"))?,
-                            )
-                        } else if source == "history" {
-                            None
-                        } else {
-                            return Err(io::Error::other("Unknown terminal read source"));
-                        };
-                        read_output(client, &request, command)
+                        read_output(client, &request, command, "current")
                     }
                 }
                 _ => Err(io::Error::other("Unknown terminal tool")),
@@ -661,7 +667,7 @@ impl Agent {
                     Ok(Some(command)) => {
                         operation.stage = Stage::Command {
                             command,
-                            until: Some(Instant::now() + Duration::from_secs(1)),
+                            until: Instant::now() + Duration::from_secs(1),
                         };
                         self.operation = Some(operation);
                     }
@@ -669,36 +675,62 @@ impl Agent {
                         let pane = operation.request.input["pane"].as_u64().unwrap();
                         operation
                             .request
-                            .respond(terminal_context(client, pane).map(|mut context| {
-                                self.observed_activity = Some((pane, observation(&context)));
-                                context["input_queued"] = json!(true);
-                                context["completion_signal"] = json!(false);
-                                context.to_string()
-                            }))?;
+                            .respond(terminal_observation(client, pane, None).map(
+                                |mut context| {
+                                    self.observed_activity =
+                                        Some((pane, client.terminal_revision(pane).unwrap()));
+                                    context["input_queued"] = json!(true);
+                                    context.to_string()
+                                },
+                            ))?;
                     }
                     Err(error) => operation.request.respond(Err(io::Error::other(error)))?,
                 }
             }
             ClientEvent::History { result, .. } => {
-                let Stage::Read { before, .. } = operation.stage else {
+                let Stage::Read {
+                    before, outcome, ..
+                } = operation.stage
+                else {
                     unreachable!()
                 };
                 if result.is_ok() {
                     self.observed_activity =
                         Some((operation.request.input["pane"].as_u64().unwrap(), before));
                 }
-                let result = result.map(|page| {
+                let result = result.map_err(io::Error::other).and_then(|page| {
                     let marker = page.command.as_ref();
-                    json!({
-                        "source": if operation.request.name == "shell" {"command"} else {operation.request.input["source"].as_str().unwrap_or("history")},
-                        "command": marker.map(|marker| marker.id),
-                        "exit_code": marker.and_then(|marker| marker.status),
-                        "running": marker.map(|marker| marker.status.is_none()),
+                    let outcome = if outcome == "timeout" && marker.is_some_and(|marker| marker.status.is_some()) {
+                        "completed"
+                    } else {
+                        outcome
+                    };
+                    let mut result = json!({
+                        "outcome": outcome,
                         "incomplete": page.incomplete,
-                        "next_cursor": page.next.as_ref().map(|cursor| json!({"epoch":cursor.epoch,"row":cursor.row,"offset":cursor.offset})),
-                        "text": page.text,
-                    }).to_string()
-                }).map_err(io::Error::other);
+                        "cursor": {"epoch":page.cursor.epoch,"row":page.cursor.row,"offset":page.cursor.offset},
+                        "has_more": page.has_more,
+                    });
+                    result["text"] = Value::String(page.text);
+                    if let Some(matched) = page.matched {
+                        result["matched"] = json!(matched);
+                    }
+                    if let Some(marker) = marker {
+                        result["command"] = json!(marker.id);
+                        result["exit_code"] = json!(marker.status);
+                        result["running"] = json!(marker.status.is_none());
+                    }
+                    if outcome == "timeout" && marker.is_some() {
+                        let pane = operation.request.input["pane"].as_u64().unwrap();
+                        let mut context = terminal_observation(client, pane, None)?;
+                        self.observed_input = Some((pane, context["input_generation"].as_u64().unwrap()));
+                        result["screen"] = context["screen"].take();
+                        result["shell_prompt"] = context["shell_prompt"].take();
+                        result["input_generation"] = context["input_generation"].take();
+                        result["process"] = context["process"].take();
+                    }
+                    Ok(result.to_string())
+                });
                 operation.request.respond(result)?;
             }
             _ => unreachable!(),
@@ -727,27 +759,41 @@ impl Agent {
                             .iter()
                             .find(|block| block.id == *command);
                         // Older completed commands fall outside the recent-status window.
-                        if marker.is_none_or(|marker| marker.status.is_some())
-                            || until.is_some_and(|until| Instant::now() >= until)
-                        {
-                            operation.stage =
-                                read_output(client, &operation.request, Some(*command))?;
+                        let completed = marker.is_none_or(|marker| marker.status.is_some());
+                        if completed || Instant::now() >= *until {
+                            operation.stage = read_output(
+                                client,
+                                &operation.request,
+                                Some(*command),
+                                if completed { "completed" } else { "timeout" },
+                            )?;
                         }
                     }
-                    Stage::Change { before } => {
-                        let context = terminal_context(client, pane)?;
-                        if *before != observation(&context) {
-                            if operation.request.input["source"]
-                                .as_str()
-                                .unwrap_or("screen")
-                                == "screen"
-                            {
+                    Stage::Change { until } => {
+                        let activity = client.terminal_revision(pane)?;
+                        let changed = self.observed_activity != Some((pane, activity));
+                        if changed || Instant::now() >= *until {
+                            let outcome = if operation.request.input["wait"] != true {
+                                "current"
+                            } else if changed {
+                                "changed"
+                            } else {
+                                "timeout"
+                            };
+                            if operation.request.input["source"] == "screen" {
+                                let mut context = terminal_observation(
+                                    client,
+                                    pane,
+                                    operation.request.input["query"].as_str(),
+                                )?;
                                 self.observed_input =
                                     Some((pane, context["input_generation"].as_u64().unwrap()));
-                                self.observed_activity = Some((pane, observation(&context)));
+                                self.observed_activity = Some((pane, activity));
+                                context["outcome"] = json!(outcome);
                                 return Ok(Some(context.to_string()));
                             }
-                            operation.stage = read_output(client, &operation.request, None)?;
+                            operation.stage =
+                                read_output(client, &operation.request, None, outcome)?;
                         }
                     }
                     _ => (),
@@ -764,20 +810,11 @@ impl Agent {
     }
 }
 
-fn observation(context: &Value) -> Value {
-    json!([
-        context["screen"],
-        context["history_rows"],
-        context["command_blocks"],
-        context["input_generation"],
-        context["shell_prompt"],
-    ])
-}
-
 fn read_output(
     client: &mut Client,
     request: &TerminalRequest,
     command: Option<u64>,
+    outcome: &'static str,
 ) -> io::Result<Stage> {
     let cursor = request
         .input
@@ -793,7 +830,7 @@ fn read_output(
         .transpose()?;
     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
     let pane = request.input["pane"].as_u64().unwrap();
-    let before = observation(&terminal_context(client, pane)?);
+    let before = client.terminal_revision(pane)?;
     client.send(Action::ReadHistory {
         pane,
         request: id,
@@ -801,7 +838,11 @@ fn read_output(
         cursor,
         query: request.input["query"].as_str().map(str::to_owned),
     })?;
-    Ok(Stage::Read { id, before })
+    Ok(Stage::Read {
+        id,
+        before,
+        outcome,
+    })
 }
 
 #[cfg(test)]
@@ -946,7 +987,7 @@ mod tests {
             agent.insert(input).unwrap();
             let cursor = agent.cursor;
             let error = agent
-                .send(input.into(), &config, 1, serde_json::Value::Null)
+                .send(input.into(), &config, 1, serde_json::Value::Null, 0)
                 .unwrap_err();
             assert!(error.to_string().contains(diagnostic));
             assert_eq!(agent.input, input);

@@ -211,25 +211,29 @@ class Lab:
                          if block['type'] == 'tool_result')
             assert not block.get('is_error'), block
             result = json.loads(block['content'])
-            if name == 'shell-output':
-                self.command = result['command']
-                if result['running']:
-                    return ('command-wait', 'read', {'source':'command','command':self.command,'wait':True})
             if name in ('shell-output', 'command-wait'):
+                if name == 'shell-output':
+                    self.command = result['command']
+                if result['running']:
+                    assert result['outcome'] == 'timeout', result
+                    return ('command-wait', 'read', {'source':'command','command':self.command,'wait':True})
                 assert not result['running'] and result['exit_code'] == 0, result
             if name == 'page':
                 self.output_prefix = result['text']
                 expected = ''.join(f'history-{i:06d} payload-for-agent-benchmark\n' for i in range(1, 20001))
                 assert self.output_prefix and expected.startswith(self.output_prefix)
-                self.page = result['next_cursor']
-                assert self.page is not None
+                self.page = result['cursor']
+                assert result['has_more'] and not result['incomplete'], result
             if name == 'page-next':
                 expected = ''.join(f'history-{i:06d} payload-for-agent-benchmark\n' for i in range(1, 20001))
                 assert result['text'] and expected.startswith(self.output_prefix + result['text'])
             if name == 'query-hit':
-                assert 'history-020000' in result['text']
+                expected = ''.join(f'history-{i:06d} payload-for-agent-benchmark\n' for i in range(9999, 10002))
+                assert result['text'] == expected and result['matched'], result
+                assert result['has_more'] and not result['incomplete'], result
             if name == 'query-miss':
-                assert result['text'] == ''
+                assert result['text'] == '' and not result['matched'], result
+                assert not result['has_more'] and result['cursor'] is not None, result
             if name == 'input-ack':
                 assert result['input_queued']
             if name == 'shell-roundtrip':
@@ -250,7 +254,7 @@ class Lab:
         if index == 2:
             return ('page-next', 'read', {'source':'command','command':self.command,'cursor':self.page})
         if index == 3:
-            return ('query-hit', 'read', {'source':'command','command':self.command,'query':'history-020000'})
+            return ('query-hit', 'read', {'source':'command','command':self.command,'query':'history-010000'})
         if index == 4:
             return ('query-miss', 'read', {'source':'history','query':'absent-agent-benchmark-query'})
         if index < 13:
@@ -279,8 +283,101 @@ class Lab:
                 'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds'] for role,value in begin.items()},
                 'request_bytes':self.requests}
 
+    def run_interactive(self):
+        samples = {}
+        wait_costs = {}
+        wait_begin = {}
+        prefix = '续读🙂 Continue?'
+        appended = '追加λ=yes\n软折行🙂' + 'w' * 300 + '\n'
+
+        def next_tool(body):
+            if self.tool_sent:
+                name, sent = self.tool_sent
+                elapsed = (time.monotonic_ns() - sent) / 1e6
+                samples[name] = elapsed
+                block = next(block for message in reversed(body['messages'])
+                             if isinstance(message['content'], list) for block in reversed(message['content'])
+                             if block['type'] == 'tool_result')
+                assert not block.get('is_error'), block
+                result = json.loads(block['content'])
+                if name in ('interactive-shell', 'continuous-shell'):
+                    assert result['running'] and result['outcome'] == 'timeout', result
+                    self.command = result['command']
+                if name == 'interactive-wait':
+                    end = self.sample()
+                    wait_costs[name] = {
+                        'seconds': elapsed / 1000,
+                        'product_cpu_seconds': {role: end[role]['cpu_seconds'] - value['cpu_seconds']
+                                                for role, value in wait_begin.items()},
+                        'product_pss_kib': {role: value['pss_kib'] for role, value in end.items()},
+                    }
+                    assert result['running'] and result['outcome'] == 'timeout', result
+                    assert 4500 <= elapsed < 6500, elapsed
+                    assert result['text'] == prefix, result
+                    assert not result['has_more'] and not result['incomplete'], result
+                    self.page = result['cursor']
+                    assert self.page['offset'] == len(prefix.encode()), result
+                    assert any('Continue?' in text for _, text in result['screen']['rows']), result
+                    assert result['shell_prompt'] is None, result
+                    assert result['screen']['cursor']['visible'], result
+                    assert isinstance(result['input_generation'], int), result
+                if name in ('interactive-eof', 'interactive-final-eof'):
+                    assert result['text'] == '' and result['cursor'] == self.page, result
+                    assert not result['has_more'] and not result['incomplete'], result
+                if name == 'interactive-answer':
+                    assert result['input_queued'], result
+                if name in ('interactive-complete', 'continuous-wait'):
+                    assert not result['running'] and result['exit_code'] == 0, result
+                    assert result['outcome'] == 'completed', result
+                    if name == 'interactive-complete':
+                        assert result['text'] == appended, result
+                        assert not result['has_more'] and not result['incomplete'], result
+                        self.page = result['cursor']
+                    else:
+                        assert elapsed >= 2500, f'output woke command wait: {elapsed}ms'
+                        assert result['text'] == ''.join(f'tick-{i:02d}\n' for i in range(1, 17)), result
+            index = self.tool_index
+            self.tool_index += 1
+            if index == 0:
+                return ('interactive-shell', 'shell', {'command': 'sleep 2; printf \'续读🙂 Continue?\'; read -r -s answer; printf \'追加λ=%s\\n软折行🙂\' "$answer"; printf \'w%.0s\' {1..300}; printf \'\\n\''})
+            if index == 1:
+                wait_begin.update(self.sample())
+                return ('interactive-wait', 'read', {'source':'command','command':self.command,'wait':True})
+            if index == 2:
+                return ('interactive-eof', 'read', {'source':'command','command':self.command,'cursor':self.page})
+            if index == 3:
+                return ('interactive-answer', 'input', {'text':'yes\n'})
+            if index == 4:
+                return ('interactive-complete', 'read', {'source':'command','command':self.command,'cursor':self.page,'wait':True})
+            if index == 5:
+                return ('interactive-final-eof', 'read', {'source':'command','command':self.command,'cursor':self.page})
+            if index == 6:
+                return ('continuous-shell', 'shell', {'command': 'for i in $(seq 1 16); do printf \'tick-%02d\\n\' "$i"; sleep .25; done'})
+            if index == 7:
+                return ('continuous-wait', 'read', {'source':'command','command':self.command,'wait':True})
+            return None
+
+        self.next_tool = next_tool
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'benchmark interactive command waits\r')
+        self.wait(self.ready.is_set, 'interactive model request')
+        self.discover()
+        start = time.monotonic()
+        self.go.set()
+        self.wait(self.done.is_set, 'interactive command observations', 16)
+        self.wait(lambda: b'tools-finished-proof' in self.output, 'interactive final answer rendered')
+        assert len(self.requests) == 9, self.requests
+        return {'case':'interactive-correctness', 'seconds':time.monotonic() - start,
+                'roundtrip_ms':samples, 'interactive_exit_code':0, 'continuous_wait_requests':1,
+                'wait_costs':wait_costs,
+                'request_bytes':self.requests}
+
     def run_waits(self):
         samples = {}
+        quiet_waits = {}
+        quiet_begin = {}
+        full_screen = None
 
         def activity(marker, delay=0):
             def emit():
@@ -292,6 +389,7 @@ class Lab:
                 time.sleep(.15)
 
         def next_tool(body):
+            nonlocal full_screen
             if self.tool_sent:
                 name, sent = self.tool_sent
                 elapsed = (time.monotonic_ns() - sent) / 1e6
@@ -304,11 +402,40 @@ class Lab:
                 else:
                     assert not block.get('is_error'), block
                     result = json.loads(block['content'])
-                    if name.startswith('screen-'):
+                    if name in ('screen-before', 'screen-after'):
                         assert name in str(result['screen']['rows']), result
-                    if name.startswith('history-'):
+                    if name in ('history-before', 'history-after', 'history-input-state'):
                         marker = 'probe-0001' if name == 'history-input-state' else name
-                        assert marker in result['text'], result
+                        assert marker in result['text'] and result['matched'], result
+                    if name in ('screen-before', 'screen-after', 'history-before', 'history-after', 'history-input-state'):
+                        assert result['outcome'] == 'changed', result
+                    if name in ('screen-timeout', 'history-timeout'):
+                        end = self.sample()
+                        quiet_waits[name] = {
+                            'seconds': elapsed / 1000,
+                            'product_cpu_seconds': {role: end[role]['cpu_seconds'] - value['cpu_seconds']
+                                                    for role, value in quiet_begin.items()},
+                            'product_pss_kib': {role: value['pss_kib'] for role, value in end.items()},
+                        }
+                        assert result['outcome'] == 'timeout', result
+                        assert 4500 <= elapsed < 6500, elapsed
+                    if name == 'screen-timeout':
+                        full_screen = result['screen']
+                    if name in ('screen-query-hit', 'screen-query-miss'):
+                        assert result['outcome'] == 'current', result
+                        screen = result['screen']
+                        matches = [row for row, text in full_screen['rows'] if 'screen-before' in text] if name == 'screen-query-hit' else []
+                        assert screen['matches'] == matches, result
+                        cursor = screen['cursor']
+                        selected = {row for match in matches for row in range(match - 1, match + 2)}
+                        if cursor['visible']:
+                            selected.add(cursor['row'])
+                        rows = dict(screen['rows'])
+                        assert rows.keys() <= selected, result
+                        for row, text in full_screen['rows']:
+                            if row in selected:
+                                assert rows[row].rstrip(' ') == text.rstrip(' '), result
+                        assert any(row not in selected for row, _ in full_screen['rows']), result
                     if name.endswith('-after'):
                         assert elapsed >= 100, f'{name} returned without new activity: {elapsed}ms'
                     if name.endswith('-before'):
@@ -324,20 +451,30 @@ class Lab:
                 activity('screen-after', .15)
                 return ('screen-after', 'read', {'source':'screen','wait':True})
             if index == 2:
+                quiet_begin.update(self.sample())
+                return ('screen-timeout', 'read', {'source':'screen','wait':True})
+            if index == 3:
+                return ('screen-query-hit', 'read', {'source':'screen','query':'screen-before'})
+            if index == 4:
+                return ('screen-query-miss', 'read', {'source':'screen','query':'absent-agent-benchmark-query'})
+            if index == 5:
                 activity('history-before')
                 return ('history-before', 'read', {'source':'history','wait':True,'query':'history-before'})
-            if index == 3:
+            if index == 6:
                 activity('history-after', .15)
                 return ('history-after', 'read', {'source':'history','wait':True,'query':'history-after'})
-            if index == 4:
+            if index == 7:
+                quiet_begin.update(self.sample())
+                return ('history-timeout', 'read', {'source':'history','wait':True})
+            if index == 8:
                 os.write(self.master, b'\x1bhx')
                 time.sleep(.15)
                 return ('history-input-state', 'read', {'source':'history','wait':True,'query':'probe-0001'})
-            if index == 5:
+            if index == 9:
                 return ('history-input', 'input', {'text':'x'})
-            if index == 6:
+            if index == 10:
                 return ('input-state', 'read', {'source':'screen'})
-            if index in (7, 8):
+            if index in (11, 12):
                 return (f'input-ack-{index}', 'input', {'text':'x'})
             return None
 
@@ -350,10 +487,11 @@ class Lab:
         self.discover()
         start = time.monotonic()
         self.go.set()
-        self.wait(self.done.is_set, 'terminal wait observations', 6)
+        self.wait(self.done.is_set, 'terminal wait observations', 18)
         self.wait(lambda: b'tools-finished-proof' in self.output, 'wait final answer rendered')
         return {'case':'wait-observations', 'seconds':time.monotonic() - start,
                 'roundtrip_ms':samples, 'history_input_rejected':True,
+                'quiet_waits':quiet_waits,
                 'request_bytes':self.requests}
 
     def discover(self):
@@ -509,6 +647,14 @@ def main():
     try:
         lab.start()
         result = lab.run_tools()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary, tool_mode=True)
+    try:
+        lab.start()
+        result = lab.run_interactive()
         report['cases'].append(result)
         print(json.dumps(result), file=sys.stderr, flush=True)
     finally:

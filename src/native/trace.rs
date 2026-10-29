@@ -1,9 +1,8 @@
 use std::{
-    collections::VecDeque,
     ffi::OsString,
     fs::File,
     io::{self, BufWriter, Write},
-    sync::{Arc, Condvar, Mutex},
+    sync::mpsc::{SyncSender, TrySendError, sync_channel},
     thread::{self, JoinHandle},
 };
 
@@ -13,119 +12,62 @@ pub(crate) struct Trace {
     pub(crate) pending: Option<(String, String)>,
 }
 const TRACE_BLOCK: usize = 8192;
-struct TraceQueue {
-    bytes: VecDeque<Vec<u8>>,
-    opened: bool,
-    closed: bool,
-    error: Option<io::Error>,
-}
-struct TraceShared {
-    queue: Mutex<TraceQueue>,
-    changed: Condvar,
-}
 pub(crate) struct TraceWriter {
-    shared: Arc<TraceShared>,
-    worker: Option<JoinHandle<()>>,
+    sender: Option<SyncSender<Vec<u8>>>,
+    worker: Option<JoinHandle<io::Result<()>>>,
     pub(crate) draining: bool,
 }
 impl TraceWriter {
     fn new(path: OsString) -> io::Result<Self> {
-        let shared = Arc::new(TraceShared {
-            queue: Mutex::new(TraceQueue {
-                bytes: VecDeque::new(),
-                opened: false,
-                closed: false,
-                error: None,
-            }),
-            changed: Condvar::new(),
-        });
-        let queue = Arc::clone(&shared);
+        let mut file = File::create(path)?;
+        let (sender, receiver) = sync_channel::<Vec<u8>>(8);
         let worker = thread::Builder::new()
             .name("nextty-trace".into())
             .spawn(move || {
-                let result = (|| {
-                    let mut file = File::create(path)?;
-                    {
-                        let mut state = queue.queue.lock().unwrap();
-                        state.opened = true;
-                        queue.changed.notify_all();
-                    }
-                    loop {
-                        let bytes = {
-                            let mut state = queue.queue.lock().unwrap();
-                            while state.bytes.is_empty() && !state.closed {
-                                state = queue.changed.wait(state).unwrap();
-                            }
-                            let Some(bytes) = state.bytes.pop_front() else {
-                                return Ok(());
-                            };
-                            queue.changed.notify_all();
-                            bytes
-                        };
-                        file.write_all(&bytes)?;
-                    }
-                })();
-                let mut state = queue.queue.lock().unwrap();
-                state.error = result.err();
-                state.opened = true;
-                state.closed = true;
-                queue.changed.notify_all();
+                for bytes in receiver {
+                    file.write_all(&bytes)?;
+                }
+                Ok(())
             })?;
-        // Preserve construction-time path errors before the input loop starts.
-        let mut state = shared.queue.lock().unwrap();
-        while !state.opened {
-            state = shared.changed.wait(state).unwrap();
-        }
-        if let Some(error) = state.error.take() {
-            return Err(error);
-        }
-        drop(state);
         Ok(Self {
-            shared,
+            sender: Some(sender),
             worker: Some(worker),
             draining: false,
         })
     }
-    pub(crate) fn finish(&mut self) -> io::Result<()> {
-        self.shared.queue.lock().unwrap().closed = true;
-        self.shared.changed.notify_all();
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
-        self.shared
-            .queue
-            .lock()
-            .unwrap()
-            .error
+    fn finish(&mut self) -> io::Result<()> {
+        self.sender.take();
+        self.worker
             .take()
-            .map_or(Ok(()), Err)
+            .map_or(Ok(()), |worker| worker.join().unwrap())
     }
 }
 impl Write for TraceWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut state = self.shared.queue.lock().unwrap();
-        while self.draining && state.bytes.len() == 8 && !state.closed {
-            state = self.shared.changed.wait(state).unwrap();
-        }
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "trace writer stopped",
-            ));
-        }
-        if state.bytes.len() == 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "trace queue is full; recording incomplete",
-            ));
-        }
+        let sender = self
+            .sender
+            .as_ref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "trace writer stopped"))?;
         let count = bytes.len().min(TRACE_BLOCK);
-        state.bytes.push_back(bytes[..count].to_vec());
-        self.shared.changed.notify_all();
+        let block = bytes[..count].to_vec();
+        if self.draining {
+            sender
+                .send(block)
+                .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "trace writer stopped"))?;
+        } else {
+            sender.try_send(block).map_err(|error| match error {
+                TrySendError::Full(_) => io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "trace queue is full; recording incomplete",
+                ),
+                TrySendError::Disconnected(_) => {
+                    io::Error::new(io::ErrorKind::BrokenPipe, "trace writer stopped")
+                }
+            })?;
+        }
         Ok(count)
     }
     fn flush(&mut self) -> io::Result<()> {
-        // BufWriter has queued its bytes; the worker writes directly to File.
         Ok(())
     }
 }

@@ -679,7 +679,6 @@ static void wayland_selection(NtWindow *w, int primary);
 
 /* Wayland listeners use the display's default queue; the driver may enqueue onto it. */
 static void shell_ping(void *data, struct xdg_wm_base *shell, uint32_t serial) {
-    (void)data;
     xdg_wm_base_pong(shell, serial);
 }
 static const struct xdg_wm_base_listener shell_listener = {.ping = shell_ping};
@@ -698,7 +697,6 @@ static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
 static const struct wl_callback_listener frame_listener = {.done = frame_done};
 static void toplevel_configure(void *data, struct xdg_toplevel *top, int32_t width, int32_t height,
                                struct wl_array *states) {
-    (void)top;
     NtWindow *w = data;
     w->pending_width = width;
     w->pending_height = height;
@@ -730,19 +728,11 @@ static void toplevel_configure(void *data, struct xdg_toplevel *top, int32_t wid
     emit(w, (NtEvent){.kind = NT_WINDOW_STATE, .code = flags, .x = received});
 }
 static void toplevel_close(void *data, struct xdg_toplevel *top) {
-    (void)top;
     emit(data, (NtEvent){.kind = NT_CLOSE});
 }
 static void toplevel_bounds(void *data, struct xdg_toplevel *top, int32_t width, int32_t height) {
-    (void)data;
-    (void)top;
-    (void)width;
-    (void)height;
 }
 static void toplevel_capabilities(void *data, struct xdg_toplevel *top, struct wl_array *caps) {
-    (void)data;
-    (void)top;
-    (void)caps;
 }
 static const struct xdg_toplevel_listener toplevel_listener = {.configure = toplevel_configure,
                                                                .close = toplevel_close,
@@ -768,28 +758,20 @@ static void update_refresh(NtWindow *w) {
     set_frame_period(w, refresh ? (1000000000000LL + refresh - 1) / refresh : 0);
 }
 static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) {
-    (void)surface;
     NtWindow *w = data;
     Output *o = wl_output_get_user_data(output);
     o->entered = 1;
     update_refresh(w);
 }
 static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) {
-    (void)surface;
     NtWindow *w = data;
     Output *o = wl_output_get_user_data(output);
     o->entered = 0;
     update_refresh(w);
 }
 static void surface_scale(void *data, struct wl_surface *surface, int32_t scale) {
-    (void)data;
-    (void)surface;
-    (void)scale;
 }
 static void surface_transform(void *data, struct wl_surface *surface, uint32_t transform) {
-    (void)data;
-    (void)surface;
-    (void)transform;
 }
 static const struct wl_surface_listener surface_listener = {.enter = surface_enter,
                                                             .leave = surface_leave,
@@ -797,7 +779,6 @@ static const struct wl_surface_listener surface_listener = {.enter = surface_ent
                                                             .preferred_buffer_transform =
                                                                 surface_transform};
 static void fractional_scale(void *data, struct wp_fractional_scale_v1 *obj, uint32_t scale) {
-    (void)obj;
     NtWindow *w = data;
     double value = scale / 120.0;
     if (value != w->scale) {
@@ -810,40 +791,20 @@ static const struct wp_fractional_scale_v1_listener fractional_listener = {.pref
 static void output_geometry(void *data, struct wl_output *o, int32_t x, int32_t y, int32_t pw,
                             int32_t ph, int32_t sub, const char *make, const char *model,
                             int32_t transform) {
-    (void)data;
-    (void)o;
-    (void)x;
-    (void)y;
-    (void)pw;
-    (void)ph;
-    (void)sub;
-    (void)make;
-    (void)model;
-    (void)transform;
 }
 static void output_mode(void *data, struct wl_output *o, uint32_t flags, int32_t width,
                         int32_t height, int32_t refresh) {
-    (void)width;
-    (void)height;
     Output *output = data;
     if (flags & WL_OUTPUT_MODE_CURRENT)
         output->refresh = refresh > 0 ? refresh : 0;
-    (void)o;
 }
 static void output_done(void *data, struct wl_output *o) {
-    (void)o;
     Output *out = data;
     update_refresh(out->window);
 }
 static void output_scale(void *data, struct wl_output *o, int32_t scale) {
-    (void)o;
-    (void)data;
-    (void)scale;
 }
 static void output_name(void *data, struct wl_output *o, const char *name) {
-    (void)data;
-    (void)o;
-    (void)name;
 }
 static const struct wl_output_listener output_listener = {.geometry = output_geometry,
                                                           .mode = output_mode,
@@ -854,7 +815,6 @@ static const struct wl_output_listener output_listener = {.geometry = output_geo
 
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int fd,
                             uint32_t size) {
-    (void)keyboard;
     NtWindow *w = data;
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size) {
         close(fd);
@@ -885,18 +845,12 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 }
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface, struct wl_array *keys) {
-    (void)keyboard;
-    (void)surface;
-    (void)keys;
     NtWindow *w = data;
     w->serial = serial;
     emit(w, (NtEvent){.kind = NT_FOCUS, .code = 1});
 }
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface) {
-    (void)keyboard;
-    (void)serial;
-    (void)surface;
     NtWindow *w = data;
     w->modifiers = 0;
     if (w->compose)
@@ -916,8 +870,6 @@ static void wayland_key(NtWindow *w, uint32_t key, int composing) {
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
                          uint32_t key, uint32_t state) {
-    (void)keyboard;
-    (void)time;
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
@@ -929,7 +881,6 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t depressed, uint32_t latched, uint32_t locked,
                                uint32_t group) {
-    (void)keyboard;
     NtWindow *w = data;
     w->serial = serial;
     if (w->key_state) {
@@ -939,10 +890,6 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_
 }
 static void keyboard_repeat(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
     /* Mutter owns repetition for wl_keyboard v10 and sends repeat_info(0, 0). */
-    (void)data;
-    (void)keyboard;
-    (void)rate;
-    (void)delay;
 }
 static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard_keymap,
                                                               .enter = keyboard_enter,
@@ -952,8 +899,6 @@ static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard
                                                               .repeat_info = keyboard_repeat};
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
-    (void)pointer;
-    (void)surface;
     NtWindow *w = data;
     w->pointer_serial = serial;
     w->pointer_inside = 1;
@@ -967,17 +912,12 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
 }
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface) {
-    (void)pointer;
-    (void)serial;
-    (void)surface;
     NtWindow *w = data;
     w->pointer_inside = 0;
     emit(w, (NtEvent){.kind = NT_POINTER_LEAVE});
 }
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x,
                            wl_fixed_t y) {
-    (void)pointer;
-    (void)time;
     NtWindow *w = data;
     w->mouse_x = wl_fixed_to_double(x);
     w->mouse_y = wl_fixed_to_double(y);
@@ -986,8 +926,6 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
 }
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
                            uint32_t button, uint32_t state) {
-    (void)pointer;
-    (void)time;
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
@@ -1003,17 +941,14 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 }
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
                          wl_fixed_t value) {
-    (void)time;
     NtWindow *w = data;
     double v = wl_fixed_to_double(value);
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
         w->axis_y += v / 10.0;
     else
         w->axis_x += v / 10.0;
-    (void)pointer;
 }
 static void pointer_frame(void *data, struct wl_pointer *pointer) {
-    (void)pointer;
     NtWindow *w = data;
     double x = w->axis_value_x ? w->axis_value_x / 120.0 : w->axis_x;
     double y = w->axis_value_y ? w->axis_value_y / 120.0 : w->axis_y;
@@ -1023,20 +958,12 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
     w->axis_value_x = w->axis_value_y = 0;
 }
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source) {
-    (void)data;
-    (void)pointer;
-    (void)source;
 }
 static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time,
                               uint32_t axis) {
-    (void)data;
-    (void)pointer;
-    (void)time;
-    (void)axis;
 }
 static void pointer_axis_value(void *data, struct wl_pointer *pointer, uint32_t axis,
                                int32_t value) {
-    (void)pointer;
     NtWindow *w = data;
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
         w->axis_value_y = value;
@@ -1045,10 +972,6 @@ static void pointer_axis_value(void *data, struct wl_pointer *pointer, uint32_t 
 }
 static void pointer_axis_direction(void *data, struct wl_pointer *pointer, uint32_t axis,
                                    uint32_t direction) {
-    (void)data;
-    (void)pointer;
-    (void)axis;
-    (void)direction;
 }
 static const struct wl_pointer_listener pointer_listener = {.enter = pointer_enter,
                                                             .leave = pointer_leave,
@@ -1062,7 +985,6 @@ static const struct wl_pointer_listener pointer_listener = {.enter = pointer_ent
                                                             .axis_relative_direction =
                                                                 pointer_axis_direction};
 static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
-    (void)surface;
     NtWindow *w = data;
     w->text_enabled = 1;
     zwp_text_input_v3_enable(input);
@@ -1073,7 +995,6 @@ static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_su
     zwp_text_input_v3_commit(w->text_input);
 }
 static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
-    (void)surface;
     NtWindow *w = data;
     if (w->text_enabled) {
         zwp_text_input_v3_disable(input);
@@ -1088,7 +1009,6 @@ static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_su
 }
 static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char *text,
                          int32_t begin, int32_t end) {
-    (void)input;
     NtWindow *w = data;
     free(w->pending_preedit);
     w->pending_preedit = strdup(text ? text : "");
@@ -1100,7 +1020,6 @@ static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char
     w->preedit_end = end;
 }
 static void text_commit_string(void *data, struct zwp_text_input_v3 *input, const char *text) {
-    (void)input;
     NtWindow *w = data;
     free(w->pending_commit);
     w->pending_commit = strdup(text ? text : "");
@@ -1113,14 +1032,11 @@ static void text_delete(void *data, struct zwp_text_input_v3 *input, uint32_t be
                         uint32_t after) {
     /* No surrounding text is offered by this terminal; the protocol forbids
        nonzero deletion beyond the offered range. */
-    (void)input;
     NtWindow *w = data;
     if (before || after)
         fail(w, "input method requested deletion without surrounding text");
 }
 static void text_done(void *data, struct zwp_text_input_v3 *input, uint32_t serial) {
-    (void)input;
-    (void)serial;
     NtWindow *w = data;
     /* Stale serials still carry valid edits. No state requests are issued from
        done: application cursor changes have already committed their own state. */
@@ -1167,28 +1083,17 @@ static void source_remove(Source *source) {
     free(source);
 }
 static void source_target(void *data, struct wl_data_source *source, const char *mime) {
-    (void)data;
-    (void)source;
-    (void)mime;
 }
 static void source_send(void *data, struct wl_data_source *proxy, const char *mime, int32_t fd) {
-    (void)proxy;
-    (void)mime;
     Source *s = data;
     add_transfer(s->window, fd, 1, s->bytes, s->length, s->file_fd);
 }
 static void source_cancel(void *data, struct wl_data_source *proxy) {
-    (void)proxy;
     source_remove(data);
 }
 static void source_drop(void *data, struct wl_data_source *proxy) {
-    (void)data;
-    (void)proxy;
 }
 static void source_action(void *data, struct wl_data_source *proxy, uint32_t action) {
-    (void)data;
-    (void)proxy;
-    (void)action;
 }
 static const struct wl_data_source_listener source_listener = {.target = source_target,
                                                                .send = source_send,
@@ -1198,11 +1103,9 @@ static const struct wl_data_source_listener source_listener = {.target = source_
                                                                .action = source_action};
 static void primary_send(void *data, struct zwp_primary_selection_source_v1 *source,
                          const char *mime, int32_t fd) {
-    (void)source;
     source_send(data, NULL, mime, fd);
 }
 static void primary_cancel(void *data, struct zwp_primary_selection_source_v1 *source) {
-    (void)source;
     source_remove(data);
 }
 static const struct zwp_primary_selection_source_v1_listener primary_source_listener = {
@@ -1251,19 +1154,14 @@ static void offer_mime(Offer *o, const char *mime) {
         o->mime = "text/plain";
 }
 static void data_offer_mime(void *data, struct wl_data_offer *offer, const char *mime) {
-    (void)offer;
     offer_mime(data, mime);
 }
 static void data_offer_action(void *data, struct wl_data_offer *offer, uint32_t action) {
-    (void)data;
-    (void)offer;
-    (void)action;
 }
 static const struct wl_data_offer_listener offer_listener = {
     .offer = data_offer_mime, .source_actions = data_offer_action, .action = data_offer_action};
 static void primary_offer_mime(void *data, struct zwp_primary_selection_offer_v1 *offer,
                                const char *mime) {
-    (void)offer;
     offer_mime(data, mime);
 }
 static const struct zwp_primary_selection_offer_v1_listener primary_offer_listener = {
@@ -1286,7 +1184,6 @@ static void offer_destroy(Offer *o) {
     free(o);
 }
 static void data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *o = calloc(1, sizeof *o);
     if (!o) {
@@ -1300,7 +1197,6 @@ static void data_offer(void *data, struct wl_data_device *device, struct wl_data
     wl_data_offer_add_listener(offer, &offer_listener, o);
 }
 static void data_leave(void *data, struct wl_data_device *device) {
-    (void)device;
     NtWindow *w = data;
     Offer *offer = w->dnd_offer;
     w->dnd_offer = NULL;
@@ -1310,9 +1206,6 @@ static void data_leave(void *data, struct wl_data_device *device) {
 static void data_enter(void *data, struct wl_data_device *device, uint32_t serial,
                        struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
                        struct wl_data_offer *offer) {
-    (void)surface;
-    (void)x;
-    (void)y;
     NtWindow *w = data;
     data_leave(data, device);
     if (offer) {
@@ -1322,14 +1215,8 @@ static void data_enter(void *data, struct wl_data_device *device, uint32_t seria
 }
 static void data_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x,
                         wl_fixed_t y) {
-    (void)data;
-    (void)device;
-    (void)time;
-    (void)x;
-    (void)y;
 }
 static void data_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *old = w->selection[0];
     w->selection[0] = offer ? wl_data_offer_get_user_data(offer) : NULL;
@@ -1346,7 +1233,6 @@ static const struct wl_data_device_listener data_listener = {.data_offer = data_
                                                              .selection = data_selection};
 static void primary_offer(void *data, struct zwp_primary_selection_device_v1 *device,
                           struct zwp_primary_selection_offer_v1 *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *o = calloc(1, sizeof *o);
     if (!o) {
@@ -1362,7 +1248,6 @@ static void primary_offer(void *data, struct zwp_primary_selection_device_v1 *de
 }
 static void primary_selection(void *data, struct zwp_primary_selection_device_v1 *device,
                               struct zwp_primary_selection_offer_v1 *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *old = w->selection[1];
     w->selection[1] = offer ? zwp_primary_selection_offer_v1_get_user_data(offer) : NULL;
@@ -1395,15 +1280,11 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
     }
 }
 static void seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data;
-    (void)seat;
-    (void)name;
 }
 static const struct wl_seat_listener seat_listener = {.capabilities = seat_capabilities,
                                                       .name = seat_name};
 static void presentation_clock(void *data, struct wp_presentation *presentation,
                                uint32_t clock_id) {
-    (void)presentation;
     NtWindow *w = data;
     w->presentation_clock = (int)clock_id;
 }
@@ -1419,16 +1300,11 @@ static void feedback_remove(Feedback *feedback) {
 }
 static void feedback_output(void *data, struct wp_presentation_feedback *feedback,
                             struct wl_output *output) {
-    (void)data;
-    (void)feedback;
-    (void)output;
 }
 static void feedback_presented(void *data, struct wp_presentation_feedback *proxy,
                                uint32_t seconds_hi, uint32_t seconds_lo, uint32_t nanoseconds,
                                uint32_t refresh, uint32_t sequence_hi, uint32_t sequence_lo,
                                uint32_t flags) {
-    (void)sequence_hi;
-    (void)sequence_lo;
     Feedback *feedback = data;
     NtWindow *w = feedback->window;
     double seconds =
@@ -1439,7 +1315,6 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *prox
                       .x = seconds,
                       .y = refresh,
                       .start = w->presentation_clock});
-    (void)proxy;
     feedback_remove(feedback);
 }
 static void feedback_discarded(void *data, struct wp_presentation_feedback *proxy) {
@@ -1449,7 +1324,6 @@ static void feedback_discarded(void *data, struct wp_presentation_feedback *prox
                       .code = feedback->id,
                       .start = w->presentation_clock,
                       .end = 1});
-    (void)proxy;
     feedback_remove(feedback);
 }
 static const struct wp_presentation_feedback_listener feedback_listener = {
@@ -1499,7 +1373,6 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 #undef BIND
 }
 static void registry_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)registry;
     NtWindow *w = data;
     Output **link = &w->outputs;
     while (*link) {

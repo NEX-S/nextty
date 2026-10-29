@@ -1,6 +1,7 @@
 //! Shared asynchronous file navigation for terminal front ends.
 
 use std::borrow::Cow;
+use std::cmp::Reverse;
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions, ReadDir};
@@ -109,14 +110,6 @@ struct Scan {
     entries: Vec<FileEntry>,
     error: Option<io::Error>,
     truncated: bool,
-}
-
-impl Scan {
-    fn record_error(&mut self, error: io::Error) {
-        if self.error.is_none() {
-            self.error = Some(error);
-        }
-    }
 }
 
 impl FileNav {
@@ -718,31 +711,25 @@ fn list_directory(directory: ReadDir, cancelled: &impl Fn() -> bool) -> Scan {
         if cancelled() {
             return Scan::default();
         }
-        let entry = match entry {
+        let (path, kind) = match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
             Ok(entry) => entry,
             Err(error) => {
-                scan.record_error(error);
+                scan.error.get_or_insert(error);
                 continue;
             }
         };
-        let path = entry.path();
-        match entry.file_type() {
-            Ok(kind) => {
-                let is_dir = if kind.is_symlink() {
-                    match fs::metadata(&path) {
-                        Ok(metadata) => metadata.is_dir(),
-                        Err(error) => {
-                            scan.record_error(error);
-                            false
-                        }
-                    }
-                } else {
-                    kind.is_dir()
-                };
-                scan.entries.push(FileEntry { path, is_dir });
+        let is_dir = if kind.is_symlink() {
+            match fs::metadata(&path) {
+                Ok(metadata) => metadata.is_dir(),
+                Err(error) => {
+                    scan.error.get_or_insert(error);
+                    false
+                }
             }
-            Err(error) => scan.record_error(error),
-        }
+        } else {
+            kind.is_dir()
+        };
+        scan.entries.push(FileEntry { path, is_dir });
     }
     scan.entries.sort_unstable_by(|a, b| {
         b.is_dir
@@ -766,7 +753,7 @@ fn search_directory(
     let relative_start = directory.as_os_str().len()
         + usize::from(!directory.as_os_str().as_bytes().ends_with(b"/"));
     let mut directories = vec![root];
-    let mut matches: Vec<(i64, FileEntry)> = Vec::new();
+    let mut matches: Vec<(Reverse<i64>, PathBuf)> = Vec::new();
     let mut scan = Scan::default();
     let mut last_update = Instant::now();
     let mut dirty = false;
@@ -778,25 +765,19 @@ fn search_directory(
             directories.pop();
             continue;
         };
-        let entry = match entry {
+        let (path, kind) = match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
             Ok(entry) => entry,
             Err(error) => {
-                scan.record_error(error);
-                continue;
-            }
-        };
-        let path = entry.path();
-        let kind = match entry.file_type() {
-            Ok(kind) => kind,
-            Err(error) => {
-                scan.record_error(error);
+                scan.error.get_or_insert(error);
                 continue;
             }
         };
         if kind.is_dir() {
             match fs::read_dir(&path) {
                 Ok(children) => directories.push(children),
-                Err(error) => scan.record_error(error),
+                Err(error) => {
+                    scan.error.get_or_insert(error);
+                }
             }
         } else {
             // Explicit browsing may enter directory links; recursion never follows them.
@@ -804,31 +785,22 @@ fn search_directory(
                 match fs::metadata(&path) {
                     Ok(metadata) if metadata.is_dir() => continue,
                     Ok(_) => {}
-                    Err(error) => scan.record_error(error),
+                    Err(error) => {
+                        scan.error.get_or_insert(error);
+                    }
                 }
             }
             let relative = OsStr::from_bytes(&path.as_os_str().as_bytes()[relative_start..]);
             if (ascii_pattern || !relative.as_bytes().is_ascii())
                 && let Some(score) = fuzzy_score(&pattern, &relative.to_string_lossy())
             {
-                let item = (
-                    score,
-                    FileEntry {
-                        path,
-                        is_dir: false,
-                    },
-                );
-                let compare = |current: &(i64, FileEntry)| {
-                    item.0
-                        .cmp(&current.0)
-                        .then_with(|| current.1.path.cmp(&item.1.path))
-                };
+                let item = (Reverse(score), path);
                 let position = if matches.len() == SEARCH_LIMIT
-                    && matches.last().is_some_and(|last| compare(last).is_le())
+                    && matches.last().is_some_and(|worst| item >= *worst)
                 {
                     SEARCH_LIMIT
                 } else {
-                    matches.partition_point(|current| compare(current).is_lt())
+                    matches.partition_point(|current| *current < item)
                 };
                 if matches.len() == SEARCH_LIMIT && !scan.truncated {
                     scan.truncated = true;
@@ -843,7 +815,13 @@ fn search_directory(
         }
         if dirty && last_update.elapsed() >= Duration::from_millis(40) {
             let update = Scan {
-                entries: matches.iter().map(|(_, entry)| entry.clone()).collect(),
+                entries: matches
+                    .iter()
+                    .map(|(_, path)| FileEntry {
+                        path: path.clone(),
+                        is_dir: false,
+                    })
+                    .collect(),
                 truncated: scan.truncated,
                 ..Scan::default()
             };
@@ -855,7 +833,13 @@ fn search_directory(
             last_update = Instant::now();
         }
     }
-    scan.entries = matches.into_iter().map(|(_, entry)| entry).collect();
+    scan.entries = matches
+        .into_iter()
+        .map(|(_, path)| FileEntry {
+            path,
+            is_dir: false,
+        })
+        .collect();
     scan
 }
 

@@ -146,7 +146,9 @@ pub(crate) struct Monitor {
     descending: bool,
     query: String,
     cursor: usize,
-    selected: Option<u32>,
+    selected: Option<(u32, u64)>,
+    process_order: Vec<usize>,
+    process_revision: Option<u64>,
     pending: Vec<u8>,
     anchor: Option<(u32, i32)>,
     reveal: bool,
@@ -171,6 +173,8 @@ impl Monitor {
             query: String::new(),
             cursor: 0,
             selected: None,
+            process_order: Vec::new(),
+            process_revision: None,
             pending: Vec::new(),
             anchor: None,
             reveal: false,
@@ -183,6 +187,7 @@ impl Monitor {
     pub fn insert_query(&mut self, text: &str) {
         let text: String = text.chars().filter(|c| !c.is_control()).collect();
         self.query.insert_str(self.cursor, &text);
+        self.process_revision = None;
         self.cursor += text.len();
         self.pending.clear();
         self.scroll = 0;
@@ -196,6 +201,7 @@ impl Monitor {
             self.focus = Action::Tab(self.tab);
         }
         self.stats.set_processes_enabled(self.open && self.tab == 2);
+        self.sync_process_detail();
     }
     pub fn resize(&mut self, rows: u16, total: u16) {
         self.height = rows.max(8).min(total.saturating_sub(6).max(1));
@@ -244,43 +250,82 @@ impl Monitor {
             Action::Sort(sort) => {
                 self.descending = self.sort != sort || !self.descending;
                 self.sort = sort;
+                self.process_revision = None;
                 self.anchor = None;
             }
             Action::Search => self.searching = true,
             Action::Process(pid) => {
-                self.selected = if self.selected == Some(pid) {
+                self.selected = if self.selected.is_some_and(|selected| selected.0 == pid) {
                     None
                 } else {
-                    Some(pid)
+                    self.stats
+                        .processes()
+                        .iter()
+                        .find(|p| p.pid == pid)
+                        .map(|p| (p.pid, p.start))
                 };
             }
         }
         self.stats.set_processes_enabled(self.open && self.tab == 2);
+        self.sync_process_detail();
     }
-    fn processes(&self) -> Vec<&Process> {
+    fn sync_process_detail(&mut self) {
+        self.stats
+            .set_process_detail(if self.open && self.tab == 2 {
+                self.selected.filter(|identity| {
+                    self.process_order.iter().any(|&index| {
+                        self.stats
+                            .processes()
+                            .get(index)
+                            .is_some_and(|p| (p.pid, p.start) == *identity)
+                    })
+                })
+            } else {
+                None
+            });
+    }
+    fn rebuild_processes(&mut self) {
+        let revision = self.stats.process_revision();
+        if self.process_revision == Some(revision) {
+            return;
+        }
+        if let Some((pid, start)) = self.selected
+            && !self
+                .stats
+                .processes()
+                .iter()
+                .any(|p| p.pid == pid && p.start == start)
+        {
+            self.selected = None;
+        }
         let query = self.query.to_lowercase();
         let numeric = query.bytes().all(|byte| byte.is_ascii_digit());
-        let mut rows: Vec<_> = self
-            .stats
-            .processes()
-            .iter()
-            .filter(|p| {
-                query.is_empty()
-                    || if p.name.is_ascii() {
-                        // comm names are short; compare ASCII without a lowercase allocation.
-                        p.name
-                            .as_bytes()
-                            .windows(query.len())
-                            .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
-                    } else {
-                        p.name.to_lowercase().contains(&query)
-                    }
-                    || numeric
-                        && (p.pid.to_string().contains(&query)
-                            || p.uid.to_string().contains(&query))
-            })
-            .collect();
-        rows.sort_by(|a, b| {
+        let processes = self.stats.processes();
+        self.process_order.clear();
+        self.process_order.extend(
+            processes
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| {
+                    query.is_empty()
+                        || if p.name.is_ascii() {
+                            // comm names are short; compare ASCII without a lowercase allocation.
+                            p.name
+                                .as_bytes()
+                                .windows(query.len())
+                                .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                        } else {
+                            p.name.to_lowercase().contains(&query)
+                        }
+                        || numeric
+                            && (p.pid.to_string().contains(&query)
+                                || p.uid.to_string().contains(&query))
+                })
+                .map(|(index, _)| index),
+        );
+        self.process_order.sort_by(|&a, &b| {
+            let a = &processes[a];
+            let b = &processes[b];
             let value = |p: &Process| match self.sort {
                 1 => p.rss as f64,
                 2 => p.read.unwrap_or(0.) + p.write.unwrap_or(0.),
@@ -294,9 +339,15 @@ impl Monitor {
             };
             order.then_with(|| a.pid.cmp(&b.pid))
         });
-        rows
+        self.process_revision = Some(revision);
+        self.sync_process_detail();
     }
-    fn controls(&self) -> Vec<Action> {
+    fn processes(&self) -> impl Clone + ExactSizeIterator<Item = &Process> {
+        self.process_order
+            .iter()
+            .map(|&index| &self.stats.processes()[index])
+    }
+    fn controls(&mut self) -> Vec<Action> {
         let mut controls: Vec<_> = (0..4).map(Action::Tab).collect();
         if self.tab < 2 && self.width >= 50 {
             controls.extend([60, 300, 900].map(Action::Range));
@@ -318,13 +369,15 @@ impl Monitor {
                         .map(|(id, _, _)| Action::Sort(*id - 2)),
                 );
             }
+            self.rebuild_processes();
             let rows = self.processes();
             let pid = match self.focus {
-                Action::Process(pid) if rows.iter().any(|p| p.pid == pid) => Some(pid),
+                Action::Process(pid) if rows.clone().any(|p| p.pid == pid) => Some(pid),
                 _ => self
                     .selected
-                    .filter(|pid| rows.iter().any(|p| p.pid == *pid))
-                    .or_else(|| rows.first().map(|p| p.pid)),
+                    .map(|selected| selected.0)
+                    .filter(|pid| rows.clone().any(|p| p.pid == *pid))
+                    .or_else(|| rows.clone().next().map(|p| p.pid)),
             };
             if let Some(pid) = pid {
                 controls.push(Action::Process(pid));
@@ -348,23 +401,27 @@ impl Monitor {
         self.reveal = true;
     }
     fn move_process(&mut self, delta: isize) {
-        let rows = self.processes();
-        let current = if let Action::Process(pid) = self.focus {
-            rows.iter().position(|p| p.pid == pid).unwrap_or(0)
-        } else {
-            0
+        self.rebuild_processes();
+        let pid = {
+            let mut rows = self.processes();
+            let current = if let Action::Process(pid) = self.focus {
+                rows.clone().position(|p| p.pid == pid).unwrap_or(0)
+            } else {
+                0
+            };
+            let index = current
+                .saturating_add_signed(delta)
+                .min(rows.len().saturating_sub(1));
+            rows.nth(index).map(|p| (p.pid, p.start))
         };
-        let index = current
-            .saturating_add_signed(delta)
-            .min(rows.len().saturating_sub(1));
-        let pid = rows.get(index).map(|p| p.pid);
-        if let Some(pid) = pid {
+        if let Some((pid, start)) = pid {
             self.focus = Action::Process(pid);
             if self.selected.is_some() {
-                self.selected = Some(pid);
+                self.selected = Some((pid, start));
             }
             self.searching = false;
             self.reveal = true;
+            self.sync_process_detail();
         }
     }
     pub fn key(&mut self, symbol: u32, text: &str, control: bool) -> bool {
@@ -402,6 +459,7 @@ impl Monitor {
                 0xff57 => self.cursor = self.query.len(),
                 0xff08 => {
                     if let Some((i, _)) = self.query[..self.cursor].char_indices().next_back() {
+                        self.process_revision = None;
                         self.query.drain(i..self.cursor);
                         self.cursor = i;
                     }
@@ -410,6 +468,7 @@ impl Monitor {
                 }
                 0xffff => {
                     if let Some(ch) = self.query[self.cursor..].chars().next() {
+                        self.process_revision = None;
                         self.query.drain(self.cursor..self.cursor + ch.len_utf8());
                     }
                     self.scroll = 0;
@@ -417,7 +476,8 @@ impl Monitor {
                 }
                 0xff0d => {
                     self.searching = false;
-                    let pid = self.processes().first().map(|p| p.pid);
+                    self.rebuild_processes();
+                    let pid = self.processes().next().map(|p| p.pid);
                     if let Some(pid) = pid {
                         self.focus = Action::Process(pid);
                         self.reveal = true;
@@ -426,6 +486,7 @@ impl Monitor {
                 _ if control => match text {
                     "u" => {
                         self.query.clear();
+                        self.process_revision = None;
                         self.cursor = 0;
                         self.anchor = None;
                         self.scroll = 0;
@@ -659,7 +720,7 @@ impl Monitor {
         let pid = if let Action::Process(pid) = self.focus {
             Some(pid)
         } else {
-            self.selected
+            self.selected.map(|selected| selected.0)
         };
         if let Some(pid) = pid
             && let Some(hit) = hits.iter().find(|hit| hit.action == Action::Process(pid))
@@ -680,6 +741,9 @@ impl Monitor {
             return view;
         }
         self.width = width;
+        if self.tab == 2 {
+            self.rebuild_processes();
+        }
         let side = if width >= 80 { 13 } else { 9 };
         let x = side + 1;
         let w = width.saturating_sub(x + 1);
@@ -797,8 +861,9 @@ impl Monitor {
             && !body.hits.iter().any(|hit| hit.action == self.focus)
         {
             self.focus = Action::Search;
-            if self.selected == Some(pid) {
+            if self.selected.is_some_and(|selected| selected.0 == pid) {
                 self.selected = None;
+                self.sync_process_detail();
             }
             self.reveal = true;
         }
@@ -809,7 +874,7 @@ impl Monitor {
                 let bottom = hit.y
                     + if self
                         .selected
-                        .is_some_and(|pid| hit.action == Action::Process(pid))
+                        .is_some_and(|selected| hit.action == Action::Process(selected.0))
                     {
                         4
                     } else {
@@ -865,7 +930,7 @@ impl Monitor {
                     let processes = self.stats.processes();
                     let process =
                         &processes[processes.binary_search_by_key(&pid, |p| p.pid).unwrap()];
-                    let selected = self.selected == Some(pid);
+                    let selected = self.selected.is_some_and(|selected| selected.0 == pid);
                     view.texts.push(Text {
                         x: hit.x,
                         y: hit.y,
@@ -976,7 +1041,7 @@ impl Monitor {
             column += cells + 1;
         }
         let processes = self.processes();
-        if processes.is_empty() {
+        if processes.len() == 0 {
             body.text(x, 4, width, "No matches · waiting for samples", MUTED);
             return;
         }
@@ -990,7 +1055,7 @@ impl Monitor {
                 action: Action::Process(p.pid),
             });
             y += 1;
-            if self.selected == Some(p.pid) {
+            if self.selected == Some((p.pid, p.start)) {
                 y = body.lines(
                     x + 1,
                     y,

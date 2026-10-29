@@ -1333,6 +1333,159 @@ fn attached_frontends_agree_after_sparse_text_and_palette_changes() {
 }
 
 #[test]
+fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
+    let server = TestServer::start();
+    let mut clients = Vec::new();
+    let mut frontends = Vec::new();
+    for id in 1..=2 {
+        let (sender, receiver) = UnixStream::pair().unwrap();
+        clients.push(Connection::new(id, sender).unwrap());
+        frontends.push(Client {
+            peer: Peer::new(receiver).unwrap(),
+            #[cfg(feature = "agent")]
+            endpoint: ClientEndpoint::Local(PathBuf::new()),
+            screen_flow: ScreenFlow::Streaming,
+            agent_events: Vec::new(),
+            agent_delegate: false,
+            snapshot: None,
+            screens: HashMap::new(),
+            terminal_revisions: HashMap::new(),
+            write_error: None,
+            ssh: None,
+        });
+    }
+    let mut workspaces = HashMap::new();
+    apply_action(
+        0,
+        Action::Create {
+            name: "live".into(),
+            options: CreateOptions {
+                size: WindowSize {
+                    num_cols: 30,
+                    num_lines: 5,
+                    cell_width: 0,
+                    cell_height: 0,
+                },
+                directory: Some(server.directory.join("home")),
+                program: Some(Shell::new("/bin/sleep".into(), vec!["30".into()])),
+                ..CreateOptions::default()
+            },
+        },
+        &mut clients,
+        &mut workspaces,
+        &mut HashSet::new(),
+        &server.directory.join("history"),
+        &mut ClosingTerminals::default(),
+    )
+    .unwrap();
+    clients[1].workspace = Some("live".into());
+    clients[1].agent = true;
+    let workspace = workspaces.get_mut("live").unwrap();
+    let pane = workspace.focused();
+    let mut parser = crate::vt::Parser::new();
+    let (offset, selection) = {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        for line in 0..12 {
+            parser.advance(&mut core, format!("old-{line}\r\n").as_bytes());
+        }
+        parser.advance(&mut core, b"\x1b[?25l\x1b[1;1Hlive-one\x1b[2;1Hlive-two");
+        core.scroll_display(Scroll::Top);
+        let offset = core.display_offset();
+        assert!(offset >= core.screen_lines());
+        let point = Point {
+            line: -(offset as i32),
+            column: 0,
+        };
+        core.selection_start(point, Side::Left, SelectionType::Simple);
+        core.selection_update(Point { column: 4, ..point }, Side::Right);
+        (offset, core.selection_range())
+    };
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |client, _| client.screens().contains_key(&pane));
+    }
+    assert!(grid_contains(&frontends[0], "old-0"));
+    assert!(!grid_contains(&frontends[0], "live-one"));
+    assert!(grid_contains(&frontends[1], "live-one"));
+    assert_eq!(frontends[0].screens()[&pane].display_offset(), offset);
+    assert_eq!(frontends[1].screens()[&pane].display_offset(), 0);
+    let historical_rows: Vec<_> = frontends[0].screens()[&pane]
+        .rows
+        .iter()
+        .map(|row| row.cells.clone())
+        .collect();
+
+    #[cfg(feature = "agent")]
+    {
+        let mut session = crate::ui::AgentSession::default();
+        session.model.input = "describe current screen".into();
+        session.context.basket.push(crate::ui::ContextItem {
+            label: "Screen".into(),
+            source: "live · pane 1".into(),
+            kind: "Screen".into(),
+            snapshot: crate::context::snapshot(&frontends[0].screens()[&pane], None),
+        });
+        frontends[0].agent_delegate = true;
+        assert!(session.send(&frontends[0]).unwrap());
+        let request = &session.model.pending[0];
+        assert_eq!(request["pane"], pane);
+        assert!(request.get("target").is_none());
+        assert!(request["basket"][0][3].as_str().unwrap().contains("old-0"));
+    }
+
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[2;1Hhidden-update");
+        assert_eq!(core.dirty_rows().count(), 0);
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |_, events| !events.is_empty());
+    }
+    assert!(grid_contains(&frontends[1], "hidden-update"));
+    assert!(!grid_contains(&frontends[0], "hidden-update"));
+    for (row, original) in frontends[0].screens()[&pane]
+        .rows
+        .iter()
+        .zip(historical_rows)
+    {
+        assert_eq!(row.cells, original);
+    }
+    assert_eq!(frontends[0].screens()[&pane].display_offset(), offset);
+    assert_eq!(frontends[0].screens()[&pane].selection_range(), selection);
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        assert_eq!(core.display_offset(), offset);
+        assert_eq!(core.selection_range(), selection);
+        core.scroll_display(Scroll::Bottom);
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |_, events| !events.is_empty());
+        assert_eq!(frontend.screens()[&pane].display_offset(), 0);
+        frontend.screens.get_mut(&pane).unwrap().reset_damage();
+    }
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        parser.advance(&mut core, b"\x1b[2;1Hbottom-delta!");
+        assert_eq!(core.dirty_rows().count(), 1);
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |client, _| grid_contains(client, "bottom-delta!"));
+        assert_eq!(
+            frontend.screens()[&pane].dirty_rows().collect::<Vec<_>>(),
+            vec![1]
+        );
+    }
+    assert_same_screen(&frontends[0], &frontends[1], pane);
+}
+
+#[test]
 fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update() {
     use crate::vt::{Color, Parser, Rgb};
     let server = TestServer::start();
@@ -1365,6 +1518,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
+            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         });
@@ -2532,6 +2686,39 @@ time.sleep(60)
 }
 
 #[test]
+fn disconnecting_first_client_preserves_later_poll_results() {
+    let server = TestServer::start();
+    let mut first = Client::connect(&server.socket()).unwrap();
+    let mut second = Client::connect(&server.socket()).unwrap();
+    for client in [&mut first, &mut second] {
+        client.send(Action::List).unwrap();
+        wait(client, |_, events| {
+            events
+                .iter()
+                .any(|event| matches!(event, ClientEvent::List(_)))
+        });
+    }
+    let pid = server.child.id() as libc::pid_t;
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGSTOP) }, 0);
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid, &mut status, libc::WUNTRACED) },
+        pid
+    );
+    assert!(libc::WIFSTOPPED(status));
+    first.send(Action::Detach).unwrap();
+    first.flush().unwrap();
+    second.send(Action::List).unwrap();
+    second.flush().unwrap();
+    assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
+    wait(&mut second, |_, events| {
+        events
+            .iter()
+            .any(|event| matches!(event, ClientEvent::List(_)))
+    });
+}
+
+#[test]
 fn dropping_a_backpressured_frontend_leaves_the_daemon_idle_and_attachable() {
     let server = TestServer::start();
     let client = blocked_input_client(&server);
@@ -2614,6 +2801,7 @@ fn detached_behind_a_large_response_supersedes_a_known_write_failure() {
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
+        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2646,6 +2834,7 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
+        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2722,6 +2911,7 @@ fn write_failure_without_detached_still_reports_the_original_error() {
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
+        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2777,6 +2967,7 @@ fn demand_screen_retains_damage_and_recovers_after_other_consumers_and_pending_o
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
+            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         });

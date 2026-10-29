@@ -325,7 +325,7 @@ impl Ui {
                     .get(index)
                 {
                     self.agent.sessions[self.agent.current].context.preview =
-                        Some((item.clone(), 0));
+                        Some(ContextPreview::new(item.clone(), 0));
                     self.agent.keyboard = AgentAction::CopyPreview;
                     self.focus = Focus::Controls;
                 }
@@ -352,7 +352,7 @@ impl Ui {
                     .context
                     .preview
                     .as_ref()
-                    .map(|(item, _)| item.snapshot.text.clone()));
+                    .map(|preview| preview.item.snapshot.text.clone()));
             }
             AgentAction::ClosePreview => {
                 self.agent.sessions[self.agent.current].context.preview = None;
@@ -399,32 +399,7 @@ impl Ui {
 
     #[cfg(feature = "agent")]
     pub fn poll_agent(&mut self, client: &mut Client, config: &Config) -> io::Result<(bool, bool)> {
-        self.agent.focus = Some(
-            match self.focus {
-                Focus::Editor => "editor",
-                Focus::Output => "output",
-                Focus::Controls => "controls",
-                #[cfg(feature = "files")]
-                Focus::Files => "files",
-                #[cfg(feature = "monitor")]
-                Focus::Monitor => "monitor",
-                Focus::Terminal => "terminal",
-            }
-            .into(),
-        );
-        let result = self.agent.poll_remote(client, config)?;
-        self.focus = match self.agent.focus.as_deref() {
-            Some("editor") => Focus::Editor,
-            Some("output") => Focus::Output,
-            Some("controls") => Focus::Controls,
-            Some("terminal") => Focus::Terminal,
-            #[cfg(feature = "files")]
-            Some("files") => Focus::Files,
-            #[cfg(feature = "monitor")]
-            Some("monitor") => Focus::Monitor,
-            _ => self.focus,
-        };
-        Ok(result)
+        self.agent.poll_remote(client, config, &mut self.focus)
     }
 
     #[cfg(feature = "agent")]
@@ -533,11 +508,39 @@ impl ContextItem {
 }
 
 #[cfg(feature = "agent")]
+pub(crate) struct ContextPreview {
+    pub item: ContextItem,
+    pub scroll: usize,
+    columns: usize,
+    pub lines: Vec<Range<usize>>,
+}
+
+#[cfg(feature = "agent")]
+impl ContextPreview {
+    pub fn new(item: ContextItem, scroll: usize) -> Self {
+        Self {
+            item,
+            scroll,
+            columns: 0,
+            lines: Vec::new(),
+        }
+    }
+
+    pub fn prepare(&mut self, columns: usize) {
+        let columns = columns.max(1);
+        if self.columns != columns {
+            self.lines = wrap_context(&self.item.snapshot.text, columns);
+            self.columns = columns;
+        }
+    }
+}
+
+#[cfg(feature = "agent")]
 #[derive(Default)]
 pub(crate) struct ChatContext {
     pub basket: Vec<ContextItem>,
     pub menu: bool,
-    pub preview: Option<(ContextItem, usize)>,
+    pub preview: Option<ContextPreview>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -556,6 +559,33 @@ pub(crate) enum Focus {
 }
 #[cfg(feature = "agent")]
 impl Focus {
+    fn view(self) -> &'static str {
+        match self {
+            Self::Terminal => "terminal",
+            Self::Editor => "editor",
+            Self::Output => "output",
+            Self::Controls => "controls",
+            #[cfg(feature = "files")]
+            Self::Files => "files",
+            #[cfg(feature = "monitor")]
+            Self::Monitor => "monitor",
+        }
+    }
+
+    fn from_view(value: &str) -> Option<Self> {
+        Some(match value {
+            "terminal" => Self::Terminal,
+            "editor" => Self::Editor,
+            "output" => Self::Output,
+            "controls" => Self::Controls,
+            #[cfg(feature = "files")]
+            "files" => Self::Files,
+            #[cfg(feature = "monitor")]
+            "monitor" => Self::Monitor,
+            _ => return None,
+        })
+    }
+
     pub fn is_agent(self) -> bool {
         matches!(self, Self::Editor | Self::Output | Self::Controls)
     }
@@ -772,7 +802,6 @@ impl Drop for MarkdownWorker {
 #[cfg(feature = "agent")]
 pub(crate) struct AgentPanel {
     pub open: bool,
-    pub focus: Option<String>,
     pub width: Option<f32>,
     pub sessions: Vec<AgentSession>,
     pub current: usize,
@@ -780,6 +809,7 @@ pub(crate) struct AgentPanel {
     next_id: u64,
     remote_opened: bool,
     remote_ready: bool,
+    pub view_dirty: bool,
     last_view: Option<serde_json::Value>,
     markdown_worker: Option<MarkdownWorker>,
     next_render: u64,
@@ -790,7 +820,6 @@ impl Default for AgentPanel {
     fn default() -> Self {
         Self {
             open: false,
-            focus: None,
             width: None,
             sessions: vec![AgentSession {
                 model: Agent::mirror(),
@@ -801,6 +830,7 @@ impl Default for AgentPanel {
             next_id: 1,
             remote_opened: false,
             remote_ready: false,
+            view_dirty: true,
             last_view: None,
             markdown_worker: None,
             next_render: 0,
@@ -823,15 +853,7 @@ impl AgentPanel {
             self.sessions
                 .iter()
                 .map(|session| {
-                    let mut model = session.model.snapshot();
-                    model["rewind_restore"] = serde_json::json!(
-                        session.rewind_restore.as_ref().map(|(turn, input, items)| (
-                            *turn,
-                            input,
-                            items.iter().map(ContextItem::view).collect::<Vec<_>>()
-                        ))
-                    );
-                    serde_json::Value::Array(vec![session.id.into(), model])
+                    serde_json::Value::Array(vec![session.id.into(), session.model.snapshot()])
                 })
                 .collect::<Vec<_>>(),
         )
@@ -856,31 +878,27 @@ impl AgentPanel {
                     session.columns = 0;
                     session.sync_rendered();
                 }
-                session.rewind_restore = rewind.map(|(turn, input, items)| {
-                    (
-                        turn,
-                        input,
-                        items.into_iter().map(ContextItem::from_view).collect(),
-                    )
-                });
                 if session.model.remote
-                    && let Some((turn, input, items)) = &session.rewind_restore
-                    && session.rewind_applied != Some(*turn)
+                    && let Some((turn, input, items)) = rewind
+                    && session.rewind_applied != Some(turn)
                 {
-                    session.model.input = input.clone();
+                    session.model.input = input;
                     session.model.cursor = session.model.input.len();
                     session.model.anchor = None;
                     session.model.scroll = 0;
-                    session.context.basket = items.clone();
+                    session.context.basket =
+                        items.into_iter().map(ContextItem::from_view).collect();
                     session.context.preview = None;
                     session.context.menu = false;
                     session.editor_scroll = None;
                     session.rewind_target = None;
-                    session.rewind_applied = Some(*turn);
+                    session.rewind_applied = Some(turn);
+                    self.view_dirty = true;
                     redraw = true;
                 }
                 if selection.is_some() && !session.selection_matches(selection.as_ref()) {
                     session.clear_selection();
+                    self.view_dirty = true;
                     redraw = true;
                 }
             }
@@ -893,6 +911,7 @@ impl AgentPanel {
         &mut self,
         client: &mut Client,
         config: &Config,
+        focus: &mut Focus,
     ) -> io::Result<(bool, bool)> {
         if client.snapshot().is_none() {
             return Ok((false, false));
@@ -906,10 +925,13 @@ impl AgentPanel {
         for (kind, payload) in client.take_agent_events() {
             match kind {
                 0 => {
-                    self.restore_view_state(
+                    if let Some(restored) = self.restore_view_state(
                         serde_json::from_slice(&payload).map_err(io::Error::other)?,
-                    )?;
-                    self.last_view = Some(self.view_state());
+                    )? {
+                        *focus = restored;
+                    }
+                    self.last_view = Some(self.view_state(*focus));
+                    self.view_dirty = false;
                     changed = true;
                 }
                 1 => {
@@ -930,12 +952,15 @@ impl AgentPanel {
             }
         }
         if self.remote_ready && client.can_agent_input() {
-            let view = self.view_state();
-            if self.last_view.as_ref() != Some(&view) {
-                client.send(crate::workspace::Action::AgentView(
-                    serde_json::to_vec(&view).map_err(io::Error::other)?,
-                ))?;
-                self.last_view = Some(view);
+            if self.view_dirty {
+                let view = self.view_state(*focus);
+                if self.last_view.as_ref() != Some(&view) {
+                    client.send(crate::workspace::Action::AgentView(
+                        serde_json::to_vec(&view).map_err(io::Error::other)?,
+                    ))?;
+                    self.last_view = Some(view);
+                }
+                self.view_dirty = false;
             }
             for session in &mut self.sessions {
                 for mut request in std::mem::take(&mut session.model.pending) {
@@ -953,7 +978,7 @@ impl AgentPanel {
         Ok((changed, messages))
     }
 
-    pub fn view_state(&self) -> serde_json::Value {
+    pub fn view_state(&self, focus: Focus) -> serde_json::Value {
         use serde_json::json;
         let sessions: Vec<_> = self.sessions.iter().map(|session| {
             let point = |point: TranscriptPoint| (point.message, point.part, point.offset);
@@ -967,7 +992,7 @@ impl AgentPanel {
                 "scroll": session.model.scroll,
                 "basket": session.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
                 "menu": session.context.menu,
-                "preview": session.context.preview.as_ref().map(|(item, scroll)| (item.view(), *scroll)),
+                "preview": session.context.preview.as_ref().map(|preview| (preview.item.view(), preview.scroll)),
                 "expanded_tools": expanded_tools,
                 "editor_scroll": session.editor_scroll,
                 "rewind_target": session.rewind_target,
@@ -977,7 +1002,7 @@ impl AgentPanel {
         }).collect();
         let mut view = json!({
             "open": self.open,
-            "focus": self.focus,
+            "focus": focus.view(),
             "width": self.width,
             "current": self.current,
             "keyboard": self.keyboard.view(),
@@ -987,14 +1012,17 @@ impl AgentPanel {
         view
     }
 
-    pub fn restore_view_state(&mut self, mut value: serde_json::Value) -> io::Result<()> {
+    pub fn restore_view_state(
+        &mut self,
+        mut value: serde_json::Value,
+    ) -> io::Result<Option<Focus>> {
         macro_rules! read {
             ($value:expr) => {
                 serde_json::from_value($value.take()).map_err(io::Error::other)?
             };
         }
         let open = read!(value["open"]);
-        let focus = read!(value["focus"]);
+        let focus: Option<String> = read!(value["focus"]);
         let width = read!(value["width"]);
         let current: usize = read!(value["current"]);
         let keyboard = AgentAction::from_view(read!(value["keyboard"]))?;
@@ -1029,8 +1057,8 @@ impl AgentPanel {
             session.context.basket = basket.into_iter().map(ContextItem::from_view).collect();
             session.context.menu = read!(value["menu"]);
             let preview: Option<(ContextView, usize)> = read!(value["preview"]);
-            session.context.preview =
-                preview.map(|(item, scroll)| (ContextItem::from_view(item), scroll));
+            session.context.preview = preview
+                .map(|(item, scroll)| ContextPreview::new(ContextItem::from_view(item), scroll));
             session.expanded_tools = read!(value["expanded_tools"]);
             session.editor_scroll = read!(value["editor_scroll"]);
             session.rewind_target = read!(value["rewind_target"]);
@@ -1061,7 +1089,6 @@ impl AgentPanel {
         for session in &mut sessions {
             if let Some(index) = previous.iter().position(|old| old.id == session.id) {
                 let old = previous.swap_remove(index);
-                session.rewind_restore = old.rewind_restore;
                 let mut view = std::mem::replace(&mut session.model, old.model);
                 session.model.input = std::mem::take(&mut view.input);
                 session.model.cursor = view.cursor;
@@ -1070,13 +1097,12 @@ impl AgentPanel {
             }
         }
         self.open = open;
-        self.focus = focus;
         self.width = width;
         self.current = current;
         self.keyboard = keyboard;
         self.next_id = next_id;
         self.sessions = sessions;
-        Ok(())
+        Ok(focus.as_deref().and_then(Focus::from_view))
     }
 
     pub fn active(&self) -> &AgentSession {
@@ -1093,7 +1119,9 @@ impl AgentPanel {
         // Commit with wrapping during draw so input keeps the displayed frame's geometry.
         self.apply_markdown();
         self.request_markdown()?;
+        let scroll = self.active().model.scroll;
         self.active_mut().layout(columns);
+        self.view_dirty |= scroll != self.active().model.scroll;
         Ok(())
     }
 
@@ -1101,11 +1129,12 @@ impl AgentPanel {
         if !self.open {
             return Ok(());
         }
-        let session = self.active_mut();
+        let session = &mut self.sessions[self.current];
         let selection = session.selection_checkpoint();
         session.sync_rendered();
         if selection.is_some() && !session.selection_matches(selection.as_ref()) {
             session.clear_selection();
+            self.view_dirty = true;
         }
         if session.render_request.is_none() {
             let messages: Vec<_> = session
@@ -1186,6 +1215,7 @@ impl AgentPanel {
         }
         if session.selection.is_some() && !session.selection_matches(selection.as_ref()) {
             session.clear_selection();
+            self.view_dirty = true;
         }
         session.columns = 0;
     }
@@ -1436,7 +1466,6 @@ pub(crate) struct AgentSession {
     pub editor_scroll: Option<usize>,
     pub rewind_target: Option<u64>,
     selection: Option<ChatSelection>,
-    rewind_restore: Option<(u64, String, Vec<ContextItem>)>,
     rewind_applied: Option<u64>,
 }
 
@@ -1759,14 +1788,12 @@ impl AgentSession {
             .snapshot()
             .ok_or_else(|| io::Error::other("No workspace"))?
             .focused;
-        let target = crate::agent::terminal_context(client, pane)?;
         if !client.can_agent_input() {
             return Err(io::Error::other("Workspace is read-only"));
         }
         let mut request = serde_json::json!({
             "action": "send",
             "pane": pane,
-            "target": target,
             "basket": self.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
         });
         request["input"] = serde_json::Value::String(std::mem::take(&mut self.model.input));
@@ -2118,8 +2145,9 @@ mod tests {
         };
         assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
         owner.active_mut().model.messages.clear();
-        owner.active_mut().rewind_restore = Some((1, "restored draft".into(), Vec::new()));
-        panel.restore_models(owner.model_snapshot()).unwrap();
+        let mut models = owner.model_snapshot();
+        models[0][1]["rewind_restore"] = serde_json::json!([1, "restored draft", []]);
+        panel.restore_models(models).unwrap();
         assert!(panel.poll_layout().unwrap());
         panel.prepare_layout(40).unwrap();
         assert!(panel.active().model.messages.is_empty());
@@ -2310,7 +2338,7 @@ mod tests {
                 incomplete: false,
             },
         };
-        let mut view = owner.view_state();
+        let mut view = owner.view_state(Focus::Terminal);
         let canonical = owner.model_snapshot();
         view["sessions"][0]["input"] = serde_json::json!("typing");
         view["sessions"][0]["cursor"] = serde_json::json!(6);
@@ -2326,21 +2354,20 @@ mod tests {
         let canonical = frontend.model_snapshot();
         frontend.restore_view_state(view.clone()).unwrap();
         assert_eq!(frontend.model_snapshot(), canonical);
-        owner.active_mut().rewind_restore = Some((4, "earlier".into(), vec![item]));
-        let models = owner.model_snapshot();
+        let mut models = owner.model_snapshot();
+        models[0][1]["rewind_restore"] = serde_json::json!([4, "earlier", [item.view()]]);
         frontend.restore_models(models.clone()).unwrap();
         assert_eq!(frontend.active().model.input, "earlier");
         assert_eq!(frontend.active().context.basket.len(), 1);
         frontend.active_mut().model.insert(" edited").unwrap();
         frontend.restore_models(models.clone()).unwrap();
         assert_eq!(frontend.active().model.input, "earlier edited");
-        let view = frontend.view_state();
+        let view = frontend.view_state(Focus::Terminal);
         let mut attached = AgentPanel::default();
         attached.restore_view_state(view).unwrap();
         attached.restore_models(models).unwrap();
         assert_eq!(attached.active().model.input, "earlier edited");
         assert_eq!(attached.active().context.basket.len(), 1);
-        owner.active_mut().rewind_restore = None;
         attached.restore_models(owner.model_snapshot()).unwrap();
         assert_eq!(attached.active().model.input, "earlier edited");
         assert_eq!(attached.active().context.basket.len(), 1);
@@ -2370,7 +2397,7 @@ mod tests {
             session.model.scroll = 7;
             session.context.basket.push(item.clone());
             session.context.menu = true;
-            session.context.preview = Some((item.clone(), 3));
+            session.context.preview = Some(ContextPreview::new(item.clone(), 3));
             session.expanded_tools.insert("tool-11".into());
             session.editor_scroll = Some(2);
             session.rewind_target = Some(11);
@@ -2388,7 +2415,7 @@ mod tests {
                 dragging: true,
             });
         }
-        let view = panel.view_state();
+        let view = panel.view_state(Focus::Output);
         assert!(view["sessions"][0].get("messages").is_none());
         let mut restored = AgentPanel::default();
         restored.new_session();
@@ -2405,8 +2432,8 @@ mod tests {
             session.layout(40);
         }
         restored.sessions.swap(0, 1);
-        restored.restore_view_state(view.clone()).unwrap();
-        assert_eq!(restored.view_state(), view);
+        assert!(restored.restore_view_state(view.clone()).unwrap() == Some(Focus::Output));
+        assert_eq!(restored.view_state(Focus::Output), view);
         for session in &restored.sessions {
             assert_eq!(
                 session.model.messages[0].text,
@@ -2423,7 +2450,7 @@ mod tests {
         let mut invalid = view.clone();
         invalid["sessions"][0]["cursor"] = serde_json::json!(1);
         assert!(restored.restore_view_state(invalid).is_err());
-        assert_eq!(restored.view_state(), view);
+        assert_eq!(restored.view_state(Focus::Output), view);
         restored.new_session();
         assert_eq!(restored.active().id, 2);
     }

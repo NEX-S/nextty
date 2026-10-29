@@ -60,7 +60,15 @@ fn main() {
         let object = out.join(format!("native-{index}.o"));
         let mut cc = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()));
         cc.args([
-            "-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra", "-Werror", "-Inative",
+            "-std=c11",
+            "-O2",
+            "-g",
+            "-fPIC",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "-Werror",
+            "-Inative",
         ])
         .arg("-I")
         .arg(out)

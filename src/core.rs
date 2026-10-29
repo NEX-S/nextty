@@ -242,6 +242,32 @@ impl Mode {
     }
 }
 
+fn ansi_mode(mode: u16) -> Option<Mode> {
+    match mode {
+        4 => Some(Mode::INSERT),
+        20 => Some(Mode::LINE_FEED_NEW_LINE),
+        _ => None,
+    }
+}
+
+fn private_mode(mode: u16) -> Option<Mode> {
+    Some(match mode {
+        1 => Mode::APP_CURSOR,
+        7 => Mode::LINE_WRAP,
+        25 => Mode::SHOW_CURSOR,
+        1000 => Mode::MOUSE_CLICK,
+        1002 => Mode::MOUSE_DRAG,
+        1003 => Mode::MOUSE_MOTION,
+        1004 => Mode::FOCUS_IN_OUT,
+        1005 => Mode::UTF8_MOUSE,
+        1006 => Mode::SGR_MOUSE,
+        1007 => Mode::ALTERNATE_SCROLL,
+        2004 => Mode::BRACKETED_PASTE,
+        2026 => Mode::SYNC_UPDATE,
+        _ => return None,
+    })
+}
+
 impl std::ops::BitOr for Mode {
     type Output = Self;
     fn bitor(self, other: Self) -> Self {
@@ -961,6 +987,10 @@ impl Core {
         }
         unreachable!("visible row outside the screen")
     }
+    #[cfg(feature = "tui")]
+    pub(crate) fn screen_row(&self, line: usize) -> &Row {
+        &self.active.rows[self.hot_history_size() + line]
+    }
     pub fn cursor(&self) -> (Point, CursorShape) {
         (
             self.active.cursor.point,
@@ -1518,25 +1548,12 @@ impl Core {
         }
     }
     fn set_private(&mut self, mode: u16, enabled: bool) {
-        let raw = mode;
-        let flag = match raw {
-            1 => Mode::APP_CURSOR,
+        match mode {
             6 => {
                 self.active.cursor.origin = enabled;
                 self.goto(0, 0);
                 return;
             }
-            7 => Mode::LINE_WRAP,
-            25 => Mode::SHOW_CURSOR,
-            1000 => Mode::MOUSE_CLICK,
-            1002 => Mode::MOUSE_DRAG,
-            1003 => Mode::MOUSE_MOTION,
-            1004 => Mode::FOCUS_IN_OUT,
-            1005 => Mode::UTF8_MOUSE,
-            1006 => Mode::SGR_MOUSE,
-            1007 => Mode::ALTERNATE_SCROLL,
-            2004 => Mode::BRACKETED_PASTE,
-            2026 => Mode::SYNC_UPDATE,
             47 => {
                 self.set_alternate(enabled, false, false);
                 return;
@@ -1567,7 +1584,10 @@ impl Core {
                 self.goto(0, 0);
                 return;
             }
-            _ => return,
+            _ => {}
+        }
+        let Some(flag) = private_mode(mode) else {
+            return;
         };
         if enabled && flag.intersects(Mode::MOUSE_MODE) {
             self.mode.remove(Mode::MOUSE_MODE);
@@ -2324,17 +2344,13 @@ impl Core {
         }
     }
     pub(crate) fn set_mode(&mut self, mode: u16) {
-        match mode {
-            4 => self.mode.insert(Mode::INSERT),
-            20 => self.mode.insert(Mode::LINE_FEED_NEW_LINE),
-            _ => {}
+        if let Some(flag) = ansi_mode(mode) {
+            self.mode.insert(flag);
         }
     }
     pub(crate) fn unset_mode(&mut self, mode: u16) {
-        match mode {
-            4 => self.mode.remove(Mode::INSERT),
-            20 => self.mode.remove(Mode::LINE_FEED_NEW_LINE),
-            _ => {}
+        if let Some(flag) = ansi_mode(mode) {
+            self.mode.remove(flag);
         }
     }
     pub(crate) fn set_private_mode(&mut self, mode: u16) {
@@ -2402,11 +2418,7 @@ impl Core {
         }
     }
     pub(crate) fn report_mode(&mut self, mode: u16) {
-        let enabled = match mode {
-            4 => Some(self.mode.contains(Mode::INSERT)),
-            20 => Some(self.mode.contains(Mode::LINE_FEED_NEW_LINE)),
-            _ => None,
-        };
+        let enabled = ansi_mode(mode).map(|flag| self.mode.contains(flag));
         self.write_reply(format_args!(
             "\x1b[{};{}$y",
             mode,
@@ -2415,21 +2427,9 @@ impl Core {
     }
     pub(crate) fn report_private_mode(&mut self, mode: u16) {
         let flag = match mode {
-            1 => Some(Mode::APP_CURSOR),
             6 => Some(Mode::ORIGIN),
-            7 => Some(Mode::LINE_WRAP),
-            25 => Some(Mode::SHOW_CURSOR),
             47 | 1047 | 1049 => Some(Mode::ALT_SCREEN),
-            1000 => Some(Mode::MOUSE_CLICK),
-            1002 => Some(Mode::MOUSE_DRAG),
-            1003 => Some(Mode::MOUSE_MOTION),
-            1004 => Some(Mode::FOCUS_IN_OUT),
-            1005 => Some(Mode::UTF8_MOUSE),
-            1006 => Some(Mode::SGR_MOUSE),
-            1007 => Some(Mode::ALTERNATE_SCROLL),
-            2004 => Some(Mode::BRACKETED_PASTE),
-            2026 => Some(Mode::SYNC_UPDATE),
-            _ => None,
+            _ => private_mode(mode),
         };
         self.write_reply(format_args!(
             "\x1b[?{};{}$y",
@@ -3486,12 +3486,15 @@ impl Core {
                 Some(self.command_metadata(block)),
             )
         } else {
+            let cursor_row = self.block_origin + main.cursor.point.line as u64;
+            let last_used = main
+                .rows
+                .iter()
+                .rposition(|row| row.used() != 0)
+                .map_or(cursor_row, |index| history.hot_start + index as u64);
             (
                 (0, 0),
-                (
-                    history.hot_start + main.rows.len() as u64 - 1,
-                    self.columns(),
-                ),
+                (cursor_row.max(last_used), self.columns()),
                 history.first != 0,
                 None,
             )

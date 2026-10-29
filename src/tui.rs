@@ -8,7 +8,7 @@ use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::input::mouse_bytes;
 use crate::screen::Screen;
 #[cfg(feature = "agent")]
-use crate::ui::{AgentAction, AgentLine, column_offset, wrap_context};
+use crate::ui::{AgentAction, AgentLine, column_offset};
 use crate::ui::{Focus, Ui};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 use crate::width::{fit_label, scalar_width, text_width};
@@ -922,7 +922,9 @@ impl Frontend {
         }
         if mouse.code & 64 != 0 {
             let up = mouse.code & 1 == 0;
-            if let Some((_, scroll)) = &mut self.ui.agent.active_mut().context.preview {
+            if let Some(crate::ui::ContextPreview { scroll, .. }) =
+                &mut self.ui.agent.active_mut().context.preview
+            {
                 *scroll = if up {
                     scroll.saturating_sub(3)
                 } else {
@@ -1034,7 +1036,8 @@ impl Frontend {
                 }
                 AgentAction::Inspect(index) => {
                     if let Some(item) = self.ui.agent.active().context.basket.get(index) {
-                        self.ui.agent.active_mut().context.preview = Some((item.clone(), 0));
+                        self.ui.agent.active_mut().context.preview =
+                            Some(crate::ui::ContextPreview::new(item.clone(), 0));
                     }
                 }
                 AgentAction::Remove(index) => {
@@ -1045,7 +1048,9 @@ impl Frontend {
                     self.full = true;
                 }
                 AgentAction::CopyPreview => {
-                    if let Some((item, _)) = &self.ui.agent.active().context.preview {
+                    if let Some(crate::ui::ContextPreview { item, .. }) =
+                        &self.ui.agent.active().context.preview
+                    {
                         self.copy_text(item.snapshot.text.clone());
                     }
                 }
@@ -1184,13 +1189,17 @@ impl Frontend {
         let rows = usize::from(chat_end.saturating_sub(chat_top));
         let columns = usize::from(editor.cols);
         self.ui.agent.prepare_layout(columns)?;
-        self.ui.agent.active_mut().model.scroll = self
+        let scroll = self
             .ui
             .agent
             .active()
             .model
             .scroll
             .min(self.ui.agent.active().lines.len().saturating_sub(rows));
+        if scroll != self.ui.agent.active().model.scroll {
+            self.ui.agent.active_mut().model.scroll = scroll;
+            self.ui.agent.view_dirty = true;
+        }
         let first = self
             .ui
             .agent
@@ -1555,11 +1564,19 @@ impl Frontend {
                 ));
             }
         }
-        if let Some((item, scroll)) = &mut self.ui.agent.active_mut().context.preview {
+        if let Some(preview) = &mut self.ui.agent.active_mut().context.preview {
             let columns = self.size.num_cols.saturating_sub(4);
             let rows = usize::from(self.size.num_lines.saturating_sub(5));
-            let lines = wrap_context(&item.snapshot.text, usize::from(columns));
+            preview.prepare(usize::from(columns));
+            let crate::ui::ContextPreview {
+                item,
+                scroll,
+                lines,
+                ..
+            } = preview;
+            let previous_scroll = *scroll;
             *scroll = (*scroll).min(lines.len().saturating_sub(rows));
+            let scroll_changed = previous_scroll != *scroll;
             for y in 1..self.size.num_lines.saturating_sub(1) {
                 draw_text(
                     output,
@@ -1621,6 +1638,7 @@ impl Frontend {
                 AgentAction::CopyPreview,
             ));
             output.write_all(b"\x1b[?25l")?;
+            self.ui.agent.view_dirty |= scroll_changed;
         }
         let hovered = self.pointer.and_then(|(x, y)| {
             self.agent_hits
@@ -2282,6 +2300,10 @@ impl Frontend {
 
     fn input(&mut self, event: Input) -> io::Result<()> {
         #[cfg(feature = "agent")]
+        {
+            self.ui.agent.view_dirty = true;
+        }
+        #[cfg(feature = "agent")]
         if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
             self.ui.agent_rewind_key(0);
         }
@@ -2513,7 +2535,7 @@ impl Frontend {
                             .preview
                             .as_ref()
                             .unwrap()
-                            .0
+                            .item
                             .snapshot
                             .text
                             .clone();
@@ -2528,7 +2550,7 @@ impl Frontend {
                             .preview
                             .as_mut()
                             .unwrap()
-                            .1;
+                            .scroll;
                         if matches!(bytes.as_slice(), b"\x1b[A" | b"\x1b[5~") {
                             *scroll = scroll.saturating_sub(3);
                         } else if matches!(bytes.as_slice(), b"\x1b[B" | b"\x1b[6~") {

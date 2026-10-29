@@ -430,6 +430,7 @@ pub struct Client {
     peer: Peer,
     snapshot: Option<Snapshot>,
     screens: HashMap<PaneId, Screen>,
+    terminal_revisions: HashMap<PaneId, u64>,
     write_error: Option<io::Error>,
     ssh: Option<(Child, String)>,
 }
@@ -446,6 +447,7 @@ impl Client {
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
+            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         })
@@ -477,6 +479,7 @@ impl Client {
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
+            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: Some((child, target)),
         };
@@ -640,6 +643,13 @@ impl Client {
                 .as_ref()
                 .is_some_and(|snapshot| snapshot.controller)
     }
+    #[cfg(any(test, feature = "agent"))]
+    pub(crate) fn terminal_revision(&self, pane: PaneId) -> io::Result<u64> {
+        self.terminal_revisions
+            .get(&pane)
+            .copied()
+            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
+    }
     pub fn poll(&mut self) -> io::Result<Vec<ClientEvent>> {
         let responses = match self.peer.responses(self.snapshot.as_ref()) {
             Ok(responses) => responses,
@@ -655,7 +665,28 @@ impl Client {
                     self.screens
                         .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
                     for (id, update) in updates {
-                        self.screens.entry(id).or_default().apply(update)?;
+                        let screen = self.screens.entry(id).or_default();
+                        if self.agent_delegate && screen.changes_activity(&update) {
+                            *self.terminal_revisions.entry(id).or_default() += 1;
+                        }
+                        screen.apply(update)?;
+                    }
+                    if self.agent_delegate {
+                        self.terminal_revisions
+                            .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
+                        for pane in &snapshot.panes {
+                            let revision = self.terminal_revisions.entry(pane.id).or_default();
+                            let previous = self.snapshot.as_ref().and_then(|snapshot| {
+                                snapshot.panes.iter().find(|old| old.id == pane.id)
+                            });
+                            if previous.is_none_or(|old| {
+                                old.input_generation != pane.input_generation
+                                    || old.shell_prompt != pane.shell_prompt
+                                    || old.command_blocks != pane.command_blocks
+                            }) {
+                                *revision += 1;
+                            }
+                        }
                     }
                     if let Some(previous) = &self.snapshot {
                         for pane in &snapshot.panes {
@@ -1085,31 +1116,23 @@ impl Workspace {
     fn focused(&self) -> PaneId {
         self.tabs[self.active].focused
     }
+    fn area(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 1,
+            cols: self.size.num_cols,
+            rows: self.size.num_lines.saturating_sub(1),
+        }
+    }
     fn layout(&self) -> Vec<(PaneId, Rect)> {
         let mut result = Vec::new();
-        self.tabs[self.active].root.layout(
-            Rect {
-                x: 0,
-                y: 1,
-                cols: self.size.num_cols,
-                rows: self.size.num_lines.saturating_sub(1),
-            },
-            &mut result,
-        );
+        self.tabs[self.active].root.layout(self.area(), &mut result);
         result
     }
     fn all_layouts(&self) -> Vec<(PaneId, Rect)> {
         let mut result = Vec::new();
         for tab in &self.tabs {
-            tab.root.layout(
-                Rect {
-                    x: 0,
-                    y: 1,
-                    cols: self.size.num_cols,
-                    rows: self.size.num_lines.saturating_sub(1),
-                },
-                &mut result,
-            );
+            tab.root.layout(self.area(), &mut result);
         }
         result
     }
@@ -1583,6 +1606,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
             return Err(error);
         }
+        // Both client passes use this poll's order; remove failed clients next iteration.
         let client_count = clients.len();
         for index in 0..client_count {
             if clients[index].failed {
@@ -1700,7 +1724,6 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
             dirty.insert(name.clone());
         }
-        clients.retain(|client| !client.failed);
         for (name, workspace) in workspaces.extract_if(|_, workspace| workspace.tabs.is_empty()) {
             drop(workspace);
             for client in &mut clients {
@@ -1715,17 +1738,9 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
         }
         for client in &mut clients {
-            let ready = client
-                .copy
-                .as_ref()
-                .and_then(|(_, receiver)| match receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "history copy worker disconnected",
-                    ))),
-                });
+            let ready = client.copy.as_ref().and_then(|(_, receiver)| {
+                worker_result(receiver, "history copy worker disconnected")
+            });
             if let Some(result) = ready {
                 let (request, _) = client.copy.take().unwrap();
                 match result {
@@ -1782,14 +1797,8 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     });
                     continue;
                 }
-                let ready = match client.reads[index].receiver.try_recv() {
-                    Ok(result) => Some(result),
-                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(io::Error::new(
-                        io::ErrorKind::BrokenPipe,
-                        "history reader disconnected",
-                    ))),
-                };
+                let ready =
+                    worker_result(&client.reads[index].receiver, "history reader disconnected");
                 if let Some(result) = ready {
                     let read = client.reads.swap_remove(index);
                     client.respond(Response::History {
@@ -1846,13 +1855,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                 search
                     .receiver
                     .as_ref()
-                    .and_then(|receiver| match receiver.try_recv() {
-                        Ok(result) => Some(result),
-                        Err(std::sync::mpsc::TryRecvError::Empty) => None,
-                        Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(
-                            io::Error::new(io::ErrorKind::BrokenPipe, "pane search worker stopped"),
-                        )),
-                    })
+                    .and_then(|receiver| worker_result(receiver, "pane search worker stopped"))
             };
             if let Some(result) = ready {
                 search.receiver = None;
@@ -1899,7 +1902,8 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
         }
         for (client, fd) in clients.iter_mut().zip(&fds[1..1 + client_count]) {
-            if fd.events & libc::POLLOUT != 0 && fd.revents & libc::POLLOUT == 0 {
+            debug_assert_eq!(client.peer.fd(), fd.fd);
+            if client.failed || fd.events & libc::POLLOUT != 0 && fd.revents & libc::POLLOUT == 0 {
                 continue;
             }
             if let Err(error) = client.peer.flush() {
@@ -1917,6 +1921,19 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
     }
 }
+fn worker_result<T>(
+    receiver: &std::sync::mpsc::Receiver<io::Result<T>>,
+    disconnected: &'static str,
+) -> Option<io::Result<T>> {
+    match receiver.try_recv() {
+        Ok(result) => Some(result),
+        Err(std::sync::mpsc::TryRecvError::Empty) => None,
+        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+            Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, disconnected)))
+        }
+    }
+}
+
 fn broadcast(
     workspace: &mut Workspace,
     clients: &mut [Connection],
@@ -1982,13 +1999,21 @@ fn broadcast(
                         && (client.agent || active.iter().any(|(pane, _)| *pane == id))
                 })
             };
+            let offset = core.display_offset();
             let full = eligible()
-                .any(|client| client.full || !client.known.contains_key(&id))
+                .any(|client| {
+                    (!client.agent || offset == 0)
+                        && (client.full || !client.known.contains_key(&id))
+                })
                 .then(|| Update::capture(&core, true));
-            let delta = (eligible().any(|client| !client.full && client.known.contains_key(&id))
-                && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
+            let delta = (eligible().any(|client| {
+                (!client.agent || offset == 0) && !client.full && client.known.contains_key(&id)
+            }) && (full.is_none()
+                || core.dirty_rows().count() != core.screen_lines()))
             .then(|| Update::capture(&core, false));
-            frames.push((id, full, delta));
+            let live = (offset != 0 && eligible().any(|client| client.agent))
+                .then(|| Update::capture_live(&core));
+            frames.push((id, full, delta, live));
             core.reset_damage();
         }
         drop(core);
@@ -2030,15 +2055,19 @@ fn broadcast(
             })
         };
         updates.clear();
-        updates.extend(frames.iter().filter_map(|(id, full, delta)| {
+        updates.extend(frames.iter().filter_map(|(id, full, delta, live)| {
             if !client.agent && !active.iter().any(|(pane, _)| pane == id) {
                 return None;
             }
-            let update = if !client.known.contains_key(id) || client.full {
-                full.as_ref()
+            let update = if client.agent
+                && let Some(live) = live
+            {
+                live
+            } else if !client.known.contains_key(id) || client.full {
+                full.as_ref()?
             } else {
-                delta.as_ref().or(full.as_ref())
-            }?;
+                delta.as_ref().or(full.as_ref())?
+            };
             Some((*id, update))
         }));
         snapshot.controller = workspace.controller == Some(client.id);
@@ -2053,7 +2082,7 @@ fn broadcast(
                 snapshot
                     .panes
                     .iter()
-                    .filter(|pane| frames.iter().any(|(id, _, _)| *id == pane.id))
+                    .filter(|pane| frames.iter().any(|(id, _, _, _)| *id == pane.id))
                     .map(|pane| (pane.id, Arc::clone(&pane.process))),
             );
         }
@@ -2244,11 +2273,7 @@ fn apply_action(
             workspace.resize(size)?;
             clients[index].workspace = Some(name.clone());
             clients[index].size = size;
-            for client in clients {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
             dirty.insert(name);
             return Ok(());
         }
@@ -2466,11 +2491,7 @@ fn apply_action(
                 return Ok(());
             }
             workspace.resize(size)?;
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
         }
         Action::ResizeSplit {
             first,
@@ -2490,11 +2511,7 @@ fn apply_action(
                 return Ok(());
             }
             workspace.resize(workspace.size)?;
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
         }
         Action::Split { pane, axis } => {
             let pane = if pane == 0 { workspace.focused() } else { pane };
@@ -2518,11 +2535,7 @@ fn apply_action(
             workspace.tabs[workspace.active].root.split(pane, new, axis);
             workspace.tabs[workspace.active].focused = new;
             workspace.resize(workspace.size)?;
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
         }
         Action::NewTab { pane } => {
             pane_ref(pane)?;
@@ -2534,11 +2547,7 @@ fn apply_action(
                 focused: new,
             });
             workspace.active = workspace.tabs.len() - 1;
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
         }
         Action::Focus(pane) => {
             if pane == previous_focus {
@@ -2565,11 +2574,7 @@ fn apply_action(
                 return Ok(());
             }
             workspace.active = active;
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.full = true;
-                }
-            }
+            mark_full(clients, &name);
         }
         Action::ClosePane(pane) => {
             pane_ref(pane)?;
@@ -2931,6 +2936,13 @@ fn validate_name(name: &str) -> io::Result<()> {
         ))
     } else {
         Ok(())
+    }
+}
+fn mark_full(clients: &mut [Connection], workspace: &str) {
+    for client in clients {
+        if client.workspace.as_deref() == Some(workspace) {
+            client.full = true;
+        }
     }
 }
 fn pane_directory(terminal: &Terminal) -> io::Result<Option<PathBuf>> {

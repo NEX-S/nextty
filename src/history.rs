@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -112,11 +112,7 @@ impl HistoryBudget {
             if files.open.as_ref().is_some_and(|(open, _)| open == &path) {
                 files.open = None;
             }
-            match fs::remove_file(path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
-            }
+            remove_segment(&path)?;
             files.used -= bytes;
             evicted = true;
         }
@@ -179,11 +175,7 @@ impl HistoryBudget {
             {
                 files.open = None;
             }
-            match fs::remove_file(&segment.path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
-            }
+            remove_segment(&segment.path)?;
         }
         Ok(())
     }
@@ -227,7 +219,9 @@ pub struct HistoryCursor {
 #[derive(Debug)]
 pub struct HistoryPage {
     pub text: String,
-    pub next: Option<HistoryCursor>,
+    pub cursor: HistoryCursor,
+    pub has_more: bool,
+    pub matched: Option<bool>,
     pub incomplete: bool,
     pub command: Option<crate::core::CommandBlock>,
 }
@@ -355,13 +349,9 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
         if job.cancelled.load(Ordering::Relaxed) {
             break;
         }
-        let mut reader = match File::open(path) {
-            Ok(file) => BufReader::new(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                matcher.gap();
-                continue;
-            }
-            Err(error) => return Err(error),
+        let Some(mut reader) = open_segment(path)? else {
+            matcher.gap();
+            continue;
         };
         let mut id = *start;
         let end = (*end).min(job.hot_start);
@@ -483,13 +473,7 @@ impl History {
         let thread = std::thread::Builder::new()
             .name("history-io".into())
             .spawn(move || {
-                let mut archive = Archive {
-                    budget: config.budget,
-                    segments: VecDeque::new(),
-                    end: 0,
-                    order_hint: None,
-                    encoded: Vec::new(),
-                };
+                let mut archive = Archive::new(config.budget);
                 let mut search_worker: Option<SearchWorker> = None;
                 while let Ok(request) = requests.recv() {
                     let result = match request {
@@ -760,21 +744,44 @@ impl Drop for History {
 }
 
 pub(crate) const READ_LIMIT: usize = 16 * 1024;
+struct ReadLine {
+    cursor: HistoryCursor,
+    text: String,
+}
 struct ReadText<'a> {
     read: &'a HistoryRead,
     cursor: HistoryCursor,
     text: String,
-    carry: String,
+    pending: VecDeque<ReadLine>,
     found: bool,
+    has_more: bool,
 }
 impl ReadText<'_> {
-    fn append(output: &mut String, text: &str) -> usize {
-        let mut count = (READ_LIMIT - output.len()).min(text.len());
-        while !text.is_char_boundary(count) {
+    fn append(&mut self, cursor: HistoryCursor, input: &str) -> bool {
+        let mut count = (READ_LIMIT - self.text.len()).min(input.len());
+        while !input.is_char_boundary(count) {
             count -= 1;
         }
-        output.push_str(&text[..count]);
-        count
+        self.text.push_str(&input[..count]);
+        self.advance(cursor, count, input.len());
+        count < input.len() || self.text.len() == READ_LIMIT
+    }
+    fn advance(&mut self, cursor: HistoryCursor, count: usize, length: usize) {
+        self.cursor = HistoryCursor {
+            offset: cursor.offset + count as u64,
+            ..cursor
+        };
+        self.has_more = cursor.row < self.read.end.0 || count < length;
+        if count == length && cursor.row < self.read.end.0 {
+            self.cursor.row += 1;
+            self.cursor.offset = 0;
+        }
+    }
+    fn skip_to(&mut self, row: u64) {
+        self.pending.clear();
+        self.cursor.row = row.min(self.read.end.0);
+        self.cursor.offset = 0;
+        self.has_more = row <= self.read.end.0;
     }
     fn row(&mut self, id: u64, row: &Row, bytes: &mut Vec<u8>) -> io::Result<bool> {
         if self.read.cancelled.load(Ordering::Relaxed) {
@@ -808,39 +815,76 @@ impl ReadText<'_> {
                 "History row changed or cursor offset is outside the requested output",
             )
         })?;
-        self.cursor.row = id;
-        self.cursor.offset = offset as u64;
-        let consumed = if self.found {
-            Self::append(&mut self.text, input)
-        } else {
-            let prefix = self.carry.len();
-            self.carry.push_str(input);
-            let query = self.read.query.as_deref().unwrap();
-            if let Some(found) = self.carry.find(query) {
-                self.found = true;
-                let appended = Self::append(&mut self.text, &self.carry[found..]);
-                self.carry.clear();
-                (found.saturating_sub(prefix)
-                    + appended.saturating_sub(prefix.saturating_sub(found)))
-                .min(input.len())
-            } else {
-                let mut keep = self
-                    .carry
-                    .len()
-                    .saturating_sub(query.len().saturating_sub(1));
-                while !self.carry.is_char_boundary(keep) {
-                    keep -= 1;
-                }
-                self.carry.drain(..keep);
-                input.len()
-            }
+        let cursor = HistoryCursor {
+            row: id,
+            offset: offset as u64,
+            ..self.cursor
         };
-        self.cursor.offset += consumed as u64;
-        if consumed == input.len() {
-            self.cursor.row = id + 1;
-            self.cursor.offset = 0;
+        let Some(query) = self.read.query.as_deref() else {
+            return Ok(self.append(cursor, input));
+        };
+        if self.found {
+            self.append(cursor, input);
+            return Ok(true);
         }
-        Ok(consumed < input.len() || self.text.len() == READ_LIMIT)
+        self.advance(cursor, input.len(), input.len());
+        self.pending.push_back(ReadLine {
+            cursor,
+            text: input.to_owned(),
+        });
+        let pending: String = self.pending.iter().map(|line| line.text.as_str()).collect();
+        if let Some(found) = pending.find(query) {
+            self.found = true;
+            let mut row_start = 0;
+            let mut previous_start = 0;
+            let mut excerpt_start = 0;
+            for line in &self.pending {
+                if found < row_start + line.text.len() {
+                    excerpt_start = previous_start;
+                    break;
+                }
+                previous_start = row_start;
+                row_start += line.text.len();
+            }
+            // Preserve the match before spending the byte budget on preceding context.
+            excerpt_start =
+                excerpt_start.max(found.saturating_sub(READ_LIMIT.saturating_sub(query.len())));
+            while !pending.is_char_boundary(excerpt_start) {
+                excerpt_start += 1;
+            }
+            let mut skipped = 0;
+            while let Some(line) = self.pending.pop_front() {
+                if skipped + line.text.len() <= excerpt_start {
+                    skipped += line.text.len();
+                    continue;
+                }
+                let from = excerpt_start.saturating_sub(skipped);
+                let full = self.append(
+                    HistoryCursor {
+                        offset: line.cursor.offset + from as u64,
+                        ..line.cursor
+                    },
+                    &line.text[from..],
+                );
+                skipped += line.text.len();
+                if full {
+                    return Ok(true);
+                }
+            }
+        } else {
+            let suffix_start = pending.len().saturating_sub(query.len().saturating_sub(1));
+            let mut skipped = 0;
+            let mut rows = 0usize;
+            for line in &self.pending {
+                if skipped + line.text.len() > suffix_start {
+                    break;
+                }
+                skipped += line.text.len();
+                rows += 1;
+            }
+            self.pending.drain(..rows.saturating_sub(1));
+        }
+        Ok(false)
     }
 }
 
@@ -850,22 +894,17 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
         .map_or(read.hot_start, |(_, start, _)| *start)
         .min(read.hot_start);
     let mut incomplete = read.incomplete || read.cursor.row < first;
-    let cursor = if read.cursor.row < first {
-        HistoryCursor {
-            row: first,
-            offset: 0,
-            ..read.cursor
-        }
-    } else {
-        read.cursor
-    };
     let mut output = ReadText {
         read,
-        cursor,
+        cursor: read.cursor,
         text: String::new(),
-        carry: String::new(),
-        found: read.query.is_none(),
+        pending: VecDeque::new(),
+        found: false,
+        has_more: true,
     };
+    if read.cursor.row < first {
+        output.skip_to(first);
+    }
     let mut cells = Vec::new();
     let mut bytes = Vec::new();
     let mut full = false;
@@ -873,25 +912,28 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
         if read.cancelled.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        if *start >= read.hot_start || *start > read.end.0 {
+        if !output.has_more || *start >= read.hot_start || *start > read.end.0 {
             break;
+        }
+        if *end <= output.cursor.row {
+            continue;
         }
         if *start > output.cursor.row {
             incomplete = true;
-            output.cursor.row = *start;
-            output.cursor.offset = 0;
-            output.carry.clear();
-        }
-        let mut file = match File::open(path) {
-            Ok(file) => BufReader::new(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                incomplete = true;
-                output.cursor.row = *end;
-                output.cursor.offset = 0;
-                output.carry.clear();
-                continue;
+            output.skip_to(*start);
+            if output.found {
+                full = true;
+                break;
             }
-            Err(error) => return Err(error),
+        }
+        let Some(mut file) = open_segment(path)? else {
+            incomplete = true;
+            output.skip_to(*end);
+            if output.found {
+                full = true;
+                break;
+            }
+            continue;
         };
         let from = output.cursor.row.max(*start);
         skip_rows(&mut file, from - *start)?;
@@ -910,13 +952,12 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
             break;
         }
     }
-    if !full && output.cursor.row < read.hot_start && output.cursor.row <= read.end.0 {
+    if !full && output.has_more && output.cursor.row < read.hot_start {
         incomplete = true;
-        output.cursor.row = read.hot_start;
-        output.cursor.offset = 0;
-        output.carry.clear();
+        output.skip_to(read.hot_start);
+        full = output.found;
     }
-    if !full {
+    if !full && output.has_more {
         for (index, row) in read
             .hot
             .iter()
@@ -934,7 +975,9 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
     }
     Ok(HistoryPage {
         text: output.text,
-        next: (output.cursor.row <= read.end.0).then_some(output.cursor),
+        cursor: output.cursor,
+        has_more: output.has_more,
+        matched: read.query.as_ref().map(|_| output.found),
         incomplete,
         command: read.command.clone(),
     })
@@ -955,6 +998,15 @@ struct Archive {
     encoded: Vec<u8>,
 }
 impl Archive {
+    fn new(budget: Arc<HistoryBudget>) -> Self {
+        Self {
+            budget,
+            segments: VecDeque::new(),
+            end: 0,
+            order_hint: None,
+            encoded: Vec::new(),
+        }
+    }
     fn first(&mut self) -> io::Result<u64> {
         while let Some(segment) = self.segments.front() {
             if segment.path.try_exists()? {
@@ -1030,16 +1082,11 @@ impl Archive {
             if segment.start >= end {
                 break;
             }
-            let mut file = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    // Another pane can evict a not-yet-open segment. Keep only a
-                    // contiguous suffix and retain its real row ID.
-                    actual = segment.end.min(end);
-                    rows.clear();
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(mut file) = open_segment(&segment.path)? else {
+                // Keep only a contiguous suffix and retain its real row ID.
+                actual = segment.end.min(end);
+                rows.clear();
+                continue;
             };
             let start = actual.max(segment.start);
             skip_rows(&mut file, start - segment.start)?;
@@ -1119,14 +1166,10 @@ impl Archive {
             if segment.start >= hot_start || segment.start > end.0 {
                 break;
             }
-            let mut reader = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    incomplete = true;
-                    next = segment.end.min(hot_start);
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(mut reader) = open_segment(&segment.path)? else {
+                incomplete = true;
+                next = segment.end.min(hot_start);
+                continue;
             };
             // Keep the segment open while copying it. Repeated small pages would
             // decode the same prefix for every batch, especially for empty rows.
@@ -1193,17 +1236,10 @@ impl Archive {
                 else {
                     return Ok(None);
                 };
-                let file = match File::open(&segment.path) {
-                    Ok(file) => file,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(error),
+                let Some(file) = open_segment(&segment.path)? else {
+                    return Ok(None);
                 };
-                input = Some((
-                    segment.start,
-                    segment.end,
-                    VecDeque::new(),
-                    BufReader::new(file),
-                ));
+                input = Some((segment.start, segment.end, VecDeque::new(), file));
             }
             let (next, _, rows, file) = input.as_mut().unwrap();
             while *next <= id {
@@ -1389,10 +1425,8 @@ impl Archive {
         }
         let mut cells = Vec::new();
         while let Some(segment) = self.segments.pop_front() {
-            let mut file = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+            let Some(mut file) = open_segment(&segment.path)? else {
+                continue;
             };
             output.archive.order_hint = Some(segment.order);
             for id in segment.start..segment.end {
@@ -1489,13 +1523,7 @@ struct ReflowOutput {
 impl ReflowOutput {
     fn new(budget: Arc<HistoryBudget>, request: &Reflow) -> Self {
         Self {
-            archive: Archive {
-                budget,
-                segments: VecDeque::new(),
-                end: 0,
-                order_hint: None,
-                encoded: Vec::new(),
-            },
+            archive: Archive::new(budget),
             tail: VecDeque::new(),
             pending: Vec::new(),
             row: Row::new(request.columns, Cell::default()),
@@ -1620,7 +1648,20 @@ impl ReflowOutput {
         Ok(row.cells)
     }
 }
-use std::os::unix::fs::OpenOptionsExt;
+/// `None` means another pane's append evicted the segment.
+fn open_segment(path: &Path) -> io::Result<Option<BufReader<File>>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(BufReader::new(file))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+fn remove_segment(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
 fn write_text(
     file: &mut impl Write,
     row: &Row,
@@ -1842,13 +1883,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut archive = Archive {
-            budget: HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap(),
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        };
+        let mut archive = Archive::new(HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap());
         let mut core = crate::core::Core::new(
             crate::core::WindowSize {
                 num_cols: 4,
@@ -1894,6 +1929,84 @@ mod tests {
         drop(worker);
         archive.clear().unwrap();
         drop(archive);
+    }
+    #[test]
+    fn text_query_matches_across_segments_hard_lines_and_the_cold_hot_boundary() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
+        fs::create_dir_all(&root).unwrap();
+        let directory = root.join(format!(
+            "read-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let budget = HistoryBudget::new(directory, 1024 * 1024).unwrap();
+        let mut core = crate::core::Core::new(
+            crate::core::WindowSize {
+                num_cols: 8,
+                num_lines: 8,
+                cell_width: 0,
+                cell_height: 0,
+            },
+            0xffffff,
+            0,
+        );
+        crate::vt::Parser::new().advance(
+            &mut core,
+            "before\r\nabcde中Xa\u{301}bc\r\nlast\r\nafter\r\ntail".as_bytes(),
+        );
+        let segments = [(0, 2), (2, 3)]
+            .into_iter()
+            .map(|(start, end)| {
+                let path: Arc<Path> = budget.directory.join(format!("{start}.rows")).into();
+                let mut file = File::create(&path).unwrap();
+                for id in start..end {
+                    write_row(&mut file, core.row(id)).unwrap();
+                }
+                (path, start as u64, end as u64)
+            })
+            .collect::<Vec<_>>();
+        let read = HistoryRead {
+            start: (0, 0),
+            end: (5, core.row(5).used()),
+            hot_start: 3,
+            hot: (3..=5).map(|id| core.row(id).clone()).collect(),
+            cursor: HistoryCursor {
+                epoch: 3,
+                row: 0,
+                offset: 0,
+            },
+            query: Some("中Xa\u{301}bc\nlast".into()),
+            incomplete: false,
+            command: None,
+            cancelled: Default::default(),
+        };
+        let page = read_archive(&read, &segments).unwrap();
+        assert_eq!(page.text, "before\nabcde中Xa\u{301}bc\nlast\nafter\n");
+        assert_eq!(page.matched, Some(true));
+        assert!(page.has_more);
+        assert!(!page.incomplete);
+        assert_eq!(
+            page.cursor,
+            HistoryCursor {
+                epoch: 3,
+                row: 5,
+                offset: 0
+            }
+        );
+
+        fs::remove_file(&segments[0].0).unwrap();
+        let missing = HistoryRead {
+            end: (0, core.row(0).used()),
+            hot: Vec::new(),
+            query: None,
+            ..read
+        };
+        let page = read_archive(&missing, &segments).unwrap();
+        assert_eq!(page.text, "");
+        assert_eq!(page.cursor.row, 0);
+        assert_eq!(page.cursor.offset, 0);
+        assert!(!page.has_more);
+        assert!(page.incomplete);
     }
     #[test]
     fn copied_unicode_and_combining_marks_survive_long_rows_and_prompt_filtering() {
@@ -1995,13 +2108,7 @@ mod tests {
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
         let budget = HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap();
-        let mut archive = Archive {
-            budget: budget.clone(),
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        };
+        let mut archive = Archive::new(budget.clone());
         let rows =
             vec![Row::from_parts(vec![Cell::default(); 80], false, 0, Vec::new()).unwrap(); 32];
         for _ in 0..625 {
@@ -2045,15 +2152,6 @@ mod eviction_tests {
         )
         .unwrap()
     }
-    fn archive(budget: Arc<HistoryBudget>) -> Archive {
-        Archive {
-            budget,
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        }
-    }
     fn row(id: u64) -> Row {
         let value = format!("{id:06} {}", "x".repeat(65));
         let cells = value
@@ -2069,7 +2167,7 @@ mod eviction_tests {
 
     #[test]
     fn removed_cached_segment_is_replaced_before_publishing_more_rows() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive.append(0, &[row(0)]).unwrap();
         fs::remove_file(&archive.segments.back().unwrap().path).unwrap();
         archive.append(1, &[row(1)]).unwrap();
@@ -2086,7 +2184,7 @@ mod eviction_tests {
             if evicted {
                 Arc::get_mut(&mut budget).unwrap().capacity = 1;
             }
-            let mut archive = archive(budget.clone());
+            let mut archive = Archive::new(budget.clone());
             archive
                 .append(0, &(0..BATCH as u64).map(row).collect::<Vec<_>>())
                 .unwrap();
@@ -2578,7 +2676,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                 row
             })
             .collect::<Vec<_>>();
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive.append(0, &rows[..300]).unwrap();
         for kind in [
             SelectionType::Lines,
@@ -2598,7 +2696,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn paging_and_copy_preserve_mixed_rows_after_long_empty_prefixes() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         let blank = Row::from_parts(vec![Cell::default(); 80], false, 0, Vec::new()).unwrap();
         let mut rows = vec![blank; 2000];
         rows[910] = row(910);
@@ -2636,7 +2734,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn paging_and_copy_only_require_the_requested_prefix_to_be_readable() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         let rows = (0..4).map(row).collect::<Vec<_>>();
         archive.append(0, &rows).unwrap();
         let mut prefix = Vec::new();
@@ -2714,8 +2812,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn unregister_distinguishes_segments_with_the_same_order() {
         let budget = budget();
-        let mut first = archive(budget.clone());
-        let mut second = archive(budget.clone());
+        let mut first = Archive::new(budget.clone());
+        let mut second = Archive::new(budget.clone());
         first.order_hint = Some(7);
         second.order_hint = Some(7);
         let row = Row::from_parts(
@@ -2765,7 +2863,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn height_reflow_preserves_cold_files_and_recovers_the_required_tail() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive
             .append(0, &(0..320).map(row).collect::<Vec<_>>())
             .unwrap();
@@ -2859,8 +2957,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn pages_return_the_actual_start_after_another_pane_evicts_the_old_prefix() {
         let budget = budget();
-        let mut first = archive(budget.clone());
-        let mut other = archive(budget);
+        let mut first = Archive::new(budget.clone());
+        let mut other = Archive::new(budget);
         let rows = (0..192).map(row).collect::<Vec<_>>();
         first.append(0, &rows).unwrap();
         other
@@ -2906,7 +3004,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn concurrent_eviction_marks_copy_incomplete_and_keeps_the_hot_suffix_in_order() {
         let budget = budget();
-        let mut first = archive(budget.clone());
+        let mut first = Archive::new(budget.clone());
         let rows = (0..192).map(row).collect::<Vec<_>>();
         first.append(0, &rows).unwrap();
         assert_eq!(first.first().unwrap(), 0);
@@ -2915,7 +3013,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         let flood_barrier = barrier.clone();
         let flood_evicted = evicted.clone();
         let thread = std::thread::spawn(move || {
-            let mut other = archive(budget);
+            let mut other = Archive::new(budget);
             flood_barrier.wait();
             let batch = (0..192).map(row).collect::<Vec<_>>();
             for _ in 0..4 {

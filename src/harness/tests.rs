@@ -394,7 +394,7 @@ fn shell_input_and_history_reads_share_the_target_and_preserve_later_turns() {
         calls.push(request.name.clone());
         let text = match request.name.as_str() {
             "shell" => json!({"command":7,"state":"running"}).to_string(),
-            "read" => json!({"command":7,"exit_code":0,"text":"same-shell","next_cursor":null})
+            "read" => json!({"command":7,"exit_code":0,"text":"same-shell","cursor":{"epoch":1,"row":1,"offset":10},"has_more":false,"incomplete":false})
                 .to_string(),
             "input" => json!({"screen":"#0 main"}).to_string(),
             name => panic!("unexpected terminal tool {name}"),

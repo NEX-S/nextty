@@ -2,6 +2,173 @@ use super::*;
 
 #[cfg(feature = "agent")]
 #[test]
+fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
+    use crate::wire::{Peer, Response};
+    use serde_json::json;
+    use std::os::unix::net::UnixListener;
+    let path =
+        std::path::PathBuf::from(format!("target/tui-agent-sync-{}.sock", std::process::id()));
+    let listener = UnixListener::bind(&path).unwrap();
+    let client = Client::connect(&path).unwrap();
+    let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
+    let size = WindowSize {
+        num_cols: 140,
+        num_lines: 40,
+        cell_width: 0,
+        cell_height: 0,
+    };
+    let mut snapshot = Snapshot {
+        name: "sync".into(),
+        controller: true,
+        focused: 1,
+        active_tab: 1,
+        tabs: Vec::new(),
+        panes: Vec::new(),
+    };
+    server
+        .send_response(Response::State(snapshot.clone(), Vec::new()))
+        .unwrap();
+    server
+        .send_response(Response::Agent {
+            kind: 5,
+            payload: Vec::new(),
+        })
+        .unwrap();
+    server.flush().unwrap();
+    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
+    frontend.poll().unwrap();
+    let sync = |frontend: &mut Frontend, server: &mut Peer| {
+        frontend
+            .ui
+            .poll_agent(&mut frontend.client, &frontend.config)
+            .unwrap();
+        frontend.client.flush().unwrap();
+        let mut views = Vec::<serde_json::Value>::new();
+        while let Some(action) = server.next_action().unwrap() {
+            if let Action::AgentView(payload) = action {
+                views.push(serde_json::from_slice(&payload).unwrap());
+            }
+        }
+        views
+    };
+    assert_eq!(sync(&mut frontend, &mut server).len(), 1);
+    assert!(sync(&mut frontend, &mut server).is_empty());
+    frontend.input(Input::Alt(b'a')).unwrap();
+    frontend.input(Input::Bytes(b"draft".to_vec())).unwrap();
+    let mut view = sync(&mut frontend, &mut server).pop().unwrap();
+    assert_eq!(view["open"], true);
+    assert_eq!(view["sessions"][0]["input"], "draft");
+
+    let attachment = json!(["registers", "pane 1", "Screen", "rax 0x1234", false]);
+    view["sessions"][0]["basket"] = json!([attachment]);
+    view["sessions"][0]["preview"] = json!([attachment, 999]);
+    view["focus"] = json!("controls");
+    view["keyboard"] = json!([9, 0]);
+    server
+        .send_response(Response::Agent {
+            kind: 0,
+            payload: serde_json::to_vec(&view).unwrap(),
+        })
+        .unwrap();
+    server.flush().unwrap();
+    frontend.poll().unwrap();
+    assert!(sync(&mut frontend, &mut server).is_empty());
+    assert_eq!(frontend.ui.agent.active().context.basket.len(), 1);
+    let mut output = Vec::new();
+    frontend.draw_agent(&mut output).unwrap();
+    assert_eq!(
+        sync(&mut frontend, &mut server)[0]["sessions"][0]["preview"][1],
+        0
+    );
+    frontend.draw_agent(&mut output).unwrap();
+    assert!(!frontend.ui.agent.view_dirty);
+    frontend.input(Input::Escape).unwrap();
+    assert!(sync(&mut frontend, &mut server)[0]["sessions"][0]["preview"].is_null());
+    frontend.input(Input::Bytes(b"\r".to_vec())).unwrap();
+    let view = sync(&mut frontend, &mut server).pop().unwrap();
+    assert_eq!(view["sessions"][0]["basket"], json!([]));
+
+    frontend.input(Input::Bytes(b"\x1b[Z".to_vec())).unwrap();
+    assert!(frontend.ui.focus == Focus::Output);
+    frontend.input(Input::Bytes(b"\x1b[5~".to_vec())).unwrap();
+    assert_eq!(
+        sync(&mut frontend, &mut server)[0]["sessions"][0]["scroll"],
+        10
+    );
+    frontend.draw_agent(&mut output).unwrap();
+    assert_eq!(
+        sync(&mut frontend, &mut server)[0]["sessions"][0]["scroll"],
+        0
+    );
+    frontend.draw_agent(&mut output).unwrap();
+    assert!(!frontend.ui.agent.view_dirty);
+    assert!(sync(&mut frontend, &mut server).is_empty());
+
+    let mut models = json!([[0, {
+        "messages": [["You", "earlier", null, 1]],
+        "busy": false, "revision": 1, "turn": 1
+    }]]);
+    server
+        .send_response(Response::Agent {
+            kind: 1,
+            payload: serde_json::to_vec(&models).unwrap(),
+        })
+        .unwrap();
+    server.flush().unwrap();
+    frontend.poll().unwrap();
+    assert!(sync(&mut frontend, &mut server).is_empty());
+    frontend.input(Input::Bytes(b"\x1b[Z".to_vec())).unwrap();
+    frontend.input(Input::Escape).unwrap();
+    assert_eq!(
+        sync(&mut frontend, &mut server)[0]["sessions"][0]["rewind_target"],
+        1
+    );
+    frontend.input(Input::Bytes(b"\r".to_vec())).unwrap();
+    sync(&mut frontend, &mut server);
+    models[0][1]["rewind_restore"] = json!([1, "earlier", [attachment]]);
+    server
+        .send_response(Response::Agent {
+            kind: 1,
+            payload: serde_json::to_vec(&models).unwrap(),
+        })
+        .unwrap();
+    server.flush().unwrap();
+    frontend.poll().unwrap();
+    let view = sync(&mut frontend, &mut server).pop().unwrap();
+    assert_eq!(view["sessions"][0]["input"], "earlier");
+    assert_eq!(view["sessions"][0]["basket"], json!([attachment]));
+    assert_eq!(view["sessions"][0]["rewind_applied"], 1);
+
+    snapshot.controller = false;
+    server
+        .send_response(Response::State(snapshot.clone(), Vec::new()))
+        .unwrap();
+    server.flush().unwrap();
+    frontend.poll().unwrap();
+    frontend.input(Input::Bytes(b" edited".to_vec())).unwrap();
+    assert!(sync(&mut frontend, &mut server).is_empty());
+    assert!(frontend.ui.agent.view_dirty);
+    snapshot.controller = true;
+    server
+        .send_response(Response::State(snapshot, Vec::new()))
+        .unwrap();
+    server.flush().unwrap();
+    frontend.poll().unwrap();
+    assert_eq!(
+        sync(&mut frontend, &mut server)[0]["sessions"][0]["input"],
+        "earlier edited"
+    );
+    frontend.input(Input::Bytes(b"\x1b[C".to_vec())).unwrap();
+    assert!(sync(&mut frontend, &mut server).is_empty());
+    assert!(!frontend.ui.agent.view_dirty);
+    drop(frontend);
+    drop(server);
+    drop(listener);
+    std::fs::remove_file(path).unwrap();
+}
+
+#[cfg(feature = "agent")]
+#[test]
 fn agent_markdown_renders_and_selects_the_visible_text() {
     use crate::core::Core;
     use std::os::unix::net::UnixListener;
@@ -722,7 +889,7 @@ fn agent_draft_selection_and_captured_paste_never_reach_the_pane() {
         &frontend.ui.agent.active().model.input[selection],
         "draft line"
     );
-    frontend.ui.agent.active_mut().context.preview = Some((
+    frontend.ui.agent.active_mut().context.preview = Some(crate::ui::ContextPreview::new(
         crate::ui::ContextItem {
             label: "Screen".into(),
             source: "test pane".into(),
