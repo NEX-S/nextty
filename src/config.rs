@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::{io::ErrorKind, path::PathBuf};
+use std::{borrow::Cow, io::ErrorKind, path::PathBuf};
 
 pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
 
@@ -349,7 +349,7 @@ impl<'a> Parser<'a> {
                 if !digits_valid(digits, radix) {
                     return Err(invalid());
                 }
-                return u64::from_str_radix(&digits.replace('_', ""), radix)
+                return u64::from_str_radix(&without_underscores(digits), radix)
                     .map(|value| value as f32)
                     .map_err(|_| invalid());
             }
@@ -371,7 +371,7 @@ impl<'a> Parser<'a> {
         {
             return Err(invalid());
         }
-        let cleaned = token.replace('_', "");
+        let cleaned = without_underscores(token);
         if fraction.is_some() || exponent.is_some() {
             cleaned
                 .parse::<f64>()
@@ -408,8 +408,16 @@ impl<'a> Parser<'a> {
                 "invalid configuration integer {token:?}"
             )));
         }
-        u64::from_str_radix(&digits.replace('_', ""), radix)
+        u64::from_str_radix(&without_underscores(digits), radix)
             .map_err(|_| Error::msg(format!("configuration integer out of range {token:?}")))
+    }
+}
+
+fn without_underscores(text: &str) -> Cow<'_, str> {
+    if text.contains('_') {
+        Cow::Owned(text.replace('_', ""))
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
