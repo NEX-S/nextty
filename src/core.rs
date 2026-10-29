@@ -1469,13 +1469,17 @@ impl Core {
         self.dirty = vec![true; lines];
     }
 
-    fn write_reply(&mut self, reply: impl Into<Cow<'static, str>>) {
-        let reply = reply.into();
+    #[inline]
+    fn write_reply(&mut self, reply: std::fmt::Arguments<'_>) {
         if let Some(Event::Write(previous)) = self.events.last_mut() {
-            previous.extend_from_slice(reply.as_bytes());
+            if let Some(text) = reply.as_str() {
+                previous.extend_from_slice(text.as_bytes());
+            } else {
+                std::io::Write::write_fmt(previous, reply).unwrap();
+            }
         } else {
             self.events
-                .push(Event::Write(reply.into_owned().into_bytes()));
+                .push(Event::Write(std::fmt::format(reply).into_bytes()));
         }
     }
     fn set_private(&mut self, mode: u16, enabled: bool) {
@@ -2340,15 +2344,15 @@ impl Core {
     }
     pub(crate) fn identify_terminal(&mut self, intermediate: Option<char>) {
         match intermediate {
-            None => self.write_reply("\x1b[?6c"),
-            Some('>') => self.write_reply("\x1b[>0;1;0c"),
-            Some('=') => self.write_reply("\x1bP!|00000000\x1b\\"),
+            None => self.write_reply(format_args!("\x1b[?6c")),
+            Some('>') => self.write_reply(format_args!("\x1b[>0;1;0c")),
+            Some('=') => self.write_reply(format_args!("\x1bP!|00000000\x1b\\")),
             _ => {}
         }
     }
     pub(crate) fn device_status(&mut self, status: usize) {
         match status {
-            5 => self.write_reply("\x1b[0n"),
+            5 => self.write_reply(format_args!("\x1b[0n")),
             6 => {
                 let point = self.active.cursor.point;
                 let top = if self.active.cursor.origin {
@@ -2357,7 +2361,7 @@ impl Core {
                     0
                 };
                 let line = (point.line - top).max(0) as usize;
-                self.write_reply(format!("\x1b[{};{}R", line + 1, point.column + 1));
+                self.write_reply(format_args!("\x1b[{};{}R", line + 1, point.column + 1));
             }
             _ => {}
         }
@@ -2368,7 +2372,7 @@ impl Core {
             20 => Some(self.mode.contains(Mode::LINE_FEED_NEW_LINE)),
             _ => None,
         };
-        self.write_reply(format!(
+        self.write_reply(format_args!(
             "\x1b[{};{}$y",
             mode,
             enabled.map_or(0, |enabled| if enabled { 1 } else { 2 })
@@ -2392,7 +2396,7 @@ impl Core {
             2026 => Some(Mode::SYNC_UPDATE),
             _ => None,
         };
-        self.write_reply(format!(
+        self.write_reply(format_args!(
             "\x1b[?{};{}$y",
             mode,
             flag.map_or(0, |flag| if self.mode().contains(flag) { 1 } else { 2 })
@@ -2429,7 +2433,7 @@ impl Core {
             })
         };
         let color = self.color(color);
-        self.write_reply(format!(
+        self.write_reply(format_args!(
             "\x1b]{prefix};rgb:{:04x}/{:04x}/{:04x}{terminator}",
             u16::from(color.r) * 257,
             u16::from(color.g) * 257,
@@ -2449,7 +2453,10 @@ impl Core {
     }
     pub(crate) fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
         if matches!(clipboard, b'c' | b'p' | b's') {
-            self.write_reply(format!("\x1b]52;{};{terminator}", char::from(clipboard)));
+            self.write_reply(format_args!(
+                "\x1b]52;{};{terminator}",
+                char::from(clipboard)
+            ));
         }
     }
     pub(crate) fn set_title(&mut self, title: Option<Cow<'_, str>>) {
@@ -2471,23 +2478,21 @@ impl Core {
         }
     }
     pub(crate) fn text_area_size_pixels(&mut self) {
-        self.write_reply(format!(
+        self.write_reply(format_args!(
             "\x1b[4;{};{}t",
             u32::from(self.size.num_lines) * u32::from(self.size.cell_height),
             u32::from(self.size.num_cols) * u32::from(self.size.cell_width)
         ));
     }
     pub(crate) fn text_area_size_chars(&mut self) {
-        self.write_reply(format!(
-            "\x1b[8;{};{}t",
-            self.size.num_lines, self.size.num_cols
-        ));
+        let size = self.size;
+        self.write_reply(format_args!("\x1b[8;{};{}t", size.num_lines, size.num_cols));
     }
     pub(crate) fn report_keyboard_mode(&mut self) {
-        self.write_reply("\x1b[?0u");
+        self.write_reply(format_args!("\x1b[?0u"));
     }
     pub(crate) fn report_modify_other_keys(&mut self) {
-        self.write_reply("\x1b[>4;0m");
+        self.write_reply(format_args!("\x1b[>4;0m"));
     }
 }
 
