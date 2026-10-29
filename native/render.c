@@ -85,7 +85,6 @@ struct NtLine {
 typedef struct {
     cairo_scaled_font_t *font;
     uint32_t glyph;
-    unsigned color;
     uint16_t x, y, width, height;
     int left, top;
 } CachedGlyph;
@@ -1191,11 +1190,11 @@ static int reserve_quads(NtRenderer *r, size_t count) {
 }
 
 static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
-    size_t hash = (((uintptr_t)glyph->font >> 4) ^ ((size_t)glyph->glyph * 2654435761u) ^ glyph->color_glyph) & (GLYPH_SLOTS - 1);
+    size_t hash = (((uintptr_t)glyph->font >> 4) ^ ((size_t)glyph->glyph * 2654435761u)) & (GLYPH_SLOTS - 1);
     size_t slot = hash;
     while (r->glyphs[slot].font) {
         CachedGlyph *entry = &r->glyphs[slot];
-        if (entry->font == glyph->font && entry->glyph == glyph->glyph && entry->color == glyph->color_glyph)
+        if (entry->font == glyph->font && entry->glyph == glyph->glyph)
             return entry;
         slot = (slot + 1) & (GLYPH_SLOTS - 1);
     }
@@ -1255,7 +1254,7 @@ static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
     }
     CachedGlyph *entry = &r->glyphs[slot];
     *entry = (CachedGlyph){ .font = cairo_scaled_font_reference(glyph->font), .glyph = glyph->glyph,
-        .color = glyph->color_glyph, .x = x, .y = y, .width = width,
+        .x = x, .y = y, .width = width,
         .height = height, .left = left, .top = top };
     ++r->glyph_count;
     return entry;
@@ -1353,8 +1352,8 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
             q = make_quad(x + glyph->x + (float)((entry->left + 0.5) * inverse_scale),
                        y + glyph->y + (float)((entry->top + 0.5) * inverse_scale),
                        (float)((entry->width - 1) * inverse_scale), (float)((entry->height - 1) * inverse_scale),
-                       glyph->color, entry->color ? 2 : 1);
-            float inverse_atlas = 1.f / r->atlas_size[entry->color != 0];
+                       glyph->color, glyph->color_glyph ? 2 : 1);
+            float inverse_atlas = 1.f / r->atlas_size[glyph->color_glyph != 0];
             q.uv[0] = (entry->x + 0.5f) * inverse_atlas;
             q.uv[1] = (entry->y + 0.5f) * inverse_atlas;
             q.uv[2] = (entry->width - 1) * inverse_atlas;
