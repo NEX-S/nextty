@@ -266,7 +266,15 @@ impl Monitor {
             .iter()
             .filter(|p| {
                 query.is_empty()
-                    || p.name.to_lowercase().contains(&query)
+                    || if p.name.is_ascii() {
+                        // comm names are short; compare ASCII without a lowercase allocation.
+                        p.name
+                            .as_bytes()
+                            .windows(query.len())
+                            .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                    } else {
+                        p.name.to_lowercase().contains(&query)
+                    }
                     || numeric
                         && (p.pid.to_string().contains(&query)
                             || p.uid.to_string().contains(&query))
