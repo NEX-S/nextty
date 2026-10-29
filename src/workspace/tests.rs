@@ -758,8 +758,18 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         client.snapshot().unwrap().panes.len() == 2
     });
     owner
-        .send(Action::Input {
+        .send(Action::AgentInput {
             pane,
+            request: 9,
+            generation: owner
+                .snapshot()
+                .unwrap()
+                .panes
+                .iter()
+                .find(|view| view.id == pane)
+                .unwrap()
+                .input_generation,
+            prompt: None,
             data: b"printf '\\142ackground-agent-ok\\n'\n".to_vec(),
         })
         .unwrap();
@@ -811,8 +821,18 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     });
     drop(frontend);
     owner
-        .send(Action::Input {
+        .send(Action::AgentInput {
             pane,
+            request: 9,
+            generation: owner
+                .snapshot()
+                .unwrap()
+                .panes
+                .iter()
+                .find(|view| view.id == pane)
+                .unwrap()
+                .input_generation,
+            prompt: None,
             data: b"printf '\\144etached-agent-ok\\n'\n".to_vec(),
         })
         .unwrap();
@@ -2141,7 +2161,7 @@ fn starting_selection_in_a_second_pane_clears_the_first_and_copies_the_new_text(
         .unwrap();
     wait(&mut client, |_, events| {
         events.iter().any(
-            |event| matches!(event, ClientEvent::Error(error) if error.contains("no selection")),
+            |event| matches!(event, ClientEvent::CopyError {request:78,error} if error.contains("no selection")),
         )
     });
 }
@@ -2653,6 +2673,8 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
             process: Default::default(),
             blocks: Vec::new(),
             command_blocks: Vec::new(),
+            input_generation: 0,
+            shell_prompt: None,
         }],
     };
     let mut core = crate::core::Core::new(size, 0xffffff, 0);
@@ -3029,4 +3051,270 @@ fn initial_demand_attach_error_can_draw_without_a_snapshot() {
     assert!(client.snapshot().is_none());
     assert!(!client.screen_waiting());
     assert!(client.prepare_screen().unwrap());
+}
+
+#[test]
+fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_results() {
+    use std::io::Read;
+    let server = TestServer::start();
+    let home = server.directory.join("home");
+    fs::write(home.join(".zshrc"), "").unwrap();
+    fs::write(home.join(".bashrc"), "").unwrap();
+    fs::create_dir(home.join("project")).unwrap();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    client
+        .send(Action::Create {
+            name: "agent-shell".into(),
+            options: CreateOptions {
+                directory: Some(home.clone()),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.panes[0].shell_prompt.is_some())
+    });
+    let pane = client.snapshot().unwrap().panes[0].clone();
+    let block = pane.shell_prompt.unwrap();
+    client.send(Action::AgentInput {
+        pane: pane.id, request: 1, generation: pane.input_generation, prompt: Some(block),
+        data: b"cd project; export NEXTTY_AGENT_VALUE=same-shell; printf '%s\\n' \"$NEXTTY_AGENT_VALUE\"\n".to_vec(),
+    }).unwrap();
+    let mut accepted = false;
+    wait(&mut client, |client, events| {
+        accepted |= events.iter().any(|event| matches!(event, ClientEvent::AgentInput {request:1, result:Ok(Some(id))} if *id==block));
+        accepted
+            && client.snapshot().unwrap().panes[0].shell_prompt.is_some()
+            && client.snapshot().unwrap().panes[0]
+                .command_blocks
+                .iter()
+                .any(|command| command.id == block && command.status == Some(0))
+    });
+    assert_eq!(
+        client.snapshot().unwrap().panes[0].cwd.as_ref(),
+        Some(&home.join("project"))
+    );
+    assert!(grid_contains(&client, "same-shell"));
+    client
+        .send(Action::AgentInput {
+            pane: pane.id,
+            request: 2,
+            generation: pane.input_generation,
+            prompt: Some(block),
+            data: b"printf wrong\n".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |_, events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::AgentInput {
+                    request: 2,
+                    result: Err(_)
+                }
+            )
+        })
+    });
+    client
+        .send(Action::Input {
+            pane: pane.id,
+            data: b"printf user-draft".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().panes[0].input_generation > pane.input_generation + 1
+    });
+    let generation = client.snapshot().unwrap().panes[0].input_generation;
+    assert!(client.snapshot().unwrap().panes[0].shell_prompt.is_none());
+    client
+        .send(Action::AgentInput {
+            pane: pane.id,
+            request: 3,
+            generation,
+            prompt: None,
+            data: b"; printf wrong\n".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |_, events| {
+        events.iter().any(|event| {
+            matches!(
+                event,
+                ClientEvent::AgentInput {
+                    request: 3,
+                    result: Err(_)
+                }
+            )
+        })
+    });
+    client
+        .send(Action::Input {
+            pane: pane.id,
+            data: b"\x15\n".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().panes[0].shell_prompt.is_some()
+    });
+    for _ in 0..5 {
+        let previous = client.snapshot().unwrap().panes[0].shell_prompt;
+        client
+            .send(Action::Input {
+                pane: pane.id,
+                data: b":\n".to_vec(),
+            })
+            .unwrap();
+        wait(&mut client, |client, _| {
+            client.snapshot().unwrap().panes[0]
+                .shell_prompt
+                .is_some_and(|id| Some(id) != previous)
+        });
+    }
+    assert!(
+        client.snapshot().unwrap().panes[0]
+            .command_blocks
+            .iter()
+            .all(|command| command.id != block)
+    );
+    for action in [
+        Action::ReadHistory {
+            pane: pane.id,
+            request: 11,
+            block: None,
+            cursor: None,
+            query: Some("same-shell".into()),
+        },
+        Action::ReadHistory {
+            pane: pane.id,
+            request: 12,
+            block: Some(u64::MAX),
+            cursor: None,
+            query: None,
+        },
+        Action::ReadHistory {
+            pane: pane.id,
+            request: 13,
+            block: Some(block),
+            cursor: None,
+            query: None,
+        },
+        Action::CopyBlock {
+            pane: pane.id,
+            request: 14,
+            block,
+        },
+        Action::CopyBlock {
+            pane: pane.id,
+            request: 15,
+            block: u64::MAX,
+        },
+        Action::CopyBlock {
+            pane: pane.id,
+            request: 16,
+            block,
+        },
+    ] {
+        client.peer.send_action(&action).unwrap();
+    }
+    client.flush().unwrap();
+    let mut received = HashSet::new();
+    let mut command_metadata = false;
+    wait(&mut client, |_, events| {
+        for event in events {
+            match event {
+                ClientEvent::Clipboard {
+                    request,
+                    file,
+                    incomplete,
+                } => {
+                    assert!(!incomplete);
+                    let mut output = String::new();
+                    file.try_clone()
+                        .unwrap()
+                        .read_to_string(&mut output)
+                        .unwrap();
+                    assert!(output.contains("same-shell"));
+                    received.insert(*request);
+                }
+                ClientEvent::CopyError { request, error } => {
+                    assert_eq!(*request, 15);
+                    assert!(error.contains("no longer retained"));
+                    received.insert(*request);
+                }
+                ClientEvent::History { request, result } => {
+                    if *request == 12 {
+                        assert!(result.as_ref().unwrap_err().contains("no longer retained"));
+                    } else {
+                        let page = result.as_ref().unwrap();
+                        assert!(!page.incomplete);
+                        assert!(page.text.contains("same-shell"));
+                        if *request == 13 {
+                            let command = page.command.as_ref().unwrap();
+                            assert_eq!(command.id, block);
+                            assert_eq!(command.status, Some(0));
+                            assert!(command.complete && command.has_output);
+                            command_metadata = true;
+                        }
+                    }
+                    received.insert(*request);
+                }
+                ClientEvent::Error(error) => panic!("uncorrelated error: {error}"),
+                _ => (),
+            }
+        }
+        received.len() == 6
+    });
+    assert_eq!(received, HashSet::from([11, 12, 13, 14, 15, 16]));
+    assert!(command_metadata);
+}
+
+#[test]
+fn closing_a_pane_completes_its_pending_history_read_without_more_terminal_events() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    client.send(Action::Create {
+        name:"read-close".into(),
+        options:CreateOptions {
+            program:Some(Shell::new("/bin/sh".into(),vec!["-c".into(),"i=0; while [ $i -lt 4000 ]; do printf 'history-%04d long-query-source\\n' $i; i=$((i+1)); done; printf READY; exec sleep 120".into()])),
+            ..CreateOptions::default()
+        },
+    }).unwrap();
+    wait(&mut client, |client, _| grid_contains(client, "READY"));
+    let pane = client.snapshot().unwrap().focused;
+    client
+        .send(Action::Split {
+            pane,
+            axis: Axis::LeftRight,
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().panes.len() == 2
+    });
+    client
+        .peer
+        .send_action(&Action::ReadHistory {
+            pane,
+            request: 99,
+            block: None,
+            cursor: None,
+            query: Some("no-such-history-match".into()),
+        })
+        .unwrap();
+    client.peer.send_action(&Action::ClosePane(pane)).unwrap();
+    client.flush().unwrap();
+    let mut finished = false;
+    wait(&mut client, |client, events| {
+        for event in events {
+            if let ClientEvent::History {
+                request: 99,
+                result,
+            } = event
+            {
+                assert!(result.as_ref().unwrap_err().contains("no longer exists"));
+                finished = true;
+            }
+        }
+        finished && client.snapshot().unwrap().panes.len() == 1
+    });
 }

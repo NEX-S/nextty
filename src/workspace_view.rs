@@ -528,12 +528,6 @@ impl WorkspaceView {
                     revents: 0,
                 }),
             );
-            #[cfg(feature = "agent")]
-            pollfds.extend(self.ui.agent.fds().map(|(fd, events)| libc::pollfd {
-                fd,
-                events,
-                revents: 0,
-            }));
             self.window.wait(&mut pollfds, timeout, &mut events)?;
             if pollfds[0].revents & libc::POLLOUT != 0 {
                 self.client.flush()?;
@@ -611,9 +605,13 @@ impl WorkspaceView {
                             truncated,
                         )?;
                     }
-                    ClientEvent::Error(error) => self.message(error),
+                    ClientEvent::Error(error) | ClientEvent::CopyError { error, .. } => {
+                        self.message(error)
+                    }
                     ClientEvent::Detached => self.running = false,
-                    ClientEvent::List(_) => (),
+                    ClientEvent::List(_)
+                    | ClientEvent::AgentInput { .. }
+                    | ClientEvent::History { .. } => (),
                     ClientEvent::ClipboardStore { primary, text } => {
                         self.window.selection(primary, &text)
                     }

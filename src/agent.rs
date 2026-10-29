@@ -1,7 +1,10 @@
 use crate::harness::{Event, Harness, TerminalRequest};
-use crate::workspace::{Action, Client};
+use crate::workspace::{Action, Client, ClientEvent};
+use serde_json::{Value, json};
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
-use std::{io, ops::Range, path::PathBuf};
+use std::time::{Duration, Instant};
+use std::{io, ops::Range};
 
 const INPUT_LIMIT: usize = 64 * 1024;
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
@@ -30,7 +33,8 @@ pub(crate) struct Agent {
     rewind: Option<String>,
     runtime: Option<Harness>,
     response: Option<usize>,
-    monitors: Vec<(u64, TerminalRequest)>,
+    operation: Option<Operation>,
+    observed_input: Option<(u64, u64)>,
 }
 
 impl Agent {
@@ -182,27 +186,11 @@ impl Agent {
         true
     }
 
-    pub fn is_goal(&self) -> io::Result<bool> {
-        let goal = self
-            .input
-            .trim_start()
-            .strip_prefix("/goal")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
-        if goal.is_some_and(|rest| rest.trim().is_empty()) {
-            return Err(io::Error::other(
-                "Use /goal followed by the task to complete",
-            ));
-        }
-        Ok(goal.is_some())
-    }
-
     pub fn send(
         &mut self,
         prompt: String,
-        cwd: Option<PathBuf>,
         config: &crate::config::Config,
         pane: u64,
-        remote: bool,
         target: serde_json::Value,
     ) -> io::Result<u64> {
         if self.busy {
@@ -211,16 +199,13 @@ impl Agent {
                 "Agent is still responding",
             ));
         }
-        let goal = self.is_goal()?;
         if self.runtime.is_none() {
-            self.runtime = Some(Harness::start(cwd, remote, config, self.turn)?);
+            self.runtime = Some(Harness::start(config, self.turn)?);
         }
-        let turn = self
-            .runtime
-            .as_ref()
-            .unwrap()
-            .send(prompt, pane, goal, target)?;
+        let generation = target["input_generation"].as_u64();
+        let turn = self.runtime.as_ref().unwrap().send(prompt, pane, target)?;
         self.turn = turn;
+        self.observed_input = generation.map(|generation| (pane, generation));
         self.messages.push(Message {
             turn,
             role: "You".into(),
@@ -281,12 +266,27 @@ impl Agent {
         Ok(())
     }
 
+    pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
+        self.abort()?;
+        if let Some(Operation {
+            stage: Stage::Read { id },
+            ..
+        }) = &self.operation
+        {
+            client.send(Action::CancelHistory { request: *id })?;
+        }
+        Ok(())
+    }
+
     pub fn poll(&mut self, client: &mut Client) -> io::Result<bool> {
+        self.advance(client)?;
         let Some(runtime) = &self.runtime else {
             return Ok(false);
         };
         let events = runtime.poll()?;
-        let changed = !events.is_empty();
+        let changed = events
+            .iter()
+            .any(|event| !matches!(event, Event::Terminal(_)));
         for event in events {
             match event {
                 Event::Text(text) => {
@@ -339,22 +339,7 @@ impl Agent {
                         });
                     }
                 }
-                Event::Terminal(request) => {
-                    if request.name == "monitor_terminal" {
-                        match request.input["block"].as_u64() {
-                            Some(block) => self.monitors.push((block, request)),
-                            None => self.runtime.as_ref().unwrap().respond(
-                                request,
-                                Err(io::Error::other(
-                                    "Missing shell block ID; inspect command_blocks first",
-                                )),
-                            )?,
-                        }
-                        continue;
-                    }
-                    let result = terminal_request(client, &request);
-                    self.runtime.as_ref().unwrap().respond(request, result)?;
-                }
+                Event::Terminal(request) => self.begin(request, client)?,
                 Event::Notice(text) => {
                     self.messages.push(Message {
                         turn: self.turn,
@@ -405,44 +390,8 @@ impl Agent {
             }
             self.trim();
         }
-        self.poll_monitors(client)?;
+        self.advance(client)?;
         Ok(changed)
-    }
-
-    pub fn poll_monitors(&mut self, client: &Client) -> io::Result<()> {
-        let mut pending = Vec::new();
-        for (block, request) in self.monitors.drain(..) {
-            let result = if request.canceled.load(Ordering::Acquire) {
-                Some(Err(io::ErrorKind::Interrupted.into()))
-            } else {
-                let marker = client
-                    .snapshot()
-                    .and_then(|s| {
-                        s.panes
-                            .iter()
-                            .find(|p| Some(p.id) == request.input["pane"].as_u64())
-                    })
-                    .and_then(|p| p.command_blocks.iter().find(|b| b.id == block));
-                match marker {
-                    Some(marker) if !marker.has_output => Some(Err(io::Error::other("This block is a prompt, not an executing shell command"))),
-                    Some(marker) if marker.status.is_none() => None,
-                    Some(marker) => Some(terminal_context(client,request.input["pane"].as_u64().unwrap(), false).map(|mut context| {
-                        context["command_finished"]=serde_json::json!({"block":block,"exit_code":marker.status,"source":"OSC133","output_incomplete":!marker.complete});
-                        context.to_string()
-                    })),
-                    None => Some(Err(io::Error::other("Shell block is no longer observable; cannot determine its exit status"))),
-                }
-            };
-            if let Some(result) = result {
-                if let Some(runtime) = &self.runtime {
-                    runtime.respond(request, result)?;
-                }
-            } else {
-                pending.push((block, request));
-            }
-        }
-        self.monitors = pending;
-        Ok(())
     }
 
     fn trim(&mut self) {
@@ -486,11 +435,7 @@ impl Agent {
     }
 }
 
-pub(crate) fn terminal_context(
-    client: &Client,
-    pane: u64,
-    html: bool,
-) -> io::Result<serde_json::Value> {
+pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<serde_json::Value> {
     let snapshot = client
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?;
@@ -503,7 +448,6 @@ pub(crate) fn terminal_context(
         .screens()
         .get(&pane)
         .ok_or_else(|| io::Error::other("No screen for pane"))?;
-    let capture = crate::context::snapshot(screen, None);
     Ok(serde_json::json!({
         "target": {
             "workspace": snapshot.name,
@@ -528,64 +472,315 @@ pub(crate) fn terminal_context(
             },
             "symbols": {"availability": "unknown"},
         },
-        "screen": if html {
-            crate::agent_context::html(screen)
-        } else {
-            crate::agent_context::shape(screen)
-        },
+        "screen": crate::agent_context::shape(screen),
         "command_blocks": view.command_blocks.iter().rev().map(|b| serde_json::json!({
             "id":b.id,"has_output":b.has_output,"exit_code":b.status,
             "output_incomplete":!b.complete,
         })).collect::<Vec<_>>(),
-        "raw_text": capture.text,
-        "incomplete": capture.incomplete,
+        "history_rows": screen.history,
+        "input_generation": view.input_generation,
+        "shell_prompt": view.shell_prompt,
     }))
 }
 
-fn terminal_request(client: &mut Client, request: &TerminalRequest) -> io::Result<String> {
-    if request.canceled.load(Ordering::Acquire) {
-        return Err(io::ErrorKind::Interrupted.into());
+static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
+
+struct Operation {
+    request: TerminalRequest,
+    stage: Stage,
+}
+
+enum Stage {
+    Input {
+        id: u64,
+        generation: u64,
+    },
+    Command {
+        command: u64,
+        until: Option<Instant>,
+    },
+    Read {
+        id: u64,
+    },
+    Change {
+        before: Value,
+    },
+}
+
+impl Agent {
+    pub fn deadline(&self) -> Option<Instant> {
+        self.operation
+            .as_ref()
+            .and_then(|operation| match operation.stage {
+                Stage::Command { until, .. } => until,
+                _ => None,
+            })
     }
-    let pane = request.input["pane"]
-        .as_u64()
-        .ok_or_else(|| io::Error::other("Missing pane ID"))?;
-    match request.name.as_str() {
-        "read_terminal" => {
-            Ok(terminal_context(client, pane, request.input["view"] == "html")?.to_string())
+
+    fn begin(&mut self, request: TerminalRequest, client: &mut Client) -> io::Result<()> {
+        let result = (|| {
+            if request.canceled.load(Ordering::Acquire) {
+                return Err(io::ErrorKind::Interrupted.into());
+            }
+            let pane = request.input["pane"].as_u64().unwrap();
+            match request.name.as_str() {
+                "shell" | "input" => {
+                    let shell = request.name == "shell";
+                    let view = client
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.panes.iter().find(|view| view.id == pane))
+                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    let field = if shell { "command" } else { "text" };
+                    let text = request.input[field]
+                        .as_str()
+                        .ok_or_else(|| io::Error::other(format!("Missing string {field}")))?;
+                    let prompt = if shell {
+                        Some(view.shell_prompt.ok_or_else(|| io::Error::other("The terminal is not at an untouched integrated shell prompt; read its state and use input for the current program"))?)
+                    } else {
+                        None
+                    };
+                    let mut data = text.as_bytes().to_vec();
+                    if shell {
+                        if client.screens().get(&pane).is_some_and(|screen| {
+                            screen.mode.contains(crate::core::Mode::BRACKETED_PASTE)
+                        }) {
+                            data = [
+                                b"\x1b[200~".as_slice(),
+                                data.as_slice(),
+                                b"\x1b[201~\r".as_slice(),
+                            ]
+                            .concat();
+                        } else {
+                            if text.chars().any(char::is_control) {
+                                return Err(io::Error::other(
+                                    "Shell editing controls require bracketed paste; use a single printable command",
+                                ));
+                            }
+                            data.push(b'\r');
+                        }
+                    }
+                    let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+                    let generation = self
+                        .observed_input
+                        .filter(|(target, _)| *target == pane)
+                        .map(|(_, generation)| generation)
+                        .ok_or_else(|| {
+                            io::Error::other("Read the current terminal state before sending input")
+                        })?;
+                    client.send(Action::AgentInput {
+                        pane,
+                        request: id,
+                        generation,
+                        prompt,
+                        data,
+                    })?;
+                    Ok(Stage::Input { id, generation })
+                }
+                "read" => {
+                    let source = request.input["source"].as_str().unwrap_or("screen");
+                    if source == "command" && request.input["wait"] == true {
+                        let command = request.input["command"]
+                            .as_u64()
+                            .ok_or_else(|| io::Error::other("Missing command ID"))?;
+                        Ok(Stage::Command {
+                            command,
+                            until: None,
+                        })
+                    } else if request.input["wait"] == true {
+                        Ok(Stage::Change {
+                            before: observation(&terminal_context(client, pane)?),
+                        })
+                    } else if source == "screen" {
+                        Ok(Stage::Change {
+                            before: Value::Null,
+                        })
+                    } else {
+                        let command = if source == "command" {
+                            Some(
+                                request.input["command"]
+                                    .as_u64()
+                                    .ok_or_else(|| io::Error::other("Missing command ID"))?,
+                            )
+                        } else if source == "history" {
+                            None
+                        } else {
+                            return Err(io::Error::other("Unknown terminal read source"));
+                        };
+                        read_output(client, &request, command)
+                    }
+                }
+                _ => Err(io::Error::other("Unknown terminal tool")),
+            }
+        })();
+        match result {
+            Ok(stage) => self.operation = Some(Operation { request, stage }),
+            Err(error) => request.respond(Err(error))?,
         }
-        "send_terminal" => {
-            let snapshot = client
-                .snapshot()
-                .ok_or_else(|| io::Error::other("No workspace"))?;
-            snapshot
-                .panes
-                .iter()
-                .find(|p| p.id == pane)
-                .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
-            if !client.can_agent_input() {
-                return Err(io::Error::other("Workspace is read-only"));
-            }
-            let text = request.input["text"]
-                .as_str()
-                .ok_or_else(|| io::Error::other("Missing terminal input text"))?;
-            let mut text = text.to_owned();
-            if request.input["submit"].as_bool() == Some(true) && !text.ends_with(['\r', '\n']) {
-                text.push('\r');
-            }
-            if text.len() > INPUT_LIMIT {
-                return Err(io::Error::other("Terminal input exceeds 64 KiB"));
-            }
-            let length = text.len();
-            client.send(Action::Input {
-                pane,
-                data: text.into_bytes(),
-            })?;
-            Ok(format!(
-                "Queued {length} input bytes to pane {pane}; read_terminal to inspect the result"
-            ))
-        }
-        _ => Err(io::Error::other("Unknown terminal tool")),
+        Ok(())
     }
+
+    pub fn handle_event(&mut self, event: &mut ClientEvent, client: &Client) -> io::Result<()> {
+        let id = match event {
+            ClientEvent::AgentInput { request, .. } | ClientEvent::History { request, .. } => {
+                *request
+            }
+            _ => return Ok(()),
+        };
+        if !self.operation.as_ref().is_some_and(|operation| matches!(operation.stage, Stage::Input {id:pending,..} | Stage::Read {id:pending} if pending == id)) {
+            return Ok(());
+        }
+        let mut operation = self.operation.take().unwrap();
+        let event = std::mem::replace(event, ClientEvent::Updated);
+        if operation.request.canceled.load(Ordering::Acquire) {
+            return operation
+                .request
+                .respond(Err(io::ErrorKind::Interrupted.into()));
+        }
+        match event {
+            ClientEvent::AgentInput { result, .. } => {
+                let Stage::Input { generation, .. } = operation.stage else {
+                    unreachable!()
+                };
+                if result.is_ok() {
+                    self.observed_input = Some((
+                        operation.request.input["pane"].as_u64().unwrap(),
+                        generation + 1,
+                    ));
+                }
+                match result {
+                    Ok(Some(command)) => {
+                        operation.stage = Stage::Command {
+                            command,
+                            until: Some(Instant::now() + Duration::from_secs(1)),
+                        };
+                        self.operation = Some(operation);
+                    }
+                    Ok(None) => {
+                        let pane = operation.request.input["pane"].as_u64().unwrap();
+                        operation
+                            .request
+                            .respond(terminal_context(client, pane).map(|mut context| {
+                                context["input_queued"] = json!(true);
+                                context["completion_signal"] = json!(false);
+                                context.to_string()
+                            }))?;
+                    }
+                    Err(error) => operation.request.respond(Err(io::Error::other(error)))?,
+                }
+            }
+            ClientEvent::History { result, .. } => {
+                let result = result.map(|page| {
+                    let marker = page.command.as_ref();
+                    json!({
+                        "source": if operation.request.name == "shell" {"command"} else {operation.request.input["source"].as_str().unwrap_or("history")},
+                        "command": marker.map(|marker| marker.id),
+                        "exit_code": marker.and_then(|marker| marker.status),
+                        "running": marker.map(|marker| marker.status.is_none()),
+                        "incomplete": page.incomplete,
+                        "next_cursor": page.next.as_ref().map(|cursor| json!({"epoch":cursor.epoch,"row":cursor.row,"offset":cursor.offset})),
+                        "text": page.text,
+                    }).to_string()
+                }).map_err(io::Error::other);
+                operation.request.respond(result)?;
+            }
+            _ => unreachable!(),
+        }
+        Ok(())
+    }
+
+    fn advance(&mut self, client: &mut Client) -> io::Result<()> {
+        if let Some(mut operation) = self.operation.take() {
+            let result = (|| -> io::Result<Option<String>> {
+                if operation.request.canceled.load(Ordering::Acquire) {
+                    if let Stage::Read { id } = operation.stage {
+                        client.send(Action::CancelHistory { request: id })?;
+                    }
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let pane = operation.request.input["pane"].as_u64().unwrap();
+                match &operation.stage {
+                    Stage::Command { command, until } => {
+                        let view = client
+                            .snapshot()
+                            .and_then(|snapshot| snapshot.panes.iter().find(|view| view.id == pane))
+                            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                        let marker = view
+                            .command_blocks
+                            .iter()
+                            .find(|block| block.id == *command);
+                        // Older completed commands fall outside the recent-status window.
+                        if marker.is_none_or(|marker| marker.status.is_some())
+                            || until.is_some_and(|until| Instant::now() >= until)
+                        {
+                            operation.stage =
+                                read_output(client, &operation.request, Some(*command))?;
+                        }
+                    }
+                    Stage::Change { before } => {
+                        let context = terminal_context(client, pane)?;
+                        if *before != observation(&context) {
+                            if operation.request.input["source"]
+                                .as_str()
+                                .unwrap_or("screen")
+                                == "screen"
+                            {
+                                self.observed_input =
+                                    Some((pane, context["input_generation"].as_u64().unwrap()));
+                                return Ok(Some(context.to_string()));
+                            }
+                            operation.stage = read_output(client, &operation.request, None)?;
+                        }
+                    }
+                    _ => (),
+                }
+                Ok(None)
+            })();
+            match result {
+                Ok(Some(text)) => operation.request.respond(Ok(text))?,
+                Ok(None) => self.operation = Some(operation),
+                Err(error) => operation.request.respond(Err(error))?,
+            }
+        }
+        Ok(())
+    }
+}
+
+fn observation(context: &Value) -> Value {
+    json!([
+        context["screen"],
+        context["history_rows"],
+        context["command_blocks"],
+        context["input_generation"],
+        context["shell_prompt"],
+    ])
+}
+
+fn read_output(
+    client: &mut Client,
+    request: &TerminalRequest,
+    command: Option<u64>,
+) -> io::Result<Stage> {
+    let cursor = request
+        .input
+        .get("cursor")
+        .filter(|cursor| !cursor.is_null())
+        .map(|cursor| -> io::Result<crate::history::HistoryCursor> {
+            Ok(crate::history::HistoryCursor {
+                epoch: serde_json::from_value(cursor["epoch"].clone())?,
+                row: serde_json::from_value(cursor["row"].clone())?,
+                offset: serde_json::from_value(cursor["offset"].clone())?,
+            })
+        })
+        .transpose()?;
+    let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+    client.send(Action::ReadHistory {
+        pane: request.input["pane"].as_u64().unwrap(),
+        request: id,
+        block: command,
+        cursor,
+        query: request.input["query"].as_str().map(str::to_owned),
+    })?;
+    Ok(Stage::Read { id })
 }
 
 #[cfg(test)]
@@ -694,7 +889,7 @@ mod tests {
         agent.messages.push(Message {
             turn: 2,
             role: "You".into(),
-            text: "/goal inspect the debugger".into(),
+            text: "inspect the debugger".into(),
             id: None,
         });
         agent.messages.push(Message {
@@ -707,13 +902,13 @@ mod tests {
         for index in 0..160 {
             agent.messages.push(Message {
                 turn: 2,
-                role: "read_terminal".into(),
+                role: "read".into(),
                 text: "x".repeat(4096),
                 id: Some(index.to_string()),
             });
             agent.trim();
         }
-        assert_eq!(agent.messages[0].text, "/goal inspect the debugger");
+        assert_eq!(agent.messages[0].text, "inspect the debugger");
         assert_eq!(agent.messages[agent.response.unwrap()].text, "working");
         assert!(agent.messages.iter().map(|m| m.text.len()).sum::<usize>() <= TRANSCRIPT_LIMIT);
         assert!(agent.messages.len() <= 128);
@@ -723,21 +918,14 @@ mod tests {
     fn rejected_send_keeps_the_draft_without_starting_a_worker() {
         let config = crate::config::Config::default();
         for (input, diagnostic) in [
-            ("/goal  ", "followed by the task"),
+            ("inspect current shell", "Set model"),
             ("keep 中文", "Set model"),
         ] {
             let mut agent = Agent::default();
             agent.insert(input).unwrap();
             let cursor = agent.cursor;
             let error = agent
-                .send(
-                    input.into(),
-                    None,
-                    &config,
-                    1,
-                    false,
-                    serde_json::Value::Null,
-                )
+                .send(input.into(), &config, 1, serde_json::Value::Null)
                 .unwrap_err();
             assert!(error.to_string().contains(diagnostic));
             assert_eq!(agent.input, input);

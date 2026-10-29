@@ -7,8 +7,8 @@ use crate::screen::Update;
 use crate::terminal::{ProcessMetadata, Shell};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 use crate::workspace::{
-    Action, Axis, BlockMarker, CommandBlock, CreateOptions, Direction, PaneView, Snapshot, TabView,
-    WorkspaceInfo,
+    Action, Axis, BlockMarker, CommandBlock, CreateOptions, Direction, HistoryCursor, HistoryPage,
+    PaneView, Snapshot, TabView, WorkspaceInfo,
 };
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -21,10 +21,22 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 13;
+pub(crate) const VERSION: u8 = 14;
 
 pub(crate) enum Response {
     ScreenDirty,
+    AgentInput {
+        request: u64,
+        result: Result<Option<u64>, String>,
+    },
+    CopyError {
+        request: u64,
+        error: String,
+    },
+    History {
+        request: u64,
+        result: Result<HistoryPage, String>,
+    },
     Agent {
         kind: u8,
         payload: Vec<u8>,
@@ -344,6 +356,45 @@ impl Peer {
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
         let mut encoder = Encoder::new();
         let file = match response {
+            Response::History { request, result } => {
+                encoder.u8(16);
+                encoder.u64(request);
+                encoder.bool(result.is_ok());
+                match result {
+                    Ok(page) => {
+                        encoder.string(&page.text);
+                        encode_cursor(&mut encoder, page.next);
+                        encoder.bool(page.incomplete);
+                        encoder.bool(page.command.is_some());
+                        if let Some(command) = page.command {
+                            encode_command(&mut encoder, &command);
+                        }
+                    }
+                    Err(error) => encoder.string(&error),
+                }
+                None
+            }
+            Response::CopyError { request, error } => {
+                encoder.u8(15);
+                encoder.u64(request);
+                encoder.string(&error);
+                None
+            }
+            Response::AgentInput { request, result } => {
+                encoder.u8(14);
+                encoder.u64(request);
+                encoder.bool(result.is_ok());
+                match result {
+                    Ok(block) => {
+                        encoder.bool(block.is_some());
+                        if let Some(block) = block {
+                            encoder.u64(block);
+                        }
+                    }
+                    Err(error) => encoder.string(&error),
+                }
+                None
+            }
             Response::ScreenDirty => {
                 encoder.u8(13);
                 None
@@ -661,6 +712,37 @@ impl Peer {
         while let Some(packet) = packet(&self.input[self.consumed..])? {
             let mut d = Decoder::new(packet)?;
             let response = match d.u8()? {
+                16 => {
+                    let request = d.u64()?;
+                    let result = if d.bool()? {
+                        Ok(HistoryPage {
+                            text: d.string(crate::history::READ_LIMIT)?,
+                            next: decode_cursor(&mut d)?,
+                            incomplete: d.bool()?,
+                            command: if d.bool()? {
+                                Some(decode_command(&mut d)?)
+                            } else {
+                                None
+                            },
+                        })
+                    } else {
+                        Err(d.string(65536)?)
+                    };
+                    Some(Response::History { request, result })
+                }
+                15 => Some(Response::CopyError {
+                    request: d.u64()?,
+                    error: d.string(65536)?,
+                }),
+                14 => {
+                    let request = d.u64()?;
+                    let result = if d.bool()? {
+                        Ok(if d.bool()? { Some(d.u64()?) } else { None })
+                    } else {
+                        Err(d.string(65536)?)
+                    };
+                    Some(Response::AgentInput { request, result })
+                }
                 13 => Some(Response::ScreenDirty),
                 12 => Some(Response::Agent {
                     kind: d.u8()?,
@@ -1140,6 +1222,47 @@ fn encode_action(e: &mut Encoder, action: &Action) {
         }
         Action::List => e.u8(3),
         Action::Input { pane, data } => encode_input(e, *pane, data),
+        Action::AgentInput {
+            pane,
+            request,
+            generation,
+            prompt,
+            data,
+        } => {
+            e.u8(33);
+            e.u64(*pane);
+            e.u64(*request);
+            e.u64(*generation);
+            e.bool(prompt.is_some());
+            if let Some(prompt) = prompt {
+                e.u64(*prompt);
+            }
+            e.bytes(data);
+        }
+        Action::CancelHistory { request } => {
+            e.u8(35);
+            e.u64(*request);
+        }
+        Action::ReadHistory {
+            pane,
+            request,
+            block,
+            cursor,
+            query,
+        } => {
+            e.u8(34);
+            e.u64(*pane);
+            e.u64(*request);
+            e.bool(block.is_some());
+            if let Some(block) = block {
+                e.u64(*block);
+            }
+            encode_cursor(e, *cursor);
+            e.bool(query.is_some());
+            if let Some(query) = query {
+                e.string(query);
+            }
+        }
         Action::Resize(size) => {
             e.u8(5);
             e.size(*size);
@@ -1304,6 +1427,25 @@ fn decode_side(d: &mut Decoder<'_>) -> io::Result<Side> {
 }
 fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
     Ok(match d.u8()? {
+        33 => Action::AgentInput {
+            pane: d.u64()?,
+            request: d.u64()?,
+            generation: d.u64()?,
+            prompt: if d.bool()? { Some(d.u64()?) } else { None },
+            data: d.bytes(MAX_FRAME)?.to_vec(),
+        },
+        35 => Action::CancelHistory { request: d.u64()? },
+        34 => Action::ReadHistory {
+            pane: d.u64()?,
+            request: d.u64()?,
+            block: if d.bool()? { Some(d.u64()?) } else { None },
+            cursor: decode_cursor(d)?,
+            query: if d.bool()? {
+                Some(d.string(MAX_FRAME)?)
+            } else {
+                None
+            },
+        },
         32 => Action::ScreenRequest,
         27 => Action::AgentOpen,
         28 => Action::AgentView(d.bytes(MAX_FRAME)?.to_vec()),
@@ -1488,6 +1630,42 @@ fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMet
         unavailable,
     })
 }
+fn encode_cursor(e: &mut Encoder, cursor: Option<HistoryCursor>) {
+    e.bool(cursor.is_some());
+    if let Some(cursor) = cursor {
+        e.u64(cursor.epoch);
+        e.u64(cursor.row);
+        e.u64(cursor.offset);
+    }
+}
+fn decode_cursor(d: &mut Decoder<'_>) -> io::Result<Option<HistoryCursor>> {
+    Ok(if d.bool()? {
+        Some(HistoryCursor {
+            epoch: d.u64()?,
+            row: d.u64()?,
+            offset: d.u64()?,
+        })
+    } else {
+        None
+    })
+}
+fn encode_command(e: &mut Encoder, command: &CommandBlock) {
+    e.u64(command.id);
+    e.bool(command.complete);
+    e.bool(command.has_output);
+    e.bool(command.status.is_some());
+    if let Some(status) = command.status {
+        e.i32(status);
+    }
+}
+fn decode_command(d: &mut Decoder<'_>) -> io::Result<CommandBlock> {
+    Ok(CommandBlock {
+        id: d.u64()?,
+        complete: d.bool()?,
+        has_output: d.bool()?,
+        status: if d.bool()? { Some(d.i32()?) } else { None },
+    })
+}
 fn encode_snapshot(
     e: &mut Encoder,
     snapshot: &Snapshot,
@@ -1511,6 +1689,11 @@ fn encode_snapshot(
         e.u16(pane.rect.rows);
         e.string(&pane.title);
         e.path(&pane.cwd);
+        e.u64(pane.input_generation);
+        e.bool(pane.shell_prompt.is_some());
+        if let Some(prompt) = pane.shell_prompt {
+            e.u64(prompt);
+        }
         let changed = previous
             .get(&pane.id)
             .is_none_or(|process| !Arc::ptr_eq(process, &pane.process));
@@ -1535,13 +1718,7 @@ fn encode_snapshot(
         }
         e.u32(pane.command_blocks.len() as u32);
         for block in &pane.command_blocks {
-            e.u64(block.id);
-            e.bool(block.complete);
-            e.bool(block.has_output);
-            e.bool(block.status.is_some());
-            if let Some(status) = block.status {
-                e.i32(status);
-            }
+            encode_command(e, block);
         }
     }
 }
@@ -1570,6 +1747,8 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
         };
         let title = d.string(65536)?;
         let cwd = d.path()?;
+        let input_generation = d.u64()?;
+        let shell_prompt = if d.bool()? { Some(d.u64()?) } else { None };
         let process = if d.bool()? {
             Arc::new(decode_process(d)?)
         } else {
@@ -1602,12 +1781,7 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
         let count = d.count(4)?;
         let mut command_blocks = Vec::with_capacity(count);
         for _ in 0..count {
-            command_blocks.push(CommandBlock {
-                id: d.u64()?,
-                complete: d.bool()?,
-                has_output: d.bool()?,
-                status: if d.bool()? { Some(d.i32()?) } else { None },
-            });
+            command_blocks.push(decode_command(d)?);
         }
         panes.push(PaneView {
             id,
@@ -1617,6 +1791,8 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
             process,
             blocks,
             command_blocks,
+            input_generation,
+            shell_prompt,
         });
     }
     Ok(Snapshot {
@@ -1899,6 +2075,8 @@ mod tests {
                 }),
                 blocks: Vec::new(),
                 command_blocks: Vec::new(),
+                input_generation: 0,
+                shell_prompt: None,
             }],
         };
         let mut known = HashMap::new();
@@ -1996,6 +2174,8 @@ mod tests {
                 process: Arc::new(expected.clone()),
                 blocks: Vec::new(),
                 command_blocks: command_blocks.clone(),
+                input_generation: 23,
+                shell_prompt: Some(44),
             }],
         };
         let (left, right) = UnixStream::pair().unwrap();
@@ -2011,6 +2191,8 @@ mod tests {
             panic!("state not delivered")
         };
         assert_eq!(*snapshot.panes[0].process, expected);
+        assert_eq!(snapshot.panes[0].input_generation, 23);
+        assert_eq!(snapshot.panes[0].shell_prompt, Some(44));
         assert_eq!(snapshot.panes[0].command_blocks, command_blocks);
     }
 

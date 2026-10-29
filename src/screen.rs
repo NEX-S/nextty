@@ -357,6 +357,8 @@ mod tests {
             cwd: None,
             blocks: core.visible_blocks(),
             command_blocks: core.recent_command_blocks(),
+            input_generation: 0,
+            shell_prompt: None,
         };
         let mut screen = Screen::default();
         screen.apply(Update::capture(&core, true)).unwrap();

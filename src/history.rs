@@ -217,6 +217,33 @@ pub struct HistoryCopy {
     pub incomplete: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HistoryCursor {
+    pub epoch: u64,
+    pub row: u64,
+    pub offset: u64,
+}
+
+#[derive(Debug)]
+pub struct HistoryPage {
+    pub text: String,
+    pub next: Option<HistoryCursor>,
+    pub incomplete: bool,
+    pub command: Option<crate::core::CommandBlock>,
+}
+
+pub(crate) struct HistoryRead {
+    pub start: (u64, usize),
+    pub end: (u64, usize),
+    pub hot_start: u64,
+    pub hot: Vec<Row>,
+    pub cursor: HistoryCursor,
+    pub query: Option<String>,
+    pub incomplete: bool,
+    pub command: Option<crate::core::CommandBlock>,
+    pub cancelled: Arc<AtomicBool>,
+}
+
 struct SearchJob {
     segments: Vec<(PathBuf, u64, u64)>,
     hot_start: u64,
@@ -228,9 +255,27 @@ struct SearchJob {
     wake: OwnedFd,
     sender: mpsc::Sender<io::Result<crate::search::SearchResult>>,
 }
+struct ReadJob {
+    read: HistoryRead,
+    segments: Vec<(PathBuf, u64, u64)>,
+    sender: mpsc::Sender<io::Result<HistoryPage>>,
+    wake: Arc<OwnedFd>,
+}
+enum SearchWork {
+    Find(SearchJob),
+    Read(ReadJob),
+}
+impl SearchWork {
+    fn cancelled(&self) -> &Arc<AtomicBool> {
+        match self {
+            Self::Find(job) => &job.cancelled,
+            Self::Read(job) => &job.read.cancelled,
+        }
+    }
+}
 #[derive(Default)]
 struct SearchState {
-    pending: VecDeque<SearchJob>,
+    pending: VecDeque<SearchWork>,
     active: Option<Arc<AtomicBool>>,
     closed: bool,
 }
@@ -252,13 +297,26 @@ impl SearchWorker {
                         return;
                     }
                     let job = state.pending.pop_front().unwrap();
-                    state.active = Some(Arc::clone(&job.cancelled));
+                    state.active = Some(Arc::clone(job.cancelled()));
                     drop(state);
-                    let result = search_archive(&job);
-                    if !job.cancelled.load(Ordering::Relaxed) {
-                        let _ = job.sender.send(result);
-                        if let Err(error) = notify(job.wake.as_raw_fd()) {
-                            eprintln!("notify pane search: {error}");
+                    match job {
+                        SearchWork::Find(job) => {
+                            let result = search_archive(&job);
+                            if !job.cancelled.load(Ordering::Relaxed) {
+                                let _ = job.sender.send(result);
+                                if let Err(error) = notify(job.wake.as_raw_fd()) {
+                                    eprintln!("notify pane search: {error}");
+                                }
+                            }
+                        }
+                        SearchWork::Read(job) => {
+                            let result = read_archive(&job.read, &job.segments);
+                            if !job.read.cancelled.load(Ordering::Relaxed) {
+                                let _ = job.sender.send(result);
+                                if let Err(error) = notify(job.wake.as_raw_fd()) {
+                                    eprintln!("notify history read: {error}");
+                                }
+                            }
                         }
                     }
                     lock.lock().unwrap().active = None;
@@ -266,13 +324,13 @@ impl SearchWorker {
             })?;
         Ok(Self(shared))
     }
-    fn submit(&self, job: SearchJob) {
+    fn submit(&self, job: SearchWork) {
         let (lock, changed) = &*self.0;
         let mut state = lock.lock().unwrap();
         state
             .pending
-            .retain(|job| !job.cancelled.load(Ordering::Relaxed));
-        if !job.cancelled.load(Ordering::Relaxed) {
+            .retain(|job| !job.cancelled().load(Ordering::Relaxed));
+        if !job.cancelled().load(Ordering::Relaxed) {
             state.pending.push_back(job);
             changed.notify_one();
         }
@@ -361,6 +419,10 @@ pub(crate) enum Reply {
     Error(io::Error),
 }
 enum Request {
+    Read {
+        read: HistoryRead,
+        sender: mpsc::Sender<io::Result<HistoryPage>>,
+    },
     Append {
         start: u64,
         rows: Vec<Row>,
@@ -431,6 +493,41 @@ impl History {
                 let mut search_worker: Option<SearchWorker> = None;
                 while let Ok(request) = requests.recv() {
                     let result = match request {
+                        Request::Read { read, sender } => {
+                            let setup = archive.first().and_then(|_| {
+                                if search_worker.is_none() {
+                                    search_worker = Some(SearchWorker::new()?);
+                                }
+                                Ok(())
+                            });
+                            match setup {
+                                Ok(()) => {
+                                    let segments = archive
+                                        .segments
+                                        .iter()
+                                        .filter(|segment| {
+                                            segment.end > read.cursor.row
+                                                && segment.start <= read.end.0
+                                        })
+                                        .map(|segment| {
+                                            (segment.path.clone(), segment.start, segment.end)
+                                        })
+                                        .collect();
+                                    search_worker.as_ref().unwrap().submit(SearchWork::Read(
+                                        ReadJob {
+                                            read,
+                                            segments,
+                                            sender,
+                                            wake: Arc::clone(&wake),
+                                        },
+                                    ));
+                                }
+                                Err(error) => {
+                                    let _ = sender.send(Err(error));
+                                }
+                            }
+                            None
+                        }
                         Request::Append { start, rows } => Some(
                             archive
                                 .append(start, &rows)
@@ -487,7 +584,10 @@ impl History {
                                         }
                                     }
                                 }
-                                search_worker.as_ref().unwrap().submit(job);
+                                search_worker
+                                    .as_ref()
+                                    .unwrap()
+                                    .submit(SearchWork::Find(job));
                             }
                             None
                         }
@@ -643,6 +743,12 @@ impl History {
         })?;
         Ok(receiver)
     }
+
+    pub fn read(&self, read: HistoryRead) -> io::Result<mpsc::Receiver<io::Result<HistoryPage>>> {
+        let (sender, receiver) = mpsc::channel();
+        self.send(Request::Read { read, sender })?;
+        Ok(receiver)
+    }
 }
 impl Drop for History {
     fn drop(&mut self) {
@@ -653,6 +759,188 @@ impl Drop for History {
             eprintln!("history worker panicked");
         }
     }
+}
+
+pub(crate) const READ_LIMIT: usize = 16 * 1024;
+struct ReadText<'a> {
+    read: &'a HistoryRead,
+    cursor: HistoryCursor,
+    text: String,
+    carry: String,
+    found: bool,
+}
+impl ReadText<'_> {
+    fn append(&mut self, text: &str) -> usize {
+        let mut count = (READ_LIMIT - self.text.len()).min(text.len());
+        while !text.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.text.push_str(&text[..count]);
+        count
+    }
+    fn row(&mut self, id: u64, row: &Row) -> io::Result<bool> {
+        if self.read.cancelled.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        let mut bytes = Vec::new();
+        let from = if id == self.read.start.0 {
+            self.read.start.1
+        } else {
+            0
+        };
+        let to = if id == self.read.end.0 {
+            self.read.end.1.min(row.used())
+        } else {
+            row.used()
+        };
+        write_text(&mut bytes, row, from, to, false)?;
+        if id != self.read.end.0 && !row.wrapped {
+            bytes.push(b'\n');
+        }
+        let rendered = String::from_utf8(bytes)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let offset = if id == self.cursor.row {
+            self.cursor.offset as usize
+        } else {
+            0
+        };
+        let input = rendered.get(offset..).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "History row changed or cursor offset is outside the requested output",
+            )
+        })?;
+        self.cursor.row = id;
+        self.cursor.offset = offset as u64;
+        let consumed = if self.found {
+            self.append(input)
+        } else {
+            let prefix = self.carry.len();
+            self.carry.push_str(input);
+            let query = self.read.query.as_deref().unwrap();
+            if let Some(found) = self.carry.find(query) {
+                self.found = true;
+                let matched = self.carry[found..].to_owned();
+                self.carry.clear();
+                (found.saturating_sub(prefix)
+                    + self
+                        .append(&matched)
+                        .saturating_sub(prefix.saturating_sub(found)))
+                .min(input.len())
+            } else {
+                let mut keep = self
+                    .carry
+                    .len()
+                    .saturating_sub(query.len().saturating_sub(1));
+                while !self.carry.is_char_boundary(keep) {
+                    keep -= 1;
+                }
+                self.carry.drain(..keep);
+                input.len()
+            }
+        };
+        self.cursor.offset += consumed as u64;
+        if consumed == input.len() {
+            self.cursor.row = id + 1;
+            self.cursor.offset = 0;
+        }
+        Ok(consumed < input.len() || self.text.len() == READ_LIMIT)
+    }
+}
+
+fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Result<HistoryPage> {
+    let first = segments
+        .first()
+        .map_or(read.hot_start, |(_, start, _)| *start)
+        .min(read.hot_start);
+    let mut incomplete = read.incomplete || read.cursor.row < first;
+    let cursor = if read.cursor.row < first {
+        HistoryCursor {
+            row: first,
+            offset: 0,
+            ..read.cursor
+        }
+    } else {
+        read.cursor
+    };
+    let mut output = ReadText {
+        read,
+        cursor,
+        text: String::new(),
+        carry: String::new(),
+        found: read.query.is_none(),
+    };
+    let mut cells = Vec::new();
+    let mut full = false;
+    for (path, start, end) in segments {
+        if read.cancelled.load(Ordering::Relaxed) {
+            return Err(io::ErrorKind::Interrupted.into());
+        }
+        if *start >= read.hot_start || *start > read.end.0 {
+            break;
+        }
+        if *start > output.cursor.row {
+            incomplete = true;
+            output.cursor.row = *start;
+            output.cursor.offset = 0;
+            output.carry.clear();
+        }
+        let mut file = match File::open(path) {
+            Ok(file) => BufReader::new(file),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                incomplete = true;
+                output.cursor.row = *end;
+                output.cursor.offset = 0;
+                output.carry.clear();
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        let from = output.cursor.row.max(*start);
+        cells = skip_rows(&mut file, from - *start, cells)?;
+        for id in from..(*end).min(read.hot_start) {
+            if id > read.end.0 {
+                break;
+            }
+            let row = read_row(&mut file, cells)?;
+            full = output.row(id, &row)?;
+            cells = row.cells;
+            if full {
+                break;
+            }
+        }
+        if full {
+            break;
+        }
+    }
+    if !full && output.cursor.row < read.hot_start && output.cursor.row <= read.end.0 {
+        incomplete = true;
+        output.cursor.row = read.hot_start;
+        output.cursor.offset = 0;
+        output.carry.clear();
+    }
+    if !full {
+        for (index, row) in read
+            .hot
+            .iter()
+            .enumerate()
+            .skip(output.cursor.row.saturating_sub(read.hot_start) as usize)
+        {
+            let id = read.hot_start + index as u64;
+            if id > read.end.0 {
+                break;
+            }
+            if output.row(id, row)? {
+                break;
+            }
+        }
+    }
+    Ok(HistoryPage {
+        text: output.text,
+        next: (output.cursor.row <= read.end.0).then_some(output.cursor),
+        incomplete,
+        command: read.command.clone(),
+    })
 }
 
 struct Segment {
@@ -1578,7 +1866,7 @@ mod tests {
             sender,
         };
         let worker = SearchWorker::new().unwrap();
-        worker.submit(job);
+        worker.submit(SearchWork::Find(job));
         let result = receiver
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap()

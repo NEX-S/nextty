@@ -275,6 +275,20 @@ impl Terminal {
             .copy_block(id)
     }
 
+    #[cfg(feature = "tui")]
+    pub fn read_history(
+        &self,
+        block: Option<u64>,
+        cursor: Option<crate::history::HistoryCursor>,
+        query: Option<String>,
+        cancelled: Arc<AtomicBool>,
+    ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryPage>>> {
+        self.core
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .read_history(block, cursor, query, cancelled)
+    }
+
     pub fn process_metadata(&self) -> Arc<ProcessMetadata> {
         self.process_metadata.lock().unwrap().clone()
     }

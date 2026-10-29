@@ -1,8 +1,6 @@
 use crate::core::{Flags, Mode};
 use crate::screen::Screen;
-use crate::vt::{Color, NamedColor};
 use serde_json::{Value, json};
-use std::fmt::Write;
 
 pub(crate) fn shape(screen: &Screen) -> Value {
     let mut rows = Vec::new();
@@ -50,13 +48,6 @@ pub(crate) fn shape(screen: &Screen) -> Value {
             rows.push(json!([index, text]));
         }
     }
-    let mut result = metadata(screen);
-    result["rows"] = Value::Array(rows);
-    result["omitted"] = Value::Array(omitted);
-    result
-}
-
-fn metadata(screen: &Screen) -> Value {
     let wrapped_rows: Vec<_> = screen
         .rows
         .iter()
@@ -65,6 +56,8 @@ fn metadata(screen: &Screen) -> Value {
         .collect();
     let cursor = screen.cursor();
     json!({
+        "rows": rows,
+        "omitted": omitted,
         "columns": screen.columns(),
         "lines": screen.screen_lines(),
         "alternate_screen": screen.mode().contains(Mode::ALT_SCREEN),
@@ -76,139 +69,6 @@ fn metadata(screen: &Screen) -> Value {
         },
         "wrapped_rows": wrapped_rows,
     })
-}
-
-fn html_escape(c: char, output: &mut String) {
-    match c {
-        '&' => output.push_str("&amp;"),
-        '<' => output.push_str("&lt;"),
-        '>' => output.push_str("&gt;"),
-        '"' => output.push_str("&quot;"),
-        '\'' => output.push_str("&#39;"),
-        _ => output.push(c),
-    }
-}
-
-fn html_color(screen: &Screen, color: Color, dim: bool) -> String {
-    let mut color = screen.color(color);
-    if dim {
-        color = color.dimmed();
-    }
-    format!("#{:02x}{:02x}{:02x}", color.r, color.g, color.b)
-}
-
-pub(crate) fn html(screen: &Screen) -> Value {
-    let mut styles = Vec::<String>::new();
-    let mut content = String::new();
-    for (index, row) in screen.rows.iter().enumerate() {
-        write!(content, "<span data-row=\"{index}\">").unwrap();
-        let end = row
-            .non_default_len()
-            .max(row.extras().last().map_or(0, |(column, _)| column + 1));
-        let mut previous = None;
-        for (_, cell, extra) in row.cells_with_extras(0..end) {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            let mut fg = html_color(screen, cell.fg, cell.flags.contains(Flags::DIM));
-            let mut bg = html_color(screen, cell.bg, false);
-            let inverse = cell.flags.contains(Flags::INVERSE);
-            if inverse {
-                std::mem::swap(&mut fg, &mut bg);
-            }
-            let mut style = format!("color:{fg};background:{bg}");
-            if cell.flags.contains(Flags::BOLD) {
-                style.push_str(";font-weight:bold");
-            }
-            if cell.flags.contains(Flags::ITALIC) {
-                style.push_str(";font-style:italic");
-            }
-            let underline = cell.flags.intersects(Flags::ALL_UNDERLINES);
-            let strike = cell.flags.contains(Flags::STRIKEOUT);
-            if underline || strike {
-                style.push_str(";text-decoration-line:");
-                if underline {
-                    style.push_str("underline");
-                }
-                if strike {
-                    if underline {
-                        style.push(' ');
-                    }
-                    style.push_str("line-through");
-                }
-                if underline {
-                    let kind = if cell.flags.contains(Flags::UNDERCURL) {
-                        "wavy"
-                    } else if cell.flags.contains(Flags::DOUBLE_UNDERLINE) {
-                        "double"
-                    } else if cell.flags.contains(Flags::DOTTED_UNDERLINE) {
-                        "dotted"
-                    } else if cell.flags.contains(Flags::DASHED_UNDERLINE) {
-                        "dashed"
-                    } else {
-                        "solid"
-                    };
-                    write!(style, ";text-decoration-style:{kind}").unwrap();
-                    if let Some(color) = extra.and_then(|e| e.underline_color) {
-                        write!(
-                            style,
-                            ";text-decoration-color:{}",
-                            html_color(screen, color, false)
-                        )
-                        .unwrap();
-                    }
-                }
-            }
-            let class = styles.iter().position(|s| *s == style).unwrap_or_else(|| {
-                styles.push(style);
-                styles.len() - 1
-            });
-            if previous != Some((class, inverse)) {
-                if previous.is_some() {
-                    content.push_str("</span>");
-                }
-                write!(content, "<span class=\"s{class}\"").unwrap();
-                if inverse {
-                    content.push_str(" data-inverse=\"true\"");
-                }
-                content.push('>');
-                previous = Some((class, inverse));
-            }
-            if cell.flags.contains(Flags::HIDDEN) {
-                content.push(' ');
-                if cell.flags.contains(Flags::WIDE_CHAR) {
-                    content.push(' ');
-                }
-            } else {
-                html_escape(cell.c, &mut content);
-                if let Some(extra) = extra {
-                    for c in &extra.zerowidth {
-                        html_escape(*c, &mut content);
-                    }
-                }
-            }
-        }
-        if previous.is_some() {
-            content.push_str("</span>");
-        }
-        content.push_str("</span>\n");
-    }
-    let mut output = String::from("<style>");
-    for (index, style) in styles.iter().enumerate() {
-        write!(output, ".s{index}{{{style}}}").unwrap();
-    }
-    write!(
-        output,
-        "</style><pre data-columns=\"{}\" data-lines=\"{}\" style=\"margin:0;white-space:pre;font-family:monospace;color:{};background:{}\">{content}</pre>",
-        screen.columns(),
-        screen.screen_lines(),
-        html_color(screen, Color::Named(NamedColor::Foreground), false),
-        html_color(screen, Color::Named(NamedColor::Background), false),
-    )
-    .unwrap();
-    let mut result = metadata(screen);
-    result["html"] = Value::String(output);
-    result
 }
 
 #[cfg(test)]
@@ -273,45 +133,5 @@ mod tests {
         );
         assert_eq!(result["wrapped_rows"], json!([0]));
         assert_eq!(result["omitted"], json!([]));
-    }
-
-    #[test]
-    fn html_preserves_color_inverse_and_text_without_leaking_hidden_cells() {
-        let source = screen(
-            40,
-            5,
-            "\x1b[38;2;255;0;0mAB\x1b[7mC\x1b[0m<&>\"'\r\n\x1b[1;2mD\x1b[0m\x1b[8m秘密\x1b[0m中e\u{301}",
-        );
-        let text_view = shape(&source);
-        let result = html(&source);
-        assert!(result.get("rows").is_none());
-        assert!(result.get("omitted").is_none());
-        assert_eq!(result["cursor"], text_view["cursor"]);
-        assert_eq!(result["wrapped_rows"], text_view["wrapped_rows"]);
-        let output = result["html"].as_str().unwrap();
-        assert!(output.contains("color:#ff0000;background:#000000"));
-        assert!(output.contains("color:#000000;background:#ff0000"));
-        assert!(output.contains("data-inverse=\"true\">C</span>"));
-        assert!(output.contains(">AB</span>"));
-        assert!(output.contains("&lt;&amp;&gt;&quot;&#39;"));
-        assert!(output.contains("color:#a8a8a8;background:#000000;font-weight:bold"));
-        assert!(!output.contains('秘'));
-        assert!(!output.contains('密'));
-        assert!(output.contains("    中e\u{301}"));
-        assert_eq!(output.matches("data-row=").count(), 5);
-    }
-
-    #[test]
-    fn html_keeps_background_on_blank_cells_and_original_row_numbers() {
-        let result = html(&screen(
-            8,
-            3,
-            "\x1b[48;2;0;0;238m\x1b[2K\x1b[0m\r\n────────",
-        ));
-        let output = result["html"].as_str().unwrap();
-        assert!(output.contains("background:#0000ee"));
-        assert!(output.contains(">        </span>"));
-        assert!(output.contains("data-row=\"1\""));
-        assert!(output.contains("────────"));
     }
 }

@@ -14,7 +14,7 @@ nextty is built around a small terminal core, explicit ownership of background w
 - **Workspaces:** tabs, nested splits, draggable dividers, named sessions, detach/attach, and multiple viewers. The latest attachment controls input and size; earlier attachments remain read-only.
 - **SSH sessions:** the same workspace UI through system OpenSSH. Authentication, host keys, aliases, and jump hosts use your SSH configuration. The remote machine needs no display server or extra listening port.
 - **Command-aware output:** Bash/Zsh integration records prompts, command output, and exit status. Jump between prompts, copy a command's output, or search retained history without sending search text to the shell.
-- **Agent panel:** separate conversations, streamed Markdown, terminal-context attachments, cancellable commands, background tasks, and conversation rewind. Conversations keep running after the frontend detaches.
+- **Agent panel:** separate conversations, streamed Markdown, terminal-context attachments, current-shell execution, paged history, and conversation rewind. Conversations keep running after the frontend detaches.
 - **Local tools:** an asynchronous file browser with fuzzy search and text preview, plus CPU, memory, network, process, and storage monitoring.
 
 The workspace layer is optional. A `gui`-only build opens one PTY directly, without nextty's tabs, panels, or session daemon. It works well as a desktop host for tmux.
@@ -157,9 +157,11 @@ Each conversation has its own draft, attachments, transcript, and worker. A loca
 
 A submission includes the focused pane's current viewport and backend process metadata. Selection and visible-screen attachments are immutable snapshots. They do not read process memory or issue debugger commands. Context is sent when you submit a message.
 
-The Agent can read the displayed terminal, send input to its existing application, run supporting local shell commands, monitor command completion, and delegate independent tasks. Supporting commands have a 120-second timeout; independent command monitors wait for actual exit. Local shell tools are unavailable for SSH workspaces, where the visible remote PTY remains the execution surface. Tool actions run with your permissions, not in a sandbox.
+The Agent works in the selected pane's existing PTY. It has three tools: `shell` submits a command at an untouched integrated shell prompt, `input` operates the current foreground program, and `read` retrieves the screen, command output, or terminal history. Shell submissions preserve the user's current directory, environment, aliases, functions, and job control. They require Bash/Zsh shell integration; if the foreground program or input state is unclear, the Agent must inspect it rather than start another shell. Input versions prevent a delayed Agent action from overwriting intervening user input.
 
-`/goal <task>` keeps working until the model finishes explicitly, you stop it, information is missing, or an error occurs. Background task results wake the parent without repeated model polling. Older observations can be retrieved from an archive, and long conversations use checkpoints and a source-referenced working-memory ledger. These mechanisms manage context; they do not make observations current or verify the model's conclusions.
+Reads do not scroll the window or alter selections. Command output and history are read asynchronously from the existing history store, including retained disk history. Results are bounded to 16 KiB and return cursors for subsequent pages; a read does not export or duplicate the entire history. Search runs away from the owner event loop. Alternate-screen reads show the current TUI, while history reads refer to the main terminal's retained text. Repainted TUI frames and evicted history cannot be recovered. Shell completion is reported by OSC 133, not inferred from a screen refresh or a quiet interval.
+
+Stopping a reply cancels model requests and waits; it does not send Ctrl+C or terminate programs already running in the user's terminal. Interrupting a foreground program is an explicit `input` action. The Agent runs locally, including for SSH workspaces, and credentials stay local. There is no independent command shell, subagent spawning, or `/goal` command. Long conversations retain recent complete exchanges and one rolling summary; older terminal output remains available through the history tools while retained.
 
 ## Architecture
 
@@ -218,7 +220,7 @@ The ANSI frontend emits terminal escape sequences from those visible rows instea
 - [workspace_view.rs](src/workspace_view.rs), [tui.rs](src/tui.rs), [desktop.rs](src/desktop.rs): desktop workspace, ANSI, and direct desktop frontends.
 - [paint.rs](src/paint.rs), [native/](native/): drawing packets, Wayland, font shaping, and Vulkan.
 - [history.rs](src/history.rs): bounded disk history and asynchronous history operations.
-- [agent_owner.rs](src/agent_owner.rs), [harness.rs](src/harness.rs), [agent_http.rs](src/agent_http.rs), [agent_command.rs](src/agent_command.rs): conversation ownership, model/tool loop, HTTP, and shell tools.
+- [agent_owner.rs](src/agent_owner.rs), [harness.rs](src/harness.rs), [agent_http.rs](src/agent_http.rs): conversation ownership, model/tool loop, HTTP, and terminal tools.
 - [files.rs](src/files.rs), [monitor.rs](src/monitor.rs), [system_stats.rs](src/system_stats.rs): file navigation and local resource monitoring.
 
 ## Performance details

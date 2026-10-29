@@ -477,3 +477,152 @@ fn synchronized_replay_obeys_disk_backpressure_without_exposing_partial_commits(
     assert_eq!(core.history_size(), 19998);
     assert!(!core.mode().contains(Mode::SYNC_UPDATE));
 }
+
+#[test]
+fn history_and_command_reads_keep_main_screen_contents_while_alternate_is_active() {
+    let mut core = core(30, 4, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    feed(
+        &mut core,
+        &mut parser,
+        b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07",
+    );
+    let block = core.blocks.back().unwrap().id;
+    let output = (0..700)
+        .map(|line| format!("line-{line:04} 中\r\n"))
+        .collect::<String>();
+    feed(&mut core, &mut parser, output.as_bytes());
+    feed(
+        &mut core,
+        &mut parser,
+        b"\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+    );
+    assert!(core.shell_prompt().is_some());
+    feed(&mut core, &mut parser, b"\x1b[?1049hALT-ONLY");
+    let cursor = core.cursor();
+    let selection = core.selection_range();
+    let command = core.copy_block(block).unwrap().recv().unwrap().unwrap();
+    assert!(!command.incomplete);
+    let command = text(command);
+    assert_eq!(command.lines().count(), 700);
+    assert!(command.starts_with("line-0000 中\n"));
+    assert!(command.ends_with("line-0699 中\n"));
+    let all = core
+        .read_history(None, None, None, Default::default())
+        .unwrap()
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert!(!all.incomplete);
+    let all = all.text;
+    assert!(all.contains("line-0000 中\n") && all.contains("line-0699 中\n"));
+    assert!(!all.contains("ALT-ONLY"));
+    assert_eq!(core.cursor(), cursor);
+    assert_eq!(core.selection_range(), selection);
+    assert!(core.mode().contains(Mode::ALT_SCREEN));
+    assert!(core.shell_prompt().is_none());
+}
+
+#[test]
+fn history_read_pages_utf8_searches_across_rows_and_rejects_stale_cursors() {
+    let mut core = core(64, 4, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    feed(
+        &mut core,
+        &mut parser,
+        b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07",
+    );
+    let block = core.blocks.back().unwrap().id;
+    let source = format!(
+        "{}中😀boundary-proof\r\nend-proof\r\n",
+        "x".repeat(16 * 1024 - 1)
+    );
+    feed(&mut core, &mut parser, source.as_bytes());
+    feed(
+        &mut core,
+        &mut parser,
+        b"\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07",
+    );
+    let first = core
+        .read_history(Some(block), None, None, Default::default())
+        .unwrap()
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert_eq!(first.text.len(), 16 * 1024 - 1);
+    assert!(!first.incomplete);
+    assert_eq!(first.command.as_ref().unwrap().status, Some(7));
+    let cursor = first.next.unwrap();
+    core.scroll_display(Scroll::Top);
+    settle(&mut core);
+    let offset = core.display_offset();
+    let next = core
+        .read_history(Some(block), Some(cursor), None, Default::default())
+        .unwrap()
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert!(next.text.starts_with("中😀boundary-proof\n"));
+    assert_eq!(
+        format!("{}{}", first.text, next.text),
+        source.replace("\r\n", "\n")
+    );
+    assert_eq!(core.display_offset(), offset);
+    let found = core
+        .read_history(
+            Some(block),
+            None,
+            Some("x中😀boundary-proof".into()),
+            Default::default(),
+        )
+        .unwrap()
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert!(found.text.starts_with("x中😀boundary-proof\n"));
+    assert!(found.text.contains("end-proof"));
+    core.resize(WindowSize {
+        num_cols: 80,
+        ..core.size
+    });
+    settle(&mut core);
+    let error = core
+        .read_history(Some(block), Some(cursor), None, Default::default())
+        .unwrap_err();
+    assert!(error.to_string().contains("stale"));
+}
+
+#[test]
+fn history_query_cursor_skips_ascii_and_unicode_prefixes_without_repeating_results() {
+    for prefix in ["prefix ", "中😀 "] {
+        let mut core = core(80, 4, budget(8 * 1024 * 1024));
+        let mut parser = Parser::new();
+        feed(
+            &mut core,
+            &mut parser,
+            b"\x1b]133;A\x07$ \x1b]133;B\x07build\r\n\x1b]133;C\x07",
+        );
+        let block = core.blocks.back().unwrap().id;
+        let tail = format!("MATCH {}\r\nend-proof\r\n", "z".repeat(20 * 1024));
+        feed(&mut core, &mut parser, format!("{prefix}{tail}").as_bytes());
+        feed(&mut core, &mut parser, b"\x1b]133;D;0\x07");
+        let mut page = core
+            .read_history(Some(block), None, Some("MATCH".into()), Default::default())
+            .unwrap()
+            .recv()
+            .unwrap()
+            .unwrap();
+        assert_eq!(page.text.len(), 16 * 1024);
+        let mut text = page.text;
+        while let Some(cursor) = page.next {
+            page = core
+                .read_history(Some(block), Some(cursor), None, Default::default())
+                .unwrap()
+                .recv()
+                .unwrap()
+                .unwrap();
+            text.push_str(&page.text);
+        }
+        assert_eq!(text, tail.replace("\r\n", "\n"));
+    }
+}

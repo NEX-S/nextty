@@ -63,9 +63,6 @@ mod agent_http;
 mod agent_context;
 
 #[cfg(feature = "agent")]
-mod agent_command;
-
-#[cfg(feature = "agent")]
 mod harness;
 
 #[cfg(feature = "agent")]

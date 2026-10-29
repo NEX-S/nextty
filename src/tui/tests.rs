@@ -522,6 +522,8 @@ fn global_shortcuts_and_layered_escape_keep_focus_and_drafts() {
             cwd: Some(std::env::current_dir().unwrap()),
             blocks: Vec::new(),
             command_blocks: Vec::new(),
+            input_generation: 0,
+            shell_prompt: None,
         }],
     };
     peer.send_state(&snapshot, &[], &Default::default())
@@ -827,6 +829,8 @@ fn shortening_selection_preserves_text_and_clears_unselected_padding() {
         cwd: None,
         blocks: Vec::new(),
         command_blocks: Vec::new(),
+        input_generation: 0,
+        shell_prompt: None,
     };
     let mut screen = Screen::default();
     let mut host = Core::new(size, 0xcccccc, 0x202020);
@@ -1046,6 +1050,8 @@ fn metadata_updates_remove_hover_from_unchanged_output_rows() {
             cwd: None,
             blocks: core.visible_blocks(),
             command_blocks: core.recent_command_blocks(),
+            input_generation: 0,
+            shell_prompt: None,
         }],
     };
     server
@@ -1296,6 +1302,8 @@ fn file_paste_edits_only_local_query_and_enter_inserts_a_quoted_path() {
                     cwd: Some(directory.clone()),
                     blocks: Vec::new(),
                     command_blocks: Vec::new(),
+                    input_generation: 0,
+                    shell_prompt: None,
                 }],
             },
             Vec::new(),
@@ -1394,6 +1402,8 @@ fn result_rows_keep_full_width_and_hover_preserves_selection() {
         cwd: None,
         blocks: core.visible_blocks(),
         command_blocks: core.recent_command_blocks(),
+        input_generation: 0,
+        shell_prompt: None,
     };
     let mut screen = Screen::default();
     screen.apply(Update::capture(&core, true)).unwrap();
@@ -1477,6 +1487,8 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
             cwd: None,
             blocks: Vec::new(),
             command_blocks: Vec::new(),
+            input_generation: 0,
+            shell_prompt: None,
         };
         let mut screen = Screen::default();
         screen.apply(Update::capture(&core, true)).unwrap();
@@ -1549,6 +1561,8 @@ fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
         cwd: None,
         blocks: Vec::new(),
         command_blocks: Vec::new(),
+        input_generation: 0,
+        shell_prompt: None,
     };
     let mut output = Vec::new();
     draw_row(&mut output, &screen, &pane, 0, 40, false).unwrap();

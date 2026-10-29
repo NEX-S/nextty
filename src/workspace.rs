@@ -2,11 +2,12 @@
 pub use crate::core::{BlockMarker, CommandBlock};
 use crate::core::{Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryConfig, HistoryCopy};
+pub use crate::history::{HistoryCursor, HistoryPage};
 use crate::screen::{Screen, Update};
 use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
 use crate::wire::{Peer, Response};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "agent")]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
@@ -18,6 +19,7 @@ use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -104,6 +106,13 @@ pub enum Action {
         pane: PaneId,
         data: Vec<u8>,
     },
+    AgentInput {
+        pane: PaneId,
+        request: u64,
+        generation: u64,
+        prompt: Option<u64>,
+        data: Vec<u8>,
+    },
     Resize(WindowSize),
     Split {
         /// Zero selects the focused pane when the server executes the action.
@@ -154,6 +163,16 @@ pub enum Action {
         block: u64,
         request: u64,
     },
+    ReadHistory {
+        pane: PaneId,
+        request: u64,
+        block: Option<u64>,
+        cursor: Option<HistoryCursor>,
+        query: Option<String>,
+    },
+    CancelHistory {
+        request: u64,
+    },
     Search {
         pane: PaneId,
         request: u64,
@@ -193,6 +212,8 @@ pub struct PaneView {
     pub process: Arc<crate::terminal::ProcessMetadata>,
     pub blocks: Vec<BlockMarker>,
     pub command_blocks: Vec<CommandBlock>,
+    pub input_generation: u64,
+    pub shell_prompt: Option<u64>,
 }
 #[derive(Clone, Debug)]
 pub struct Snapshot {
@@ -348,11 +369,23 @@ pub fn tab_chrome<'a>(
 
 pub enum ClientEvent {
     Updated,
+    AgentInput {
+        request: u64,
+        result: Result<Option<u64>, String>,
+    },
     List(Vec<WorkspaceInfo>),
     Clipboard {
         request: u64,
         file: File,
         incomplete: bool,
+    },
+    CopyError {
+        request: u64,
+        error: String,
+    },
+    History {
+        request: u64,
+        result: Result<HistoryPage, String>,
     },
     ClipboardStore {
         primary: bool,
@@ -660,6 +693,9 @@ impl Client {
                     ClientEvent::Updated
                 }
                 Response::List(list) => ClientEvent::List(list),
+                Response::AgentInput { request, result } => {
+                    ClientEvent::AgentInput { request, result }
+                }
                 Response::Clipboard {
                     request,
                     file,
@@ -669,6 +705,8 @@ impl Client {
                     file,
                     incomplete,
                 },
+                Response::CopyError { request, error } => ClientEvent::CopyError { request, error },
+                Response::History { request, result } => ClientEvent::History { request, result },
                 Response::ClipboardStore { primary, text } => {
                     ClientEvent::ClipboardStore { primary, text }
                 }
@@ -1257,6 +1295,18 @@ impl Drop for PaneSearch {
         }
     }
 }
+struct PendingRead {
+    request: u64,
+    pane: PaneId,
+    receiver: std::sync::mpsc::Receiver<io::Result<HistoryPage>>,
+    cancelled: Arc<AtomicBool>,
+}
+impl Drop for PendingRead {
+    fn drop(&mut self) {
+        self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
 struct Connection {
     screen_flow: ScreenFlow,
     agent: bool,
@@ -1270,7 +1320,9 @@ struct Connection {
     copy: Option<(u64, std::sync::mpsc::Receiver<io::Result<HistoryCopy>>)>,
     deferred: Option<Action>,
     ending: bool,
-    copy_request: Option<(String, Action)>,
+    copy_requests: VecDeque<(String, Action)>,
+    reads: Vec<PendingRead>,
+    read_requests: VecDeque<(String, Action)>,
     search: Option<PaneSearch>,
 }
 
@@ -1299,7 +1351,9 @@ impl Connection {
             copy: None,
             deferred: None,
             ending: false,
-            copy_request: None,
+            copy_requests: VecDeque::new(),
+            reads: Vec::new(),
+            read_requests: VecDeque::new(),
             search: None,
         })
     }
@@ -1338,7 +1392,9 @@ impl Connection {
         self.workspace = None;
         self.ending = true;
         self.deferred = None;
-        self.copy_request = None;
+        self.copy_requests.clear();
+        self.read_requests.clear();
+        self.reads.clear();
         self.copy = None;
         self.search = None;
         self.respond(Response::Detached);
@@ -1653,22 +1709,6 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
         }
         for client in &mut clients {
-            if let Some((name, action)) = client.copy_request.take() {
-                let pane = match action {
-                    Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. } => pane,
-                    _ => unreachable!(),
-                };
-                let result = workspaces
-                    .get(&name)
-                    .and_then(|workspace| workspace.panes.get(&pane))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
-                    })
-                    .and_then(|pane| queue_copy(client, &name, &pane.terminal, action));
-                if let Err(error) = result {
-                    client.respond(Response::Error(error.to_string()));
-                }
-            }
             let ready = client
                 .copy
                 .as_ref()
@@ -1688,7 +1728,85 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                         file: copy.file,
                         incomplete: copy.incomplete,
                     }),
-                    Err(error) => client.respond(Response::Error(error.to_string())),
+                    Err(error) => client.respond(Response::CopyError {
+                        request,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            while client.copy.is_none()
+                && let Some((name, action)) = client.copy_requests.pop_front()
+            {
+                let request = copy_request(&action);
+                let pane = match action {
+                    Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. } => pane,
+                    _ => unreachable!(),
+                };
+                let result = workspaces
+                    .get(&name)
+                    .and_then(|workspace| workspace.panes.get(&pane))
+                    .ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
+                    })
+                    .and_then(|pane| queue_copy(client, &name, &pane.terminal, action));
+                match result {
+                    Ok(true) => (),
+                    Ok(false) => break,
+                    Err(error) => client.respond(Response::CopyError {
+                        request,
+                        error: error.to_string(),
+                    }),
+                }
+            }
+        }
+        for client in &mut clients {
+            for index in (0..client.reads.len()).rev() {
+                if client
+                    .workspace
+                    .as_ref()
+                    .and_then(|name| workspaces.get(name))
+                    .is_none_or(|workspace| {
+                        !workspace.panes.contains_key(&client.reads[index].pane)
+                    })
+                {
+                    let read = client.reads.swap_remove(index);
+                    client.respond(Response::History {
+                        request: read.request,
+                        result: Err("history source pane no longer exists".into()),
+                    });
+                    continue;
+                }
+                let ready = match client.reads[index].receiver.try_recv() {
+                    Ok(result) => Some(result),
+                    Err(std::sync::mpsc::TryRecvError::Empty) => None,
+                    Err(std::sync::mpsc::TryRecvError::Disconnected) => Some(Err(io::Error::new(
+                        io::ErrorKind::BrokenPipe,
+                        "history reader disconnected",
+                    ))),
+                };
+                if let Some(result) = ready {
+                    let read = client.reads.swap_remove(index);
+                    client.respond(Response::History {
+                        request: read.request,
+                        result: result.map_err(|error| error.to_string()),
+                    });
+                }
+            }
+            for _ in 0..client.read_requests.len() {
+                let (name, action) = client.read_requests.pop_front().unwrap();
+                let (pane, request) = match &action {
+                    Action::ReadHistory { pane, request, .. } => (*pane, *request),
+                    _ => unreachable!(),
+                };
+                match workspaces
+                    .get(&name)
+                    .and_then(|workspace| workspace.panes.get(&pane))
+                {
+                    Some(pane) => queue_read(client, &name, &pane.terminal, action),
+                    None => client.respond(Response::History {
+                        request,
+                        result: Err("history source pane no longer exists".into()),
+                    }),
                 }
             }
         }
@@ -1845,6 +1963,8 @@ fn broadcast(
             .map_err(|error| io::Error::other(error.to_string()))?;
         let blocks = core.visible_blocks();
         let command_blocks = core.recent_command_blocks();
+        let input_generation = core.input_generation();
+        let shell_prompt = core.shell_prompt();
         let cwd = core.current_directory().map(Path::to_path_buf);
         if !core.mode().contains(Mode::SYNC_UPDATE) {
             let eligible = || {
@@ -1877,6 +1997,8 @@ fn broadcast(
             process,
             blocks,
             command_blocks,
+            input_generation,
+            shell_prompt,
         });
     }
     let mut all_snapshot = workspace.snapshot(panes)?;
@@ -1951,7 +2073,10 @@ fn apply_action(
     if clients[index].agent
         && !matches!(
             action,
-            Action::Input { .. }
+            Action::AgentInput { .. }
+                | Action::CopyBlock { .. }
+                | Action::ReadHistory { .. }
+                | Action::CancelHistory { .. }
                 | Action::AgentUpdate { .. }
                 | Action::Detach
                 | Action::ScreenRequest
@@ -1959,10 +2084,23 @@ fn apply_action(
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "agent owner can only update agent state or send PTY input",
+            "agent owner action is not authorized",
         ));
     }
     match action {
+        Action::CancelHistory { request } => {
+            clients[index].read_requests.retain(
+                |(_, action)| !matches!(action,Action::ReadHistory {request:id,..} if *id==request),
+            );
+            if let Some(position) = clients[index]
+                .reads
+                .iter()
+                .position(|read| read.request == request)
+            {
+                clients[index].reads.swap_remove(position);
+            }
+            return Ok(());
+        }
         Action::ScreenRequest => {
             clients[index].screen_flow = ScreenFlow::Requested;
             return Ok(());
@@ -2231,11 +2369,12 @@ fn apply_action(
         }
     }
     if workspace.controller != Some(client_id)
-        && !(clients[index].agent && matches!(action, Action::Input { .. }))
+        && !(clients[index].agent && matches!(action, Action::AgentInput { .. }))
         && !matches!(
             action,
             Action::CopySelection { .. }
                 | Action::CopyBlock { .. }
+                | Action::ReadHistory { .. }
                 | Action::Search { .. }
                 | Action::SearchCancel { .. }
                 | Action::Terminate
@@ -2253,21 +2392,64 @@ fn apply_action(
             .get(&id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane does not exist"))
     };
-    if let Action::Input { pane, data } = action {
-        let terminal = &pane_ref(pane)?.terminal;
-        let focus_report = data == b"\x1b[I" || data == b"\x1b[O";
-        terminal.try_write(data)?;
-        if !focus_report {
+    if let Action::AgentInput {
+        pane,
+        request,
+        generation,
+        prompt,
+        data,
+    } = action
+    {
+        let result = (|| -> io::Result<Option<u64>> {
+            let terminal = &pane_ref(pane)?.terminal;
             let mut core = terminal
                 .core
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            let selected = core.clear_selection();
-            let scrolled = core.display_offset() != 0;
-            core.scroll_display(Scroll::Bottom);
-            if selected || scrolled {
-                dirty.insert(workspace.name.clone());
+            if core.input_generation() != generation {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "Terminal input changed; observe it again before sending input",
+                ));
             }
+            if core.shell_editing() {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "The shell already has pending input",
+                ));
+            }
+            if let Some(prompt) = prompt
+                && core.shell_prompt() != Some(prompt)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    "The shell is not at an untouched prompt",
+                ));
+            }
+            terminal.try_write(data)?;
+            core.note_input();
+            core.clear_selection();
+            core.scroll_display(Scroll::Bottom);
+            Ok(prompt)
+        })()
+        .map_err(|error| error.to_string());
+        clients[index].respond(Response::AgentInput { request, result });
+        dirty.insert(workspace.name.clone());
+        return Ok(());
+    }
+    if let Action::Input { pane, data } = action {
+        let terminal = &pane_ref(pane)?.terminal;
+        let focus_report = data == b"\x1b[I" || data == b"\x1b[O";
+        let mut core = terminal
+            .core
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        terminal.try_write(data)?;
+        if !focus_report {
+            core.note_input();
+            core.clear_selection();
+            core.scroll_display(Scroll::Bottom);
+            dirty.insert(workspace.name.clone());
         }
         return Ok(());
     }
@@ -2480,14 +2662,6 @@ fn apply_action(
                 return Ok(());
             }
         }
-        action @ Action::CopySelection { pane, .. } => {
-            queue_copy(
-                &mut clients[index],
-                &name,
-                &pane_ref(pane)?.terminal,
-                action,
-            )?;
-        }
         Action::PromptJump { pane, previous } => {
             if !pane_ref(pane)?
                 .terminal
@@ -2499,14 +2673,24 @@ fn apply_action(
                 return Ok(());
             }
         }
-        action @ Action::CopyBlock { pane, .. } => {
-            queue_copy(
-                &mut clients[index],
-                &name,
-                &pane_ref(pane)?.terminal,
-                action,
-            )?;
+        action @ (Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. }) => {
+            let request = copy_request(&action);
+            if let Err(error) = pane_ref(pane)
+                .and_then(|pane| queue_copy(&mut clients[index], &name, &pane.terminal, action))
+            {
+                clients[index].respond(Response::CopyError {
+                    request,
+                    error: error.to_string(),
+                });
+            }
         }
+        action @ Action::ReadHistory { pane, request, .. } => match pane_ref(pane) {
+            Ok(pane) => queue_read(&mut clients[index], &name, &pane.terminal, action),
+            Err(error) => clients[index].respond(Response::History {
+                request,
+                result: Err(error.to_string()),
+            }),
+        },
         Action::Search {
             pane,
             request,
@@ -2650,26 +2834,69 @@ fn queue_copy(
     name: &str,
     terminal: &Terminal,
     action: Action,
-) -> io::Result<()> {
-    if client.copy.is_some() || client.copy_request.is_some() {
-        return Err(io::Error::new(
-            io::ErrorKind::WouldBlock,
-            "a history copy is already in progress",
-        ));
+) -> io::Result<bool> {
+    if client.copy.is_some() {
+        client.copy_requests.push_back((name.to_owned(), action));
+        return Ok(false);
     }
     let (request, result) = match action {
         Action::CopySelection { request, .. } => (request, terminal.copy_selection()),
         Action::CopyBlock { request, block, .. } => (request, terminal.copy_block(block)),
         _ => unreachable!(),
     };
-    match result {
-        Ok(receiver) => client.copy = Some((request, receiver)),
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            client.copy_request = Some((name.to_owned(), action))
+    let progressed = match result {
+        Ok(receiver) => {
+            client.copy = Some((request, receiver));
+            true
         }
-        Err(error) => return Err(error),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            client.copy_requests.push_back((name.to_owned(), action));
+            false
+        }
+        Err(error) => {
+            client.respond(Response::CopyError {
+                request,
+                error: error.to_string(),
+            });
+            true
+        }
+    };
+    Ok(progressed)
+}
+fn queue_read(client: &mut Connection, name: &str, terminal: &Terminal, action: Action) {
+    let Action::ReadHistory {
+        pane,
+        request,
+        block,
+        cursor,
+        ref query,
+        ..
+    } = action
+    else {
+        unreachable!()
+    };
+    let cancelled = Arc::new(AtomicBool::new(false));
+    match terminal.read_history(block, cursor, query.clone(), Arc::clone(&cancelled)) {
+        Ok(receiver) => client.reads.push(PendingRead {
+            request,
+            pane,
+            receiver,
+            cancelled,
+        }),
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            client.read_requests.push_back((name.to_owned(), action))
+        }
+        Err(error) => client.respond(Response::History {
+            request,
+            result: Err(error.to_string()),
+        }),
     }
-    Ok(())
+}
+fn copy_request(action: &Action) -> u64 {
+    match action {
+        Action::CopySelection { request, .. } | Action::CopyBlock { request, .. } => *request,
+        _ => unreachable!(),
+    }
 }
 fn validate_point(core: &crate::core::Core, point: Point) -> io::Result<()> {
     if point.column >= core.columns()

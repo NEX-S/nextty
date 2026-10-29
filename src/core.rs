@@ -1,5 +1,7 @@
 #[cfg(feature = "tui")]
-use crate::history::{History, HistoryConfig, HistoryCopy, Reflow, Reply};
+use crate::history::{
+    History, HistoryConfig, HistoryCopy, HistoryCursor, HistoryPage, HistoryRead, Reflow, Reply,
+};
 use crate::vt::{
     Attr, ClearMode, Color, CursorShape, LineClearMode, NamedColor, Rgb, StandardCharset,
 };
@@ -51,6 +53,7 @@ struct DiskHistory {
     stored_end: u64,
     spool: VecDeque<Row>,
     epoch: u64,
+    layout_epoch: u64,
     page_start: u64,
     page: Vec<Row>,
     requested: Option<(u64, u64)>,
@@ -838,6 +841,10 @@ pub struct Core {
     block_origin: u64,
     #[cfg(feature = "tui")]
     directory: Option<PathBuf>,
+    #[cfg(feature = "tui")]
+    input_generation: u64,
+    #[cfg(feature = "tui")]
+    prompt_dirty: bool,
 }
 
 impl Core {
@@ -874,6 +881,10 @@ impl Core {
             block_origin: 0,
             #[cfg(feature = "tui")]
             directory: None,
+            #[cfg(feature = "tui")]
+            input_generation: 0,
+            #[cfg(feature = "tui")]
+            prompt_dirty: false,
         }
     }
 
@@ -2490,6 +2501,7 @@ impl Core {
             stored_end: 0,
             spool: VecDeque::new(),
             epoch: 0,
+            layout_epoch: 0,
             page_start: 0,
             page: Vec::new(),
             requested: None,
@@ -2761,6 +2773,7 @@ impl Core {
             history.desired_size = None;
             history.requested = None;
             history.epoch += 1;
+            history.layout_epoch += 1;
         }
     }
     fn finish_history_resize(
@@ -2877,6 +2890,7 @@ impl Core {
             history.page.clear();
             history.requested = None;
             history.epoch += 1;
+            history.layout_epoch += 1;
             history.resizing = None;
             history.desired_size = desired_size;
         }
@@ -2886,6 +2900,36 @@ impl Core {
 
 #[cfg(feature = "tui")]
 impl Core {
+    pub fn input_generation(&self) -> u64 {
+        self.input_generation
+    }
+
+    pub fn note_input(&mut self) {
+        self.input_generation += 1;
+        self.prompt_dirty = true;
+    }
+
+    pub fn shell_prompt(&self) -> Option<u64> {
+        if self.mode.contains(Mode::ALT_SCREEN) || self.prompt_dirty {
+            return None;
+        }
+        let block = self.blocks.back()?;
+        let command = block.command?;
+        let cursor = BlockPoint {
+            row: self.block_origin + self.active.cursor.point.line as u64,
+            column: self.active.cursor.point.column + usize::from(self.active.cursor.wrap_pending),
+        };
+        (block.output.is_none() && block.end.is_none() && command == cursor).then_some(block.id)
+    }
+
+    pub fn shell_editing(&self) -> bool {
+        !self.mode.contains(Mode::ALT_SCREEN)
+            && self.prompt_dirty
+            && self.blocks.back().is_some_and(|block| {
+                block.command.is_some() && block.output.is_none() && block.end.is_none()
+            })
+    }
+
     pub fn current_directory(&self) -> Option<&Path> {
         self.directory.as_deref()
     }
@@ -3002,6 +3046,7 @@ impl Core {
                     status: None,
                     incomplete: false,
                 });
+                self.prompt_dirty = false;
                 self.next_block += 1;
             }
             b"B" => {
@@ -3016,6 +3061,7 @@ impl Core {
                     && block.end.is_none()
                 {
                     block.output = Some(point);
+                    self.prompt_dirty = false;
                 }
             }
             b"D" => {
@@ -3069,7 +3115,7 @@ impl Core {
             self.blocks.pop_front();
         }
     }
-    pub fn recent_command_blocks(&self) -> Vec<CommandBlock> {
+    fn command_metadata(&self, block: &Block) -> CommandBlock {
         let main = if self.mode.contains(Mode::ALT_SCREEN) {
             &self.inactive
         } else {
@@ -3082,18 +3128,21 @@ impl Core {
             },
             |history| history.first,
         );
+        CommandBlock {
+            id: block.id,
+            complete: block.end.is_some()
+                && !block.incomplete
+                && block.prompt.row >= first
+                && block.output.is_none_or(|point| point.row >= first),
+            status: block.status,
+            has_output: block.output.is_some(),
+        }
+    }
+    pub fn recent_command_blocks(&self) -> Vec<CommandBlock> {
         self.blocks
             .iter()
             .skip(self.blocks.len().saturating_sub(4))
-            .map(|block| CommandBlock {
-                id: block.id,
-                complete: block.end.is_some()
-                    && !block.incomplete
-                    && block.prompt.row >= first
-                    && block.output.is_none_or(|point| point.row >= first),
-                status: block.status,
-                has_output: block.output.is_some(),
-            })
+            .map(|block| self.command_metadata(block))
             .collect()
     }
     pub fn visible_blocks(&self) -> Vec<BlockMarker> {
@@ -3306,9 +3355,14 @@ impl Core {
                 "command has no output marker",
             )
         })?;
+        let main = if self.mode.contains(Mode::ALT_SCREEN) {
+            &self.inactive
+        } else {
+            &self.active
+        };
         let end = block.end.unwrap_or(BlockPoint {
-            row: self.block_origin + self.active.cursor.point.line as u64,
-            column: self.active.cursor.point.column + usize::from(self.active.cursor.wrap_pending),
+            row: self.block_origin + main.cursor.point.line as u64,
+            column: main.cursor.point.column + usize::from(main.cursor.wrap_pending),
         });
         let history = self.history.as_ref().ok_or_else(|| {
             std::io::Error::new(
@@ -3316,9 +3370,9 @@ impl Core {
                 "disk history is not enabled",
             )
         })?;
-        let first = self.block_origin.saturating_sub(self.history_size() as u64);
+        let first = history.first;
         let incomplete = block.incomplete || block.prompt.row < first || start.row < first;
-        let (hot_start, hot) = self.copy_hot_rows(history.hot_start, start.row, end.row);
+        let (hot_start, hot) = Self::copy_rows(&main.rows, history.hot_start, start.row, end.row);
         history.io.copy(
             (start.row, start.column),
             (end.row, end.column),
@@ -3328,22 +3382,107 @@ impl Core {
             incomplete,
         )
     }
+
+    pub fn read_history(
+        &mut self,
+        block: Option<u64>,
+        cursor: Option<HistoryCursor>,
+        query: Option<String>,
+        cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<HistoryPage>>> {
+        self.flush_history(true);
+        self.require_history_ready_for_copy()?;
+        let history = self.history.as_ref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "disk history is not enabled",
+            )
+        })?;
+        if cursor.is_some_and(|cursor| cursor.epoch != history.layout_epoch) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "History cursor is stale after terminal resize or clear; read again without a cursor",
+            ));
+        }
+        let main = if self.mode.contains(Mode::ALT_SCREEN) {
+            &self.inactive
+        } else {
+            &self.active
+        };
+        let (start, end, incomplete, command) = if let Some(id) = block {
+            let block = self
+                .blocks
+                .iter()
+                .find(|block| block.id == id)
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "command block no longer retained",
+                    )
+                })?;
+            let start = block.output.ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "command has no output marker",
+                )
+            })?;
+            let end = block.end.unwrap_or(BlockPoint {
+                row: self.block_origin + main.cursor.point.line as u64,
+                column: main.cursor.point.column + usize::from(main.cursor.wrap_pending),
+            });
+            (
+                (start.row, start.column),
+                (end.max(start).row, end.max(start).column),
+                block.incomplete || block.prompt.row < history.first || end < start,
+                Some(self.command_metadata(block)),
+            )
+        } else {
+            (
+                (0, 0),
+                (
+                    history.hot_start + main.rows.len() as u64 - 1,
+                    self.columns(),
+                ),
+                history.first != 0,
+                None,
+            )
+        };
+        let cursor = cursor.unwrap_or(HistoryCursor {
+            epoch: history.layout_epoch,
+            row: start.0,
+            offset: 0,
+        });
+        if cursor.row < start.0 || cursor.row > end.0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "History cursor is outside the requested command or history range",
+            ));
+        }
+        let (hot_start, hot) = Self::copy_rows(&main.rows, history.hot_start, cursor.row, end.0);
+        history.io.read(HistoryRead {
+            start,
+            end,
+            hot_start,
+            hot,
+            cursor,
+            query,
+            incomplete,
+            command,
+            cancelled,
+        })
+    }
 }
 
 #[cfg(feature = "tui")]
 impl Core {
-    fn copy_hot_rows(&self, hot_start: u64, start: u64, end: u64) -> (u64, Vec<Row>) {
-        let count = self.active.rows.len() as u64;
+    fn copy_rows(rows: &VecDeque<Row>, hot_start: u64, start: u64, end: u64) -> (u64, Vec<Row>) {
+        let count = rows.len() as u64;
         let from = start.saturating_sub(hot_start).min(count) as usize;
         let to = end.saturating_add(1).saturating_sub(hot_start).min(count) as usize;
         // A running command may move its cursor above its output marker.
         (
             hot_start + from as u64,
-            self.active
-                .rows
-                .range(from..to.max(from))
-                .cloned()
-                .collect(),
+            rows.range(from..to.max(from)).cloned().collect(),
         )
     }
 
@@ -3397,7 +3536,7 @@ impl Core {
         let (hot_start, hot) = if self.mode.contains(Mode::ALT_SCREEN) {
             (hot_start, self.active.rows.iter().cloned().collect())
         } else if kind == Some(SelectionType::Simple) {
-            self.copy_hot_rows(hot_start, start.0, end.0)
+            Self::copy_rows(&self.active.rows, hot_start, start.0, end.0)
         } else {
             let count = self.active.rows.len();
             let mut from = start.0.saturating_sub(hot_start).min(count as u64) as usize;

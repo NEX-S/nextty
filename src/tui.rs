@@ -307,12 +307,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     revents: 0,
                 },
             ]);
-            #[cfg(feature = "agent")]
-            fds.extend(frontend.ui.agent.fds().map(|(fd, events)| libc::pollfd {
-                fd,
-                events,
-                revents: 0,
-            }));
             let milliseconds = timeout.map_or(-1, |timeout| {
                 timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
             });
@@ -2211,7 +2205,7 @@ impl Frontend {
                     self.layout.extend(layout);
                 }
             }
-            ClientEvent::Error(error) => {
+            ClientEvent::Error(error) | ClientEvent::CopyError { error, .. } => {
                 self.copy_pending = false;
                 self.message(error);
             }
@@ -2271,7 +2265,8 @@ impl Frontend {
                     self.full = true;
                 }
             }
-            ClientEvent::List(_) => {}
+            ClientEvent::List(_) | ClientEvent::AgentInput { .. } | ClientEvent::History { .. } => {
+            }
         }
         Ok(())
     }

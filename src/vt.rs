@@ -13,7 +13,7 @@ pub struct Rgb {
 }
 
 impl Rgb {
-    #[cfg(any(feature = "gui", feature = "agent"))]
+    #[cfg(feature = "gui")]
     pub(crate) fn dimmed(self) -> Self {
         let channels = [self.r, self.g, self.b];
         let maximum = f32::from(*channels.iter().max().unwrap()) / 255.;
