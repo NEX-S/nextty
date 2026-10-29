@@ -1023,7 +1023,6 @@ impl Archive {
         let end = start.saturating_add(count as u64);
         let mut actual = start.max(first).min(end);
         let mut rows = Vec::with_capacity(count);
-        let mut cells = Vec::new();
         let begin = self
             .segments
             .partition_point(|segment| segment.end <= actual);
@@ -1045,8 +1044,7 @@ impl Archive {
             let start = actual.max(segment.start);
             skip_rows(&mut file, start - segment.start)?;
             for _ in start..segment.end.min(end) {
-                rows.push(read_row::<true>(&mut file, cells)?);
-                cells = Vec::new();
+                rows.push(read_row::<true>(&mut file, Vec::new())?);
             }
         }
         Ok((actual, rows))
