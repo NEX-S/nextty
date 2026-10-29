@@ -1284,28 +1284,34 @@ impl AgentPanel {
             .current
             .saturating_sub(count - 1)
             .min(self.sessions.len() - count);
-        let desired: Vec<usize> = (start..start + count)
-            .map(|index| (crate::width::text_width(self.sessions[index].title()) + 4).max(8))
+        // Reuse the column slot for desired widths while fitting the tabs.
+        let mut tabs: Vec<_> = (start..start + count)
+            .map(|index| {
+                (
+                    index,
+                    (crate::width::text_width(self.sessions[index].title()) + 4).max(8),
+                    0,
+                )
+            })
             .collect();
-        let mut widths = vec![0; count];
         let mut remaining = available;
         loop {
-            let pending = widths.iter().filter(|width| **width == 0).count();
+            let pending = tabs.iter().filter(|(_, _, width)| *width == 0).count();
             if pending == 0 {
                 break;
             }
             let share = remaining / pending;
             let mut fitted = false;
-            for index in 0..count {
-                if widths[index] == 0 && desired[index] <= share {
-                    widths[index] = desired[index];
-                    remaining -= desired[index];
+            for (_, desired, width) in &mut tabs {
+                if *width == 0 && *desired <= share {
+                    *width = *desired;
+                    remaining -= *desired;
                     fitted = true;
                 }
             }
             if !fitted {
                 let mut extra = remaining % pending;
-                for width in &mut widths {
+                for (_, _, width) in &mut tabs {
                     if *width == 0 {
                         *width = share + usize::from(extra > 0);
                         extra = extra.saturating_sub(1);
@@ -1314,11 +1320,10 @@ impl AgentPanel {
                 break;
             }
         }
-        let mut tabs = Vec::new();
         let mut x = 0;
-        for (offset, width) in widths.into_iter().enumerate() {
-            tabs.push((start + offset, x, width));
-            x += width;
+        for (_, column, width) in &mut tabs {
+            *column = x;
+            x += *width;
         }
         tabs
     }
