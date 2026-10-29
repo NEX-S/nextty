@@ -5,7 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -27,8 +27,8 @@ pub struct HistoryBudget {
     notifications: Mutex<Vec<std::sync::Weak<OwnedFd>>>,
 }
 struct BudgetFiles {
-    open: Option<(PathBuf, File)>,
-    files: VecDeque<(PathBuf, u64, u64)>,
+    open: Option<(Arc<Path>, File)>,
+    files: VecDeque<(Arc<Path>, u64, u64)>,
     used: u64,
 }
 impl HistoryBudget {
@@ -55,7 +55,7 @@ impl HistoryBudget {
     }
     fn append_file(
         &self,
-        path: &PathBuf,
+        path: &Arc<Path>,
         create: bool,
         data: &[u8],
         order: u64,
@@ -245,7 +245,7 @@ pub(crate) struct HistoryRead {
 }
 
 struct SearchJob {
-    segments: Vec<(PathBuf, u64, u64)>,
+    segments: Vec<(Arc<Path>, u64, u64)>,
     hot_start: u64,
     hot: Vec<Row>,
     query: String,
@@ -257,7 +257,7 @@ struct SearchJob {
 }
 struct ReadJob {
     read: HistoryRead,
-    segments: Vec<(PathBuf, u64, u64)>,
+    segments: Vec<(Arc<Path>, u64, u64)>,
     sender: mpsc::Sender<io::Result<HistoryPage>>,
     wake: Arc<OwnedFd>,
 }
@@ -846,7 +846,7 @@ impl ReadText<'_> {
     }
 }
 
-fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Result<HistoryPage> {
+fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::Result<HistoryPage> {
     let first = segments
         .first()
         .map_or(read.hot_start, |(_, start, _)| *start)
@@ -943,7 +943,7 @@ fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Res
 }
 
 struct Segment {
-    path: PathBuf,
+    path: Arc<Path>,
     start: u64,
     end: u64,
     bytes: u64,
@@ -1005,7 +1005,7 @@ impl Archive {
                 segment.end += chunk.len() as u64;
             } else {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
-                let path = self.budget.directory.join(format!("{id}.rows"));
+                let path: Arc<Path> = self.budget.directory.join(format!("{id}.rows")).into();
                 let order = self.order_hint.unwrap_or(id);
                 let bytes = self.budget.append_file(&path, true, &self.encoded, order)?;
                 self.segments.push_back(Segment {
