@@ -2433,12 +2433,18 @@ impl Core {
             })
         };
         let color = self.color(color);
-        self.write_reply(format_args!(
-            "\x1b]{prefix};rgb:{:04x}/{:04x}/{:04x}{terminator}",
-            u16::from(color.r) * 257,
-            u16::from(color.g) * 257,
-            u16::from(color.b) * 257
-        ));
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut rgb = *b"0000/0000/0000";
+        for (component, output) in [color.r, color.g, color.b]
+            .into_iter()
+            .zip(rgb.chunks_mut(5))
+        {
+            let high = HEX[(component >> 4) as usize];
+            let low = HEX[(component & 15) as usize];
+            output[..4].copy_from_slice(&[high, low, high, low]);
+        }
+        let rgb = std::str::from_utf8(&rgb).unwrap();
+        self.write_reply(format_args!("\x1b]{prefix};rgb:{rgb}{terminator}"));
     }
     pub(crate) fn clipboard_store(&mut self, clipboard: u8, data: &[u8]) {
         if !matches!(clipboard, b'c' | b'p' | b's') {
