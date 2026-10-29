@@ -396,7 +396,7 @@ impl WorkspaceView {
         let chip_top = editor_y - self.cell.1 * (attachment_rows as f32 + 0.5);
         let picking_rewind = self.ui.agent.active().rewind_index().is_some();
         let chat_end = chip_top - self.cell.1 * (0.5 + f32::from(picking_rewind));
-        self.ui.agent.active_mut().layout(columns);
+        self.ui.agent.prepare_layout(columns)?;
         let top = layout.top + tab_height + padding;
         let rows = ((chat_end - top) / self.cell.1).max(0.) as usize;
         if let Some(target) = self.ui.agent.active().rewind_index()

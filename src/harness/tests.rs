@@ -224,6 +224,96 @@ fn paired(messages: &[Value]) {
     }
     assert!(pending.is_empty(), "history ends with unmatched tool_use");
 }
+
+#[test]
+fn completed_tool_result_survives_a_full_event_queue() {
+    let server = Server::new(2, |index, body, stream| {
+        paired(body["messages"].as_array().unwrap());
+        if index == 0 {
+            sse(
+                stream,
+                response(
+                    "",
+                    &[
+                        ("completed", "shell", json!({"command":"one side effect"})),
+                        ("unstarted", "input", json!({"text":"must not run\n"})),
+                    ],
+                ),
+            );
+        } else {
+            let messages = body["messages"].as_array().unwrap();
+            let results = messages
+                .iter()
+                .find_map(|message| {
+                    message["content"].as_array().filter(|blocks| {
+                        blocks
+                            .first()
+                            .is_some_and(|block| block["type"] == "tool_result")
+                    })
+                })
+                .unwrap();
+            assert_eq!(results[0]["content"], "unique executed result");
+            assert_eq!(results[0]["is_error"], false);
+            assert_eq!(results[1]["tool_use_id"], "unstarted");
+            assert_eq!(results[1]["is_error"], true);
+            sse(stream, response("Recovered after backpressure.", &[]));
+        }
+    });
+    let worker = Worker::new(server.url.clone());
+    let agent = worker.agent();
+    agent.send("execute once".into(), 17, json!({})).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let request = loop {
+        assert!(Instant::now() < deadline);
+        wait(agent.fd(), 50).unwrap();
+        if let Some(request) = agent.poll().unwrap().into_iter().find_map(|event| {
+            if let Event::Terminal(request) = event {
+                Some(request)
+            } else {
+                None
+            }
+        }) {
+            break request;
+        }
+    };
+    assert_eq!(request.name, "shell");
+    for _ in 0..1024 {
+        emit(&agent.shared, Event::Notice(String::new())).unwrap();
+    }
+    request
+        .respond(Ok("unique executed result".into()))
+        .unwrap();
+    while agent.shared.state.lock().unwrap().active.is_some()
+        && !agent.worker.as_ref().unwrap().is_finished()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "turn did not settle under backpressure"
+        );
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert!(
+        !agent.worker.as_ref().unwrap().is_finished(),
+        "backpressure killed the session"
+    );
+    let events = agent.poll().unwrap();
+    assert!(events.iter().any(|event| matches!(event, Event::Settled)));
+    assert!(
+        events
+            .iter()
+            .all(|event| !matches!(event, Event::Terminal(_)))
+    );
+    agent.send("continue".into(), 17, json!({})).unwrap();
+    let events = settled(agent, |_| panic!("unstarted tool was replayed"));
+    assert!(events.iter().any(
+        |event| matches!(event, Event::Text(text) if text == "Recovered after backpressure.")
+    ));
+    for turn in worker.finish().0 {
+        paired(&turn.messages);
+    }
+    server.finish();
+}
+
 #[test]
 fn shell_input_and_history_reads_share_the_target_and_preserve_later_turns() {
     let server = Server::new(5, |index, body, stream| {

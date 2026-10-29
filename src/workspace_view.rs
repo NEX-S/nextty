@@ -521,6 +521,8 @@ impl WorkspaceView {
                     ),
                     #[cfg(feature = "monitor")]
                     (self.ui.resources.stats.fd(), libc::POLLIN),
+                    #[cfg(feature = "agent")]
+                    (self.ui.agent.layout_fd(), libc::POLLIN),
                 ]
                 .map(|(fd, events)| libc::pollfd {
                     fd,
@@ -623,6 +625,7 @@ impl WorkspaceView {
                 self.ui.agent.width = Some(self.agent_width);
                 let (changed, messages_changed) =
                     self.ui.poll_agent(&mut self.client, &self.config)?;
+                let layout_changed = self.ui.agent.poll_layout()?;
                 if let Some(width) = self.ui.agent.width {
                     self.agent_width = width;
                 }
@@ -642,7 +645,7 @@ impl WorkspaceView {
                         )
                     });
                 }
-                self.dirty |= changed && self.ui.agent.open;
+                self.dirty |= changed && self.ui.agent.open || layout_changed;
             }
             self.refresh_hover();
             #[cfg(feature = "files")]

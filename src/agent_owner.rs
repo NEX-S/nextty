@@ -8,6 +8,7 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 fn bytes(value: &OsStr) -> Value {
     json!(value.as_bytes())
@@ -160,6 +161,8 @@ pub fn run() -> io::Result<()> {
     })?;
     let mut sessions = Vec::<Session>::new();
     let mut pending = Vec::new();
+    let mut publish_models = false;
+    let mut publish_at = Instant::now();
     loop {
         let mut fds = vec![
             libc::pollfd {
@@ -189,6 +192,7 @@ pub fn run() -> io::Result<()> {
             sessions
                 .iter()
                 .filter_map(|session| session.model.deadline())
+                .chain((publish_models && client.can_agent_input()).then_some(publish_at))
                 .min()
                 .map_or(-1, |deadline| {
                     deadline
@@ -221,7 +225,6 @@ pub fn run() -> io::Result<()> {
         if client.snapshot().is_none() {
             continue;
         }
-        let mut publish_models = false;
         for (kind, payload) in pending.drain(..) {
             match kind {
                 0 => {
@@ -270,13 +273,18 @@ pub fn run() -> io::Result<()> {
         for session in &mut sessions {
             publish_models |= session.poll(&mut client)?;
         }
-        if client.can_agent_input() && publish_models {
+        if client.can_agent_input()
+            && publish_models
+            && (Instant::now() >= publish_at || sessions.iter().all(|session| !session.model.busy))
+        {
             client.send(Action::AgentUpdate {
                 kind: 1,
                 payload: serde_json::to_vec(
                     &sessions.iter().map(Session::snapshot).collect::<Vec<_>>(),
                 )?,
             })?;
+            publish_models = false;
+            publish_at = Instant::now() + Duration::from_millis(16);
         }
     }
 }

@@ -30,6 +30,10 @@ fn agent_markdown_renders_and_selects_the_visible_text() {
             text: source.into(),
             id: None,
         });
+    frontend
+        .ui
+        .agent
+        .wait_layout(usize::from(frontend.editor_rect().cols));
     let mut bytes = Vec::new();
     frontend.draw_agent(&mut bytes).unwrap();
     let mut host = Core::new(size, 0xcccccc, 0x202020);
@@ -128,6 +132,10 @@ fn agent_tabs_keep_drafts_and_drag_selection_copies_across_messages() {
             turn: 1,
         },
     ]);
+    frontend
+        .ui
+        .agent
+        .wait_layout(usize::from(frontend.editor_rect().cols));
     let mut rendered = Vec::new();
     frontend.draw_agent(&mut rendered).unwrap();
     let rendered = String::from_utf8(rendered).unwrap();

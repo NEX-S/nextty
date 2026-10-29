@@ -382,7 +382,7 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
                 id += empty as u64;
                 continue;
             }
-            let row = read_row(&mut reader, cells)?;
+            let row = read_row::<true>(&mut reader, cells)?;
             matcher.row(id, &row);
             cells = row.cells;
             id += 1;
@@ -674,9 +674,7 @@ impl History {
             .unwrap()
             .try_send(request)
             .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => {
-                    io::Error::new(io::ErrorKind::WouldBlock, "history queue is full")
-                }
+                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
                 mpsc::TrySendError::Disconnected(_) => {
                     io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
                 }
@@ -896,12 +894,12 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
             Err(error) => return Err(error),
         };
         let from = output.cursor.row.max(*start);
-        cells = skip_rows(&mut file, from - *start, cells)?;
+        skip_rows(&mut file, from - *start)?;
         for id in from..(*end).min(read.hot_start) {
             if id > read.end.0 {
                 break;
             }
-            let row = read_row(&mut file, cells)?;
+            let row = read_row::<false>(&mut file, cells)?;
             full = output.row(id, &row, &mut bytes)?;
             cells = row.cells;
             if full {
@@ -1045,9 +1043,9 @@ impl Archive {
                 Err(error) => return Err(error),
             };
             let start = actual.max(segment.start);
-            cells = skip_rows(&mut file, start - segment.start, cells)?;
+            skip_rows(&mut file, start - segment.start)?;
             for _ in start..segment.end.min(end) {
-                rows.push(read_row(&mut file, cells)?);
+                rows.push(read_row::<true>(&mut file, cells)?);
                 cells = Vec::new();
             }
         }
@@ -1135,12 +1133,12 @@ impl Archive {
             // Keep the segment open while copying it. Repeated small pages would
             // decode the same prefix for every batch, especially for empty rows.
             let row_start = next.max(segment.start).min(hot_start);
-            cells = skip_rows(&mut reader, row_start - segment.start, cells)?;
+            skip_rows(&mut reader, row_start - segment.start)?;
             for id in row_start..segment.end.min(hot_start) {
                 if id > end.0 {
                     break;
                 }
-                let row = read_row(&mut reader, cells)?;
+                let row = read_row::<true>(&mut reader, cells)?;
                 write(id, &row)?;
                 next = id + 1;
                 cells = row.cells;
@@ -1211,7 +1209,7 @@ impl Archive {
             }
             let (next, _, rows, file) = input.as_mut().unwrap();
             while *next <= id {
-                let mut cells = if rows.len() == BATCH {
+                let cells = if rows.len() == BATCH {
                     rows.pop_front().unwrap().cells
                 } else {
                     Vec::new()
@@ -1219,10 +1217,10 @@ impl Archive {
                 // Retain preceding rows for backward selection expansion.
                 let skip = (id - *next).saturating_sub((BATCH - 1) as u64);
                 if skip != 0 {
-                    cells = skip_rows(file, skip, cells)?;
+                    skip_rows(file, skip)?;
                     *next += skip;
                 }
-                rows.push_back(read_row(file, cells)?);
+                rows.push_back(read_row::<true>(file, cells)?);
                 *next += 1;
             }
             Ok(rows.back().cloned().map(Cow::Owned))
@@ -1400,7 +1398,7 @@ impl Archive {
             };
             output.archive.order_hint = Some(segment.order);
             for id in segment.start..segment.end {
-                let row = read_row(&mut file, cells)?;
+                let row = read_row::<true>(&mut file, cells)?;
                 cells = output.row(id, row, &anchors, &mut anchor, &request)?;
             }
             drop(file);
@@ -1730,43 +1728,52 @@ fn empty_row_headers(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
         header[2..6] == [0; 4] && header[7..] == [0; 2] && header[..2] != [0, 0]
     })
 }
-fn skip_rows(
-    file: &mut BufReader<File>,
-    mut count: u64,
-    mut cells: Vec<Cell>,
-) -> io::Result<Vec<Cell>> {
+fn skip_rows(file: &mut BufReader<File>, mut count: u64) -> io::Result<()> {
     while count != 0 {
         let empty = empty_row_headers(file.fill_buf()?)
             .take(count as usize)
             .count();
         if empty == 0 {
-            cells = read_row(file, cells)?.cells;
+            let header = read_array::<9>(file)?;
+            let stored = u16::from_le_bytes([header[4], header[5]]);
+            let extras = u16::from_le_bytes([header[7], header[8]]);
+            file.seek_relative(i64::from(stored) * 14)?;
+            for _ in 0..extras {
+                let extra = read_array::<6>(file)?;
+                let combining = u32::from_le_bytes(extra[2..].try_into().unwrap());
+                file.seek_relative(i64::from(combining) * 4)?;
+                if read_array::<1>(file)?[0] != 0 {
+                    file.seek_relative(4)?;
+                }
+            }
             count -= 1;
         } else {
             file.consume(empty * 9);
             count -= empty as u64;
         }
     }
-    Ok(cells)
+    Ok(())
 }
 fn read_array<const N: usize>(file: &mut impl Read) -> io::Result<[u8; N]> {
     let mut bytes = [0; N];
     file.read_exact(&mut bytes)?;
     Ok(bytes)
 }
-fn decode_cells(cells: &mut [Cell], bytes: &[u8]) -> io::Result<()> {
+fn decode_cells<const COLORS: bool>(cells: &mut [Cell], bytes: &[u8]) -> io::Result<()> {
     for (cell, bytes) in cells.iter_mut().zip(bytes.chunks_exact(14)) {
         cell.c = char::from_u32(u32::from_le_bytes(bytes[..4].try_into().unwrap())).ok_or_else(
             || io::Error::new(io::ErrorKind::InvalidData, "invalid history character"),
         )?;
-        cell.fg = read_color(bytes[4..8].try_into().unwrap())?;
-        cell.bg = read_color(bytes[8..12].try_into().unwrap())?;
+        if COLORS {
+            cell.fg = read_color(bytes[4..8].try_into().unwrap())?;
+            cell.bg = read_color(bytes[8..12].try_into().unwrap())?;
+        }
         cell.flags = Flags::from_bits(u16::from_le_bytes(bytes[12..].try_into().unwrap()))
             .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history flags"))?;
     }
     Ok(())
 }
-fn read_row(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
+fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
     let header = read_array::<9>(file)?;
     let columns = u16::from_le_bytes([header[0], header[1]]) as usize;
     let used = u16::from_le_bytes([header[2], header[3]]) as usize;
@@ -1785,12 +1792,12 @@ fn read_row(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
         let length = cells.len() * 14;
         let buffered = file.fill_buf()?;
         if buffered.len() >= length {
-            decode_cells(cells, &buffered[..length])?;
+            decode_cells::<COLORS>(cells, &buffered[..length])?;
             file.consume(length);
         } else {
             let mut bytes = [0; 14 * 64];
             file.read_exact(&mut bytes[..length])?;
-            decode_cells(cells, &bytes[..length])?;
+            decode_cells::<COLORS>(cells, &bytes[..length])?;
         }
     }
     let mut extras = Vec::with_capacity(count);
@@ -1970,7 +1977,7 @@ mod tests {
             let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
             let mut cells = Vec::new();
             for expected in &rows {
-                let decoded = read_row(&mut reader, cells).unwrap();
+                let decoded = read_row::<true>(&mut reader, cells).unwrap();
                 assert_eq!(decoded.cells, expected.cells);
                 assert_eq!(decoded.used(), expected.used());
                 assert_eq!(decoded.wrapped, expected.wrapped);

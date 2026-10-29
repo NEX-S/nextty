@@ -153,7 +153,8 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 let (changed, _) = frontend
                     .ui
                     .poll_agent(&mut frontend.client, &frontend.config)?;
-                if changed && frontend.ui.agent.open {
+                let layout_changed = frontend.ui.agent.poll_layout()?;
+                if (changed && frontend.ui.agent.open) || layout_changed {
                     frontend.agent_dirty = true;
                     frontend.dirty = true;
                 }
@@ -303,6 +304,12 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                         .as_ref()
                         .filter(|_| frontend.ui.files_open)
                         .map_or(-1, |files| files.fd()),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                #[cfg(feature = "agent")]
+                libc::pollfd {
+                    fd: frontend.ui.agent.layout_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
@@ -1074,7 +1081,7 @@ impl Frontend {
         let indent = match session.lines.get(line)? {
             AgentLine::Role(_) => 3,
             AgentLine::Text { message, .. } => {
-                let message = &session.model.messages[*message as usize];
+                let message = session.model.messages.get(*message as usize)?;
                 if message.role == "You" {
                     1
                 } else if message.id.is_some() {
@@ -1174,7 +1181,7 @@ impl Frontend {
         let chat_top = side.y + 1;
         let rows = usize::from(chat_end.saturating_sub(chat_top));
         let columns = usize::from(editor.cols);
-        self.ui.agent.active_mut().layout(columns);
+        self.ui.agent.prepare_layout(columns)?;
         self.ui.agent.active_mut().model.scroll = self
             .ui
             .agent

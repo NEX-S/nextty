@@ -13,7 +13,12 @@ use crate::{
     workspace::{Client, PaneId},
 };
 #[cfg(feature = "agent")]
-use std::{collections::HashSet, ops::Range};
+use std::{
+    collections::HashSet,
+    ops::Range,
+    os::fd::{AsRawFd, OwnedFd, RawFd},
+    sync::{Arc, Condvar, Mutex},
+};
 use std::{
     io,
     time::{Duration, Instant},
@@ -658,6 +663,113 @@ struct ChatSelection {
 }
 
 #[cfg(feature = "agent")]
+struct RenderedMarkdown {
+    turn: u64,
+    source: String,
+    document: crate::markdown::Markdown,
+}
+
+#[cfg(feature = "agent")]
+struct MarkdownJob {
+    session: u64,
+    request: u64,
+    messages: Vec<(usize, u64, String)>,
+}
+
+#[cfg(feature = "agent")]
+struct MarkdownResult {
+    session: u64,
+    request: u64,
+    messages: Vec<(usize, RenderedMarkdown)>,
+}
+
+#[cfg(feature = "agent")]
+#[derive(Default)]
+struct MarkdownWork {
+    pending: Option<MarkdownJob>,
+    result: Option<MarkdownResult>,
+    closed: bool,
+}
+
+#[cfg(feature = "agent")]
+struct MarkdownWorker {
+    shared: Arc<(Mutex<MarkdownWork>, Condvar)>,
+    notification: Arc<OwnedFd>,
+}
+
+#[cfg(feature = "agent")]
+impl MarkdownWorker {
+    fn new() -> io::Result<Self> {
+        let shared = Arc::new((Mutex::new(MarkdownWork::default()), Condvar::new()));
+        let notification = Arc::new(crate::eventfd::new()?);
+        let worker = Arc::clone(&shared);
+        let wake = Arc::clone(&notification);
+        std::thread::Builder::new()
+            .name("nextty-markdown".into())
+            .spawn(move || {
+                loop {
+                    let (lock, changed) = &*worker;
+                    let mut state = lock.lock().unwrap();
+                    while state.pending.is_none() && !state.closed {
+                        state = changed.wait(state).unwrap();
+                    }
+                    if state.closed {
+                        return;
+                    }
+                    let job = state.pending.take().unwrap();
+                    drop(state);
+                    let messages = job
+                        .messages
+                        .into_iter()
+                        .map(|(index, turn, source)| {
+                            let document = crate::markdown::Markdown::render(&source);
+                            (
+                                index,
+                                RenderedMarkdown {
+                                    turn,
+                                    source,
+                                    document,
+                                },
+                            )
+                        })
+                        .collect();
+                    lock.lock().unwrap().result = Some(MarkdownResult {
+                        session: job.session,
+                        request: job.request,
+                        messages,
+                    });
+                    crate::eventfd::notify(wake.as_raw_fd()).unwrap();
+                }
+            })?;
+        Ok(Self {
+            shared,
+            notification,
+        })
+    }
+
+    fn submit(&self, job: MarkdownJob) {
+        let (lock, changed) = &*self.shared;
+        lock.lock().unwrap().pending = Some(job);
+        changed.notify_one();
+    }
+
+    fn take(&self) -> Option<MarkdownResult> {
+        self.shared.0.lock().unwrap().result.take()
+    }
+}
+
+#[cfg(feature = "agent")]
+impl Drop for MarkdownWorker {
+    fn drop(&mut self) {
+        let (lock, changed) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        state.closed = true;
+        state.pending = None;
+        changed.notify_one();
+    }
+}
+
+#[cfg(feature = "agent")]
 pub(crate) struct AgentPanel {
     pub open: bool,
     pub focus: Option<String>,
@@ -669,6 +781,8 @@ pub(crate) struct AgentPanel {
     remote_opened: bool,
     remote_ready: bool,
     last_view: Option<serde_json::Value>,
+    markdown_worker: Option<MarkdownWorker>,
+    next_render: u64,
 }
 
 #[cfg(feature = "agent")]
@@ -688,6 +802,8 @@ impl Default for AgentPanel {
             remote_opened: false,
             remote_ready: false,
             last_view: None,
+            markdown_worker: None,
+            next_render: 0,
         }
     }
 }
@@ -721,9 +837,10 @@ impl AgentPanel {
         )
     }
 
-    pub fn restore_models(&mut self, value: serde_json::Value) -> io::Result<()> {
+    pub fn restore_models(&mut self, value: serde_json::Value) -> io::Result<bool> {
         let values: Vec<(u64, serde_json::Value)> =
             serde_json::from_value(value).map_err(io::Error::other)?;
+        let mut redraw = false;
         for (id, mut value) in values {
             if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
                 let selection = session.selection_checkpoint();
@@ -733,10 +850,11 @@ impl AgentPanel {
                         .map_or(serde_json::Value::Null, serde_json::Value::take),
                 )
                 .map_err(io::Error::other)?;
-                let first_changed = session.model.restore(value)?;
-                if let Some(first) = first_changed {
-                    session.render_from =
-                        Some(session.render_from.map_or(first, |old| old.min(first)));
+                let model_redraw = session.model.restore(value)?;
+                redraw |= model_redraw;
+                if model_redraw {
+                    session.columns = 0;
+                    session.sync_rendered();
                 }
                 session.rewind_restore = rewind.map(|(turn, input, items)| {
                     (
@@ -759,13 +877,16 @@ impl AgentPanel {
                     session.editor_scroll = None;
                     session.rewind_target = None;
                     session.rewind_applied = Some(*turn);
+                    redraw = true;
                 }
                 if selection.is_some() && selection != session.selection_checkpoint() {
                     session.clear_selection();
+                    redraw = true;
                 }
             }
         }
-        Ok(())
+        self.request_markdown()?;
+        Ok(redraw)
     }
 
     pub fn poll_remote(
@@ -792,11 +913,11 @@ impl AgentPanel {
                     changed = true;
                 }
                 1 => {
-                    self.restore_models(
+                    let redraw = self.restore_models(
                         serde_json::from_slice(&payload).map_err(io::Error::other)?,
                     )?;
-                    changed = true;
-                    messages = true;
+                    changed |= redraw;
+                    messages |= redraw;
                 }
                 3 => crate::agent_owner::spawn(client, &payload, config)?,
                 5 => self.remote_ready = true,
@@ -965,6 +1086,128 @@ impl AgentPanel {
         &mut self.sessions[self.current]
     }
 
+    pub fn prepare_layout(&mut self, columns: usize) -> io::Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        // Commit with wrapping during draw so input keeps the displayed frame's geometry.
+        self.apply_markdown();
+        self.request_markdown()?;
+        self.active_mut().layout(columns);
+        Ok(())
+    }
+
+    fn request_markdown(&mut self) -> io::Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        let session = self.active_mut();
+        let selection = session.selection_checkpoint();
+        session.sync_rendered();
+        if selection.is_some() && selection != session.selection_checkpoint() {
+            session.clear_selection();
+        }
+        if session.render_request.is_none() {
+            let messages: Vec<_> = session
+                .model
+                .messages
+                .iter()
+                .enumerate()
+                .filter(|&(index, message)| {
+                    message.role == "Agent"
+                        && message.id.is_none()
+                        && session.rendered[index]
+                            .as_ref()
+                            .is_none_or(|rendered| rendered.source != message.text)
+                })
+                .map(|(index, message)| (index, message.turn, message.text.clone()))
+                .collect();
+            if !messages.is_empty() {
+                if self.markdown_worker.is_none() {
+                    self.markdown_worker = Some(MarkdownWorker::new()?);
+                }
+                for session in &mut self.sessions {
+                    session.render_request = None;
+                }
+                self.next_render += 1;
+                let job = MarkdownJob {
+                    session: self.active().id,
+                    request: self.next_render,
+                    messages,
+                };
+                self.active_mut().render_request = Some(job.request);
+                self.markdown_worker.as_ref().unwrap().submit(job);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn layout_fd(&self) -> RawFd {
+        self.markdown_worker
+            .as_ref()
+            .map_or(-1, |worker| worker.notification.as_raw_fd())
+    }
+
+    pub fn poll_layout(&mut self) -> io::Result<bool> {
+        let Some(worker) = &self.markdown_worker else {
+            return Ok(false);
+        };
+        Ok(
+            crate::eventfd::consume_notification(worker.notification.as_raw_fd())?
+                && self.open
+                && worker.shared.0.lock().unwrap().result.is_some(),
+        )
+    }
+
+    fn apply_markdown(&mut self) {
+        let Some(result) = self.markdown_worker.as_ref().and_then(MarkdownWorker::take) else {
+            return;
+        };
+        let Some(session) = self.sessions.iter_mut().find(|session| {
+            session.id == result.session && session.render_request == Some(result.request)
+        }) else {
+            return;
+        };
+        session.render_request = None;
+        // New deltas can arrive between parsing and drawing the next frame.
+        if !result.messages.iter().all(|(index, rendered)| {
+            session.model.messages.get(*index).is_some_and(|message| {
+                message.role == "Agent"
+                    && message.id.is_none()
+                    && message.turn == rendered.turn
+                    && message.text.starts_with(&rendered.source)
+            })
+        }) {
+            return;
+        }
+        let selection = session.selection_checkpoint();
+        for (index, rendered) in result.messages {
+            session.rendered[index] = Some(rendered);
+        }
+        let next_selection = session.selection_checkpoint();
+        if session.selection.is_some()
+            && (next_selection.is_none() || selection.is_some() && selection != next_selection)
+        {
+            session.clear_selection();
+        }
+        session.columns = 0;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn wait_layout(&mut self, columns: usize) {
+        self.prepare_layout(columns).unwrap();
+        while self.active().render_request.is_some() {
+            let mut fd = libc::pollfd {
+                fd: self.layout_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+            self.poll_layout().unwrap();
+            self.prepare_layout(columns).unwrap();
+        }
+    }
+
     pub fn new_session(&mut self) {
         self.active_mut().end_selection();
         self.active_mut().rewind_target = None;
@@ -1088,23 +1331,31 @@ impl AgentPanel {
 pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     let mut offset = 0;
+    let columns = columns.max(1);
     for part in text.split_inclusive('\n') {
         let line = part
             .strip_suffix("\r\n")
             .or_else(|| part.strip_suffix('\n'))
             .unwrap_or(part);
         let mut start = offset;
-        let mut width = 0;
-        for (index, c) in line.char_indices() {
-            let index = offset + index;
-            let c = if c.is_control() { ' ' } else { c };
-            let next = usize::from(scalar_width(c).min(2));
-            if width + next > columns.max(1) && index > start {
-                result.push(start..index);
-                start = index;
-                width = 0;
+        if line.is_ascii() {
+            while offset + line.len() - start > columns {
+                result.push(start..start + columns);
+                start += columns;
             }
-            width += next;
+        } else {
+            let mut width = 0;
+            for (index, c) in line.char_indices() {
+                let index = offset + index;
+                let c = if c.is_control() { ' ' } else { c };
+                let next = usize::from(scalar_width(c).min(2));
+                if width + next > columns && index > start {
+                    result.push(start..index);
+                    start = index;
+                    width = 0;
+                }
+                width += next;
+            }
         }
         result.push(start..offset + line.len());
         offset += part.len();
@@ -1145,8 +1396,8 @@ pub(crate) struct AgentSession {
     pub expanded_tools: HashSet<String>,
     pub lines: Vec<AgentLine>,
     pub columns: usize,
-    rendered: Vec<Option<crate::markdown::Markdown>>,
-    render_from: Option<usize>,
+    rendered: Vec<Option<RenderedMarkdown>>,
+    render_request: Option<u64>,
     pub editor_scroll: Option<usize>,
     pub rewind_target: Option<u64>,
     selection: Option<ChatSelection>,
@@ -1174,18 +1425,41 @@ impl AgentSession {
     }
 
     pub fn message_text(&self, index: usize) -> &str {
-        self.markdown(index)
-            .map_or(&self.model.messages[index].text, |document| &document.text)
+        let message = &self.model.messages[index];
+        if message.role == "Agent" && message.id.is_none() {
+            self.markdown(index).map_or("", |document| &document.text)
+        } else {
+            &message.text
+        }
     }
 
     pub fn markdown(&self, index: usize) -> Option<&crate::markdown::Markdown> {
-        self.rendered.get(index).and_then(Option::as_ref)
+        self.rendered
+            .get(index)
+            .and_then(Option::as_ref)
+            .map(|rendered| &rendered.document)
+    }
+
+    fn sync_rendered(&mut self) {
+        self.rendered
+            .resize_with(self.model.messages.len(), || None);
+        for (message, rendered) in self.model.messages.iter().zip(&mut self.rendered) {
+            if rendered.as_ref().is_some_and(|old| {
+                message.role != "Agent"
+                    || message.id.is_some()
+                    || message.turn != old.turn
+                    || !message.text.starts_with(&old.source)
+            }) {
+                *rendered = None;
+                self.columns = 0;
+            }
+        }
     }
 
     fn line_text(&self, index: usize) -> Option<(TranscriptPoint, Range<usize>, &str)> {
         match self.lines.get(index)? {
             AgentLine::Role(message) => {
-                let text = &self.model.messages[*message as usize].role;
+                let text = &self.model.messages.get(*message as usize)?.role;
                 Some((
                     TranscriptPoint {
                         message: *message as usize,
@@ -1196,15 +1470,21 @@ impl AgentSession {
                     text,
                 ))
             }
-            AgentLine::Text { message, range } => Some((
-                TranscriptPoint {
-                    message: *message as usize,
-                    part: 1,
-                    offset: 0,
-                },
-                range.start as usize..range.end as usize,
-                self.message_text(*message as usize),
-            )),
+            AgentLine::Text { message, range } => {
+                self.model.messages.get(*message as usize)?;
+                let text = self.message_text(*message as usize);
+                let range = range.start as usize..range.end as usize;
+                text.get(range.clone())?;
+                Some((
+                    TranscriptPoint {
+                        message: *message as usize,
+                        part: 1,
+                        offset: 0,
+                    },
+                    range,
+                    text,
+                ))
+            }
             AgentLine::Blank => None,
         }
     }
@@ -1256,20 +1536,10 @@ impl AgentSession {
         let selection = self.selection.as_ref()?;
         let checkpoint = |point: TranscriptPoint| {
             let message = self.model.messages.get(point.message)?;
-            let rendered;
             let text = if point.part == 0 {
                 &message.role
-            } else if message.role == "Agent" && message.id.is_none() {
-                if let Some(document) = self.markdown(point.message).filter(|_| {
-                    self.columns != 0 && self.render_from.is_none_or(|first| point.message < first)
-                }) {
-                    &document.text
-                } else {
-                    rendered = crate::markdown::Markdown::render(&message.text);
-                    &rendered.text
-                }
             } else {
-                &message.text
+                self.message_text(point.message)
             };
             Some((
                 message.turn,
@@ -1533,64 +1803,18 @@ impl AgentSession {
         })
     }
     pub fn layout(&mut self, columns: usize) {
-        if self.columns == columns && self.render_from.is_none() {
+        if self.columns == columns {
             return;
         }
-        let from = self
-            .render_from
-            .take()
-            .filter(|_| self.columns == columns)
-            .unwrap_or(0)
-            .min(self.rendered.len());
         let previous_lines = self.lines.len();
-        let keep = if from == 0 {
-            0
-        } else {
-            self.lines
-                .iter()
-                .enumerate()
-                .filter(|(_, line)| matches!(line, AgentLine::Blank))
-                .nth(from - 1)
-                .map_or(self.lines.len(), |(index, _)| index + 1)
-        };
-        self.lines.truncate(keep);
-        let mut clear_selection = false;
-        for (index, message) in self.model.messages.iter().enumerate().skip(from) {
-            let rendered = (message.role == "Agent" && message.id.is_none())
-                .then(|| crate::markdown::Markdown::render(&message.text));
-            if self.selection.as_ref().is_some_and(|selection| {
-                [selection.anchor, selection.head].iter().any(|point| {
-                    point.message == index
-                        && self
-                            .rendered
-                            .get(index)
-                            .and_then(Option::as_ref)
-                            .is_some_and(|old| {
-                                rendered.as_ref().is_some_and(|new| {
-                                    old.text.get(..point.offset) != new.text.get(..point.offset)
-                                })
-                            })
-                })
-            }) {
-                clear_selection = true;
-            }
-            if let Some(previous) = self.rendered.get_mut(index) {
-                *previous = rendered;
-            } else {
-                self.rendered.push(rendered);
-            }
-        }
-        self.rendered.truncate(self.model.messages.len());
-        if clear_selection {
-            self.clear_selection();
-        }
+        self.lines.clear();
         self.expanded_tools.retain(|id| {
             self.model
                 .messages
                 .iter()
                 .any(|message| message.id.as_ref() == Some(id))
         });
-        for (index, message) in self.model.messages.iter().enumerate().skip(from) {
+        for (index, message) in self.model.messages.iter().enumerate() {
             let tool = message.id.is_some();
             if tool {
                 self.lines.push(AgentLine::Role(index as u32));
@@ -1688,9 +1912,205 @@ mod tests {
     }
 
     #[test]
+    fn markdown_completion_wakes_the_final_frame_and_uses_the_current_width() {
+        let mut panel = AgentPanel::default();
+        panel
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                turn: 1,
+                role: "Agent".into(),
+                text: "**done** 中文".into(),
+                id: None,
+            });
+        panel.prepare_layout(40).unwrap();
+        assert_eq!(panel.layout_fd(), -1);
+        assert!(panel.active().lines.is_empty());
+        panel.open = true;
+        panel.prepare_layout(40).unwrap();
+        assert_eq!(panel.active().message_text(0), "");
+        let mut fd = libc::pollfd {
+            fd: panel.layout_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+        assert!(panel.poll_layout().unwrap());
+        assert_eq!(panel.active().message_text(0), "");
+        panel.prepare_layout(6).unwrap();
+        assert_eq!(panel.active().message_text(0), "done 中文");
+        assert_eq!(panel.active().lines.len(), 3);
+        panel.prepare_layout(40).unwrap();
+        assert_eq!(panel.active().lines.len(), 2);
+        assert!(panel.active().render_request.is_none());
+    }
+
+    #[test]
+    fn markdown_appends_request_work_without_redrawing_until_completion() {
+        let mut owner = AgentPanel::default();
+        owner
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                turn: 1,
+                role: "Agent".into(),
+                text: "**first**".into(),
+                id: None,
+            });
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        panel.wait_layout(40);
+        assert!(!panel.poll_layout().unwrap());
+        owner.active_mut().model.messages[0].text.push_str(" next");
+        assert!(!panel.restore_models(owner.model_snapshot()).unwrap());
+        assert!(panel.active().render_request.is_some());
+        assert_eq!(panel.active().message_text(0), "first");
+        let mut fd = libc::pollfd {
+            fd: panel.layout_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+        assert!(panel.poll_layout().unwrap());
+        assert_eq!(panel.active().message_text(0), "first");
+        panel.prepare_layout(40).unwrap();
+        assert_eq!(panel.active().message_text(0), "first next");
+
+        owner.active_mut().model.busy = true;
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        owner.active_mut().model.busy = false;
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        let message = &mut owner.active_mut().model.messages[0];
+        message.role = "run · running".into();
+        message.id = Some("tool".into());
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        owner.active_mut().model.messages[0].text = "tool output".into();
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        owner.active_mut().model.messages[0].role = "run · done".into();
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+    }
+
+    #[test]
+    fn streaming_markdown_progress_survives_new_text_before_the_next_frame() {
+        let mut owner = AgentPanel::default();
+        owner
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                turn: 1,
+                role: "Agent".into(),
+                text: "**first**".into(),
+                id: None,
+            });
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        panel.restore_models(owner.model_snapshot()).unwrap();
+        let mut fd = libc::pollfd {
+            fd: panel.layout_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+        owner.active_mut().model.messages[0]
+            .text
+            .push_str("\n\nnext");
+        panel.restore_models(owner.model_snapshot()).unwrap();
+        assert!(panel.poll_layout().unwrap());
+        panel.prepare_layout(40).unwrap();
+        assert_eq!(panel.active().message_text(0), "first");
+        panel.wait_layout(40);
+        assert_eq!(panel.active().message_text(0), "first\n\nnext");
+    }
+
+    #[test]
+    fn markdown_results_ignore_outdated_requests_and_sources() {
+        for restore in [false, true] {
+            let mut owner = AgentPanel::default();
+            owner
+                .active_mut()
+                .model
+                .messages
+                .push(crate::agent::Message {
+                    turn: 1,
+                    role: "Agent".into(),
+                    text: "**old".into(),
+                    id: None,
+                });
+            let mut panel = AgentPanel {
+                open: true,
+                ..AgentPanel::default()
+            };
+            panel.restore_models(owner.model_snapshot()).unwrap();
+            let mut fd = libc::pollfd {
+                fd: panel.layout_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+            if restore {
+                owner.active_mut().model.messages[0].text = "**new**".into();
+                panel.restore_models(owner.model_snapshot()).unwrap();
+            } else {
+                panel.active_mut().model.messages[0].text = "**new**".into();
+            }
+            assert!(panel.poll_layout().unwrap());
+            panel.prepare_layout(40).unwrap();
+            assert_eq!(panel.active().message_text(0), "");
+            panel.wait_layout(40);
+            assert_eq!(panel.active().message_text(0), "new");
+        }
+    }
+
+    #[test]
+    fn rewinding_discards_a_completed_markdown_result() {
+        let mut owner = AgentPanel::default();
+        owner
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                turn: 1,
+                role: "Agent".into(),
+                text: "**discarded reply**".into(),
+                id: None,
+            });
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        panel.restore_models(owner.model_snapshot()).unwrap();
+        let mut fd = libc::pollfd {
+            fd: panel.layout_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+        owner.active_mut().model.messages.clear();
+        owner.active_mut().rewind_restore = Some((1, "restored draft".into(), Vec::new()));
+        panel.restore_models(owner.model_snapshot()).unwrap();
+        assert!(panel.poll_layout().unwrap());
+        panel.prepare_layout(40).unwrap();
+        assert!(panel.active().model.messages.is_empty());
+        assert!(panel.active().rendered.is_empty());
+        assert!(panel.active().lines.is_empty());
+        assert_eq!(panel.active().model.input, "restored draft");
+    }
+
+    #[test]
     fn transcript_selection_preserves_unicode_wraps_and_visible_tool_headers() {
-        let mut session = AgentSession::default();
-        session.model.messages = vec![
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        panel.active_mut().model.messages = vec![
             crate::agent::Message {
                 role: "You".into(),
                 text: "a中🙂e\u{301}\nnext".into(),
@@ -1710,7 +2130,8 @@ mod tests {
                 turn: 1,
             },
         ];
-        session.layout(6);
+        panel.wait_layout(6);
+        let session = panel.active_mut();
         let start = session.point(0, 1).unwrap();
         let last = session
             .lines
@@ -1749,10 +2170,13 @@ mod tests {
                 id: Some("cmd".into()),
             },
         ];
-        let mut mirror = AgentPanel::default();
+        let mut mirror = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
         mirror.restore_models(owner.model_snapshot()).unwrap();
+        mirror.wait_layout(30);
         let session = mirror.active_mut();
-        session.layout(30);
         session.begin_selection(session.point(0, 0).unwrap(), false);
         session.extend_selection(session.point(0, 4).unwrap());
         assert_eq!(session.selected_text().as_deref(), Some("keep"));
@@ -1761,8 +2185,8 @@ mod tests {
         owner.active_mut().model.messages[1].text = "done".into();
         owner.active_mut().model.revision += 1;
         mirror.restore_models(owner.model_snapshot()).unwrap();
+        mirror.wait_layout(30);
         let session = mirror.active_mut();
-        session.layout(30);
         assert!(session.selecting());
         assert_eq!(session.selected_text().as_deref(), Some("keep"));
         session.end_selection();
@@ -1771,59 +2195,71 @@ mod tests {
             .text
             .push_str(" and more");
         mirror.restore_models(owner.model_snapshot()).unwrap();
-        mirror.active_mut().layout(30);
+        mirror.wait_layout(30);
         assert_eq!(mirror.active().selected_text().as_deref(), Some("keep"));
 
         owner.active_mut().model.messages[0].text = "replaced".into();
         owner.active_mut().model.revision += 1;
         mirror.restore_models(owner.model_snapshot()).unwrap();
         assert!(mirror.active().selected_text().is_none());
-        mirror.active_mut().layout(30);
+        mirror.wait_layout(30);
         assert!(mirror.active().selected_text().is_none());
     }
 
     #[test]
     fn streaming_markdown_reformatting_clears_stale_selection_offsets() {
-        let mut session = AgentSession::default();
-        session.model.messages.push(crate::agent::Message {
-            role: "Agent".into(),
-            text: "**中文".into(),
-            id: None,
-            turn: 1,
-        });
-        session.layout(20);
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        panel
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                role: "Agent".into(),
+                text: "**中文".into(),
+                id: None,
+                turn: 1,
+            });
+        panel.wait_layout(20);
+        let session = panel.active_mut();
         session.begin_selection(session.point(0, 2).unwrap(), false);
         session.extend_selection(session.point(0, 4).unwrap());
-        session.model.messages[0].text.push_str("**");
-        session.render_from = Some(0);
-        session.layout(20);
-        assert_eq!(session.message_text(0), "中文");
-        assert_eq!(session.selected_text(), None);
+        panel.active_mut().model.messages[0].text.push_str("**");
+        panel.wait_layout(20);
+        assert_eq!(panel.active().message_text(0), "中文");
+        assert_eq!(panel.active().selected_text(), None);
     }
 
     #[test]
     fn full_layout_invalidation_overrides_pending_stream_update() {
-        let mut session = AgentSession::default();
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
         for text in ["**previous**", "reply"] {
-            session.model.messages.push(crate::agent::Message {
-                role: "Agent".into(),
-                text: text.into(),
-                id: None,
-                turn: 1,
-            });
+            panel
+                .active_mut()
+                .model
+                .messages
+                .push(crate::agent::Message {
+                    role: "Agent".into(),
+                    text: text.into(),
+                    id: None,
+                    turn: 1,
+                });
         }
-        session.layout(20);
-        session.model.messages[1].text.push_str(" next");
-        session.render_from = Some(1);
-        session.layout(20);
-        assert_eq!(session.message_text(0), "previous");
-        assert_eq!(session.message_text(1), "reply next");
-        session.model.messages.remove(0);
-        session.render_from = Some(1);
-        session.columns = 0;
-        session.layout(20);
-        assert_eq!(session.message_text(0), "reply next");
-        assert_eq!(session.rendered.len(), 1);
+        panel.wait_layout(20);
+        panel.active_mut().model.messages[1].text.push_str(" next");
+        panel.wait_layout(20);
+        assert_eq!(panel.active().message_text(0), "previous");
+        assert_eq!(panel.active().message_text(1), "reply next");
+        panel.active_mut().model.messages.remove(0);
+        panel.active_mut().columns = 0;
+        panel.wait_layout(20);
+        assert_eq!(panel.active().message_text(0), "reply next");
+        assert_eq!(panel.active().rendered.len(), 1);
     }
 
     #[test]
@@ -1983,10 +2419,13 @@ mod tests {
                     turn: 1,
                 });
         }
-        let mut frontend = AgentPanel::default();
+        let mut frontend = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
         frontend.restore_models(owner.model_snapshot()).unwrap();
+        frontend.wait_layout(40);
         let session = frontend.active_mut();
-        session.layout(40);
         let line = session
             .lines
             .iter()
@@ -1997,14 +2436,14 @@ mod tests {
         assert!(session.selected_text().is_some());
         owner.active_mut().model.messages[1].text.push_str("**");
         frontend.restore_models(owner.model_snapshot()).unwrap();
-        frontend.active_mut().layout(40);
+        frontend.wait_layout(40);
         assert_eq!(frontend.active().message_text(0), "earlier");
         assert_eq!(frontend.active().message_text(1), "中文");
         assert_eq!(frontend.active().selected_text(), None);
         owner.active_mut().model.messages.remove(0);
         owner.active_mut().model.revision += 1;
         frontend.restore_models(owner.model_snapshot()).unwrap();
-        frontend.active_mut().layout(40);
+        frontend.wait_layout(40);
         assert_eq!(frontend.active().message_text(0), "中文");
         assert_eq!(frontend.active().rendered.len(), 1);
     }

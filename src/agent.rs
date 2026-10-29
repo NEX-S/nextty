@@ -35,6 +35,7 @@ pub(crate) struct Agent {
     response: Option<usize>,
     operation: Option<Operation>,
     observed_input: Option<(u64, u64)>,
+    observed_activity: Option<(u64, Value)>,
 }
 
 impl Agent {
@@ -54,7 +55,7 @@ impl Agent {
         })
     }
 
-    pub fn restore(&mut self, mut value: serde_json::Value) -> io::Result<Option<usize>> {
+    pub fn restore(&mut self, mut value: serde_json::Value) -> io::Result<bool> {
         let messages: Vec<(String, String, Option<String>, u64)> = serde_json::from_value(
             value
                 .get_mut("messages")
@@ -74,20 +75,22 @@ impl Agent {
                 turn,
             })
             .collect();
-        let first_changed = self
-            .messages
-            .iter()
-            .zip(&messages)
-            .position(|(old, new)| old != new)
-            .or_else(|| {
-                (self.messages.len() != messages.len())
-                    .then_some(self.messages.len().min(messages.len()))
+        let redraw = self.busy != busy
+            || self.messages.len() != messages.len()
+            || self.messages.iter().zip(&messages).any(|(old, new)| {
+                old.turn != new.turn
+                    || old.role != new.role
+                    || old.id != new.id
+                    || old.text != new.text
+                        && (new.role != "Agent"
+                            || new.id.is_some()
+                            || !new.text.starts_with(&old.text))
             });
         self.messages = messages;
         self.busy = busy;
         self.revision = revision;
         self.turn = turn;
-        Ok(first_changed)
+        Ok(redraw)
     }
 
     pub fn fd(&self) -> i32 {
@@ -203,9 +206,11 @@ impl Agent {
             self.runtime = Some(Harness::start(config, self.turn)?);
         }
         let generation = target["input_generation"].as_u64();
+        let activity = observation(&target);
         let turn = self.runtime.as_ref().unwrap().send(prompt, pane, target)?;
         self.turn = turn;
         self.observed_input = generation.map(|generation| (pane, generation));
+        self.observed_activity = Some((pane, activity));
         self.messages.push(Message {
             turn,
             role: "You".into(),
@@ -269,7 +274,7 @@ impl Agent {
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
         self.abort()?;
         if let Some(Operation {
-            stage: Stage::Read { id },
+            stage: Stage::Read { id, .. },
             ..
         }) = &self.operation
         {
@@ -501,6 +506,7 @@ enum Stage {
     },
     Read {
         id: u64,
+        before: Value,
     },
     Change {
         before: Value,
@@ -588,7 +594,11 @@ impl Agent {
                         })
                     } else if request.input["wait"] == true {
                         Ok(Stage::Change {
-                            before: observation(&terminal_context(client, pane)?),
+                            before: self
+                                .observed_activity
+                                .as_ref()
+                                .filter(|(target, _)| *target == pane)
+                                .map_or(Value::Null, |(_, before)| before.clone()),
                         })
                     } else if source == "screen" {
                         Ok(Stage::Change {
@@ -626,7 +636,7 @@ impl Agent {
             }
             _ => return Ok(()),
         };
-        if !self.operation.as_ref().is_some_and(|operation| matches!(operation.stage, Stage::Input {id:pending,..} | Stage::Read {id:pending} if pending == id)) {
+        if !self.operation.as_ref().is_some_and(|operation| matches!(operation.stage, Stage::Input {id:pending,..} | Stage::Read {id:pending,..} if pending == id)) {
             return Ok(());
         }
         let mut operation = self.operation.take().unwrap();
@@ -660,6 +670,7 @@ impl Agent {
                         operation
                             .request
                             .respond(terminal_context(client, pane).map(|mut context| {
+                                self.observed_activity = Some((pane, observation(&context)));
                                 context["input_queued"] = json!(true);
                                 context["completion_signal"] = json!(false);
                                 context.to_string()
@@ -669,6 +680,13 @@ impl Agent {
                 }
             }
             ClientEvent::History { result, .. } => {
+                let Stage::Read { before, .. } = operation.stage else {
+                    unreachable!()
+                };
+                if result.is_ok() {
+                    self.observed_activity =
+                        Some((operation.request.input["pane"].as_u64().unwrap(), before));
+                }
                 let result = result.map(|page| {
                     let marker = page.command.as_ref();
                     json!({
@@ -692,7 +710,7 @@ impl Agent {
         if let Some(mut operation) = self.operation.take() {
             let result = (|| -> io::Result<Option<String>> {
                 if operation.request.canceled.load(Ordering::Acquire) {
-                    if let Stage::Read { id } = operation.stage {
+                    if let Stage::Read { id, .. } = operation.stage {
                         client.send(Action::CancelHistory { request: id })?;
                     }
                     return Err(io::ErrorKind::Interrupted.into());
@@ -726,6 +744,7 @@ impl Agent {
                             {
                                 self.observed_input =
                                     Some((pane, context["input_generation"].as_u64().unwrap()));
+                                self.observed_activity = Some((pane, observation(&context)));
                                 return Ok(Some(context.to_string()));
                             }
                             operation.stage = read_output(client, &operation.request, None)?;
@@ -773,14 +792,16 @@ fn read_output(
         })
         .transpose()?;
     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+    let pane = request.input["pane"].as_u64().unwrap();
+    let before = observation(&terminal_context(client, pane)?);
     client.send(Action::ReadHistory {
-        pane: request.input["pane"].as_u64().unwrap(),
+        pane,
         request: id,
         block: command,
         cursor,
         query: request.input["query"].as_str().map(str::to_owned),
     })?;
-    Ok(Stage::Read { id })
+    Ok(Stage::Read { id, before })
 }
 
 #[cfg(test)]
@@ -804,7 +825,7 @@ mod tests {
         mirror.anchor = Some(3);
         mirror.scroll = 7;
         let cursor = mirror.cursor;
-        assert_eq!(mirror.restore(owner.snapshot()).unwrap(), Some(0));
+        assert!(mirror.restore(owner.snapshot()).unwrap());
         assert_eq!(mirror.input, "下一条🙂");
         assert_eq!(mirror.cursor, cursor);
         assert_eq!(mirror.anchor, Some(3));

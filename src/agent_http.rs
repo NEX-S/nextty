@@ -30,6 +30,7 @@ impl Handler for Response {
 struct Sse {
     pending: Vec<u8>,
     data: Vec<u8>,
+    bytes: usize,
 }
 
 impl Sse {
@@ -50,6 +51,10 @@ impl Sse {
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
                 if !self.data.is_empty() {
+                    self.bytes += self.data.len();
+                    if self.bytes > 1024 * 1024 {
+                        return Err(io::Error::other("Model response exceeds 1 MiB"));
+                    }
                     emit(serde_json::from_slice(&self.data)?)?;
                     self.data.clear();
                 }
@@ -98,7 +103,7 @@ impl Http {
         &mut self,
         url: &str,
         headers: &[String],
-        body: &Value,
+        body: &[u8],
         wake: RawFd,
         canceled: &AtomicBool,
         mut emit: impl FnMut(Value) -> io::Result<()>,
@@ -106,7 +111,7 @@ impl Http {
         let mut easy = Easy2::new(Response::default());
         easy.url(url)?;
         easy.post(true)?;
-        easy.post_fields_copy(&serde_json::to_vec(body)?)?;
+        easy.post_fields_copy(body)?;
         easy.connect_timeout(Duration::from_secs(15))?;
         easy.low_speed_limit(1)?;
         easy.low_speed_time(Duration::from_secs(120))?;
@@ -226,7 +231,7 @@ mod tests {
             .stream(
                 &url,
                 &[],
-                &serde_json::json!({}),
+                b"{}",
                 crate::eventfd::new().unwrap().as_raw_fd(),
                 &AtomicBool::new(false),
                 |event| {
@@ -257,14 +262,9 @@ mod tests {
             stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 19\r\n\r\ngateway unavailable").unwrap();
         });
         let error = http
-            .stream(
-                &url,
-                &[],
-                &serde_json::json!({}),
-                wake.as_raw_fd(),
-                &canceled,
-                |_| panic!("HTTP error emitted as SSE"),
-            )
+            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| {
+                panic!("HTTP error emitted as SSE")
+            })
             .unwrap_err();
         assert_eq!(error.to_string(), "Agent HTTP 429: gateway unavailable");
         thread.join().unwrap();
@@ -274,14 +274,9 @@ mod tests {
                 .unwrap();
         });
         let error = http
-            .stream(
-                &url,
-                &[],
-                &serde_json::json!({}),
-                wake.as_raw_fd(),
-                &canceled,
-                |_| Err(io::Error::other("receiver full")),
-            )
+            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| {
+                Err(io::Error::other("receiver full"))
+            })
             .unwrap_err();
         assert_eq!(error.to_string(), "receiver full");
         thread.join().unwrap();
@@ -291,14 +286,7 @@ mod tests {
                 .unwrap();
         });
         let error = http
-            .stream(
-                &url,
-                &[],
-                &serde_json::json!({}),
-                wake.as_raw_fd(),
-                &canceled,
-                |_| Ok(()),
-            )
+            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| Ok(()))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
         thread.join().unwrap();
@@ -307,15 +295,8 @@ mod tests {
                 .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {}\n\n")
                 .unwrap();
         });
-        http.stream(
-            &url,
-            &[],
-            &serde_json::json!({}),
-            wake.as_raw_fd(),
-            &canceled,
-            |_| Ok(()),
-        )
-        .unwrap();
+        http.stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| Ok(()))
+            .unwrap();
         thread.join().unwrap();
     }
 
@@ -352,14 +333,7 @@ mod tests {
             start
         });
         let error = Http::new()
-            .stream(
-                &url,
-                &[],
-                &serde_json::json!({}),
-                wake.as_raw_fd(),
-                &canceled,
-                |_| Ok(()),
-            )
+            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| Ok(()))
             .unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         assert!(canceler.join().unwrap().elapsed() < Duration::from_millis(500));

@@ -661,7 +661,11 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
             quote = Some((ch, index));
         }
     }
-    let boundary = |ch: char| ch.is_whitespace() || ",│|\"'`<>".contains(ch);
+    let boundary = |ch: char| {
+        ch.is_whitespace()
+            || ",|\"'`<>，。；！？、：（）【】《》".contains(ch)
+            || matches!(ch, '\u{2500}'..='\u{257f}')
+    };
     if boundary(cells[anchor].0) {
         return Ok(Some([cells[anchor].1; 2]));
     }
@@ -676,17 +680,48 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
     if start == 0 && before >= LIMIT || end == cells.len() && right_limited {
         return Ok(None);
     }
-    while start < anchor && "([{=".contains(cells[start].0) {
+    if !cells[start..end].iter().any(|&(ch, _)| ch == '/')
+        && let Some(register_start) = (start..=anchor).rfind(|&index| cells[index].0 == '%')
+    {
+        let register_end = register_start
+            + 1
+            + cells[register_start + 1..end]
+                .iter()
+                .take_while(|(ch, _)| ch.is_ascii_alphanumeric())
+                .count();
+        if anchor < register_end {
+            return Ok(Some([cells[register_start].1, cells[register_end - 1].1]));
+        }
+    }
+    while start < end && "([{=".contains(cells[start].0) {
         start += 1;
+    }
+    if let Some(equal) = (start..end).find(|&index| cells[index].0 == '=')
+        && equal > start
+        && cells[start..equal]
+            .iter()
+            .all(|&(ch, _)| ch.is_ascii_alphanumeric() || "_-".contains(ch))
+    {
+        if anchor > equal {
+            start = equal + 1;
+        } else {
+            end = equal;
+        }
+    }
+    while end > start && ".;".contains(cells[end - 1].0) {
+        end -= 1;
     }
     for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
         let mut balance = cells[start..end].iter().fold(0i32, |balance, &(ch, _)| {
             balance + i32::from(ch == open) - i32::from(ch == close)
         });
-        while end > anchor + 1 && balance < 0 && cells[end - 1].0 == close {
+        while end > start && balance < 0 && cells[end - 1].0 == close {
             end -= 1;
             balance += 1;
         }
+    }
+    if !(start..end).contains(&anchor) {
+        return Ok(Some([cells[anchor].1; 2]));
     }
     Ok(Some([cells[start].1, cells[end - 1].1]))
 }
@@ -3511,10 +3546,7 @@ impl Core {
                     || history.desired_size.is_some()
             })
         {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::WouldBlock,
-                "history is still being committed or resized",
-            ));
+            return Err(std::io::ErrorKind::WouldBlock.into());
         }
         Ok(())
     }
