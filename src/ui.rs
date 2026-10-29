@@ -879,7 +879,7 @@ impl AgentPanel {
                     session.rewind_applied = Some(*turn);
                     redraw = true;
                 }
-                if selection.is_some() && selection != session.selection_checkpoint() {
+                if selection.is_some() && !session.selection_matches(selection.as_ref()) {
                     session.clear_selection();
                     redraw = true;
                 }
@@ -1104,7 +1104,7 @@ impl AgentPanel {
         let session = self.active_mut();
         let selection = session.selection_checkpoint();
         session.sync_rendered();
-        if selection.is_some() && selection != session.selection_checkpoint() {
+        if selection.is_some() && !session.selection_matches(selection.as_ref()) {
             session.clear_selection();
         }
         if session.render_request.is_none() {
@@ -1184,10 +1184,7 @@ impl AgentPanel {
         for (index, rendered) in result.messages {
             session.rendered[index] = Some(rendered);
         }
-        let next_selection = session.selection_checkpoint();
-        if session.selection.is_some()
-            && (next_selection.is_none() || selection.is_some() && selection != next_selection)
-        {
+        if session.selection.is_some() && !session.selection_matches(selection.as_ref()) {
             session.clear_selection();
         }
         session.columns = 0;
@@ -1533,6 +1530,23 @@ impl AgentSession {
     }
 
     fn selection_checkpoint(&self) -> Option<[(u64, Option<String>, String); 2]> {
+        self.selection_prefixes().map(|prefixes| {
+            prefixes.map(|(turn, id, text)| (turn, id.map(str::to_owned), text.to_owned()))
+        })
+    }
+
+    fn selection_matches(&self, previous: Option<&[(u64, Option<String>, String); 2]>) -> bool {
+        self.selection_prefixes().is_some_and(|current| {
+            previous.is_none_or(|previous| {
+                current
+                    == previous
+                        .each_ref()
+                        .map(|(turn, id, text)| (*turn, id.as_deref(), text.as_str()))
+            })
+        })
+    }
+
+    fn selection_prefixes(&self) -> Option<[(u64, Option<&str>, &str); 2]> {
         let selection = self.selection.as_ref()?;
         let checkpoint = |point: TranscriptPoint| {
             let message = self.model.messages.get(point.message)?;
@@ -1543,8 +1557,8 @@ impl AgentSession {
             };
             Some((
                 message.turn,
-                message.id.clone(),
-                text.get(..point.offset)?.to_owned(),
+                message.id.as_deref(),
+                text.get(..point.offset)?,
             ))
         };
         Some([checkpoint(selection.anchor)?, checkpoint(selection.head)?])
