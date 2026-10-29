@@ -153,7 +153,9 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 let (changed, _) = frontend
                     .ui
                     .poll_agent(&mut frontend.client, &frontend.config)?;
-                let layout_changed = frontend.ui.agent.poll_layout()?;
+                let layout_changed = fds.iter().any(|source| {
+                    source.fd == frontend.ui.agent.layout_fd() && source.revents != 0
+                }) && frontend.ui.agent.poll_layout()?;
                 if (changed && frontend.ui.agent.open) || layout_changed {
                     frontend.agent_dirty = true;
                     frontend.dirty = true;

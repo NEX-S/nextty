@@ -625,7 +625,10 @@ impl WorkspaceView {
                 self.ui.agent.width = Some(self.agent_width);
                 let (changed, messages_changed) =
                     self.ui.poll_agent(&mut self.client, &self.config)?;
-                let layout_changed = self.ui.agent.poll_layout()?;
+                let layout_changed = pollfds
+                    .iter()
+                    .any(|source| source.fd == self.ui.agent.layout_fd() && source.revents != 0)
+                    && self.ui.agent.poll_layout()?;
                 if let Some(width) = self.ui.agent.width {
                     self.agent_width = width;
                 }
