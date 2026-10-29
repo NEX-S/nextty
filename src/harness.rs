@@ -700,7 +700,8 @@ impl Response {
                     .ok_or_else(|| io::Error::other("Unknown or closed content block"))?;
                 if event["type"] == "content_block_stop" {
                     if block.value["type"] == "tool_use" && !block.partial.is_empty() {
-                        block.value["input"] = serde_json::from_str(&block.partial)?;
+                        block.value["input"] =
+                            serde_json::from_str(&std::mem::take(&mut block.partial))?;
                     }
                     block.closed = true;
                 } else {
