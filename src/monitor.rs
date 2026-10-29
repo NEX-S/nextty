@@ -310,11 +310,12 @@ impl Monitor {
                 .width
                 .saturating_sub(if self.width >= 80 { 15 } else { 11 });
             if body_width >= 26 {
+                let (columns, count) = process_columns(body_width, self.sort);
                 controls.extend(
-                    process_columns(body_width, self.sort)
-                        .into_iter()
+                    columns[..count]
+                        .iter()
                         .filter(|(id, _, _)| *id >= 2)
-                        .map(|(id, _, _)| Action::Sort(id - 2)),
+                        .map(|(id, _, _)| Action::Sort(*id - 2)),
                 );
             }
             let rows = self.processes();
@@ -857,7 +858,8 @@ impl Monitor {
             .iter()
             .any(|hit| matches!(hit.action, Action::Process(_)))
         {
-            let columns = process_columns(w, self.sort);
+            let (columns, count) = process_columns(w, self.sort);
+            let columns = &columns[..count];
             for hit in &view.hits {
                 if let Action::Process(pid) = hit.action {
                     let processes = self.stats.processes();
@@ -868,7 +870,7 @@ impl Monitor {
                         x: hit.x,
                         y: hit.y,
                         width: hit.width,
-                        text: process_row(process, w, &columns),
+                        text: process_row(process, w, columns),
                         color: if selected { GREEN } else { INK },
                         selected,
                         focused: false,
@@ -939,10 +941,11 @@ impl Monitor {
             body.text(x, 3, width, "Widen for process list", MUTED);
             return;
         }
-        let columns = process_columns(width, self.sort);
+        let (columns, count) = process_columns(width, self.sort);
+        let columns = &columns[..count];
         let show_io = columns.iter().any(|&(id, _, _)| id == 4);
         let mut column = x + 1;
-        for &(id, label, cells) in &columns {
+        for &(id, label, cells) in columns {
             if id >= 2 {
                 let sort = id - 2;
                 let label = format!(
@@ -1032,20 +1035,21 @@ impl Monitor {
     }
 }
 
-fn process_columns(width: u16, sort: u8) -> Vec<(u8, &'static str, u16)> {
+fn process_columns(width: u16, sort: u8) -> ([(u8, &'static str, u16); 5], usize) {
     let inner = width.saturating_sub(2);
     let show_rss = inner >= 32;
     let show_io = inner >= 46 && (width >= 70 || sort == 2);
     let name_width = inner
         .saturating_sub(7 + 6 + 2 + if show_rss { 9 } else { 0 } + if show_io { 10 } else { 0 });
-    let mut columns = vec![(0, "PID", 7), (1, "COMMAND", name_width), (2, "CPU%", 6)];
-    if show_rss {
-        columns.push((3, "RSS MiB", 8));
-    }
-    if show_io {
-        columns.push((4, "I/O MiB/s", 9));
-    }
-    columns
+    let columns = [
+        (0, "PID", 7),
+        (1, "COMMAND", name_width),
+        (2, "CPU%", 6),
+        (3, "RSS MiB", 8),
+        (4, "I/O MiB/s", 9),
+    ];
+    // I/O widths also include RSS, so visible columns form a prefix.
+    (columns, 3 + usize::from(show_rss) + usize::from(show_io))
 }
 
 fn process_row(p: &Process, width: u16, columns: &[(u8, &str, u16)]) -> String {
