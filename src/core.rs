@@ -284,7 +284,8 @@ impl Default for Cell {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Extra {
-    pub zerowidth: Vec<char>,
+    // Four chars fit inline without enlarging the container on 64-bit targets.
+    pub zerowidth: smallvec::SmallVec<[char; 4]>,
     pub underline_color: Option<Color>,
 }
 

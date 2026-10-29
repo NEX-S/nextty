@@ -239,7 +239,10 @@ fn styled_history_pages_from_disk_and_cross_boundary_copy_is_exact() {
     settle(&mut core);
     assert_eq!(core.row(0).cells[0].c, '0');
     assert_eq!(core.row(0).cells[4].c, '中');
-    assert_eq!(core.row(0).extra(4).unwrap().zerowidth, vec!['\u{301}']);
+    assert_eq!(
+        core.row(0).extra(4).unwrap().zerowidth.as_slice(),
+        &['\u{301}']
+    );
     assert_eq!(core.row(0).cells[0].fg, Color::Named(NamedColor::Red));
     core.selection_start(
         Point {

@@ -1797,7 +1797,7 @@ fn read_row(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
     for _ in 0..count {
         let column = u16::from_le_bytes(read_array(file)?) as usize;
         let count = u32::from_le_bytes(read_array(file)?) as usize;
-        let mut zerowidth = Vec::with_capacity(count.min(1024));
+        let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
         for _ in 0..count {
             zerowidth.push(
                 char::from_u32(u32::from_le_bytes(read_array(file)?)).ok_or_else(|| {
@@ -1942,10 +1942,26 @@ mod tests {
         rows[0].extras_mut().push((
             0,
             Extra {
-                zerowidth: vec!['\u{301}'],
+                zerowidth: vec!['\u{301}'].into(),
                 underline_color: Some(Color::Indexed(17)),
             },
         ));
+        rows[0].extras_mut().extend([
+            (
+                1,
+                Extra {
+                    zerowidth: vec!['\u{301}', '\u{308}', '\u{327}', '\u{20dd}', '\u{20de}'].into(),
+                    underline_color: None,
+                },
+            ),
+            (
+                2,
+                Extra {
+                    zerowidth: Vec::new().into(),
+                    underline_color: Some(Color::Indexed(42)),
+                },
+            ),
+        ]);
         let mut bytes = Vec::new();
         for row in &rows {
             write_row(&mut bytes, row).unwrap();
@@ -2579,7 +2595,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         rows[1000].extras_mut().push((
             0,
             Extra {
-                zerowidth: vec!['\u{301}'],
+                zerowidth: vec!['\u{301}'].into(),
                 underline_color: Some(Color::Indexed(17)),
             },
         ));

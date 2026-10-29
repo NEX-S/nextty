@@ -127,11 +127,11 @@ fn row_snapshots_keep_extras_across_edits_clear_and_reflow() {
 #[test]
 fn row_parts_keep_unordered_extras_addressable_and_reject_duplicate_columns() {
     let accent = Extra {
-        zerowidth: vec!['\u{301}'],
+        zerowidth: vec!['\u{301}'].into(),
         underline_color: None,
     };
     let underline = Extra {
-        zerowidth: Vec::new(),
+        zerowidth: Vec::new().into(),
         underline_color: Some(Color::Indexed(42)),
     };
     let row = Row::from_parts(
@@ -161,13 +161,19 @@ fn pending_wrap_combining_and_wide_overwrite() {
     feed(&mut core, &mut parser, "abcde界\u{301}");
     assert!(core.row(0).wrapped);
     assert_eq!(line(&core, 1), "界     ");
-    assert_eq!(core.row(1).extra(0).unwrap().zerowidth, vec!['\u{301}']);
+    assert_eq!(
+        core.row(1).extra(0).unwrap().zerowidth.as_slice(),
+        &['\u{301}']
+    );
     feed(&mut core, &mut parser, "\x1b[2;2HX");
     assert_eq!(line(&core, 1), " X    ");
     assert!(core.row(1).extra(0).is_none());
     feed(&mut core, &mut parser, "\x1b[3;1H123456\u{308}");
     assert_eq!(core.cursor().0, Point { line: 2, column: 5 });
-    assert_eq!(core.row(2).extra(5).unwrap().zerowidth, vec!['\u{308}']);
+    assert_eq!(
+        core.row(2).extra(5).unwrap().zerowidth.as_slice(),
+        &['\u{308}']
+    );
     assert!(!core.row(2).wrapped);
     feed(&mut core, &mut parser, "Z");
     assert_eq!(core.history_size(), 1);
@@ -276,7 +282,10 @@ fn reflow_preserves_explicit_spaces_colors_wide_and_combining() {
         cell_height: 16,
     });
     assert_eq!(line(&core, 0), "ab  界 cdef");
-    assert_eq!(core.row(0).extra(4).unwrap().zerowidth, vec!['\u{301}']);
+    assert_eq!(
+        core.row(0).extra(4).unwrap().zerowidth.as_slice(),
+        &['\u{301}']
+    );
     assert_eq!(core.row(1).cells[0].bg, Color::Named(NamedColor::Red));
     assert_eq!(core.row(1).cells[1].bg, Color::Named(NamedColor::Red));
 }

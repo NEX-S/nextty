@@ -1887,14 +1887,9 @@ fn encode_update(e: &mut Encoder, update: &Update) {
         e.u32(row.extras().len() as u32);
         for (column, extra) in row.extras() {
             e.u16(*column as u16);
-            e.u32(
-                extra
-                    .zerowidth
-                    .iter()
-                    .map(|ch| ch.len_utf8())
-                    .sum::<usize>() as u32,
-            );
-            for ch in &extra.zerowidth {
+            let zerowidth = extra.zerowidth.as_slice();
+            e.u32(zerowidth.iter().map(|ch| ch.len_utf8()).sum::<usize>() as u32);
+            for ch in zerowidth {
                 e.0.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
             }
             e.bool(extra.underline_color.is_some());
@@ -2015,10 +2010,15 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
         let mut extras = Vec::with_capacity(count);
         for _ in 0..count {
             let column = d.u16()? as usize;
-            let zerowidth = std::str::from_utf8(d.bytes(65536)?)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                .chars()
-                .collect();
+            let bytes = d.bytes(65536)?;
+            let zerowidth = if bytes.is_empty() {
+                Default::default()
+            } else {
+                std::str::from_utf8(bytes)
+                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                    .chars()
+                    .collect()
+            };
             let underline_color = if d.bool()? {
                 Some(decode_color(d)?)
             } else {
@@ -2756,7 +2756,7 @@ mod tests {
             vec![(
                 3072,
                 Extra {
-                    zerowidth: vec!['\u{301}'],
+                    zerowidth: vec!['\u{301}'].into(),
                     underline_color: Some(Color::Indexed(12)),
                 },
             )],

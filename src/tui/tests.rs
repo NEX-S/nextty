@@ -1519,7 +1519,10 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
             })
         );
         if right != "main" {
-            assert_eq!(host.row(1).extra(22).unwrap().zerowidth, ['\u{301}']);
+            assert_eq!(
+                host.row(1).extra(22).unwrap().zerowidth.as_slice(),
+                &['\u{301}']
+            );
         }
         parser.advance(&mut core, format!("\x1b[1;{}H\x1b[K", start + 1).as_bytes());
         screen.apply(Update::capture(&core, true)).unwrap();
