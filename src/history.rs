@@ -1754,7 +1754,19 @@ fn read_array<const N: usize>(file: &mut impl Read) -> io::Result<[u8; N]> {
     file.read_exact(&mut bytes)?;
     Ok(bytes)
 }
-fn read_row(file: &mut impl Read, mut cells: Vec<Cell>) -> io::Result<Row> {
+fn decode_cells(cells: &mut [Cell], bytes: &[u8]) -> io::Result<()> {
+    for (cell, bytes) in cells.iter_mut().zip(bytes.chunks_exact(14)) {
+        cell.c = char::from_u32(u32::from_le_bytes(bytes[..4].try_into().unwrap())).ok_or_else(
+            || io::Error::new(io::ErrorKind::InvalidData, "invalid history character"),
+        )?;
+        cell.fg = read_color(bytes[4..8].try_into().unwrap())?;
+        cell.bg = read_color(bytes[8..12].try_into().unwrap())?;
+        cell.flags = Flags::from_bits(u16::from_le_bytes(bytes[12..].try_into().unwrap()))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history flags"))?;
+    }
+    Ok(())
+}
+fn read_row(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
     let header = read_array::<9>(file)?;
     let columns = u16::from_le_bytes([header[0], header[1]]) as usize;
     let used = u16::from_le_bytes([header[2], header[3]]) as usize;
@@ -1770,19 +1782,15 @@ fn read_row(file: &mut impl Read, mut cells: Vec<Cell>) -> io::Result<Row> {
     cells.truncate(stored);
     cells.resize(columns, Cell::default());
     for cells in cells[..stored].chunks_mut(64) {
-        let mut bytes = [0; 14 * 64];
-        file.read_exact(&mut bytes[..cells.len() * 14])?;
-        for (cell, bytes) in cells.iter_mut().zip(bytes.chunks_exact(14)) {
-            cell.c = char::from_u32(u32::from_le_bytes(bytes[..4].try_into().unwrap()))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid history character")
-                })?;
-            cell.fg = read_color(bytes[4..8].try_into().unwrap())?;
-            cell.bg = read_color(bytes[8..12].try_into().unwrap())?;
-            cell.flags = Flags::from_bits(u16::from_le_bytes(bytes[12..].try_into().unwrap()))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::InvalidData, "invalid history flags")
-                })?;
+        let length = cells.len() * 14;
+        let buffered = file.fill_buf()?;
+        if buffered.len() >= length {
+            decode_cells(cells, &buffered[..length])?;
+            file.consume(length);
+        } else {
+            let mut bytes = [0; 14 * 64];
+            file.read_exact(&mut bytes[..length])?;
+            decode_cells(cells, &bytes[..length])?;
         }
     }
     let mut extras = Vec::with_capacity(count);
@@ -1913,7 +1921,7 @@ mod tests {
     fn decoding_sparse_rows_with_reused_storage_preserves_their_full_cells() {
         let mut styled = vec![Cell::default(); 9];
         styled[8].bg = Color::Indexed(17);
-        let rows = [
+        let mut rows = [
             Row::from_parts(
                 vec![
                     Cell {
@@ -1931,20 +1939,30 @@ mod tests {
             Row::from_parts(vec![Cell::default(); 3], false, 0, Vec::new()).unwrap(),
             Row::from_parts(styled, false, 0, Vec::new()).unwrap(),
         ];
+        rows[0].extras_mut().push((
+            0,
+            Extra {
+                zerowidth: vec!['\u{301}'],
+                underline_color: Some(Color::Indexed(17)),
+            },
+        ));
         let mut bytes = Vec::new();
         for row in &rows {
             write_row(&mut bytes, row).unwrap();
         }
-        let mut reader = bytes.as_slice();
-        let mut cells = Vec::new();
-        for expected in rows {
-            let decoded = read_row(&mut reader, cells).unwrap();
-            assert_eq!(decoded.cells, expected.cells);
-            assert_eq!(decoded.used(), expected.used());
-            assert_eq!(decoded.wrapped, expected.wrapped);
-            cells = decoded.cells;
+        for capacity in [7, 31, 257, 4096] {
+            let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
+            let mut cells = Vec::new();
+            for expected in &rows {
+                let decoded = read_row(&mut reader, cells).unwrap();
+                assert_eq!(decoded.cells, expected.cells);
+                assert_eq!(decoded.used(), expected.used());
+                assert_eq!(decoded.wrapped, expected.wrapped);
+                assert_eq!(decoded.extras(), expected.extras());
+                cells = decoded.cells;
+            }
+            assert!(reader.fill_buf().unwrap().is_empty());
         }
-        assert!(reader.is_empty());
     }
     #[test]
     fn empty_line_flood_uses_filled_segments_and_charges_filesystem_blocks() {
