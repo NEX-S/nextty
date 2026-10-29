@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::{collections::HashSet, io::ErrorKind, path::PathBuf};
+use std::{io::ErrorKind, path::PathBuf};
 
 pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
 
@@ -71,13 +71,13 @@ impl Config {
             offset: usize::from(text.starts_with('\u{feff}')) * 3,
         };
         let mut config = Self::default();
-        let mut seen = HashSet::new();
+        let mut seen = Vec::new();
         while parser.line_start()? {
             let key = parser.key()?;
             parser.space();
             parser.expect('=')?;
             parser.space();
-            if !seen.insert(key.clone()) {
+            if seen.contains(&key) {
                 return parser.fail(format!("duplicate configuration field {key:?}"));
             }
             match key.as_str() {
@@ -92,6 +92,7 @@ impl Config {
                 "model" => config.model = parser.string(true)?,
                 _ => return parser.fail(format!("unknown configuration field {key:?}")),
             }
+            seen.push(key);
             parser.space();
             parser.comment()?;
             if parser.peek().is_some() && !parser.newline() {
