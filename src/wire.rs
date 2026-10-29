@@ -63,6 +63,9 @@ pub(crate) enum Response {
 }
 pub(crate) struct Frame(Vec<u8>);
 impl Frame {
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
     pub fn kind(&self) -> u8 {
         self.0[5]
     }

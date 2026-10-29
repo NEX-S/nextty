@@ -176,11 +176,20 @@ fn bridge(remote: &mut Peer, daemon: &mut Peer, list: bool) -> io::Result<()> {
             && (remote.buffered_action()
                 || fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
         {
-            match remote.next_frame() {
-                Ok(Some(frame)) => daemon.send_frame(frame)?,
-                Ok(None) => (),
-                Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
-                Err(error) => return Err(error),
+            let mut bytes = 0;
+            for _ in 0..256 {
+                match remote.next_frame() {
+                    Ok(Some(frame)) => {
+                        bytes += frame.len();
+                        daemon.send_frame(frame)?;
+                    }
+                    Ok(None) => break,
+                    Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                    Err(error) => return Err(error),
+                }
+                if bytes >= 256 * 1024 || !remote.buffered_action() {
+                    break;
+                }
             }
         }
         if read_daemon
@@ -591,5 +600,64 @@ mod tests {
             assert!(Instant::now() < deadline, "bridge did not close");
             poll(&mut [fd(peer.fd(), libc::POLLIN)], 50).unwrap();
         }
+    }
+    #[test]
+    fn coalesced_input_drains_in_order_under_backpressure_before_remote_eof() {
+        let (remote_socket, bridge_socket) = UnixStream::pair().unwrap();
+        let (daemon_socket, server_socket) = UnixStream::pair().unwrap();
+        let capacity: libc::c_int = 4096;
+        assert_eq!(
+            unsafe {
+                libc::setsockopt(
+                    daemon_socket.as_raw_fd(),
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    (&capacity as *const libc::c_int).cast(),
+                    std::mem::size_of_val(&capacity) as libc::socklen_t,
+                )
+            },
+            0
+        );
+        let relay = std::thread::spawn(move || {
+            bridge(
+                &mut Peer::remote(bridge_socket).unwrap(),
+                &mut Peer::new(daemon_socket).unwrap(),
+                false,
+            )
+            .unwrap();
+        });
+        let writer = std::thread::spawn(move || {
+            let mut remote = Peer::remote(remote_socket).unwrap();
+            let mut data = vec![b'x'; 1024];
+            for index in 0..600u32 {
+                data[..4].copy_from_slice(&index.to_le_bytes());
+                remote.send_input(7, &data).unwrap();
+            }
+            flush(&mut remote).unwrap();
+        });
+        let mut server = Peer::new(server_socket).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        for index in 0..600u32 {
+            loop {
+                assert!(Instant::now() < deadline, "bridge input stalled");
+                if let Some(action) = server.next_action().unwrap() {
+                    let Action::Input { pane, data } = action else {
+                        panic!("unexpected action")
+                    };
+                    assert_eq!(pane, 7);
+                    assert_eq!(data.len(), 1024);
+                    assert_eq!(&data[..4], &index.to_le_bytes());
+                    assert!(data[4..].iter().all(|byte| *byte == b'x'));
+                    break;
+                }
+                poll(&mut [fd(server.fd(), libc::POLLIN)], 50).unwrap();
+            }
+        }
+        writer.join().unwrap();
+        relay.join().unwrap();
+        assert_eq!(
+            server.next_action().err().unwrap().kind(),
+            io::ErrorKind::UnexpectedEof
+        );
     }
 }
