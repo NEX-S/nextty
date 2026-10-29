@@ -447,7 +447,7 @@ fn draw_text(
     let text = fit_label(text, columns);
     write!(
         output,
-        "\x1b[{};{}H\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m{}",
+        "\x1b[{};{}H\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
         y + 1,
         x + 1,
         foreground >> 16 & 255,
@@ -456,8 +456,8 @@ fn draw_text(
         background >> 16 & 255,
         background >> 8 & 255,
         background & 255,
-        text
     )?;
+    output.extend_from_slice(text.as_bytes());
     let padding = usize::from(columns) - text_width(&text);
     output.resize(output.len() + padding, b' ');
     Ok(())
