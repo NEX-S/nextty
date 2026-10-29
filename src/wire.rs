@@ -343,7 +343,7 @@ impl Peer {
         updates: &[(u64, &Update)],
         previous: &HashMap<u64, Arc<ProcessMetadata>>,
     ) -> io::Result<()> {
-        let mut encoder = Encoder::new();
+        let mut encoder = Encoder::with_capacity(256);
         encoder.u8(1);
         encode_snapshot(&mut encoder, snapshot, previous);
         encoder.u32(updates.len() as u32);
