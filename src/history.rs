@@ -778,11 +778,11 @@ impl ReadText<'_> {
         self.text.push_str(&text[..count]);
         count
     }
-    fn row(&mut self, id: u64, row: &Row) -> io::Result<bool> {
+    fn row(&mut self, id: u64, row: &Row, bytes: &mut Vec<u8>) -> io::Result<bool> {
         if self.read.cancelled.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        let mut bytes = Vec::new();
+        bytes.clear();
         let from = if id == self.read.start.0 {
             self.read.start.1
         } else {
@@ -793,11 +793,11 @@ impl ReadText<'_> {
         } else {
             row.used()
         };
-        write_text(&mut bytes, row, from, to, false)?;
+        write_text(bytes, row, from, to, false)?;
         if id != self.read.end.0 && !row.wrapped {
             bytes.push(b'\n');
         }
-        let rendered = String::from_utf8(bytes)
+        let rendered = std::str::from_utf8(bytes)
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
         let offset = if id == self.cursor.row {
             self.cursor.offset as usize
@@ -871,6 +871,7 @@ fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Res
         found: read.query.is_none(),
     };
     let mut cells = Vec::new();
+    let mut bytes = Vec::new();
     let mut full = false;
     for (path, start, end) in segments {
         if read.cancelled.load(Ordering::Relaxed) {
@@ -903,7 +904,7 @@ fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Res
                 break;
             }
             let row = read_row(&mut file, cells)?;
-            full = output.row(id, &row)?;
+            full = output.row(id, &row, &mut bytes)?;
             cells = row.cells;
             if full {
                 break;
@@ -930,7 +931,7 @@ fn read_archive(read: &HistoryRead, segments: &[(PathBuf, u64, u64)]) -> io::Res
             if id > read.end.0 {
                 break;
             }
-            if output.row(id, row)? {
+            if output.row(id, row, &mut bytes)? {
                 break;
             }
         }
