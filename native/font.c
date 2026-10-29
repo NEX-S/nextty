@@ -254,9 +254,13 @@ failed:
 }
 
 static int emoji_presentation(uint32_t code) {
-    for (size_t i = 0; i < sizeof nt_emoji_presentation / sizeof *nt_emoji_presentation; ++i) {
-        if (code < nt_emoji_presentation[i][0]) return 0;
-        if (code <= nt_emoji_presentation[i][1]) return 1;
+    if (code < nt_emoji_presentation[0][0]) return 0;
+    size_t first = 0, end = sizeof nt_emoji_presentation / sizeof *nt_emoji_presentation;
+    while (first < end) {
+        size_t middle = first + (end - first) / 2;
+        if (code < nt_emoji_presentation[middle][0]) end = middle;
+        else if (code > nt_emoji_presentation[middle][1]) first = middle + 1;
+        else return 1;
     }
     return 0;
 }
