@@ -3270,9 +3270,9 @@ impl Core {
     }
     pub(crate) fn search(
         &mut self,
-        query: String,
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
-        wake: std::os::fd::OwnedFd,
+        query: &str,
+        cancelled: &Arc<std::sync::atomic::AtomicBool>,
+        wake: std::os::fd::BorrowedFd<'_>,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<crate::search::SearchResult>>>
     {
         let alternate = self.mode.contains(Mode::ALT_SCREEN);
@@ -3288,11 +3288,11 @@ impl Core {
         })?;
         let hot_start = if alternate { 0 } else { history.hot_start };
         history.io.search(
-            query,
+            query.to_owned(),
             (hot_start, self.active.rows.iter().cloned().collect()),
             (self.columns(), alternate),
-            cancelled,
-            wake,
+            Arc::clone(cancelled),
+            wake.try_clone_to_owned()?,
         )
     }
     pub(crate) fn search_select(

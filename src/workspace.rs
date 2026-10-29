@@ -2819,16 +2819,13 @@ fn apply_action(
     Ok(())
 }
 fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
-    let wake = unsafe { BorrowedFd::borrow_raw(terminal.event_fd()) }.try_clone_to_owned()?;
+    let wake = unsafe { BorrowedFd::borrow_raw(terminal.event_fd()) };
     match search
         .core
         .lock()
         .map_err(|e| io::Error::other(e.to_string()))?
-        .search(
-            search.query.clone(),
-            std::sync::Arc::clone(&search.cancelled),
-            wake,
-        ) {
+        .search(&search.query, &search.cancelled, wake)
+    {
         Ok(receiver) => search.receiver = Some(receiver),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
         Err(error) => return Err(error),
