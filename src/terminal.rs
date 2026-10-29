@@ -913,7 +913,7 @@ fn flush(
             let mut vectors = [libc::iovec {
                 iov_base: std::ptr::null_mut(),
                 iov_len: 0,
-            }; 16];
+            }; 64];
             let mut remaining = budget;
             let mut count = 0;
             for (index, data) in pending.iter().take(vectors.len()).enumerate() {
