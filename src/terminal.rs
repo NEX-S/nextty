@@ -59,19 +59,21 @@ struct EventProxy {
 }
 
 impl EventProxy {
-    fn wakeup(&self) {
-        if !self.wakeup.pending.swap(true, Ordering::AcqRel)
-            && let Err(error) = notify(self.wakeup.fd.as_raw_fd())
-        {
+    fn notify(&self) {
+        if let Err(error) = notify(self.wakeup.fd.as_raw_fd()) {
             eprintln!("notify terminal UI: {error}");
         }
     }
 
+    fn wakeup(&self) {
+        if !self.wakeup.pending.swap(true, Ordering::AcqRel) {
+            self.notify();
+        }
+    }
+
     fn send(&self, event: Event) {
-        if self.sender.send(event).is_ok()
-            && let Err(error) = notify(self.wakeup.fd.as_raw_fd())
-        {
-            eprintln!("notify terminal UI: {error}");
+        if self.sender.send(event).is_ok() {
+            self.notify();
         }
     }
 }
@@ -579,7 +581,7 @@ impl PtyLoop {
                 let queued = self.input_bytes.fetch_sub(consumed, Ordering::AcqRel);
                 let low_watermark = INPUT_CAPACITY * 3 / 4;
                 if queued > low_watermark && queued - consumed <= low_watermark {
-                    self.proxy.wakeup();
+                    self.proxy.notify();
                 }
             }
             #[cfg(feature = "tui")]

@@ -3318,3 +3318,132 @@ fn closing_a_pane_completes_its_pending_history_read_without_more_terminal_event
         finished && client.snapshot().unwrap().panes.len() == 1
     });
 }
+
+#[test]
+fn input_capacity_recovery_does_not_publish_unchanged_state() {
+    let server = TestServer::start();
+    let script = r#"import os,sys,time,tty
+from pathlib import Path
+root=Path(sys.argv[1])
+capacity=int(sys.argv[2])
+tty.setraw(0)
+def read_n(left):
+    while left:
+        data=os.read(0,min(left,65536))
+        assert data and data==b'x'*len(data)
+        left-=len(data)
+def wait_for(name):
+    while not (root/name).exists():
+        time.sleep(.001)
+os.write(1,b'READY')
+read_n(1)
+(root/'armed').touch()
+wait_for('drain')
+read_n(capacity//4-1)
+(root/'drained').touch()
+wait_for('finish')
+read_n(capacity*3//4+capacity)
+os.write(1,b'\r\nDONE')
+assert os.read(0,1)==b'y'
+os.write(1,b'\r\nAFTER')
+time.sleep(30)
+"#;
+    let mut client = Client::connect(&server.socket()).unwrap();
+    client
+        .send(Action::Create {
+            name: "persist".into(),
+            options: CreateOptions {
+                directory: Some(server.directory.join("home")),
+                program: Some(Shell::new(
+                    "python3".into(),
+                    vec![
+                        "-c".into(),
+                        script.into(),
+                        server.directory.to_str().unwrap().into(),
+                        INPUT_CAPACITY.to_string(),
+                    ],
+                )),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut client, |client, _| grid_contains(client, "READY"));
+    let pane = client.snapshot().unwrap().focused;
+    client
+        .send(Action::Input {
+            pane,
+            data: vec![b'x'; INPUT_CAPACITY],
+        })
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        client.flush().unwrap();
+        client.poll().unwrap();
+        if client.snapshot().unwrap().panes[0].input_generation == 4
+            && server.directory.join("armed").exists()
+        {
+            break;
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    let mut quiet = Instant::now();
+    while quiet.elapsed() < Duration::from_millis(50) {
+        if client
+            .poll()
+            .unwrap()
+            .iter()
+            .any(|event| matches!(event, ClientEvent::Updated))
+        {
+            quiet = Instant::now();
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    fs::write(server.directory.join("drain"), b"").unwrap();
+    let mut drained_at = None;
+    let mut updates = 0;
+    while drained_at.is_none_or(|time: Instant| time.elapsed() < Duration::from_millis(100)) {
+        updates += client
+            .poll()
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, ClientEvent::Updated))
+            .count();
+        if server.directory.join("drained").exists() {
+            drained_at.get_or_insert_with(Instant::now);
+        }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    assert_eq!(
+        updates, 0,
+        "input capacity recovery published unchanged state"
+    );
+    client
+        .send(Action::Input {
+            pane,
+            data: vec![b'x'; INPUT_CAPACITY],
+        })
+        .unwrap();
+    while client.snapshot().unwrap().panes[0].input_generation == 4 {
+        client.flush().unwrap();
+        client.poll().unwrap();
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    fs::write(server.directory.join("finish"), b"").unwrap();
+    while !grid_contains(&client, "DONE") {
+        client.flush().unwrap();
+        client.poll().unwrap();
+        assert!(Instant::now() < deadline, "deferred input did not resume");
+        std::thread::sleep(Duration::from_millis(2));
+    }
+    client
+        .send(Action::Input {
+            pane,
+            data: b"y".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| grid_contains(client, "AFTER"));
+}

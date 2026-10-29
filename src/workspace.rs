@@ -1662,12 +1662,14 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             let Some(pane) = workspace.panes.get_mut(id) else {
                 continue;
             };
-            pane.terminal.drain_notification()?;
-            pane.terminal.acknowledge_wakeup();
+            let mut changed = pane.terminal.drain_notification()?;
             let mut exit = false;
             for event in pane.terminal.events.try_iter() {
                 match event {
-                    Event::Title(title) => pane.title = title.unwrap_or_else(|| "shell".into()),
+                    Event::Title(title) => {
+                        pane.title = title.unwrap_or_else(|| "shell".into());
+                        changed = true;
+                    }
                     Event::Exit(_) => exit = true,
                     Event::Error(error) => {
                         eprintln!("workspace {name}: {error}");
@@ -1683,6 +1685,11 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     }
                 }
             }
+            if !changed && !exit {
+                // A concurrent state wakeup must stay pending until its state is observed.
+                continue;
+            }
+            pane.terminal.acknowledge_wakeup();
             if exit {
                 closing
                     .0
