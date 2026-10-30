@@ -1526,7 +1526,7 @@ pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
             .or_else(|| part.strip_suffix('\n'))
             .unwrap_or(part);
         let mut start = offset;
-        if line.is_ascii() {
+        if line.len() <= columns || line.is_ascii() {
             while offset + line.len() - start > columns {
                 result.push(start..start + columns);
                 start += columns;
