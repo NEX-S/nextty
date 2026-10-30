@@ -77,8 +77,8 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
             None
         } else if text.is_empty() {
             Some("blank")
-        } else if text.chars().filter(|c| horizontal(*c)).count() >= 3
-            && text.chars().all(|c| c == ' ' || horizontal(c))
+        } else if text.chars().all(|c| c == ' ' || horizontal(c))
+            && text.chars().filter(|c| horizontal(*c)).nth(2).is_some()
         {
             Some("separator")
         } else {
