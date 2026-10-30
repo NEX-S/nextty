@@ -180,8 +180,10 @@ pub fn run() -> io::Result<()> {
     let mut pending = Vec::new();
     let mut publish_models = false;
     let mut publish_at = Instant::now();
+    let mut fds = Vec::new();
     loop {
-        let mut fds = vec![
+        fds.clear();
+        fds.extend([
             libc::pollfd {
                 fd: client.fd(),
                 events: libc::POLLIN
@@ -197,7 +199,7 @@ pub fn run() -> io::Result<()> {
                 events: libc::POLLIN,
                 revents: 0,
             },
-        ];
+        ]);
         fds.extend(sessions.iter().map(|session| libc::pollfd {
             fd: session.model.fd(),
             events: libc::POLLIN,
