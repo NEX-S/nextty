@@ -135,9 +135,6 @@ impl Decoder {
             }
         }
         self.pending.drain(..consumed);
-        if self.pending.is_empty() {
-            self.escape_since = None;
-        }
         output.drain(..)
     }
 
