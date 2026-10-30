@@ -893,8 +893,10 @@ impl MarkdownWorker {
     fn submit(&self, job: MarkdownJob) {
         let (lock, changed) = &*self.shared;
         let previous = lock.lock().unwrap().pending.replace(job);
+        if previous.is_none() {
+            changed.notify_one();
+        }
         drop(previous);
-        changed.notify_one();
     }
 
     fn take(&self) -> Option<MarkdownResult> {
