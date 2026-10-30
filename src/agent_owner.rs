@@ -69,7 +69,12 @@ struct Session {
 }
 
 impl Session {
-    fn request(&mut self, mut request: Value, config: &Config, client: &Client) -> io::Result<()> {
+    fn request(
+        &mut self,
+        mut request: Value,
+        config: &Config,
+        client: &mut Client,
+    ) -> io::Result<()> {
         self.serialized.clear();
         match request["action"].as_str() {
             Some("send") => {
@@ -97,7 +102,7 @@ impl Session {
                 self.rewind_restore = None;
                 Ok(())
             }
-            Some("abort") => self.model.abort(),
+            Some("abort") => self.model.close(client),
             Some("rewind") => self
                 .model
                 .rewind(serde_json::from_value(request["index"].clone())?),
@@ -267,7 +272,7 @@ pub fn run() -> io::Result<()> {
                     let request: Value = serde_json::from_slice(&payload)?;
                     let id: u64 = serde_json::from_value(request["session"].clone())?;
                     if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
-                        if let Err(error) = session.request(request, &config, &client) {
+                        if let Err(error) = session.request(request, &config, &mut client) {
                             session.model.messages.push(crate::agent::Message {
                                 turn: 0,
                                 role: "Error".into(),

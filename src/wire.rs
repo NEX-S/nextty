@@ -21,7 +21,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 14;
+pub(crate) const VERSION: u8 = 16;
 
 pub(crate) enum Response {
     ScreenDirty,
@@ -1626,6 +1626,11 @@ fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
         e.string(arg);
     }
     e.u32(process.child_pid);
+    e.u8(match process.has_children {
+        None => 0,
+        Some(false) => 1,
+        Some(true) => 2,
+    });
     for pid in [process.foreground_pgid, process.foreground_pid] {
         e.bool(pid.is_some());
         if let Some(pid) = pid {
@@ -1653,6 +1658,12 @@ fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
 fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMetadata> {
     let launch_argv = d.strings(65536)?;
     let child_pid = d.u32()?;
+    let has_children = match d.u8()? {
+        0 => None,
+        1 => Some(false),
+        2 => Some(true),
+        _ => return Err(invalid("invalid child process state")),
+    };
     let foreground_pgid = if d.bool()? { Some(d.u32()?) } else { None };
     let foreground_pid = if d.bool()? { Some(d.u32()?) } else { None };
     let foreground_executable = d.path()?;
@@ -1667,6 +1678,7 @@ fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMet
     Ok(crate::terminal::ProcessMetadata {
         launch_argv,
         child_pid,
+        has_children,
         foreground_pgid,
         foreground_pid,
         foreground_executable,
@@ -1725,6 +1737,7 @@ fn encode_snapshot(
     for tab in &snapshot.tabs {
         e.u64(tab.id);
         e.string(&tab.title);
+        e.u8(tab.activity as u8);
     }
     e.u32(snapshot.panes.len() as u32);
     for pane in &snapshot.panes {
@@ -1779,6 +1792,14 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
         tabs.push(TabView {
             id: d.u64()?,
             title: d.string(65536)?,
+            activity: match d.u8()? {
+                0 => crate::workspace::TabActivity::Idle,
+                1 => crate::workspace::TabActivity::Running,
+                2 => crate::workspace::TabActivity::Finished,
+                3 => crate::workspace::TabActivity::Failed,
+                4 => crate::workspace::TabActivity::Unknown,
+                _ => return Err(invalid("invalid tab activity")),
+            },
         });
     }
     let count = d.count(1024)?;
@@ -2184,6 +2205,7 @@ mod tests {
         let expected = crate::terminal::ProcessMetadata {
             launch_argv: vec!["gdb".into(), "--args".into(), "sudo".into()],
             child_pid: 21,
+            has_children: None,
             foreground_pgid: Some(22),
             foreground_pid: Some(22),
             foreground_executable: Some("/usr/bin/gdb".into()),

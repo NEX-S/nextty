@@ -1,4 +1,4 @@
-use crate::harness::{Event, Harness, TerminalRequest};
+use crate::harness::{Event, Harness, MAX_READ_WAIT, TerminalRequest};
 use crate::workspace::{Action, Client, ClientEvent};
 use serde_json::{Value, json};
 use std::sync::atomic::AtomicU64;
@@ -8,7 +8,6 @@ use std::{io, ops::Range};
 
 const INPUT_LIMIT: usize = 64 * 1024;
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
-const READ_WAIT: Duration = Duration::from_secs(5);
 
 #[derive(PartialEq, Eq)]
 pub(crate) struct Message {
@@ -268,13 +267,27 @@ impl Agent {
     }
 
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
+        let history = if let Some(operation) = self.operation.take() {
+            let (command, history) = match operation.stage {
+                Stage::Command { command, .. } => (Some(command), None),
+                Stage::Read { id, command, .. } => (command, Some(id)),
+                _ => (None, None),
+            };
+            let result = match command {
+                Some(command) if operation.request.name == "shell" => {
+                    Ok(json!({"input_queued":true,"command":command}).to_string())
+                }
+                _ => Err(io::ErrorKind::Interrupted.into()),
+            };
+            // Queue known execution facts before abort publishes cancellation and wakes the worker.
+            let _ = operation.request.reply.send(result);
+            history
+        } else {
+            None
+        };
         self.abort()?;
-        if let Some(Operation {
-            stage: Stage::Read { id, .. },
-            ..
-        }) = &self.operation
-        {
-            client.send(Action::CancelHistory { request: *id })?;
+        if let Some(request) = history {
+            client.send(Action::CancelHistory { request })?;
         }
         Ok(())
     }
@@ -509,6 +522,7 @@ enum Stage {
     },
     Read {
         id: u64,
+        command: Option<u64>,
         before: u64,
         outcome: &'static str,
     },
@@ -611,15 +625,28 @@ impl Agent {
                         }
                         _ => return Err(io::Error::other("Unknown terminal read source")),
                     };
-                    let wait = request.input["wait"] == true;
-                    if wait && let Some(command) = command {
+                    let seconds = request
+                        .input
+                        .get("wait")
+                        .map(|value| serde_json::from_value::<u64>(value.clone()))
+                        .transpose()?
+                        .unwrap_or(0);
+                    if seconds > MAX_READ_WAIT {
+                        return Err(io::Error::other(format!(
+                            "read wait exceeds {MAX_READ_WAIT} seconds"
+                        )));
+                    }
+                    let wait = Duration::from_secs(seconds);
+                    if !wait.is_zero()
+                        && let Some(command) = command
+                    {
                         Ok(Stage::Command {
                             command,
-                            until: Instant::now() + READ_WAIT,
+                            until: Instant::now() + wait,
                         })
-                    } else if wait || source == "screen" {
+                    } else if !wait.is_zero() || source == "screen" {
                         Ok(Stage::Change {
-                            until: Instant::now() + if wait { READ_WAIT } else { Duration::ZERO },
+                            until: Instant::now() + wait,
                         })
                     } else {
                         read_output(client, &request, command, "current")
@@ -647,11 +674,6 @@ impl Agent {
         }
         let mut operation = self.operation.take().unwrap();
         let event = std::mem::replace(event, ClientEvent::Updated);
-        if operation.request.canceled.load(Ordering::Acquire) {
-            return operation
-                .request
-                .respond(Err(io::ErrorKind::Interrupted.into()));
-        }
         match event {
             ClientEvent::AgentInput { result, .. } => {
                 let Stage::Input { generation, .. } = operation.stage else {
@@ -664,14 +686,14 @@ impl Agent {
                     ));
                 }
                 match result {
-                    Ok(Some(command)) => {
+                    Ok(Some(command)) if !operation.request.canceled.load(Ordering::Acquire) => {
                         operation.stage = Stage::Command {
                             command,
                             until: Instant::now() + Duration::from_secs(1),
                         };
                         self.operation = Some(operation);
                     }
-                    Ok(None) => {
+                    Ok(command) => {
                         let pane = operation.request.input["pane"].as_u64().unwrap();
                         operation
                             .request
@@ -680,6 +702,9 @@ impl Agent {
                                     self.observed_activity =
                                         Some((pane, client.terminal_revision(pane).unwrap()));
                                     context["input_queued"] = json!(true);
+                                    if let Some(command) = command {
+                                        context["command"] = json!(command);
+                                    }
                                     context.to_string()
                                 },
                             ))?;
@@ -741,13 +766,13 @@ impl Agent {
     fn advance(&mut self, client: &mut Client) -> io::Result<()> {
         if let Some(mut operation) = self.operation.take() {
             let result = (|| -> io::Result<Option<String>> {
+                let pane = operation.request.input["pane"].as_u64().unwrap();
                 if operation.request.canceled.load(Ordering::Acquire) {
                     if let Stage::Read { id, .. } = operation.stage {
                         client.send(Action::CancelHistory { request: id })?;
                     }
                     return Err(io::ErrorKind::Interrupted.into());
                 }
-                let pane = operation.request.input["pane"].as_u64().unwrap();
                 match &operation.stage {
                     Stage::Command { command, until } => {
                         let view = client
@@ -773,13 +798,14 @@ impl Agent {
                         let activity = client.terminal_revision(pane)?;
                         let changed = self.observed_activity != Some((pane, activity));
                         if changed || Instant::now() >= *until {
-                            let outcome = if operation.request.input["wait"] != true {
-                                "current"
-                            } else if changed {
-                                "changed"
-                            } else {
-                                "timeout"
-                            };
+                            let outcome =
+                                if operation.request.input["wait"].as_u64().unwrap_or(0) == 0 {
+                                    "current"
+                                } else if changed {
+                                    "changed"
+                                } else {
+                                    "timeout"
+                                };
                             if operation.request.input["source"] == "screen" {
                                 let mut context = terminal_observation(
                                     client,
@@ -840,6 +866,7 @@ fn read_output(
     })?;
     Ok(Stage::Read {
         id,
+        command,
         before,
         outcome,
     })

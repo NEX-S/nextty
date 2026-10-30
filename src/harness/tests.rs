@@ -226,6 +226,23 @@ fn paired(messages: &[Value]) {
 }
 
 #[test]
+fn completed_terminal_result_precedes_cancellation() {
+    let (tx, rx) = mpsc::sync_channel(1);
+    let wake = crate::eventfd::new().unwrap();
+    let canceled = AtomicBool::new(false);
+    tx.send(Ok("unique executed result".into())).unwrap();
+    canceled.store(true, Ordering::Release);
+    assert_eq!(
+        receive_terminal(rx, wake.as_raw_fd(), &canceled).unwrap(),
+        "unique executed result"
+    );
+    let (_tx, rx) = mpsc::sync_channel(1);
+    let error = receive_terminal(rx, wake.as_raw_fd(), &canceled).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert_eq!(error.to_string(), "Stopped by user");
+}
+
+#[test]
 fn completed_tool_result_survives_a_full_event_queue() {
     let server = Server::new(2, |index, body, stream| {
         paired(body["messages"].as_array().unwrap());
@@ -345,7 +362,7 @@ fn shell_input_and_history_reads_share_the_target_and_preserve_later_turns() {
                         &[(
                             "output",
                             "read",
-                            json!({"source":"command","command":7,"wait":true}),
+                            json!({"source":"command","command":7,"wait":5}),
                         )],
                     )
                 }
@@ -434,7 +451,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
                             &[(
                                 "waiting",
                                 "read",
-                                json!({"source":"command","command":7,"wait":true}),
+                                json!({"source":"command","command":7,"wait":1800}),
                             )],
                         )
                     } else {

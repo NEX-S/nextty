@@ -15,6 +15,8 @@ pub struct Screen {
     pub(crate) selection: Option<SelectionRange>,
     pub(crate) offset: usize,
     pub(crate) history: usize,
+    #[cfg(feature = "tui")]
+    pub(crate) activity: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -42,6 +44,8 @@ impl Default for Screen {
             selection: None,
             offset: 0,
             history: 0,
+            #[cfg(feature = "tui")]
+            activity: 0,
         }
     }
 }
@@ -297,6 +301,39 @@ fn output_block(blocks: &[BlockMarker], line: i32, used: usize) -> Option<&Block
             && (line > start.line || start.column == 0)
             && (line < end.line || (line == end.line && end.column > 0 && used <= end.column))
     })
+}
+
+#[test]
+#[cfg(feature = "tui")]
+fn activity_compares_text_independently_of_render_damage_and_colors() {
+    let mut core = Core::new(
+        crate::core::WindowSize {
+            num_cols: 20,
+            num_lines: 4,
+            cell_width: 0,
+            cell_height: 0,
+        },
+        0xffffff,
+        0,
+    );
+    crate::vt::Parser::new().advance(&mut core, "中e\u{301}".as_bytes());
+    let mut screen = Screen::default();
+    let update = Update::capture_live(&core);
+    assert!(screen.changes_activity(&update));
+    screen.apply(update).unwrap();
+    assert!(screen.dirty.iter().all(|dirty| *dirty));
+    let mut update = Update::capture_live(&core);
+    assert!(!screen.changes_activity(&update));
+    update.rows[0].1.cells[0].fg = Color::Indexed(1);
+    assert!(!screen.changes_activity(&update));
+    update.rows[0].1.cells[0].c = '文';
+    assert!(screen.changes_activity(&update));
+    screen.apply(update).unwrap();
+    let mut update = Update::capture_live(&core);
+    update.rows[0].1.cells[0].c = '文';
+    assert!(!screen.changes_activity(&update));
+    update.cursor.1 = CursorShape::Hidden;
+    assert!(screen.changes_activity(&update));
 }
 
 #[test]

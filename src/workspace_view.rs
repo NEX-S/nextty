@@ -450,6 +450,16 @@ impl WorkspaceView {
         let mut events = Vec::new();
         let mut pollfds = Vec::new();
         while self.running {
+            if let Some(snapshot) = self.client.snapshot() {
+                let (width, _, _) = self.window.size();
+                let columns = ((width as f32 - self.control_width()) / self.cell.0).max(0.) as u16;
+                self.dirty |= self.ui.update_tabs(
+                    snapshot,
+                    columns,
+                    if self.client.is_remote() { "SSH" } else { "" },
+                    Instant::now(),
+                );
+            }
             #[cfg(feature = "monitor")]
             if let Some(snapshot) = self.client.snapshot() {
                 let directory = if self.client.is_remote() {
@@ -479,6 +489,18 @@ impl WorkspaceView {
                 };
             if let Some((_, until)) = &self.ui.status {
                 let remaining = until
+                    .saturating_duration_since(Instant::now())
+                    .as_nanos()
+                    .div_ceil(1_000_000)
+                    .min(i32::MAX as u128) as i32;
+                timeout = if timeout < 0 {
+                    remaining
+                } else {
+                    timeout.min(remaining)
+                };
+            }
+            if let Some(deadline) = self.ui.tab_deadline {
+                let remaining = deadline
                     .saturating_duration_since(Instant::now())
                     .as_nanos()
                     .div_ceil(1_000_000)
@@ -1110,6 +1132,7 @@ impl WorkspaceView {
                 0xff0d | 0xff8d => self.choose_close(choice)?,
                 0xff1b => {
                     self.closing = None;
+                    self.ui.close_tab = None;
                     self.dirty = true;
                 }
                 0xff51 => {
@@ -1324,6 +1347,8 @@ impl WorkspaceView {
                             if let Some(range) = self.ui.agent.active().model.selection() {
                                 self.window
                                     .selection(false, &self.ui.agent.active().model.input[range]);
+                            } else if self.ui.agent.active().model.busy {
+                                self.ui.agent.active_mut().model.abort()?;
                             } else {
                                 self.ui.agent.active_mut().model.clear_input();
                             }
@@ -1948,7 +1973,21 @@ impl WorkspaceView {
                 if !self.preedit.is_empty() {
                     self.message("Finish or cancel IME composition first");
                 } else if self.controller() {
-                    self.action(Action::CloseTab(tab))?;
+                    let target = self
+                        .client
+                        .snapshot()
+                        .and_then(|snapshot| {
+                            snapshot.tabs.iter().find(|candidate| candidate.id == tab)
+                        })
+                        .cloned();
+                    if let Some(target) = target {
+                        if self.ui.request_close_tab(&target) {
+                            self.action(Action::CloseTab(tab))?;
+                        } else {
+                            self.closing = Some(CloseChoice::Background);
+                            self.dirty = true;
+                        }
+                    }
                 }
             }
             GuiAction::Tab(direction) => {
@@ -3126,11 +3165,20 @@ impl WorkspaceView {
         self.dirty = true;
     }
     fn open_close(&mut self) {
+        self.ui.close_tab = None;
         self.preedit.clear();
         self.closing = Some(CloseChoice::Background);
         self.dirty = true;
     }
     fn choose_close(&mut self, choice: CloseChoice) -> Result<()> {
+        if let Some(tab) = self.ui.close_tab.take() {
+            self.closing = None;
+            self.dirty = true;
+            if choice == CloseChoice::Terminate {
+                self.action(Action::CloseTab(tab))?;
+            }
+            return Ok(());
+        }
         match choice {
             CloseChoice::Terminate => self.action(Action::Terminate)?,
             CloseChoice::Background => self.running = false,

@@ -148,6 +148,15 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
         let mut output_ready = true;
         frontend.poll()?;
         while frontend.running {
+            if let Some(snapshot) = frontend.client.snapshot() {
+                let label = frontend.label().into_owned();
+                frontend.dots_dirty |= frontend.ui.update_tabs(
+                    snapshot,
+                    frontend.view_size().num_cols,
+                    &label,
+                    Instant::now(),
+                );
+            }
             #[cfg(feature = "agent")]
             {
                 let (changed, _) = frontend
@@ -205,6 +214,11 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 } else if frontend.dirty {
                     frontend.draw(&mut output.bytes)?;
                     frontend.dirty = false;
+                    frontend.dots_dirty = false;
+                } else if frontend.dots_dirty {
+                    frontend.draw_dots(&mut output.bytes)?;
+                    frontend.draw_active_cursor(&mut output.bytes)?;
+                    frontend.dots_dirty = false;
                 }
             }
             if output_ready && let Err(error) = output.flush_available(libc::STDOUT_FILENO) {
@@ -226,6 +240,10 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             }
             let now = Instant::now();
             let mut timeout = decoder.timeout(now);
+            if let Some(deadline) = frontend.ui.tab_deadline {
+                let remaining = deadline.saturating_duration_since(now);
+                timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
+            }
             if let Some((_, until)) = &frontend.ui.status {
                 let remaining = until.saturating_duration_since(now);
                 timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
@@ -435,6 +453,16 @@ impl Output {
     }
 }
 
+#[cfg(feature = "agent")]
+fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
+    [0, 8, 16].into_iter().fold(0, |rgb, shift| {
+        rgb | ((((foreground >> shift & 255) * weight
+            + (background >> shift & 255) * (255 - weight))
+            / 255)
+            << shift)
+    })
+}
+
 fn draw_text(
     output: &mut Vec<u8>,
     x: u16,
@@ -538,6 +566,7 @@ struct Frontend {
     full: bool,
     layout: Vec<(PaneId, Rect)>,
     header: Vec<u8>,
+    dots_dirty: bool,
     ui: Ui,
     #[cfg(feature = "agent")]
     config: crate::config::Config,
@@ -551,6 +580,8 @@ struct Frontend {
     agent_dirty: bool,
     #[cfg(feature = "monitor")]
     resource_dirty: bool,
+    #[cfg(feature = "monitor")]
+    footer: String,
     #[cfg(feature = "agent")]
     selecting_editor: bool,
     #[cfg(feature = "agent")]
@@ -581,6 +612,7 @@ impl Frontend {
             full: true,
             layout: Vec::new(),
             header: Vec::new(),
+            dots_dirty: false,
             ui: Ui::new()?,
             #[cfg(feature = "agent")]
             config,
@@ -594,6 +626,8 @@ impl Frontend {
             agent_dirty: true,
             #[cfg(feature = "monitor")]
             resource_dirty: true,
+            #[cfg(feature = "monitor")]
+            footer: String::new(),
             #[cfg(feature = "agent")]
             selecting_editor: false,
             #[cfg(feature = "agent")]
@@ -686,8 +720,8 @@ impl Frontend {
 
     #[cfg(feature = "agent")]
     fn agent_width(&self) -> u16 {
-        (self.size.num_cols * 2 / 5)
-            .clamp(20, 42)
+        (self.size.num_cols / 2)
+            .clamp(20, 80)
             .min(self.size.num_cols.saturating_sub(2))
     }
 
@@ -705,23 +739,32 @@ impl Frontend {
     #[cfg(feature = "agent")]
     fn editor_rect(&self) -> Rect {
         let side = self.agent_rect();
+        let layout = self.editor_layout();
+        let rows = layout
+            .lines
+            .len()
+            .min(usize::from((side.rows / 3).clamp(1, 8))) as u16;
         Rect {
             x: side.x + 1,
-            y: (side.y + side.rows).saturating_sub(3),
+            y: (side.y + side.rows).saturating_sub(rows),
             cols: side.cols.saturating_sub(2),
-            rows: 3,
+            rows,
         }
     }
 
     #[cfg(feature = "agent")]
     fn editor_layout(&self) -> crate::ui::EditorLines {
+        let side = self.agent_rect();
         let columns = usize::from(
-            self.editor_rect()
-                .cols
+            side.cols
+                .saturating_sub(2)
                 .saturating_sub(u16::from(self.ui.agent.active().model.busy) * 3)
                 .max(1),
         );
-        self.ui.agent.active().editor_layout(columns, 3)
+        self.ui
+            .agent
+            .active()
+            .editor_layout(columns, usize::from((side.rows / 3).clamp(1, 8)))
     }
 
     #[cfg(feature = "agent")]
@@ -733,10 +776,15 @@ impl Frontend {
             if mouse.row < rect.y {
                 first = first.saturating_sub(1);
             } else if mouse.row >= rect.y + rect.rows {
-                first = (first + 1).min(lines.len().saturating_sub(3));
+                first = (first + 1).min(lines.len().saturating_sub(usize::from(rect.rows)));
             }
         }
-        let row = usize::from(mouse.row.saturating_sub(rect.y).min(2));
+        let row = usize::from(
+            mouse
+                .row
+                .saturating_sub(rect.y)
+                .min(rect.rows.saturating_sub(1)),
+        );
         let range = lines.get(first + row).cloned().unwrap_or(
             self.ui.agent.active().model.input.len()..self.ui.agent.active().model.input.len(),
         );
@@ -768,6 +816,7 @@ impl Frontend {
                 _ if bytes.contains(&3) && self.ui.agent.active_mut().model.busy => {
                     self.ui.agent.active_mut().model.abort()?
                 }
+                b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => self.ui.agent.active_mut().model.scroll = 0,
                 b"\x1b[A" | b"\x1bOA" | b"\x1b[5~" => {
                     self.ui.agent.active_mut().model.scroll = self
                         .ui
@@ -850,6 +899,8 @@ impl Frontend {
                     '\u{3}' => {
                         if let Some(range) = self.ui.agent.active().model.selection() {
                             self.copy_text(self.ui.agent.active().model.input[range].to_owned());
+                        } else if self.ui.agent.active().model.busy {
+                            self.ui.agent.active_mut().model.abort()?;
                         } else {
                             self.ui.agent.active_mut().model.clear_input();
                         }
@@ -931,12 +982,15 @@ impl Frontend {
                     scroll.saturating_add(3)
                 };
             } else if self.editor_rect().contains(mouse.column, mouse.row) {
+                let rect = self.editor_rect();
                 let layout = self.editor_layout();
                 let (lines, first) = (layout.lines, layout.first);
                 self.ui.agent.active_mut().editor_scroll = Some(if up {
                     first.saturating_sub(3)
                 } else {
-                    first.saturating_add(3).min(lines.len().saturating_sub(3))
+                    first
+                        .saturating_add(3)
+                        .min(lines.len().saturating_sub(usize::from(rect.rows)))
                 });
             } else {
                 self.ui.agent.active_mut().model.scroll = if up {
@@ -1155,36 +1209,44 @@ impl Frontend {
     #[cfg(feature = "agent")]
     fn draw_agent(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
         let side = self.agent_rect();
-        let editor = self.editor_rect();
-        let bg = self.config.background;
-        let brighter = |rgb: u32| {
-            ((rgb >> 16 & 255).saturating_add(16).min(255) << 16)
-                | ((rgb >> 8 & 255).saturating_add(16).min(255) << 8)
-                | (rgb & 255).saturating_add(16).min(255)
-        };
-        let user_bg = brighter(bg);
-        self.agent_hits.clear();
-        for row in side.y..side.y + side.rows {
-            draw_text(
+        if side.cols < 12 || side.rows < 6 {
+            self.agent_hits.clear();
+            return draw_text(
                 output,
                 side.x,
-                row,
+                side.y,
                 side.cols,
-                "",
+                "Alt+a: close",
                 self.config.foreground,
-                bg,
-            )?;
-            draw_text(output, side.x, row, 1, "│", 0x343b3d, bg)?;
+                self.config.background,
+            );
+        }
+        let editor = self.editor_rect();
+        let bg = self.config.background;
+        let foreground = self.config.foreground;
+        let muted = mix_color(foreground, bg, 180);
+        let user_bg = mix_color(foreground, bg, 20);
+        let selection_bg = mix_color(foreground, bg, 70);
+        let error = mix_color(0xe87575, foreground, 128);
+        self.agent_hits.clear();
+        for row in side.y..side.y + side.rows {
+            draw_text(output, side.x, row, side.cols, "│", muted, bg)?;
         }
         self.agent_hits.push((side, AgentAction::Output));
         self.draw_agent_tabs(output, side, editor, bg)?;
-        let attachment_rows = self.ui.agent.active().context.basket.len() as u16;
+        let attachment_count = self.ui.agent.active().context.basket.len();
+        let attachment_rows = (attachment_count as u16)
+            .min(3)
+            .min(editor.y.saturating_sub(side.y + 6));
+        let attachment_first = match self.ui.agent.keyboard {
+            AgentAction::Inspect(index) | AgentAction::Remove(index) => {
+                index.saturating_sub(usize::from(attachment_rows.saturating_sub(1)))
+            }
+            _ => attachment_count.saturating_sub(usize::from(attachment_rows)),
+        };
         let rewind = self.ui.agent.active().rewind_target.is_some();
-        let chat_end = editor.y.saturating_sub(
-            attachment_rows
-                + u16::from(attachment_rows > 0)
-                + u16::from(rewind && attachment_rows == 0),
-        );
+        let hint_rows = if rewind { 3 } else { 1 };
+        let chat_end = editor.y.saturating_sub(attachment_rows + hint_rows);
         let chat_top = side.y + 1;
         let rows = usize::from(chat_end.saturating_sub(chat_top));
         let columns = usize::from(editor.cols);
@@ -1244,7 +1306,7 @@ impl Frontend {
                         y,
                         editor.cols,
                         &format!(" {marker} {} ", message.role),
-                        0x889391,
+                        muted,
                         bg,
                     )?;
                     if let Some(selected) = self.ui.agent.active().selection_columns(first + row) {
@@ -1265,7 +1327,7 @@ impl Frontend {
                             (selected.end - selected.start) as u16,
                             &message.role[from..to],
                             self.config.foreground,
-                            0x52634c,
+                            selection_bg,
                         )?;
                     }
                     self.agent_hits.push((
@@ -1286,7 +1348,7 @@ impl Frontend {
                     let user = message.role == "You";
                     let message_bg =
                         if user && self.ui.agent.active().rewind_target == Some(message.turn) {
-                            0x394535
+                            selection_bg
                         } else if user {
                             user_bg
                         } else {
@@ -1327,7 +1389,7 @@ impl Frontend {
                                 &text[span],
                                 crate::markdown::color(style, self.config.foreground),
                                 if style & crate::markdown::CODE != 0 {
-                                    0x2b302d
+                                    user_bg
                                 } else {
                                     message_bg
                                 },
@@ -1342,7 +1404,7 @@ impl Frontend {
                             editor.cols.saturating_sub(indent),
                             &text[from..to],
                             if message.role == "Error" {
-                                0xd49790
+                                error
                             } else {
                                 self.config.foreground
                             },
@@ -1360,7 +1422,7 @@ impl Frontend {
                             (selected.end - selected.start) as u16,
                             &text[from..to],
                             self.config.foreground,
-                            0x52634c,
+                            selection_bg,
                         )?;
                     }
                     self.agent_hits.push((
@@ -1391,7 +1453,11 @@ impl Frontend {
                             y,
                             width,
                             crate::ui::REWIND_LABEL,
-                            if hovered { 0xb1c99c } else { 0x889391 },
+                            if hovered {
+                                self.config.foreground
+                            } else {
+                                muted
+                            },
                             message_bg,
                         )?;
                         self.agent_hits.push((
@@ -1407,35 +1473,95 @@ impl Frontend {
                 }
             }
         }
+        let hint = if rewind {
+            "Esc older · Enter confirm · type cancels"
+        } else if self.ui.focus == Focus::Output && self.ui.agent.active().model.scroll > 0 {
+            "History · End: latest"
+        } else {
+            match self.ui.focus {
+                Focus::Editor if self.ui.agent.active().model.busy => "Input · Ctrl+C: stop reply",
+                Focus::Editor => "Input · Enter: send · Ctrl+J: newline",
+                Focus::Output => "Output · Ctrl+C: copy / stop reply",
+                Focus::Controls => "Controls · Enter: activate",
+                _ => "Agent · Alt+o: focus",
+            }
+        };
+        draw_text(
+            output,
+            editor.x,
+            editor.y.saturating_sub(hint_rows),
+            editor.cols,
+            hint,
+            self.config.foreground,
+            bg,
+        )?;
         if rewind {
+            let session = self.ui.agent.active();
+            let target = session.model.messages.iter().find(|message| {
+                Some(message.turn) == session.rewind_target && message.role == "You"
+            });
+            let label = target.map_or(String::new(), |message| {
+                format!(
+                    "Rewind {} turns: {}",
+                    session
+                        .model
+                        .messages
+                        .iter()
+                        .filter(
+                            |candidate| candidate.role == "You" && candidate.turn >= message.turn
+                        )
+                        .count(),
+                    message.text.lines().next().unwrap_or("")
+                )
+            });
+            draw_text(
+                output,
+                editor.x,
+                editor.y.saturating_sub(2),
+                editor.cols,
+                &label,
+                self.config.foreground,
+                bg,
+            )?;
             draw_text(
                 output,
                 editor.x,
                 editor.y.saturating_sub(1),
                 editor.cols,
-                "Esc older · Enter confirm · type cancels",
-                0xb1c99c,
+                "Commands and file changes stay",
+                self.config.foreground,
                 bg,
             )?;
         }
-        for (index, item) in self.ui.agent.active().context.basket.iter().enumerate() {
-            let y = chat_end + index as u16;
+        for (row, (index, item)) in self
+            .ui
+            .agent
+            .active()
+            .context
+            .basket
+            .iter()
+            .enumerate()
+            .skip(attachment_first)
+            .take(usize::from(attachment_rows))
+            .enumerate()
+        {
+            let y = chat_end + row as u16;
             draw_text(
                 output,
                 editor.x,
                 y,
                 editor.cols.saturating_sub(3),
                 &format!(" +{} ", item.label),
-                0xb5d2a2,
+                self.config.foreground,
                 bg,
             )?;
             draw_text(
                 output,
-                editor.x + editor.cols - 3,
+                editor.x + editor.cols.saturating_sub(3),
                 y,
                 3,
                 " × ",
-                0x889391,
+                muted,
                 bg,
             )?;
             self.agent_hits.push((
@@ -1452,7 +1578,7 @@ impl Frontend {
             ));
             self.agent_hits.push((
                 Rect {
-                    x: editor.x + editor.cols - 3,
+                    x: editor.x + editor.cols.saturating_sub(3),
                     y,
                     cols: 3,
                     rows: 1,
@@ -1463,15 +1589,17 @@ impl Frontend {
         let layout = self.editor_layout();
         let (lines, first) = (layout.lines, layout.first);
         for row in 0..editor.rows {
-            draw_text(
-                output,
-                editor.x,
-                editor.y + row,
-                editor.cols,
-                "",
-                self.config.foreground,
-                user_bg,
-            )?;
+            if lines.get(first + usize::from(row)).is_none() {
+                draw_text(
+                    output,
+                    editor.x,
+                    editor.y + row,
+                    editor.cols,
+                    "",
+                    self.config.foreground,
+                    user_bg,
+                )?;
+            }
             if let Some(range) = lines.get(first + usize::from(row)) {
                 let text = &self.ui.agent.active().model.input[range.clone()];
                 draw_text(
@@ -1497,7 +1625,7 @@ impl Frontend {
                             text_width(&self.ui.agent.active().model.input[start..end]) as u16,
                             &self.ui.agent.active().model.input[start..end],
                             self.config.foreground,
-                            0x52634c,
+                            selection_bg,
                         )?;
                     }
                 }
@@ -1510,7 +1638,7 @@ impl Frontend {
                 editor.y,
                 editor.cols,
                 "Message…",
-                0x889391,
+                muted,
                 user_bg,
             )?;
         }
@@ -1518,16 +1646,16 @@ impl Frontend {
         if self.ui.agent.active().model.busy {
             draw_text(
                 output,
-                editor.x + editor.cols - 3,
+                editor.x + editor.cols.saturating_sub(3),
                 editor.y,
                 3,
                 " ■ ",
-                0xe87575,
+                self.config.foreground,
                 user_bg,
             )?;
             self.agent_hits.push((
                 Rect {
-                    x: editor.x + editor.cols - 3,
+                    x: editor.x + editor.cols.saturating_sub(3),
                     y: editor.y,
                     cols: 3,
                     rows: 1,
@@ -1550,8 +1678,8 @@ impl Frontend {
                     y,
                     editor.cols,
                     &format!(" {label} "),
-                    0xb5d2a2,
-                    0x2b3028,
+                    self.config.foreground,
+                    user_bg,
                 )?;
                 self.agent_hits.push((
                     Rect {
@@ -1594,10 +1722,18 @@ impl Frontend {
                 1,
                 columns,
                 &format!("[ {} ]", item.label),
-                0xb5d2a2,
+                self.config.foreground,
                 bg,
             )?;
-            draw_text(output, self.size.num_cols - 4, 1, 3, " × ", 0x889391, bg)?;
+            draw_text(
+                output,
+                self.size.num_cols.saturating_sub(4),
+                1,
+                3,
+                " × ",
+                muted,
+                bg,
+            )?;
             for (row, range) in lines.iter().skip(*scroll).take(rows).enumerate() {
                 draw_text(
                     output,
@@ -1612,16 +1748,16 @@ impl Frontend {
             draw_text(
                 output,
                 2,
-                self.size.num_lines - 2,
+                self.size.num_lines.saturating_sub(2),
                 columns,
                 " ⧉   Esc back",
-                0xb5d2a2,
+                self.config.foreground,
                 bg,
             )?;
             self.agent_hits.clear();
             self.agent_hits.push((
                 Rect {
-                    x: self.size.num_cols - 4,
+                    x: self.size.num_cols.saturating_sub(4),
                     y: 1,
                     cols: 3,
                     rows: 1,
@@ -1631,7 +1767,7 @@ impl Frontend {
             self.agent_hits.push((
                 Rect {
                     x: 2,
-                    y: self.size.num_lines - 2,
+                    y: self.size.num_lines.saturating_sub(2),
                     cols: text_width(" ⧉ ") as u16,
                     rows: 1,
                 },
@@ -1654,7 +1790,7 @@ impl Frontend {
                 continue;
             }
             let session = self.ui.agent.active();
-            let mut foreground = 0xb5d2a2;
+            let mut foreground = self.config.foreground;
             if matches!(action, AgentAction::Session(_)) {
                 continue;
             }
@@ -1673,18 +1809,14 @@ impl Frontend {
                     tab_bg |= ((bg >> shift & 255) * numerator / 10) << shift;
                 }
                 let (icon, color) = if *action == AgentAction::NewSession {
-                    ("+", 0xb5d2a2)
+                    ("+", self.config.foreground)
                 } else {
-                    ("×", 0xe87575)
+                    ("×", self.config.foreground)
                 };
                 draw_tab_icon(output, *rect, icon, (color, color), tab_bg, true, active)?;
                 continue;
             }
-            let background = if *action == AgentAction::Stop {
-                0x633534
-            } else {
-                0x343c34
-            };
+            let background = user_bg;
             let label = match *action {
                 AgentAction::NewSession => " + ".into(),
                 AgentAction::Session(index) => format!(
@@ -1708,7 +1840,7 @@ impl Frontend {
                 }
                 AgentAction::Rewind(_) => crate::ui::REWIND_LABEL.into(),
                 AgentAction::Stop => {
-                    foreground = 0xe87575;
+                    foreground = error;
                     " ■ ".into()
                 }
                 AgentAction::Inspect(index) => {
@@ -1739,7 +1871,7 @@ impl Frontend {
                     .find(|(_, action)| *action == self.ui.agent.keyboard)
                     .map_or(editor.y, |(rect, _)| rect.y),
             };
-            draw_text(output, side.x, row, 1, "›", 0xb1c99c, bg)?;
+            draw_text(output, side.x, row, 1, "›", self.config.foreground, bg)?;
         }
         output.write_all(b"\x1b[0m")
     }
@@ -1752,6 +1884,7 @@ impl Frontend {
         editor: Rect,
         bg: u32,
     ) -> io::Result<()> {
+        let muted = mix_color(self.config.foreground, bg, 180);
         let mut line_bg = 0;
         for shift in [16, 8, 0] {
             line_bg |= ((bg >> shift & 255) * 4 / 5) << shift;
@@ -1765,7 +1898,7 @@ impl Frontend {
             self.config.foreground,
             line_bg,
         )?;
-        draw_text(output, side.x, side.y, 1, "│", 0x343b3d, line_bg)?;
+        draw_text(output, side.x, side.y, 1, "│", muted, line_bg)?;
         let mut x = editor.x;
         for (index, column, columns) in self.ui.agent.tabs(usize::from(side.cols.saturating_sub(1)))
         {
@@ -1782,7 +1915,7 @@ impl Frontend {
             let color = if active {
                 self.config.foreground
             } else {
-                0x606060
+                muted
             };
             if active {
                 output.write_all(b"\x1b[4m")?;
@@ -1830,7 +1963,7 @@ impl Frontend {
                         rows: 1,
                     },
                     "×",
-                    (if active { 0x889391 } else { 0x404040 }, 0xe87575),
+                    (muted, self.config.foreground),
                     tab_bg,
                     hovered,
                     active,
@@ -1859,7 +1992,7 @@ impl Frontend {
                 rows: 1,
             },
             "+",
-            (0xb1c99c, 0xb5d2a2),
+            (self.config.foreground, self.config.foreground),
             line_bg,
             hovered,
             false,
@@ -1874,7 +2007,7 @@ impl Frontend {
             AgentAction::NewSession,
         ));
         let close = Rect {
-            x: side.x + side.cols - 3,
+            x: side.x + side.cols.saturating_sub(3),
             y: side.y,
             cols: 3,
             rows: 1,
@@ -1884,7 +2017,7 @@ impl Frontend {
             output,
             close,
             "×",
-            (0x889391, 0xe87575),
+            (muted, self.config.foreground),
             line_bg,
             hovered,
             false,
@@ -2047,6 +2180,18 @@ impl Frontend {
                 .size
                 .num_cols
                 .saturating_sub(text_width(&label) as u16 + 1);
+            if let Some(snapshot) = self.client.snapshot() {
+                let context = self.ui.footer(snapshot, self.client.is_remote());
+                draw_text(
+                    output,
+                    1,
+                    last,
+                    x.saturating_sub(2),
+                    &context,
+                    MUTED,
+                    BACKGROUND,
+                )?;
+            }
             let hovered = self
                 .pointer
                 .is_some_and(|(column, row)| row == last && column >= x);
@@ -2131,7 +2276,7 @@ impl Frontend {
     }
 
     fn draw_active_cursor(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        if self.ui.help {
+        if self.ui.help || self.ui.close_tab.is_some() {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         if self.ui.search.open {
@@ -2164,7 +2309,8 @@ impl Frontend {
             if self.ui.focus == Focus::Editor {
                 let layout = self.editor_layout();
                 let rect = self.editor_rect();
-                if (layout.first..layout.first + 3).contains(&layout.caret_row) {
+                if (layout.first..layout.first + usize::from(rect.rows)).contains(&layout.caret_row)
+                {
                     return write!(
                         output,
                         "\x1b[{};{}H\x1b[?25h",
@@ -2299,13 +2445,47 @@ impl Frontend {
     }
 
     fn input(&mut self, event: Input) -> io::Result<()> {
+        if let Some(tab) = self.ui.close_tab {
+            match &event {
+                Input::Escape => self.ui.close_tab = None,
+                Input::Bytes(bytes)
+                    if matches!(bytes.as_slice(), b"\t" | b"\x1b[D" | b"\x1b[C" | b"\x1b[Z") =>
+                {
+                    self.ui.close_confirm = !self.ui.close_confirm
+                }
+                Input::Bytes(bytes) if bytes == b"\r" => {
+                    if self.ui.close_confirm {
+                        self.client.send(Action::CloseTab(tab))?;
+                    }
+                    self.ui.close_tab = None;
+                }
+                Input::Mouse(mouse)
+                    if mouse.code & 3 == 0
+                        && !mouse.release
+                        && mouse.row == self.size.num_lines / 2 + 1 =>
+                {
+                    let left = (self.size.num_cols - self.size.num_cols.min(64)) / 2;
+                    if mouse.column >= left && mouse.column < left.saturating_add(16) {
+                        self.ui.close_tab = None;
+                    } else if mouse.column >= left.saturating_add(16)
+                        && mouse.column < left.saturating_add(32)
+                    {
+                        self.client.send(Action::CloseTab(tab))?;
+                        self.ui.close_tab = None;
+                    }
+                }
+                _ => (),
+            }
+            self.full = true;
+            self.dirty = true;
+            return Ok(());
+        }
         #[cfg(feature = "agent")]
         {
             self.ui.agent.view_dirty = true;
-        }
-        #[cfg(feature = "agent")]
-        if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
-            self.ui.agent_rewind_key(0);
+            if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
+                self.ui.agent_rewind_key(0);
+            }
         }
         if let Input::Alt(key) = event {
             if key == b'q' {
@@ -2936,6 +3116,10 @@ impl Frontend {
                     let tab = &snapshot.tabs[index];
                     if (x..x + width).contains(&mouse.column) {
                         let action = if (x + width - 4..x + width - 1).contains(&mouse.column) {
+                            if !self.ui.request_close_tab(tab) {
+                                self.dirty = true;
+                                return Ok(());
+                            }
                             Action::CloseTab(tab.id)
                         } else {
                             let active = snapshot
@@ -3137,6 +3321,23 @@ impl Frontend {
             .map(|block| (pane.id, block.id))
     }
 
+    fn draw_dots(&self, output: &mut Vec<u8>) -> io::Result<()> {
+        let Some(snapshot) = self.client.snapshot() else {
+            return Ok(());
+        };
+        for (index, x, _) in tab_chrome(snapshot, self.view_size().num_cols, &self.label()).0 {
+            let tab = &snapshot.tabs[index];
+            let color = self.ui.tab_color(tab, 0xcccccc, 0x202020);
+            let bg = if tab.id == snapshot.active_tab {
+                32
+            } else {
+                28
+            };
+            draw_text(output, x + 2, 0, 1, "•", color, bg)?;
+        }
+        output.write_all(b"\x1b[0m")
+    }
+
     fn draw(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
         let Some(snapshot) = self.client.snapshot() else {
             write!(output, "\x1b[H\x1b[0mWaiting for workspace — Alt+q detach")?;
@@ -3148,7 +3349,14 @@ impl Frontend {
         let size = self.view_size();
         let label = self.label();
         let start = output.len();
-        draw_tabs(output, snapshot, size.num_cols, &label, self.pointer)?;
+        draw_tabs(
+            output,
+            snapshot,
+            size.num_cols,
+            &label,
+            self.pointer,
+            &self.ui,
+        )?;
         if self.full || self.header != output[start..] {
             self.header.clear();
             self.header.extend_from_slice(&output[start..]);
@@ -3183,9 +3391,13 @@ impl Frontend {
             self.draw_files(output)?;
         }
         #[cfg(feature = "monitor")]
-        if self.full || self.resource_dirty {
-            self.draw_resources(output)?;
-            self.resource_dirty = false;
+        {
+            let footer = self.ui.footer(snapshot, self.client.is_remote());
+            if self.full || self.resource_dirty || self.footer != footer {
+                self.footer = footer;
+                self.draw_resources(output)?;
+                self.resource_dirty = false;
+            }
         }
         #[cfg(feature = "agent")]
         if self.ui.agent.open && (self.full || self.agent_dirty) {
@@ -3240,6 +3452,33 @@ impl Frontend {
                     line,
                     0xcbd0c9,
                     0x29322b,
+                )?;
+            }
+        }
+        if self.ui.close_tab.is_some() {
+            let width = self.size.num_cols.min(64);
+            let x = (self.size.num_cols - width) / 2;
+            let y = self.size.num_lines / 2;
+            for (offset, text) in [
+                "Close tab? Programs are running or state is unknown.",
+                "Closing terminates every pane in this tab.",
+                if self.ui.close_confirm {
+                    "    Cancel       [ Close tab ]"
+                } else {
+                    "  [ Cancel ]       Close tab"
+                },
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                draw_text(
+                    output,
+                    x,
+                    y.saturating_sub(1) + offset as u16,
+                    width,
+                    text,
+                    0xcccccc,
+                    0x303030,
                 )?;
             }
         }
@@ -3620,6 +3859,7 @@ fn draw_tabs(
     columns: u16,
     label: &str,
     pointer: Option<(u16, u16)>,
+    ui: &Ui,
 ) -> io::Result<()> {
     output.write_all(b"\x1b[H\x1b[0;48;2;25;25;25m\x1b[2K")?;
     let marker = if snapshot.controller {
@@ -3635,7 +3875,8 @@ fn draw_tabs(
         let active = tab.id == snapshot.active_tab;
         let bg = if active { 32 } else { 28 };
         let fg = if active { 148 } else { 96 };
-        let dot = if active { "175;196;96" } else { "64;64;64" };
+        let color = ui.tab_color(tab, 0xcccccc, 0x202020);
+        let dot = format!("{};{};{}", color >> 16 & 255, color >> 8 & 255, color & 255);
         let close = if active { "156;143;220" } else { "64;64;64" };
         let hovered =
             pointer.is_some_and(|(column, row)| row == 0 && (x..x + width).contains(&column));

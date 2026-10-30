@@ -196,7 +196,7 @@ impl SystemStats {
             sample: Sample::default(),
             process_revision: 0,
             directory: None,
-            text: "CPU —  MEM —  DSK —".into(),
+            text: "CPU —  MEM —  DSK —  SWP —".into(),
         })
     }
 
@@ -263,10 +263,16 @@ impl SystemStats {
             .disk()
             .and_then(|u| filesystem_percent(u.total, u.total - u.used, u.available));
         let text = format!(
-            "CPU {}  MEM {}  DSK {}",
+            "CPU {}  MEM {}  DSK {}  SWP {}",
             percent(self.sample.cpu),
             percent(sample_values(&self.sample)[1]),
-            percent(disk)
+            percent(disk),
+            percent(
+                self.sample
+                    .swap
+                    .filter(|usage| usage.total > 0)
+                    .map(|usage| usage.used as f32 * 100. / usage.total as f32)
+            )
         );
         let changed = text != self.text || expanded && (sampled || directory_changed);
         self.text = text;

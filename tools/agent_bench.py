@@ -216,7 +216,7 @@ class Lab:
                     self.command = result['command']
                 if result['running']:
                     assert result['outcome'] == 'timeout', result
-                    return ('command-wait', 'read', {'source':'command','command':self.command,'wait':True})
+                    return ('command-wait', 'read', {'source':'command','command':self.command,'wait':5})
                 assert not result['running'] and result['exit_code'] == 0, result
             if name == 'page':
                 self.output_prefix = result['text']
@@ -242,7 +242,7 @@ class Lab:
             if name == 'input-verify':
                 rows = [text for _, text in result['screen']['rows']]
                 if 'input-proof' not in rows or result['shell_prompt'] is None:
-                    return ('input-verify', 'read', {'source':'screen','wait':True})
+                    return ('input-verify', 'read', {'source':'screen','wait':5})
                 completed = next(block for block in result['command_blocks'] if block['has_output'])
                 assert completed['exit_code'] == 0, result
         index = self.tool_index
@@ -334,27 +334,27 @@ class Lab:
                         assert not result['has_more'] and not result['incomplete'], result
                         self.page = result['cursor']
                     else:
-                        assert elapsed >= 2500, f'output woke command wait: {elapsed}ms'
-                        assert result['text'] == ''.join(f'tick-{i:02d}\n' for i in range(1, 17)), result
+                        assert 5000 <= elapsed < 15000, f'output woke command wait: {elapsed}ms'
+                        assert result['text'] == ''.join(f'tick-{i:02d}\n' for i in range(1, 29)), result
             index = self.tool_index
             self.tool_index += 1
             if index == 0:
                 return ('interactive-shell', 'shell', {'command': 'sleep 2; printf \'续读🙂 Continue?\'; read -r -s answer; printf \'追加λ=%s\\n软折行🙂\' "$answer"; printf \'w%.0s\' {1..300}; printf \'\\n\''})
             if index == 1:
                 wait_begin.update(self.sample())
-                return ('interactive-wait', 'read', {'source':'command','command':self.command,'wait':True})
+                return ('interactive-wait', 'read', {'source':'command','command':self.command,'wait':5})
             if index == 2:
                 return ('interactive-eof', 'read', {'source':'command','command':self.command,'cursor':self.page})
             if index == 3:
                 return ('interactive-answer', 'input', {'text':'yes\n'})
             if index == 4:
-                return ('interactive-complete', 'read', {'source':'command','command':self.command,'cursor':self.page,'wait':True})
+                return ('interactive-complete', 'read', {'source':'command','command':self.command,'cursor':self.page,'wait':5})
             if index == 5:
                 return ('interactive-final-eof', 'read', {'source':'command','command':self.command,'cursor':self.page})
             if index == 6:
-                return ('continuous-shell', 'shell', {'command': 'for i in $(seq 1 16); do printf \'tick-%02d\\n\' "$i"; sleep .25; done'})
+                return ('continuous-shell', 'shell', {'command': 'for i in $(seq 1 28); do printf \'tick-%02d\\n\' "$i"; sleep .25; done'})
             if index == 7:
-                return ('continuous-wait', 'read', {'source':'command','command':self.command,'wait':True})
+                return ('continuous-wait', 'read', {'source':'command','command':self.command,'wait':15})
             return None
 
         self.next_tool = next_tool
@@ -365,7 +365,7 @@ class Lab:
         self.discover()
         start = time.monotonic()
         self.go.set()
-        self.wait(self.done.is_set, 'interactive command observations', 16)
+        self.wait(self.done.is_set, 'interactive command observations', 20)
         self.wait(lambda: b'tools-finished-proof' in self.output, 'interactive final answer rendered')
         assert len(self.requests) == 9, self.requests
         return {'case':'interactive-correctness', 'seconds':time.monotonic() - start,
@@ -446,30 +446,30 @@ class Lab:
             self.tool_index += 1
             if index == 0:
                 activity('screen-before')
-                return ('screen-before', 'read', {'source':'screen','wait':True})
+                return ('screen-before', 'read', {'source':'screen','wait':5})
             if index == 1:
                 activity('screen-after', .15)
-                return ('screen-after', 'read', {'source':'screen','wait':True})
+                return ('screen-after', 'read', {'source':'screen','wait':5})
             if index == 2:
                 quiet_begin.update(self.sample())
-                return ('screen-timeout', 'read', {'source':'screen','wait':True})
+                return ('screen-timeout', 'read', {'source':'screen','wait':5})
             if index == 3:
                 return ('screen-query-hit', 'read', {'source':'screen','query':'screen-before'})
             if index == 4:
                 return ('screen-query-miss', 'read', {'source':'screen','query':'absent-agent-benchmark-query'})
             if index == 5:
                 activity('history-before')
-                return ('history-before', 'read', {'source':'history','wait':True,'query':'history-before'})
+                return ('history-before', 'read', {'source':'history','wait':5,'query':'history-before'})
             if index == 6:
                 activity('history-after', .15)
-                return ('history-after', 'read', {'source':'history','wait':True,'query':'history-after'})
+                return ('history-after', 'read', {'source':'history','wait':5,'query':'history-after'})
             if index == 7:
                 quiet_begin.update(self.sample())
-                return ('history-timeout', 'read', {'source':'history','wait':True})
+                return ('history-timeout', 'read', {'source':'history','wait':5})
             if index == 8:
                 os.write(self.master, b'\x1bhx')
                 time.sleep(.15)
-                return ('history-input-state', 'read', {'source':'history','wait':True,'query':'probe-0001'})
+                return ('history-input-state', 'read', {'source':'history','wait':5,'query':'probe-0001'})
             if index == 9:
                 return ('history-input', 'input', {'text':'x'})
             if index == 10:

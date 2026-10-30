@@ -3185,6 +3185,13 @@ impl Core {
             has_output: block.output.is_some(),
         }
     }
+    pub fn latest_command(&self) -> Option<CommandBlock> {
+        self.blocks
+            .iter()
+            .rev()
+            .find(|block| block.output.is_some())
+            .map(|block| self.command_metadata(block))
+    }
     pub fn recent_command_blocks(&self) -> Vec<CommandBlock> {
         self.blocks
             .iter()

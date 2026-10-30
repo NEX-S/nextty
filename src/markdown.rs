@@ -8,12 +8,13 @@ pub(crate) const LINK: u8 = 8;
 pub(crate) const QUOTE: u8 = 16;
 
 pub(crate) fn color(style: u8, foreground: u32) -> u32 {
+    let dark_text = (foreground >> 16 & 255) + (foreground >> 8 & 255) + (foreground & 255) < 384;
     if style & CODE != 0 {
-        0xc6b890
+        if dark_text { 0x685520 } else { 0xc6b890 }
     } else if style & (BOLD | LINK) != 0 {
-        0xb5d2a2
+        if dark_text { 0x35552a } else { 0xb5d2a2 }
     } else if style & QUOTE != 0 {
-        0x889391
+        if dark_text { 0x56615f } else { 0x889391 }
     } else {
         foreground
     }

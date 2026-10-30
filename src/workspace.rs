@@ -198,10 +198,22 @@ pub struct WorkspaceInfo {
     pub panes: usize,
     pub attached: usize,
 }
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
+pub enum TabActivity {
+    #[default]
+    Idle,
+    Running,
+    Finished,
+    Failed,
+    Unknown,
+}
+
 #[derive(Clone, Debug)]
 pub struct TabView {
     pub id: TabId,
     pub title: String,
+    pub activity: TabActivity,
 }
 #[derive(Clone, Debug)]
 pub struct PaneView {
@@ -430,7 +442,6 @@ pub struct Client {
     peer: Peer,
     snapshot: Option<Snapshot>,
     screens: HashMap<PaneId, Screen>,
-    terminal_revisions: HashMap<PaneId, u64>,
     write_error: Option<io::Error>,
     ssh: Option<(Child, String)>,
 }
@@ -447,7 +458,6 @@ impl Client {
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
-            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         })
@@ -479,7 +489,6 @@ impl Client {
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
-            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: Some((child, target)),
         };
@@ -645,9 +654,9 @@ impl Client {
     }
     #[cfg(any(test, feature = "agent"))]
     pub(crate) fn terminal_revision(&self, pane: PaneId) -> io::Result<u64> {
-        self.terminal_revisions
+        self.screens
             .get(&pane)
-            .copied()
+            .map(|screen| screen.activity)
             .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
     }
     pub fn poll(&mut self) -> io::Result<Vec<ClientEvent>> {
@@ -667,15 +676,12 @@ impl Client {
                     for (id, update) in updates {
                         let screen = self.screens.entry(id).or_default();
                         if self.agent_delegate && screen.changes_activity(&update) {
-                            *self.terminal_revisions.entry(id).or_default() += 1;
+                            screen.activity += 1;
                         }
                         screen.apply(update)?;
                     }
                     if self.agent_delegate {
-                        self.terminal_revisions
-                            .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
                         for pane in &snapshot.panes {
-                            let revision = self.terminal_revisions.entry(pane.id).or_default();
                             let previous = self.snapshot.as_ref().and_then(|snapshot| {
                                 snapshot.panes.iter().find(|old| old.id == pane.id)
                             });
@@ -683,8 +689,9 @@ impl Client {
                                 old.input_generation != pane.input_generation
                                     || old.shell_prompt != pane.shell_prompt
                                     || old.command_blocks != pane.command_blocks
-                            }) {
-                                *revision += 1;
+                            }) && let Some(screen) = self.screens.get_mut(&pane.id)
+                            {
+                                screen.activity += 1;
                             }
                         }
                     }
@@ -1237,7 +1244,54 @@ impl Workspace {
                         None => pane_directory(&pane.terminal)?.as_deref().map(title),
                     }
                     .unwrap_or_else(|| pane.title.clone());
-                    Ok(TabView { id: tab.id, title })
+                    let mut layout = Vec::new();
+                    tab.root.layout(self.area(), &mut layout);
+                    let mut activity = TabActivity::Idle;
+                    for (id, _) in layout {
+                        let terminal = &self.panes[&id].terminal;
+                        let process = terminal.process_metadata();
+                        let core = terminal
+                            .core
+                            .lock()
+                            .map_err(|error| io::Error::other(error.to_string()))?;
+                        let latest = core.latest_command();
+                        let latest = latest.as_ref();
+                        let state = if process
+                            .foreground_pgid
+                            .is_some_and(|pgid| pgid != process.child_pid)
+                            || process.has_children == Some(true)
+                            || latest.is_some_and(|block| block.status.is_none())
+                        {
+                            TabActivity::Running
+                        } else if process.has_children.is_none()
+                            || core.shell_prompt().is_none() && !core.shell_editing()
+                        {
+                            TabActivity::Unknown
+                        } else if latest
+                            .is_some_and(|block| block.status.is_some_and(|status| status != 0))
+                        {
+                            TabActivity::Failed
+                        } else if latest.is_some() {
+                            TabActivity::Finished
+                        } else {
+                            TabActivity::Idle
+                        };
+                        let priority = |state| match state {
+                            TabActivity::Idle => 0,
+                            TabActivity::Finished => 1,
+                            TabActivity::Failed => 2,
+                            TabActivity::Unknown => 3,
+                            TabActivity::Running => 4,
+                        };
+                        if priority(state) > priority(activity) {
+                            activity = state;
+                        }
+                    }
+                    Ok(TabView {
+                        id: tab.id,
+                        title,
+                        activity,
+                    })
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             panes,

@@ -43,6 +43,7 @@ impl Shell {
 pub struct ProcessMetadata {
     pub launch_argv: Vec<String>,
     pub child_pid: u32,
+    pub has_children: Option<bool>,
     pub foreground_pgid: Option<u32>,
     // A PTY identifies a process group; procfs fields below describe its leader.
     pub foreground_pid: Option<u32>,
@@ -505,6 +506,12 @@ impl PtyLoop {
                     .push(format!("foreground cwd: {error}")),
             }
         }
+        match std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", metadata.child_pid)) {
+            Ok(children) => metadata.has_children = Some(!children.trim().is_empty()),
+            Err(error) => metadata
+                .unavailable
+                .push(format!("child processes: {error}")),
+        }
         metadata.sampled_at_ms = current.sampled_at_ms;
         let changed = metadata != *current;
         metadata.sampled_at_ms = Some(
@@ -597,7 +604,13 @@ impl PtyLoop {
             if process_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 self.sample_process();
                 process_sampled = Some(Instant::now());
-                process_deadline = None;
+                process_deadline = self
+                    .process_metadata
+                    .lock()
+                    .unwrap()
+                    .has_children
+                    .filter(|present| *present)
+                    .map(|_| Instant::now() + Duration::from_secs(1));
             }
             let sync_deadline = parser.deadline();
             if sync_deadline.is_some_and(|deadline| deadline <= Instant::now()) {

@@ -365,6 +365,7 @@ fn tab_positions_preserve_padding_and_active_visibility() {
             .into_iter()
             .enumerate()
             .map(|(index, title)| TabView {
+                activity: crate::workspace::TabActivity::Idle,
                 id: index as u64 + 1,
                 title: title.into(),
             })
@@ -378,6 +379,7 @@ fn tab_positions_preserve_padding_and_active_visibility() {
     let mut overflow = snapshot.clone();
     overflow.tabs = (0..12)
         .map(|i| TabView {
+            activity: crate::workspace::TabActivity::Idle,
             id: i + 1,
             title: format!("tab-{i}"),
         })
@@ -1349,7 +1351,6 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
-            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         });
@@ -1380,6 +1381,7 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
     .unwrap();
     clients[1].workspace = Some("live".into());
     clients[1].agent = true;
+    frontends[1].agent_delegate = true;
     let workspace = workspaces.get_mut("live").unwrap();
     let pane = workspace.focused();
     let mut parser = crate::vt::Parser::new();
@@ -1410,6 +1412,13 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
     assert!(grid_contains(&frontends[1], "live-one"));
     assert_eq!(frontends[0].screens()[&pane].display_offset(), offset);
     assert_eq!(frontends[1].screens()[&pane].display_offset(), 0);
+    let revision = frontends[1].terminal_revision(pane).unwrap();
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |_, events| !events.is_empty());
+    }
+    assert_eq!(frontends[1].terminal_revision(pane).unwrap(), revision);
     let historical_rows: Vec<_> = frontends[0].screens()[&pane]
         .rows
         .iter()
@@ -1445,6 +1454,7 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         wait(frontend, |_, events| !events.is_empty());
     }
     assert!(grid_contains(&frontends[1], "hidden-update"));
+    assert!(frontends[1].terminal_revision(pane).unwrap() > revision);
     assert!(!grid_contains(&frontends[0], "hidden-update"));
     for (row, original) in frontends[0].screens()[&pane]
         .rows
@@ -1483,6 +1493,18 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         );
     }
     assert_same_screen(&frontends[0], &frontends[1], pane);
+    let revision = frontends[1].terminal_revision(pane).unwrap();
+    {
+        let mut core = workspace.panes[&pane].terminal.core.lock().unwrap();
+        assert_eq!(core.dirty_rows().count(), 0);
+        core.note_input();
+    }
+    broadcast(workspace, &mut clients, true).unwrap();
+    for (connection, frontend) in clients.iter_mut().zip(&mut frontends) {
+        connection.peer.flush().unwrap();
+        wait(frontend, |_, events| !events.is_empty());
+    }
+    assert!(frontends[1].terminal_revision(pane).unwrap() > revision);
 }
 
 #[test]
@@ -1518,7 +1540,6 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
-            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         });
@@ -2801,7 +2822,6 @@ fn detached_behind_a_large_response_supersedes_a_known_write_failure() {
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
-        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2834,7 +2854,6 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
-        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2911,7 +2930,6 @@ fn write_failure_without_detached_still_reports_the_original_error() {
         agent_delegate: false,
         snapshot: None,
         screens: HashMap::new(),
-        terminal_revisions: HashMap::new(),
         write_error: None,
         ssh: None,
     };
@@ -2967,7 +2985,6 @@ fn demand_screen_retains_damage_and_recovers_after_other_consumers_and_pending_o
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
-            terminal_revisions: HashMap::new(),
             write_error: None,
             ssh: None,
         });
@@ -3637,4 +3654,99 @@ time.sleep(30)
         })
         .unwrap();
     wait(&mut client, |client, _| grid_contains(client, "AFTER"));
+}
+
+#[test]
+fn tab_activity_tracks_commands_even_when_the_tab_is_hidden() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    let script = "import os,tty; tty.setraw(0); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); os.write(1,b'\x1b]133;C\x07running'); os.read(0,1); os.write(1,b'\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1)";
+    client
+        .send(Action::Create {
+            name: "tab-activity".into(),
+            options: CreateOptions {
+                program: Some(Shell::new(
+                    "/usr/bin/python3".into(),
+                    vec!["-c".into(), script.into()],
+                )),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client
+            .snapshot()
+            .is_some_and(|s| s.tabs[0].activity == TabActivity::Idle)
+    });
+    let pane = client.snapshot().unwrap().focused;
+    let tab = client.snapshot().unwrap().active_tab;
+    client
+        .send(Action::Input {
+            pane,
+            data: b"r".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().tabs[0].activity == TabActivity::Running
+    });
+    client.send(Action::NewTab { pane }).unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().tabs.len() == 2
+    });
+    assert_ne!(client.snapshot().unwrap().active_tab, tab);
+    assert_eq!(
+        client.snapshot().unwrap().tabs[0].activity,
+        TabActivity::Running
+    );
+    client
+        .send(Action::Input {
+            pane,
+            data: b"f".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().tabs[0].activity == TabActivity::Failed
+    });
+}
+
+#[test]
+fn background_child_keeps_tab_running_until_it_exits() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    let script = "import os,tty,subprocess; tty.setraw(0); child=subprocess.Popen(['/bin/sleep','30']); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); child.terminate(); child.wait(); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1)";
+    client
+        .send(Action::Create {
+            name: "background-child".into(),
+            options: CreateOptions {
+                program: Some(Shell::new(
+                    "/usr/bin/python3".into(),
+                    vec!["-c".into(), script.into()],
+                )),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.tabs[0].activity == TabActivity::Running)
+    });
+    let pane = client.snapshot().unwrap().focused;
+    assert_eq!(
+        client.snapshot().unwrap().panes[0].process.has_children,
+        Some(true)
+    );
+    client
+        .send(Action::Input {
+            pane,
+            data: b"x".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        client.snapshot().unwrap().panes[0].process.has_children == Some(false)
+    });
+    assert_eq!(
+        client.snapshot().unwrap().tabs[0].activity,
+        TabActivity::Idle
+    );
 }

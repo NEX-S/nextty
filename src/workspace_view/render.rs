@@ -52,7 +52,11 @@ impl WorkspaceView {
                 "•",
                 x + cell.0 * 2.,
                 0.,
-                if active { 0xafc460ff } else { 0x404040ff },
+                (self
+                    .ui
+                    .tab_color(tab, self.config.foreground, self.config.background)
+                    << 8)
+                    | 255,
             )?;
             self.text.draw(
                 &self.renderer,
@@ -141,7 +145,7 @@ impl WorkspaceView {
         }
         Ok(x + w + self.cell.0)
     }
-    fn control_width(&self) -> f32 {
+    pub(super) fn control_width(&self) -> f32 {
         self.cell.0 * 18.
     }
     fn header_button(
@@ -1310,11 +1314,15 @@ impl WorkspaceView {
         };
         #[cfg(not(feature = "monitor"))]
         let right = layout.width - PADDING;
-        let label = self.ui.status.as_ref().map_or("", |(s, _)| s.as_str());
+        let label = self
+            .client
+            .snapshot()
+            .map(|snapshot| self.ui.footer(snapshot, self.client.is_remote()))
+            .unwrap_or_default();
         self.text.draw(
             &self.renderer,
             &fit(
-                label,
+                &label,
                 ((right - PADDING - self.cell.0 * 2.) / self.cell.0).max(0.) as usize,
             ),
             PADDING,
@@ -1451,14 +1459,31 @@ impl WorkspaceView {
         let name = self.client.snapshot().map_or("", |s| s.name.as_str());
         self.text.draw(
             &self.renderer,
-            &fit(&format!("Close window · {name}"), columns),
+            &fit(
+                &format!(
+                    "{} · {name}",
+                    if self.ui.close_tab.is_some() {
+                        "Close tab"
+                    } else {
+                        "Close window"
+                    }
+                ),
+                columns,
+            ),
             x + padding,
             y + h * 0.08,
             0xccccccff,
         )?;
         self.text.draw(
             &self.renderer,
-            &fit("End session to stop tasks and delete history", columns),
+            &fit(
+                if self.ui.close_tab.is_some() {
+                    "Programs may still be running in this tab"
+                } else {
+                    "End session to stop tasks and delete history"
+                },
+                columns,
+            ),
             x + padding,
             y + h * 0.22,
             0x888888ff,
@@ -1473,14 +1498,35 @@ impl WorkspaceView {
         };
         self.text.draw(
             &self.renderer,
-            &fit(&format!("Resume with: nextty attach {name}"), columns),
+            &fit(
+                &if self.ui.close_tab.is_some() {
+                    "Closing terminates all panes in this tab".into()
+                } else {
+                    format!("Resume with: nextty attach {name}")
+                },
+                columns,
+            ),
             x + padding,
             y + h * 0.36,
             0x888888ff,
         )?;
         for ((choice, label), &(bx, by, bw, bh)) in [
-            (CloseChoice::Terminate, "End session"),
-            (CloseChoice::Background, "Keep running (default)"),
+            (
+                CloseChoice::Terminate,
+                if self.ui.close_tab.is_some() {
+                    "Close tab"
+                } else {
+                    "End session"
+                },
+            ),
+            (
+                CloseChoice::Background,
+                if self.ui.close_tab.is_some() {
+                    "Cancel (default)"
+                } else {
+                    "Keep running (default)"
+                },
+            ),
         ]
         .into_iter()
         .zip(&rects[1..])
@@ -1752,6 +1798,7 @@ mod tests {
             active_tab: 6,
             tabs: (1..=12)
                 .map(|id| TabView {
+                    activity: crate::workspace::TabActivity::Idle,
                     id,
                     title: format!("tab-{id}"),
                 })

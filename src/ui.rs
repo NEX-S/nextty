@@ -25,8 +25,13 @@ use std::{
 };
 
 pub(crate) struct Ui {
+    tab_seen: std::collections::HashMap<crate::workspace::TabId, crate::workspace::TabActivity>,
+    pub tab_deadline: Option<Instant>,
+    tab_phase: u8,
     pub status: Option<(String, Instant)>,
     pub focus: Focus,
+    pub close_tab: Option<crate::workspace::TabId>,
+    pub close_confirm: bool,
     pub help: bool,
     pub help_scroll: usize,
     pub search: Search,
@@ -43,8 +48,13 @@ pub(crate) struct Ui {
 impl Ui {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
+            tab_seen: std::collections::HashMap::new(),
+            tab_deadline: None,
+            tab_phase: 0,
             status: None,
             focus: Focus::Terminal,
+            close_tab: None,
+            close_confirm: false,
             help: false,
             help_scroll: 0,
             search: Search::default(),
@@ -58,9 +68,108 @@ impl Ui {
             files_open: false,
         })
     }
+    pub fn update_tabs(
+        &mut self,
+        snapshot: &crate::workspace::Snapshot,
+        columns: u16,
+        label: &str,
+        now: Instant,
+    ) -> bool {
+        use crate::workspace::TabActivity;
+        let mut acknowledged = false;
+        self.tab_seen
+            .retain(|id, _| snapshot.tabs.iter().any(|tab| tab.id == *id));
+        for tab in &snapshot.tabs {
+            if tab.activity == TabActivity::Running {
+                acknowledged |= self.tab_seen.remove(&tab.id).is_some();
+            } else if tab.id == snapshot.active_tab {
+                acknowledged |= self.tab_seen.insert(tab.id, tab.activity) != Some(tab.activity);
+            }
+        }
+        let running = crate::workspace::tab_chrome(snapshot, columns, label)
+            .0
+            .iter()
+            .any(|(index, _, _)| snapshot.tabs[*index].activity == TabActivity::Running);
+        if !running {
+            self.tab_deadline = None;
+            return acknowledged;
+        }
+        let changed = self.tab_deadline.is_some_and(|deadline| now >= deadline);
+        if self.tab_deadline.is_none() || changed {
+            self.tab_phase = if changed { (self.tab_phase + 1) % 8 } else { 0 };
+            self.tab_deadline = Some(now + Duration::from_millis(250));
+        }
+        changed || acknowledged
+    }
+
+    pub fn tab_color(
+        &self,
+        tab: &crate::workspace::TabView,
+        foreground: u32,
+        background: u32,
+    ) -> u32 {
+        use crate::workspace::TabActivity;
+        if self.tab_seen.get(&tab.id) != Some(&tab.activity) {
+            match tab.activity {
+                TabActivity::Finished => return 0xfe9b30,
+                TabActivity::Failed => return 0xe87575,
+                _ => (),
+            }
+        }
+        let wave = [0, 8, 16, 24, 32, 24, 16, 8][usize::from(self.tab_phase)];
+        let weight = if tab.activity == TabActivity::Running {
+            80 + wave
+        } else {
+            64
+        };
+        [0, 8, 16].into_iter().fold(0, |rgb, shift| {
+            rgb | (((foreground >> shift & 255) * weight
+                + (background >> shift & 255) * (255 - weight))
+                / 255
+                << shift)
+        })
+    }
+
+    pub fn request_close_tab(&mut self, tab: &crate::workspace::TabView) -> bool {
+        use crate::workspace::TabActivity;
+        if matches!(tab.activity, TabActivity::Running | TabActivity::Unknown) {
+            self.close_tab = Some(tab.id);
+            self.close_confirm = false;
+            false
+        } else {
+            true
+        }
+    }
+
     pub fn message(&mut self, message: impl Into<String>) {
         self.status = Some((message.into(), Instant::now() + Duration::from_secs(4)));
     }
+    #[cfg(any(feature = "monitor", feature = "gui"))]
+    pub fn footer(&self, snapshot: &crate::workspace::Snapshot, remote: bool) -> String {
+        if let Some((message, _)) = &self.status {
+            return message.clone();
+        }
+        let location = if remote { "SSH" } else { "Local" };
+        let focus = if !snapshot.controller {
+            "Read-only"
+        } else {
+            match self.focus {
+                Focus::Terminal => "Terminal",
+                #[cfg(feature = "agent")]
+                Focus::Editor => "Agent input",
+                #[cfg(feature = "agent")]
+                Focus::Output => "Agent output",
+                #[cfg(feature = "agent")]
+                Focus::Controls => "Agent controls",
+                #[cfg(feature = "monitor")]
+                Focus::Monitor => "Monitor",
+                #[cfg(feature = "files")]
+                Focus::Files => "Files",
+            }
+        };
+        format!("{} · {location} · {focus}", snapshot.name)
+    }
+
     pub fn expire_status(&mut self) -> bool {
         if self
             .status
@@ -143,7 +252,7 @@ impl Ui {
                     "Enter / Space  Activate selected control",
                     "Ctrl+Space     Attach selection / visible screen",
                     "Enter          Send draft; Ctrl+J inserts newline",
-                    "Ctrl+C         Copy selection; otherwise stop in output",
+                    "Ctrl+C         Copy selection; otherwise stop while busy",
                     "Esc            Select previous user message; repeat for older",
                     "Enter          Confirm selected rewind; click input to cancel",
                 ]);
@@ -1119,9 +1228,16 @@ impl AgentPanel {
         // Commit with wrapping during draw so input keeps the displayed frame's geometry.
         self.apply_markdown();
         self.request_markdown()?;
-        let scroll = self.active().model.scroll;
+        let previous = (
+            self.active().model.scroll,
+            self.active().expanded_tools.len(),
+        );
         self.active_mut().layout(columns);
-        self.view_dirty |= scroll != self.active().model.scroll;
+        self.view_dirty |= previous
+            != (
+                self.active().model.scroll,
+                self.active().expanded_tools.len(),
+            );
         Ok(())
     }
 
@@ -1858,6 +1974,17 @@ impl AgentSession {
             return;
         }
         let previous_lines = self.lines.len();
+        let anchor = (self.model.scroll > 0)
+            .then(|| {
+                let last = self.lines.len().saturating_sub(self.model.scroll + 1);
+                (0..=last).rev().find_map(|index| {
+                    self.line_text(index).map(|(mut point, range, _)| {
+                        point.offset = range.start;
+                        (point, last - index)
+                    })
+                })
+            })
+            .flatten();
         self.lines.clear();
         self.expanded_tools.retain(|id| {
             self.model
@@ -1896,7 +2023,18 @@ impl AgentSession {
             }
             self.lines.push(AgentLine::Blank);
         }
-        if self.model.scroll > 0 {
+        if let Some((anchor, gap)) = anchor {
+            if let Some(index) = self.lines.iter().enumerate().position(|(index, _)| {
+                self.line_text(index).is_some_and(|(point, range, _)| {
+                    point.message == anchor.message
+                        && point.part == anchor.part
+                        && (range.contains(&anchor.offset)
+                            || range.is_empty() && range.start == anchor.offset)
+                })
+            }) {
+                self.model.scroll = self.lines.len().saturating_sub(index + gap + 1);
+            }
+        } else if self.model.scroll > 0 {
             self.model.scroll = self
                 .model
                 .scroll
@@ -1927,6 +2065,35 @@ fn context_source(client: &Client, pane: PaneId) -> String {
 #[cfg(all(test, feature = "agent"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn trimming_an_expanded_tool_marks_the_view_without_user_input() {
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        panel
+            .active_mut()
+            .model
+            .messages
+            .push(crate::agent::Message {
+                turn: 1,
+                role: "shell · done".into(),
+                text: "output".into(),
+                id: Some("old-tool".into()),
+            });
+        panel.active_mut().expanded_tools.insert("old-tool".into());
+        panel.prepare_layout(40).unwrap();
+        panel.view_dirty = false;
+        let mut models = panel.model_snapshot();
+        models[0][1]["messages"] = serde_json::json!([]);
+        panel.restore_models(models).unwrap();
+        assert!(!panel.view_dirty);
+        panel.prepare_layout(40).unwrap();
+        assert!(panel.active().expanded_tools.is_empty());
+        assert!(panel.view_dirty);
+        assert_eq!(panel.active().model.scroll, 0);
+    }
 
     #[test]
     fn escape_selects_older_messages_without_changing_the_draft_or_history() {
@@ -2661,5 +2828,36 @@ mod tests {
         let editor = panel.editor_layout(20, 3);
         assert_eq!(editor.first, 3);
         assert_eq!(editor.caret_row, 11);
+    }
+    #[test]
+    fn history_anchor_survives_reflow_and_collapsed_tool_append() {
+        let mut session = AgentSession::default();
+        session.model.messages.push(crate::agent::Message {
+            turn: 1,
+            role: "You".into(),
+            text: "0123456789".repeat(50),
+            id: None,
+        });
+        session.layout(20);
+        session.model.scroll = 10;
+        let last = session.lines.len() - session.model.scroll - 1;
+        let anchor = (0..=last)
+            .rev()
+            .find_map(|index| session.line_text(index).map(|(_, range, _)| range.start))
+            .unwrap();
+        session.layout(40);
+        let last = session.lines.len() - session.model.scroll - 1;
+        let range = session.line_text(last).unwrap().1;
+        assert!(range.contains(&anchor));
+        session.model.messages.push(crate::agent::Message {
+            turn: 2,
+            role: "shell · done".into(),
+            text: "hidden output".repeat(500),
+            id: Some("tool".into()),
+        });
+        session.columns = 0;
+        session.layout(40);
+        let last = session.lines.len() - session.model.scroll - 1;
+        assert!(session.line_text(last).unwrap().1.contains(&anchor));
     }
 }
