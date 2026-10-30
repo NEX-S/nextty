@@ -77,19 +77,22 @@ impl Ui {
     ) -> bool {
         use crate::workspace::TabActivity;
         let mut acknowledged = false;
+        let mut running = false;
         self.tab_seen
             .retain(|id, _| snapshot.tabs.iter().any(|tab| tab.id == *id));
         for tab in &snapshot.tabs {
             if tab.activity == TabActivity::Running {
+                running = true;
                 acknowledged |= self.tab_seen.remove(&tab.id).is_some();
             } else if tab.id == snapshot.active_tab {
                 acknowledged |= self.tab_seen.insert(tab.id, tab.activity) != Some(tab.activity);
             }
         }
-        let running = crate::workspace::tab_chrome(snapshot, columns, label)
-            .0
-            .iter()
-            .any(|(index, _, _)| snapshot.tabs[*index].activity == TabActivity::Running);
+        let running = running
+            && crate::workspace::tab_chrome(snapshot, columns, label)
+                .0
+                .iter()
+                .any(|(index, _, _)| snapshot.tabs[*index].activity == TabActivity::Running);
         if !running {
             self.tab_deadline = None;
             return acknowledged;
