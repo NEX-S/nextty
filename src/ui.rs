@@ -1517,6 +1517,12 @@ impl AgentPanel {
 #[cfg(feature = "agent")]
 pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
+    wrap_context_into(text, columns, |line| result.push(line));
+    result
+}
+
+#[cfg(feature = "agent")]
+fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usize>)) {
     let mut offset = 0;
     let columns = columns.max(1);
     for part in text.split_inclusive('\n') {
@@ -1527,7 +1533,7 @@ pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
         let mut start = offset;
         if line.len() <= columns || line.is_ascii() {
             while offset + line.len() - start > columns {
-                result.push(start..start + columns);
+                push(start..start + columns);
                 start += columns;
             }
         } else {
@@ -1537,20 +1543,19 @@ pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
                 let c = if c.is_control() { ' ' } else { c };
                 let next = usize::from(scalar_width(c).min(2));
                 if width + next > columns && index > start {
-                    result.push(start..index);
+                    push(start..index);
                     start = index;
                     width = 0;
                 }
                 width += next;
             }
         }
-        result.push(start..offset + line.len());
+        push(start..offset + line.len());
         offset += part.len();
     }
     if text.ends_with('\n') {
-        result.push(text.len()..text.len());
+        push(text.len()..text.len());
     }
-    result
 }
 
 #[cfg(feature = "agent")]
@@ -1991,7 +1996,8 @@ impl AgentSession {
                 })
             })
             .flatten();
-        self.lines.clear();
+        let mut lines = std::mem::take(&mut self.lines);
+        lines.clear();
         self.expanded_tools.retain(|id| {
             self.model
                 .messages
@@ -2001,7 +2007,7 @@ impl AgentSession {
         for (index, message) in self.model.messages.iter().enumerate() {
             let tool = message.id.is_some();
             if tool {
-                self.lines.push(AgentLine::Role(index as u32));
+                lines.push(AgentLine::Role(index as u32));
             }
             if !tool
                 || message
@@ -2018,17 +2024,20 @@ impl AgentSession {
                 } else {
                     0
                 };
-                self.lines.extend(
-                    wrap_context(self.message_text(index), columns.saturating_sub(reserved))
-                        .into_iter()
-                        .map(|range| AgentLine::Text {
+                wrap_context_into(
+                    self.message_text(index),
+                    columns.saturating_sub(reserved),
+                    |range| {
+                        lines.push(AgentLine::Text {
                             message: index as u32,
                             range: range.start as u32..range.end as u32,
-                        }),
+                        });
+                    },
                 );
             }
-            self.lines.push(AgentLine::Blank);
+            lines.push(AgentLine::Blank);
         }
+        self.lines = lines;
         if let Some((anchor, gap)) = anchor {
             if let Some(index) = self.lines.iter().enumerate().position(|(index, _)| {
                 self.line_text(index).is_some_and(|(point, range, _)| {
