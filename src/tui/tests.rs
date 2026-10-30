@@ -31,7 +31,7 @@ fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
     server
         .send_response(Response::Agent {
             kind: 5,
-            payload: Vec::new(),
+            payload: Vec::new().into(),
         })
         .unwrap();
     server.flush().unwrap();
@@ -67,7 +67,7 @@ fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
     server
         .send_response(Response::Agent {
             kind: 0,
-            payload: serde_json::to_vec(&view).unwrap(),
+            payload: serde_json::to_vec(&view).unwrap().into(),
         })
         .unwrap();
     server.flush().unwrap();
@@ -111,7 +111,7 @@ fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
     server
         .send_response(Response::Agent {
             kind: 1,
-            payload: serde_json::to_vec(&models).unwrap(),
+            payload: serde_json::to_vec(&models).unwrap().into(),
         })
         .unwrap();
     server.flush().unwrap();
@@ -129,7 +129,7 @@ fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
     server
         .send_response(Response::Agent {
             kind: 1,
-            payload: serde_json::to_vec(&models).unwrap(),
+            payload: serde_json::to_vec(&models).unwrap().into(),
         })
         .unwrap();
     server.flush().unwrap();

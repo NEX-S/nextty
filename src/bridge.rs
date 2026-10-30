@@ -282,13 +282,13 @@ mod tests {
         server
             .send_response(Response::Agent {
                 kind: 4,
-                payload: vec![],
+                payload: vec![].into(),
             })
             .unwrap();
         server
             .send_response(Response::Agent {
                 kind: 2,
-                payload: vec![0, 255, 2],
+                payload: vec![0, 255, 2].into(),
             })
             .unwrap();
         server
@@ -301,7 +301,7 @@ mod tests {
         receive_until(&mut remote, |response| match response {
             Response::Agent { kind, payload } => {
                 if kind == 2 {
-                    assert_eq!(payload, [0, 255, 2]);
+                    assert_eq!(payload.as_ref(), [0, 255, 2]);
                 }
                 kinds.push(kind);
                 false

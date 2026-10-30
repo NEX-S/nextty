@@ -724,6 +724,7 @@ impl Client {
                     ClientEvent::Updated
                 }
                 Response::Agent { kind, payload } => {
+                    let payload = payload.into_owned();
                     if kind == 4 {
                         self.agent_delegate = true;
                     }
@@ -1483,7 +1484,7 @@ impl Connection {
         self.respond(Response::Detached);
     }
 
-    fn respond(&mut self, response: Response) {
+    fn respond(&mut self, response: Response<'_>) {
         if let Err(error) = self.peer.send_response(response) {
             eprintln!("workspace client {}: {error}", self.id);
             self.failed = true;
@@ -2218,16 +2219,19 @@ fn apply_action(
             client.full = true;
             client.respond(Response::Agent {
                 kind: 4,
-                payload: Vec::new(),
+                payload: Vec::new().into(),
             });
             if let Some(payload) = &workspace.agent.view {
                 client.respond(Response::Agent {
                     kind: 0,
-                    payload: payload.clone(),
+                    payload: payload.as_slice().into(),
                 });
             }
             for payload in workspace.agent.pending.drain(..) {
-                client.respond(Response::Agent { kind: 2, payload });
+                client.respond(Response::Agent {
+                    kind: 2,
+                    payload: payload.into(),
+                });
             }
             dirty.insert(name);
             return Ok(());
@@ -2372,13 +2376,13 @@ fn apply_action(
                 if let Some(payload) = payload {
                     clients[index].respond(Response::Agent {
                         kind,
-                        payload: payload.clone(),
+                        payload: payload.as_slice().into(),
                     });
                 }
             }
             clients[index].respond(Response::Agent {
                 kind: 5,
-                payload: Vec::new(),
+                payload: Vec::new().into(),
             });
             return Ok(());
         }
@@ -2388,7 +2392,7 @@ fn apply_action(
             }) {
                 client.respond(Response::Agent {
                     kind: 0,
-                    payload: payload.clone(),
+                    payload: payload.as_slice().into(),
                 });
             }
             workspace.agent.view = Some(payload);
@@ -2400,7 +2404,10 @@ fn apply_action(
                     .iter_mut()
                     .find(|client| client.id == id && !client.failed)
             }) {
-                owner.respond(Response::Agent { kind: 2, payload });
+                owner.respond(Response::Agent {
+                    kind: 2,
+                    payload: payload.into(),
+                });
             } else {
                 let bytes: usize = workspace
                     .agent
@@ -2422,7 +2429,7 @@ fn apply_action(
                     workspace.agent.token = Some(token.clone());
                     clients[index].respond(Response::Agent {
                         kind: 3,
-                        payload: token,
+                        payload: token.into(),
                     });
                 }
             }
@@ -2434,7 +2441,7 @@ fn apply_action(
             }) {
                 client.respond(Response::Agent {
                     kind,
-                    payload: payload.clone(),
+                    payload: payload.as_slice().into(),
                 });
             }
             if kind == 0 {

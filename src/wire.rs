@@ -10,6 +10,7 @@ use crate::workspace::{
     Action, Axis, BlockMarker, CommandBlock, CreateOptions, Direction, HistoryCursor, HistoryPage,
     PaneView, Snapshot, TabView, WorkspaceInfo,
 };
+use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, Write};
@@ -23,7 +24,7 @@ pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
 pub(crate) const VERSION: u8 = 16;
 
-pub(crate) enum Response {
+pub(crate) enum Response<'a> {
     ScreenDirty,
     AgentInput {
         request: u64,
@@ -39,7 +40,7 @@ pub(crate) enum Response {
     },
     Agent {
         kind: u8,
-        payload: Vec<u8>,
+        payload: Cow<'a, [u8]>,
     },
     State(Snapshot, Vec<(u64, Update)>),
     List(Vec<WorkspaceInfo>),
@@ -356,7 +357,7 @@ impl Peer {
         }
         self.queue(encoder.0, None)
     }
-    pub fn send_response(&mut self, response: Response) -> io::Result<()> {
+    pub fn send_response(&mut self, response: Response<'_>) -> io::Result<()> {
         let mut encoder = match &response {
             Response::Agent { payload, .. } => Encoder::with_capacity(11 + payload.len()),
             _ => Encoder::new(),
@@ -728,7 +729,7 @@ impl Peer {
             .ok_or_else(|| invalid("clipboard response has no file descriptor"))?;
         Ok((request, File::from(file), incomplete))
     }
-    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
+    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response<'static>>> {
         let result = self.receive_responses(previous);
         if result.is_err() {
             self.copy = None;
@@ -736,7 +737,10 @@ impl Peer {
         }
         result
     }
-    fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
+    fn receive_responses(
+        &mut self,
+        previous: Option<&Snapshot>,
+    ) -> io::Result<Vec<Response<'static>>> {
         let mut result = Vec::new();
         if let Some(receiver) = &self.receiver
             && let Some(ready) = receiver.take()?
@@ -797,7 +801,7 @@ impl Peer {
                 13 => Some(Response::ScreenDirty),
                 12 => Some(Response::Agent {
                     kind: d.u8()?,
-                    payload: d.bytes(MAX_FRAME)?.to_vec(),
+                    payload: d.bytes(MAX_FRAME)?.to_vec().into(),
                 }),
                 1 => {
                     let previous = result
@@ -2122,6 +2126,27 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
 mod tests {
     use super::*;
     #[test]
+    fn borrowed_agent_payload_is_owned_by_the_queued_frame() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut sender = Peer::new(left).unwrap();
+        let mut receiver = Peer::new(right).unwrap();
+        let mut payload = "cached snapshot 中🙂".as_bytes().to_vec();
+        sender
+            .send_response(Response::Agent {
+                kind: 1,
+                payload: payload.as_slice().into(),
+            })
+            .unwrap();
+        payload.fill(b'?');
+        sender.flush().unwrap();
+        let responses = receiver.responses(None).unwrap();
+        assert!(
+            matches!(&responses[..], [Response::Agent { kind: 1, payload }]
+            if payload.as_ref() == "cached snapshot 中🙂".as_bytes())
+        );
+    }
+
+    #[test]
     fn process_deltas_inherit_the_latest_snapshot_in_and_across_reads() {
         let (left, right) = UnixStream::pair().unwrap();
         let mut sender = Peer::new(left).unwrap();
@@ -2740,7 +2765,7 @@ mod tests {
         ];
         assert!(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 5000) } > 0);
     }
-    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response>> {
+    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response<'static>>> {
         loop {
             let responses = receiver.responses(None)?;
             if !responses.is_empty() {
