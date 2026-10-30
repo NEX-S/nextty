@@ -357,7 +357,10 @@ impl Peer {
         self.queue(encoder.0, None)
     }
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
-        let mut encoder = Encoder::new();
+        let mut encoder = match &response {
+            Response::Agent { payload, .. } => Encoder::with_capacity(11 + payload.len()),
+            _ => Encoder::new(),
+        };
         let file = match response {
             Response::History { request, result } => {
                 encoder.u8(16);
