@@ -1924,7 +1924,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            result.matches,
+            result.matches.as_ref(),
             vec![crate::search::SearchMatch {
                 start_row: 0,
                 end_row: 1,
@@ -2640,7 +2640,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                     assert!(result.matches.is_empty());
                 } else {
                     assert_eq!(
-                        result.matches,
+                        result.matches.as_ref(),
                         vec![crate::search::SearchMatch {
                             start_row: 0,
                             end_row: 1001,

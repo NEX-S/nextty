@@ -2806,7 +2806,7 @@ fn apply_action(
                     search.core.lock().unwrap().restore_search(origin);
                 }
                 search.result = Some(crate::search::SearchResult {
-                    matches: Vec::new(),
+                    matches: Box::new([]),
                     truncated: false,
                     columns: 0,
                     alternate: false,

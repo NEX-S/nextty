@@ -16,7 +16,7 @@ pub(crate) struct SearchMatch {
 }
 
 pub(crate) struct SearchResult {
-    pub matches: Vec<SearchMatch>,
+    pub matches: Box<[SearchMatch]>,
     pub truncated: bool,
     pub columns: usize,
     pub alternate: bool,
@@ -133,7 +133,7 @@ impl Matcher {
     }
     pub fn finish(self, columns: usize, alternate: bool) -> SearchResult {
         SearchResult {
-            matches: self.matches.into(),
+            matches: Vec::from(self.matches).into_boxed_slice(),
             truncated: self.truncated,
             columns,
             alternate,
@@ -443,7 +443,7 @@ mod tests {
         matcher.row(10, core.row(0));
         matcher.row(11, core.row(1));
         assert_eq!(
-            matcher.finish(4, false).matches,
+            matcher.finish(4, false).matches.as_ref(),
             vec![SearchMatch {
                 start_row: 10,
                 end_row: 11,
@@ -454,7 +454,7 @@ mod tests {
         let mut matcher = Matcher::new("中");
         matcher.row(10, core.row(0));
         assert_eq!(
-            matcher.finish(4, false).matches,
+            matcher.finish(4, false).matches.as_ref(),
             vec![SearchMatch {
                 start_row: 10,
                 end_row: 10,
@@ -465,7 +465,7 @@ mod tests {
         let mut matcher = Matcher::new("\u{301}");
         matcher.row(10, core.row(0));
         assert_eq!(
-            matcher.finish(4, false).matches,
+            matcher.finish(4, false).matches.as_ref(),
             vec![SearchMatch {
                 start_row: 10,
                 end_row: 10,
