@@ -1374,6 +1374,7 @@ impl Frontend {
                     let from = range.start as usize;
                     let to = range.end as usize;
                     if let Some(document) = self.ui.agent.active().markdown(*index as usize) {
+                        let mut x = editor.x + indent;
                         for (span, style) in document.spans(from..to) {
                             if style & crate::markdown::BOLD != 0 {
                                 output.write_all(b"\x1b[1m")?;
@@ -1381,11 +1382,14 @@ impl Frontend {
                             if style & crate::markdown::ITALIC != 0 {
                                 output.write_all(b"\x1b[3m")?;
                             }
+                            let columns = text_width(&text[span.clone()]) as u16;
+                            let column = x;
+                            x += columns;
                             draw_text(
                                 output,
-                                editor.x + indent + text_width(&text[from..span.start]) as u16,
+                                column,
                                 y,
-                                text_width(&text[span.clone()]) as u16,
+                                columns,
                                 &text[span],
                                 crate::markdown::color(style, self.config.foreground),
                                 if style & crate::markdown::CODE != 0 {
