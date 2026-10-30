@@ -85,7 +85,7 @@ class Lab:
         self.ready = threading.Event()
         self.go = threading.Event()
         self.done = threading.Event()
-        self.prefix = 0
+        self.prefix = ''
         self.hz = 50
         lab = self
 
@@ -135,7 +135,7 @@ class Lab:
                         self.wfile.flush()
 
                     emit({'type': 'message_start', 'message': {'role': 'assistant', 'content': []}})
-                    prefix = ('**agent** `shell` and history.\n\n' * 8192)[:lab.prefix]
+                    prefix = lab.prefix
                     lab.expected = prefix + 'incremental agent text.\n' * (lab.hz * 4) + '\nstream-finished-proof'
                     emit({'type': 'content_block_start', 'index': 0,
                           'content_block': {'type': 'text', 'text': prefix}})
@@ -552,7 +552,10 @@ class Lab:
         return {role: cost(pid) for role, pid in self.pids.items()}
 
     def run(self, name, prefix=0, hz=50, visible=True):
-        self.prefix, self.hz = prefix, hz
+        self.hz = hz
+        self.prefix = ('**agent** `shell` and history.\n\n' * 8192)[:prefix]
+        if name == 'code-stream':
+            self.prefix = '```text\n' + ('0123456789abcdef output line\n' * 8192)[:prefix] + '\n```\n'
         if name != 'idle':
             os.write(self.master, b'\x1ba')
             self.drain(.05)
@@ -587,7 +590,7 @@ class Lab:
                 'product_pss_kib': {role: value['pss_kib'] for role, value in end.items()},
                 'threads': {role: value['threads'] for role, value in end.items()},
                 'frontend_output_bytes': output_bytes, 'request_bytes': self.requests,
-                'history_verified': name != 'idle', 'stream_prefix_bytes': prefix, 'stream_deltas': hz * 4 if name != 'idle' else 0}
+                'history_verified': name != 'idle', 'stream_prefix_bytes': len(self.prefix.encode()), 'stream_deltas': hz * 4 if name != 'idle' else 0}
 
     def close(self):
         self.go.set()
@@ -631,7 +634,8 @@ def main():
     args = parser.parse_args()
     binary = args.binary.resolve()
     cases = [('idle', 0, 50, False), ('short-stream', 0, 50, True),
-             ('long-stream', 128 * 1024, 200, True), ('long-hidden', 128 * 1024, 200, False)]
+             ('long-stream', 128 * 1024, 200, True), ('code-stream', 128 * 1024, 200, True),
+             ('long-hidden', 128 * 1024, 200, False)]
     report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'scope': __doc__, 'platform': list(os.uname()), 'samples_per_case': 80, 'cases': []}
     for name, prefix, hz, visible in cases:

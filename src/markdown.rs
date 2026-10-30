@@ -29,13 +29,17 @@ pub(crate) struct Markdown {
 impl Markdown {
     fn push(&mut self, text: &str, style: u8) {
         let start = self.text.len();
-        self.text.extend(text.chars().map(|ch| {
-            if ch.is_control() && ch != '\n' {
-                ' '
-            } else {
-                ch
-            }
-        }));
+        if text.chars().any(|ch| ch.is_control() && ch != '\n') {
+            self.text.extend(text.chars().map(|ch| {
+                if ch.is_control() && ch != '\n' {
+                    ' '
+                } else {
+                    ch
+                }
+            }));
+        } else {
+            self.text.push_str(text);
+        }
         if let Some((range, previous)) = self.spans.last_mut()
             && *previous == style
         {
@@ -69,8 +73,12 @@ impl Markdown {
     }
 
     fn content(&mut self, text: &str, style: u8, quote_depth: usize) {
+        if quote_depth == 0 {
+            self.push(text, style);
+            return;
+        }
         for part in text.split_inclusive('\n') {
-            if quote_depth > 0 && (self.text.ends_with('\n') || self.text.is_empty()) {
+            if self.text.ends_with('\n') || self.text.is_empty() {
                 for _ in 0..quote_depth {
                     self.push("│ ", QUOTE);
                 }
@@ -196,6 +204,16 @@ mod tests {
         );
         let code = document.text.find("  x").unwrap();
         assert_eq!(document.spans(code..code + 7).next().unwrap().1, CODE);
+    }
+
+    #[test]
+    fn code_controls_preserve_unicode_text_and_style_offsets() {
+        let document = Markdown::render("```text\n中\tA\u{85}B\ne\u{301}\x1bC\n```");
+        assert_eq!(document.text, "中 A B\ne\u{301} C");
+        assert_eq!(
+            document.spans(0..document.text.len()).collect::<Vec<_>>(),
+            vec![(0..document.text.len(), CODE)]
+        );
     }
 
     #[test]
