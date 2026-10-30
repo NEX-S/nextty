@@ -1512,13 +1512,9 @@ pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
 fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usize>)) {
     let mut offset = 0;
     let columns = columns.max(1);
-    for end in memchr::memchr_iter(b'\n', text.as_bytes())
-        .map(|index| index + 1)
-        .chain(std::iter::once(text.len()))
-    {
-        if end == offset {
-            break;
-        }
+    let mut ends = memchr::memchr_iter(b'\n', text.as_bytes());
+    while offset < text.len() {
+        let end = ends.next().map_or(text.len(), |index| index + 1);
         let part = &text[offset..end];
         let line = part
             .strip_suffix("\r\n")
