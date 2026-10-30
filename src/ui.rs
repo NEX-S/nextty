@@ -875,11 +875,12 @@ impl MarkdownWorker {
                             )
                         })
                         .collect();
-                    lock.lock().unwrap().result = Some(MarkdownResult {
+                    let previous = lock.lock().unwrap().result.replace(MarkdownResult {
                         session: job.session,
                         request: job.request,
                         messages,
                     });
+                    drop(previous);
                     crate::eventfd::notify(wake.as_raw_fd()).unwrap();
                 }
             })?;
