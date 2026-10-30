@@ -205,11 +205,7 @@ impl SystemStats {
     }
 
     pub fn set_processes_enabled(&mut self, enabled: bool) {
-        let mut state = self.sampler.state.lock().unwrap();
-        if state.processes_enabled != enabled {
-            state.processes_enabled = enabled;
-            self.sampler.changed.notify_one();
-        }
+        self.sampler.state.lock().unwrap().processes_enabled = enabled;
     }
 
     pub(crate) fn process_revision(&self) -> u64 {
