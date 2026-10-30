@@ -951,20 +951,14 @@ impl AgentPanel {
     }
 
     #[cfg(test)]
-    fn model_snapshot(&self) -> serde_json::Value {
-        serde_json::Value::Array(
-            self.sessions
-                .iter()
-                .map(|session| {
-                    serde_json::Value::Array(vec![session.id.into(), session.model.snapshot()])
-                })
-                .collect::<Vec<_>>(),
-        )
+    fn model_snapshot(&self) -> Vec<(u64, serde_json::Value)> {
+        self.sessions
+            .iter()
+            .map(|session| (session.id, session.model.snapshot()))
+            .collect()
     }
 
-    pub fn restore_models(&mut self, value: serde_json::Value) -> io::Result<bool> {
-        let values: Vec<(u64, serde_json::Value)> =
-            serde_json::from_value(value).map_err(io::Error::other)?;
+    pub fn restore_models(&mut self, values: Vec<(u64, serde_json::Value)>) -> io::Result<bool> {
         let mut redraw = false;
         for (id, mut value) in values {
             if let Some(session) = self.sessions.iter_mut().find(|session| session.id == id) {
@@ -2093,7 +2087,7 @@ mod tests {
         panel.prepare_layout(40).unwrap();
         panel.view_dirty = false;
         let mut models = panel.model_snapshot();
-        models[0][1]["messages"] = serde_json::json!([]);
+        models[0].1["messages"] = serde_json::json!([]);
         panel.restore_models(models).unwrap();
         assert!(!panel.view_dirty);
         panel.prepare_layout(40).unwrap();
@@ -2325,7 +2319,7 @@ mod tests {
         assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
         owner.active_mut().model.messages.clear();
         let mut models = owner.model_snapshot();
-        models[0][1]["rewind_restore"] = serde_json::json!([1, "restored draft", []]);
+        models[0].1["rewind_restore"] = serde_json::json!([1, "restored draft", []]);
         panel.restore_models(models).unwrap();
         assert!(panel.poll_layout().unwrap());
         panel.prepare_layout(40).unwrap();
@@ -2523,7 +2517,7 @@ mod tests {
         view["sessions"][0]["cursor"] = serde_json::json!(6);
         owner.restore_view_state(view.clone()).unwrap();
         assert_eq!(owner.model_snapshot(), canonical);
-        assert!(canonical[0][1].get("sent_context").is_none());
+        assert!(canonical[0].1.get("sent_context").is_none());
         assert_eq!(owner.active().model.input, "typing");
         assert!(!owner.active().model.remote);
         let mut frontend = AgentPanel::default();
@@ -2534,7 +2528,7 @@ mod tests {
         frontend.restore_view_state(view.clone()).unwrap();
         assert_eq!(frontend.model_snapshot(), canonical);
         let mut models = owner.model_snapshot();
-        models[0][1]["rewind_restore"] = serde_json::json!([4, "earlier", [item.view()]]);
+        models[0].1["rewind_restore"] = serde_json::json!([4, "earlier", [item.view()]]);
         frontend.restore_models(models.clone()).unwrap();
         assert_eq!(frontend.active().model.input, "earlier");
         assert_eq!(frontend.active().context.basket.len(), 1);
