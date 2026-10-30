@@ -2180,10 +2180,8 @@ impl Frontend {
                 " {} ",
                 fit_label(&label, self.size.num_cols.saturating_sub(4))
             );
-            let x = self
-                .size
-                .num_cols
-                .saturating_sub(text_width(&label) as u16 + 1);
+            let width = text_width(&label) as u16;
+            let x = self.size.num_cols.saturating_sub(width + 1);
             if let Some(snapshot) = self.client.snapshot() {
                 let context = self.ui.footer(snapshot, self.client.is_remote());
                 draw_text(
@@ -2201,11 +2199,9 @@ impl Frontend {
                 .is_some_and(|(column, row)| row == last && column >= x);
             draw_text(
                 output,
-                self.size
-                    .num_cols
-                    .saturating_sub(text_width(&label) as u16 + 1),
+                x,
                 last,
-                text_width(&label) as u16,
+                width,
                 &label,
                 if hovered { GREEN } else { MUTED },
                 if hovered { 0x343c34 } else { BACKGROUND },
