@@ -43,10 +43,7 @@ impl Sse {
         let scanned = self.pending.len();
         self.pending.extend_from_slice(bytes);
         let mut start = 0;
-        for end in scanned..self.pending.len() {
-            if self.pending[end] != b'\n' {
-                continue;
-            }
+        for end in memchr::memchr_iter(b'\n', &self.pending[scanned..]).map(|end| scanned + end) {
             let line = &self.pending[start..end];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() {
