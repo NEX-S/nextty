@@ -763,7 +763,8 @@ impl Response {
                         _ => return Err(io::Error::other("Invalid content delta target")),
                     }
                     if visible && field == "text" {
-                        let Value::String(text) = event["delta"]["text"].take() else {
+                        let delta = event.get_mut("delta").unwrap();
+                        let Value::String(text) = delta.get_mut("text").unwrap().take() else {
                             unreachable!()
                         };
                         emit(shared, Event::Text(text))?;
