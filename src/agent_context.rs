@@ -47,8 +47,9 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
             text.push('\n');
         }
     }
-    let mut matches = vec![false; row_ranges.len()];
+    let mut matches = Vec::new();
     if let Some(query) = query {
+        matches.resize(row_ranges.len(), false);
         let mut offset = 0;
         let mut first = 0;
         let mut last = 0;
