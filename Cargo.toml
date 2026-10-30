@@ -11,10 +11,11 @@ default = ["gui", "tui", "monitor", "files", "agent"]
 gui = []
 tui = []
 monitor = ["tui"]
-agent = ["tui", "dep:serde_json", "dep:curl", "dep:pulldown-cmark"]
+agent = ["tui", "dep:serde_json", "dep:curl", "dep:pulldown-cmark", "dep:memchr"]
 files = ["tui"]
 
 [dependencies]
+memchr = { version = "2", optional = true }
 curl = { version = "0.4", default-features = false, optional = true }
 libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false, optional = true }

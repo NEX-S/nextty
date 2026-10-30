@@ -87,6 +87,7 @@ version = "0.1.0"
 dependencies = [
  "curl",
  "libc",
+ "memchr",
  "pulldown-cmark",
  "serde_json",
  "smallvec",
