@@ -327,7 +327,9 @@ impl SearchWorker {
             .retain(|job| !job.cancelled().load(Ordering::Relaxed));
         if !job.cancelled().load(Ordering::Relaxed) {
             state.pending.push_back(job);
-            if state.active.is_none() {
+            let wake = state.active.is_none();
+            drop(state);
+            if wake {
                 changed.notify_one();
             }
         }
