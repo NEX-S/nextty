@@ -892,7 +892,8 @@ impl MarkdownWorker {
 
     fn submit(&self, job: MarkdownJob) {
         let (lock, changed) = &*self.shared;
-        lock.lock().unwrap().pending = Some(job);
+        let previous = lock.lock().unwrap().pending.replace(job);
+        drop(previous);
         changed.notify_one();
     }
 
