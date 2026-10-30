@@ -671,11 +671,14 @@ pub fn shell_quote(path: &OsStr) -> Vec<u8> {
         quoted.push(b'\'');
         return quoted;
     }
-    let mut quoted = Vec::with_capacity(path.len() + 2);
-    quoted.push(b'\'');
     let bytes = path.as_bytes();
+    // Count with search and stop at the total to scan quote-free paths only once.
+    let quotes = memchr::memchr_iter(b'\'', bytes);
+    let count = quotes.clone().fold(0, |count, _| count + 1);
+    let mut quoted = Vec::with_capacity(bytes.len() + 2 + count * 3);
+    quoted.push(b'\'');
     let mut start = 0;
-    for index in memchr::memchr_iter(b'\'', bytes) {
+    for index in quotes.take(count) {
         quoted.extend_from_slice(&bytes[start..index]);
         quoted.extend_from_slice(b"'\\''");
         start = index + 1;
