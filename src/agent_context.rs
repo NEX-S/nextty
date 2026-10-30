@@ -75,6 +75,8 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     }
     let mut rows = Vec::new();
     let mut omitted = Vec::<Value>::new();
+    let mut omitted_reason = None;
+    let mut omitted_start = 0;
     for (index, range) in row_ranges.iter().enumerate() {
         let text = &text[range.clone()];
         if query.is_some() {
@@ -97,18 +99,23 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         } else {
             None
         };
-        if let Some(reason) = reason {
-            if let Some(last) = omitted.last_mut()
-                && last["reason"] == reason
-                && last["end_row"].as_u64() == Some(index as u64 - 1)
-            {
-                last["end_row"] = json!(index);
-            } else {
-                omitted.push(json!({"start_row": index, "end_row": index, "reason": reason}));
+        if reason != omitted_reason {
+            if let Some(reason) = omitted_reason {
+                omitted.push(
+                    json!({"start_row": omitted_start, "end_row": index - 1, "reason": reason}),
+                );
             }
-        } else {
+            omitted_reason = reason;
+            omitted_start = index;
+        }
+        if reason.is_none() {
             rows.push(json!([index, text]));
         }
+    }
+    if let Some(reason) = omitted_reason {
+        omitted.push(
+            json!({"start_row": omitted_start, "end_row": row_ranges.len() - 1, "reason": reason}),
+        );
     }
     let wrapped_rows: Vec<_> = screen
         .rows
