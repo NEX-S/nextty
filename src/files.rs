@@ -596,7 +596,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         }
         _ => None,
     };
-    let Some(text) = text.filter(|text| !text.contains('\0')) else {
+    let Some(text) = text.filter(|text| memchr::memchr(0, text.as_bytes()).is_none()) else {
         return Ok(Preview {
             lines: Box::new(["Binary or non-UTF-8 file; preview unavailable".into()]),
             ..Preview::default()
