@@ -1249,7 +1249,7 @@ impl AgentPanel {
     }
 
     fn request_markdown(&mut self) -> io::Result<()> {
-        if !self.open {
+        if !self.open || self.active().render_request.is_some() {
             return Ok(());
         }
         let session = &mut self.sessions[self.current];
@@ -1259,37 +1259,35 @@ impl AgentPanel {
             session.clear_selection();
             self.view_dirty = true;
         }
-        if session.render_request.is_none() {
-            let messages: Vec<_> = session
-                .model
-                .messages
-                .iter()
-                .enumerate()
-                .filter(|&(index, message)| {
-                    message.role == "Agent"
-                        && message.id.is_none()
-                        && session.rendered[index]
-                            .as_ref()
-                            .is_none_or(|rendered| rendered.source != message.text)
-                })
-                .map(|(index, message)| (index, message.turn, message.text.clone()))
-                .collect();
-            if !messages.is_empty() {
-                if self.markdown_worker.is_none() {
-                    self.markdown_worker = Some(MarkdownWorker::new()?);
-                }
-                for session in &mut self.sessions {
-                    session.render_request = None;
-                }
-                self.next_render += 1;
-                let job = MarkdownJob {
-                    session: self.active().id,
-                    request: self.next_render,
-                    messages,
-                };
-                self.active_mut().render_request = Some(job.request);
-                self.markdown_worker.as_ref().unwrap().submit(job);
+        let messages: Vec<_> = session
+            .model
+            .messages
+            .iter()
+            .enumerate()
+            .filter(|&(index, message)| {
+                message.role == "Agent"
+                    && message.id.is_none()
+                    && session.rendered[index]
+                        .as_ref()
+                        .is_none_or(|rendered| rendered.source != message.text)
+            })
+            .map(|(index, message)| (index, message.turn, message.text.clone()))
+            .collect();
+        if !messages.is_empty() {
+            if self.markdown_worker.is_none() {
+                self.markdown_worker = Some(MarkdownWorker::new()?);
             }
+            for session in &mut self.sessions {
+                session.render_request = None;
+            }
+            self.next_render += 1;
+            let job = MarkdownJob {
+                session: self.active().id,
+                request: self.next_render,
+                messages,
+            };
+            self.active_mut().render_request = Some(job.request);
+            self.markdown_worker.as_ref().unwrap().submit(job);
         }
         Ok(())
     }
