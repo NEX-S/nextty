@@ -76,7 +76,7 @@ struct PreviewWorker {
 
 #[derive(Default)]
 struct Preview {
-    lines: Vec<String>,
+    lines: Box<[String]>,
     error: Option<io::Error>,
     truncated: bool,
 }
@@ -556,7 +556,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
     }
     if !metadata.is_file() {
         return Ok(Preview {
-            lines: vec!["Special file; preview unavailable".into()],
+            lines: Box::new(["Special file; preview unavailable".into()]),
             ..Preview::default()
         });
     }
@@ -568,7 +568,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
     let metadata = file.metadata()?;
     if !metadata.is_file() {
         return Ok(Preview {
-            lines: vec!["Special file; preview unavailable".into()],
+            lines: Box::new(["Special file; preview unavailable".into()]),
             ..Preview::default()
         });
     }
@@ -598,7 +598,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
     };
     let Some(text) = text.filter(|text| !text.contains('\0')) else {
         return Ok(Preview {
-            lines: vec!["Binary or non-UTF-8 file; preview unavailable".into()],
+            lines: Box::new(["Binary or non-UTF-8 file; preview unavailable".into()]),
             ..Preview::default()
         });
     };
@@ -611,7 +611,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         lines.push(preview_text(line.strip_suffix('\r').unwrap_or(line)));
     }
     Ok(Preview {
-        lines,
+        lines: lines.into_boxed_slice(),
         truncated,
         error: None,
     })
@@ -1274,7 +1274,10 @@ mod tests {
         let path = fixture.file("preview");
         fs::write(&path, "\t你好\u{85}\x1b[31m\r\nline\n").unwrap();
         let preview = read_preview(&path, &|| false).unwrap();
-        assert_eq!(preview.lines, ["    你好\\u{85}\\u{1b}[31m", "line"]);
+        assert_eq!(
+            preview.lines.as_ref(),
+            ["    你好\\u{85}\\u{1b}[31m", "line"]
+        );
         assert!(!preview.truncated);
         let many_lines = "line\n".repeat(PREVIEW_LINE_LIMIT + 1);
         fs::write(&path, many_lines).unwrap();
