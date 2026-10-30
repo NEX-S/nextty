@@ -727,7 +727,13 @@ impl Client {
                     if kind == 4 {
                         self.agent_delegate = true;
                     }
-                    self.agent_events.push((kind, payload));
+                    if kind == 1
+                        && let Some((1, previous)) = self.agent_events.last_mut()
+                    {
+                        *previous = payload;
+                    } else {
+                        self.agent_events.push((kind, payload));
+                    }
                     ClientEvent::Updated
                 }
                 Response::List(list) => ClientEvent::List(list),

@@ -299,8 +299,8 @@ struct Turn {
 }
 
 fn tools() -> Vec<Value> {
-    let query = json!({"type":"string","description":"Literal text to find with neighboring physical rows. Screen returns matching spans and the visible cursor row; matches lists matching row numbers. Text reads return one matching excerpt and matched indicates whether it was found. Pass the returned cursor to search the remaining range."});
-    let wait = json!({"type":"integer","minimum":0,"maximum":MAX_READ_WAIT,"description":"Seconds to wait for command completion, or for screen/history activity since the last observation. Use short waits for interaction and longer waits for a command known to be running. Returns outcome completed, changed or timeout; timeout leaves the program running. Omit or use 0 to read immediately (outcome current)."});
+    let query = json!({"type":"string"});
+    let wait = json!({"type":"integer","minimum":0,"maximum":MAX_READ_WAIT});
     let cursor = json!({"type":"object","properties":{"epoch":{"type":"integer"},"row":{"type":"integer"},"offset":{"type":"integer"}},"required":["epoch","row","offset"],"additionalProperties":false});
     vec![
         json!({
@@ -315,7 +315,7 @@ fn tools() -> Vec<Value> {
         }),
         json!({
             "name":"read",
-            "description":"Read this turn's terminal without moving the user's viewport or selection. screen reads the live application screen with original row/column coordinates, omitting decorative horizontal rules by default; command reads one shell command's output and exit state by command ID; history reads retained main-screen text. Text reads always return cursor, including at the current end. Pass it back to read later appends. has_more means this snapshot still has unread text; incomplete means retained evidence is missing. Queries select a bounded matching excerpt, not a streaming trigger or all text after a match. Express monitoring conditions in a shell command that exits on a match or when monitoring ends; nextty waits for that command to complete. A stale cursor requires a new read. Waiting command reads return a live screen if still running at timeout so you can respond to interactive prompts. History cannot recover evicted text or overwritten TUI frames.",
+            "description":"Read this turn's terminal without moving the user's viewport or selection. screen reads the live application screen with original row/column coordinates, omitting decorative horizontal rules by default; command reads one shell command's output and exit state by command ID; history reads retained main-screen text. Text reads always return cursor, including at the current end. Pass it back to read later appends. has_more means this snapshot still has unread text; incomplete means retained evidence is missing. Queries select a bounded matching excerpt, not a streaming trigger or all text after a match. Express monitoring conditions in a shell command that exits on a match or when monitoring ends; nextty waits for that command to complete. A stale cursor requires a new read. Waiting command reads return a live screen if still running at timeout so you can respond to interactive prompts. History cannot recover evicted text or overwritten TUI frames. query is literal text, with neighboring physical rows; screen queries retain the visible cursor row and list matching row numbers. Text queries return one excerpt and a matched flag; pass its cursor to search the remaining range. wait is seconds (0 or omitted reads immediately), up to 1800; command waits return on completion, screen/history waits on activity. outcome is current, completed, changed or timeout; timeout leaves programs running.",
             "input_schema":{"type":"object","anyOf":[
                 {"type":"object","properties":{"source":{"const":"screen"},"query":query,"wait":wait},"required":["source"],"additionalProperties":false},
                 {"type":"object","properties":{"source":{"const":"history"},"cursor":cursor,"query":query,"wait":wait},"required":["source"],"additionalProperties":false},
@@ -536,7 +536,7 @@ impl Session {
         prompt: &Prompt,
     ) -> io::Result<()> {
         let mut body = serde_json::to_vec(
-            &json!({"model":self.model,"max_tokens":MODEL_OUTPUT_LIMIT,"stream":true,"system":SYSTEM}),
+            &json!({"model":self.model,"max_tokens":MODEL_OUTPUT_LIMIT,"stream":true,"cache_control":{"type":"ephemeral"},"system":SYSTEM}),
         )?;
         body.pop();
         body.extend_from_slice(b",\"tools\":");

@@ -25,7 +25,6 @@ use std::{
 };
 
 pub(crate) struct Ui {
-    tab_seen: std::collections::HashMap<crate::workspace::TabId, crate::workspace::TabActivity>,
     pub tab_deadline: Option<Instant>,
     tab_phase: u8,
     pub status: Option<(String, Instant)>,
@@ -48,7 +47,6 @@ pub(crate) struct Ui {
 impl Ui {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
-            tab_seen: std::collections::HashMap::new(),
             tab_deadline: None,
             tab_phase: 0,
             status: None,
@@ -76,33 +74,24 @@ impl Ui {
         now: Instant,
     ) -> bool {
         use crate::workspace::TabActivity;
-        let mut acknowledged = false;
-        let mut running = false;
-        self.tab_seen
-            .retain(|id, _| snapshot.tabs.iter().any(|tab| tab.id == *id));
-        for tab in &snapshot.tabs {
-            if tab.activity == TabActivity::Running {
-                running = true;
-                acknowledged |= self.tab_seen.remove(&tab.id).is_some();
-            } else if tab.id == snapshot.active_tab {
-                acknowledged |= self.tab_seen.insert(tab.id, tab.activity) != Some(tab.activity);
-            }
-        }
-        let running = running
+        let running = snapshot
+            .tabs
+            .iter()
+            .any(|tab| tab.activity == TabActivity::Running)
             && crate::workspace::tab_chrome(snapshot, columns, label)
                 .0
                 .iter()
                 .any(|(index, _, _)| snapshot.tabs[*index].activity == TabActivity::Running);
         if !running {
             self.tab_deadline = None;
-            return acknowledged;
+            return false;
         }
         let changed = self.tab_deadline.is_some_and(|deadline| now >= deadline);
         if self.tab_deadline.is_none() || changed {
             self.tab_phase = if changed { (self.tab_phase + 1) % 8 } else { 0 };
             self.tab_deadline = Some(now + Duration::from_millis(250));
         }
-        changed || acknowledged
+        changed
     }
 
     pub fn tab_color(
@@ -112,12 +101,10 @@ impl Ui {
         background: u32,
     ) -> u32 {
         use crate::workspace::TabActivity;
-        if self.tab_seen.get(&tab.id) != Some(&tab.activity) {
-            match tab.activity {
-                TabActivity::Finished => return 0xfe9b30,
-                TabActivity::Failed => return 0xe87575,
-                _ => (),
-            }
+        match tab.activity {
+            TabActivity::Finished => return 0xfe9b30,
+            TabActivity::Failed => return 0xe87575,
+            _ => (),
         }
         let wave = [0, 8, 16, 24, 32, 24, 16, 8][usize::from(self.tab_phase)];
         let weight = if tab.activity == TabActivity::Running {

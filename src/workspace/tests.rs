@@ -737,20 +737,30 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
             .iter()
             .any(|event| matches!(event, ClientEvent::Error(_)))
     });
-    owner
-        .send(Action::AgentUpdate {
-            kind: 0,
-            payload: b"live-view".to_vec(),
-        })
-        .unwrap();
-    owner
-        .send(Action::AgentUpdate {
-            kind: 1,
-            payload: b"live-models".to_vec(),
-        })
-        .unwrap();
-    wait(&mut frontend, |client, _| client.agent_events.len() == 2);
-    frontend.take_agent_events();
+    for (kind, payload) in [
+        (1, "before-view"),
+        (0, "live-view"),
+        (1, "superseded-models"),
+        (1, "live-models"),
+    ] {
+        owner
+            .send(Action::AgentUpdate {
+                kind,
+                payload: payload.as_bytes().to_vec(),
+            })
+            .unwrap();
+    }
+    wait(&mut frontend, |client, _| {
+        client.agent_events.last() == Some(&(1, b"live-models".to_vec()))
+    });
+    assert_eq!(
+        frontend.take_agent_events(),
+        vec![
+            (1, b"before-view".to_vec()),
+            (0, b"live-view".to_vec()),
+            (1, b"live-models".to_vec()),
+        ]
+    );
     frontend.send(Action::NewTab { pane }).unwrap();
     wait(&mut frontend, |client, _| {
         client.snapshot().unwrap().tabs.len() == 2

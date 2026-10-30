@@ -109,7 +109,12 @@ impl Server {
                     .unwrap();
                 let mut body = vec![0; length];
                 stream.read_exact(&mut body).unwrap();
-                let body = serde_json::from_slice(&body).unwrap();
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                if body["tool_choice"]["type"] == "none" {
+                    assert!(body.get("cache_control").is_none());
+                } else {
+                    assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
+                }
                 reply(index, &body, &mut stream);
                 requests.push(body);
             }
@@ -579,6 +584,38 @@ fn incomplete_streams_and_terminal_errors_do_not_poison_the_next_turn() {
     for turn in worker.finish().0 {
         paired(&turn.messages);
     }
+    server.finish();
+}
+
+#[test]
+fn output_limit_never_executes_even_a_parseable_tool_call() {
+    let server = Server::new(2, |index, body, stream| {
+        if index == 0 {
+            let mut events = response(
+                "",
+                &[("limited", "shell", json!({"command":"must-not-run"}))],
+            );
+            let stop = events.len() - 2;
+            events[stop]["delta"]["stop_reason"] = json!("max_tokens");
+            sse(stream, events);
+        } else {
+            paired(body["messages"].as_array().unwrap());
+            assert!(body["messages"].to_string().contains("Result unavailable"));
+            sse(
+                stream,
+                response("The previous action was not executed.", &[]),
+            );
+        }
+    });
+    let worker = Worker::new(server.url.clone());
+    let agent = worker.agent();
+    agent.send("first request".into(), 17, json!({})).unwrap();
+    let events = settled(agent, |_| panic!("output-limited tool call executed"));
+    assert!(events.iter().any(|event| matches!(event, Event::Error(_))));
+    agent.send("continue".into(), 17, json!({})).unwrap();
+    let events = settled(agent, |_| panic!("unexpected tool call"));
+    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    worker.finish();
     server.finish();
 }
 

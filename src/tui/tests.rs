@@ -2211,7 +2211,7 @@ fn running_tab_close_defaults_to_cancel_and_never_sends_modal_input_to_pty() {
 }
 
 #[test]
-fn tab_dots_only_animate_visible_work_and_acknowledge_results() {
+fn tab_dots_only_animate_visible_work_and_preserve_results() {
     use crate::workspace::{TabActivity, TabView};
     let mut ui = Ui::new().unwrap();
     let now = Instant::now();
@@ -2248,12 +2248,16 @@ fn tab_dots_only_animate_visible_work_and_acknowledge_results() {
         0xfe9b30
     );
     snapshot.active_tab = 2;
-    assert!(ui.update_tabs(&snapshot, 80, "", now + Duration::from_secs(1)));
-    assert_ne!(
+    assert!(!ui.update_tabs(&snapshot, 80, "", now + Duration::from_secs(1)));
+    assert_eq!(
         ui.tab_color(&snapshot.tabs[1], 0xcccccc, 0x202020),
         0xfe9b30
     );
     snapshot.active_tab = 1;
+    assert_eq!(
+        ui.tab_color(&snapshot.tabs[1], 0xcccccc, 0x202020),
+        0xfe9b30
+    );
     snapshot.tabs[1].activity = TabActivity::Running;
     ui.update_tabs(&snapshot, 80, "", now + Duration::from_secs(2));
     snapshot.tabs[1].activity = TabActivity::Failed;
@@ -2262,6 +2266,17 @@ fn tab_dots_only_animate_visible_work_and_acknowledge_results() {
         ui.tab_color(&snapshot.tabs[1], 0xcccccc, 0x202020),
         0xe87575
     );
+    snapshot.active_tab = 2;
+    ui.update_tabs(&snapshot, 80, "", now + Duration::from_secs(4));
+    assert_eq!(
+        ui.tab_color(&snapshot.tabs[1], 0xcccccc, 0x202020),
+        0xe87575
+    );
+    snapshot.tabs[1].activity = TabActivity::Running;
+    ui.update_tabs(&snapshot, 80, "", now + Duration::from_secs(5));
+    let running = ui.tab_color(&snapshot.tabs[1], 0xcccccc, 0x202020);
+    assert_ne!(running, 0xe87575);
+    assert_ne!(running, 0xfe9b30);
 }
 
 #[test]
