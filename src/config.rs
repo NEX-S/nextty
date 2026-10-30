@@ -262,7 +262,7 @@ impl<'a> Parser<'a> {
                     continue;
                 }
             }
-            self.take();
+            self.offset += ch.len_utf8();
             if ch.is_ascii_control() && ch != '\t' {
                 return self.fail("control character in string");
             }
