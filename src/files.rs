@@ -623,12 +623,17 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
 }
 
 fn preview_text(text: &str) -> String {
-    if text.bytes().all(|byte| (b' '..=b'~').contains(&byte)) {
+    let Some(first) = text.bytes().position(|byte| !(b' '..=b'~').contains(&byte)) else {
         return text.to_owned();
-    }
+    };
     let mut result = String::with_capacity(text.len());
     let mut start = 0;
-    for (index, ch) in text.char_indices().filter(|(_, ch)| ch.is_control()) {
+    // The printable ASCII prefix makes first a UTF-8 boundary.
+    for (index, ch) in text[first..]
+        .char_indices()
+        .filter(|(_, ch)| ch.is_control())
+    {
+        let index = first + index;
         result.push_str(&text[start..index]);
         match ch {
             '\t' => result.push_str("    "),
