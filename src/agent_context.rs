@@ -12,7 +12,7 @@ fn horizontal(character: char) -> bool {
 
 pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     let mut text = String::new();
-    let mut row_ranges = Vec::new();
+    let mut row_ranges = Vec::with_capacity(screen.rows.len());
     let cursor = screen.cursor();
     let cursor_row = i64::from(cursor.0.line) + screen.display_offset() as i64;
     let cursor_visible =
