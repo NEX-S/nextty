@@ -230,14 +230,16 @@ pub fn run() -> io::Result<()> {
             return Err(error);
         }
         client.flush()?;
-        for mut event in client.poll()? {
-            for session in &mut sessions {
-                session.model.handle_event(&mut event, &client)?;
-            }
-            match event {
-                ClientEvent::Detached => return Ok(()),
-                ClientEvent::Error(error) => return Err(io::Error::other(error)),
-                _ => (),
+        if fds[0].revents != 0 || fds[1].revents != 0 || client.needs_poll() {
+            for mut event in client.poll()? {
+                for session in &mut sessions {
+                    session.model.handle_event(&mut event, &client)?;
+                }
+                match event {
+                    ClientEvent::Detached => return Ok(()),
+                    ClientEvent::Error(error) => return Err(io::Error::other(error)),
+                    _ => (),
+                }
             }
         }
         pending.extend(client.take_agent_events());
