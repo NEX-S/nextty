@@ -1081,13 +1081,12 @@ impl AgentPanel {
             let point = |point: TranscriptPoint| (point.message, point.part, point.offset);
             let mut expanded_tools: Vec<_> = session.expanded_tools.iter().collect();
             expanded_tools.sort_unstable();
-            json!({
+            let mut view = json!({
                 "id": session.id,
                 "input": session.model.input,
                 "cursor": session.model.cursor,
                 "anchor": session.model.anchor,
                 "scroll": session.model.scroll,
-                "basket": session.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
                 "menu": session.context.menu,
                 "preview": session.context.preview.as_ref().map(|preview| (preview.item.view(), preview.scroll)),
                 "expanded_tools": expanded_tools,
@@ -1095,7 +1094,11 @@ impl AgentPanel {
                 "rewind_target": session.rewind_target,
                 "rewind_applied": session.rewind_applied,
                 "selection": session.selection.as_ref().map(|selection| (point(selection.anchor), point(selection.head))),
-            })
+            });
+            view["basket"] = serde_json::Value::Array(
+                session.context.basket.iter().map(|item| json!(item.view())).collect(),
+            );
+            view
         }).collect();
         let mut view = json!({
             "open": self.open,
