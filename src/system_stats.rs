@@ -987,6 +987,14 @@ fn process_stat(text: &str, page_size: u64) -> Option<(Process, ProcessCounters)
         counters,
     ))
 }
+// Proc files report zero size; buffered reads avoid a metadata query for each one.
+fn process_text(path: PathBuf) -> io::Result<String> {
+    let mut reader = io::BufReader::with_capacity(512, fs::File::open(path)?);
+    let mut text = String::new();
+    while reader.read_line(&mut text)? != 0 {}
+    Ok(text)
+}
+
 fn sample_processes(
     previous: &HashMap<u32, ProcessCounters>,
     elapsed: Option<f64>,
@@ -1004,7 +1012,7 @@ fn sample_processes(
             continue;
         };
         let path = entry.path();
-        let Some((mut process, mut current)) = fs::read_to_string(path.join("stat"))
+        let Some((mut process, mut current)) = process_text(path.join("stat"))
             .ok()
             .and_then(|text| process_stat(&text, page_size))
         else {
@@ -1014,7 +1022,7 @@ fn sample_processes(
             Ok(meta) => meta.uid(),
             Err(_) => continue,
         };
-        current.io = fs::read_to_string(path.join("io"))
+        current.io = process_text(path.join("io"))
             .ok()
             .and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
         if let Some(old) = previous.get(&pid).filter(|old| old.start == current.start) {
@@ -1040,7 +1048,7 @@ fn sample_processes(
 
 fn process_details(identity: (u32, u64), page_size: u64) -> Option<ProcessDetails> {
     let path = PathBuf::from(format!("/proc/{}", identity.0));
-    let (process, _) = process_stat(&fs::read_to_string(path.join("stat")).ok()?, page_size)?;
+    let (process, _) = process_stat(&process_text(path.join("stat")).ok()?, page_size)?;
     if process.start != identity.1 {
         return None;
     }
@@ -1054,7 +1062,7 @@ fn process_details(identity: (u32, u64), page_size: u64) -> Option<ProcessDetail
         .filter(|v| !v.is_empty())
         .unwrap_or_else(|| format!("[{}]", process.name));
     let directory = fs::read_link(path.join("cwd")).ok();
-    let (current, _) = process_stat(&fs::read_to_string(path.join("stat")).ok()?, page_size)?;
+    let (current, _) = process_stat(&process_text(path.join("stat")).ok()?, page_size)?;
     (current.start == identity.1).then_some(ProcessDetails {
         identity,
         command,
