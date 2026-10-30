@@ -1736,7 +1736,11 @@ fn write_row(file: &mut impl Write, row: &Row) -> io::Result<()> {
     let stored = if row.used() == row.cells.len() {
         row.used()
     } else {
-        row.non_default_len().max(row.used())
+        let used = row.used();
+        row.cells[used..]
+            .iter()
+            .rposition(|cell| *cell != Cell::default())
+            .map_or(used, |column| used + column + 1)
     };
     file.write_all(&(row.cells.len() as u16).to_le_bytes())?;
     file.write_all(&(row.used() as u16).to_le_bytes())?;
