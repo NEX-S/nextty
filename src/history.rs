@@ -1926,8 +1926,10 @@ mod tests {
         assert_eq!(
             result.matches,
             vec![crate::search::SearchMatch {
-                start: (0, 2),
-                end: (1, 1)
+                start_row: 0,
+                end_row: 1,
+                start_column: 2,
+                end_column: 1,
             }]
         );
         assert!(!result.truncated);
@@ -2640,8 +2642,10 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                     assert_eq!(
                         result.matches,
                         vec![crate::search::SearchMatch {
-                            start: (0, 1),
-                            end: (1001, 3),
+                            start_row: 0,
+                            end_row: 1001,
+                            start_column: 1,
+                            end_column: 3,
                         }]
                     );
                 }

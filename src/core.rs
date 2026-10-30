@@ -3357,30 +3357,29 @@ impl Core {
         })?;
         let base = self.search_base();
         let first = base.saturating_sub(self.history_size() as u64);
-        if found.start.0 < first || found.end.0 >= base + self.screen_lines() as u64 {
+        if found.start_row < first || found.end_row >= base + self.screen_lines() as u64 {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 "search result was evicted from history",
             ));
         }
         let top = found
-            .start
-            .0
+            .start_row
             .saturating_sub((self.screen_lines() / 2) as u64);
         let offset = base.saturating_sub(top).min(self.history_size() as u64) as usize;
         self.scroll_display(Scroll::Delta(offset as i32 - self.display_offset() as i32));
         self.selection_start(
             Point {
-                line: (i128::from(found.start.0) - i128::from(base)) as i32,
-                column: usize::from(found.start.1),
+                line: (i128::from(found.start_row) - i128::from(base)) as i32,
+                column: usize::from(found.start_column),
             },
             Side::Left,
             SelectionType::Simple,
         );
         self.selection_update(
             Point {
-                line: (i128::from(found.end.0) - i128::from(base)) as i32,
-                column: usize::from(found.end.1.saturating_sub(1)),
+                line: (i128::from(found.end_row) - i128::from(base)) as i32,
+                column: usize::from(found.end_column.saturating_sub(1)),
             },
             Side::Right,
         );

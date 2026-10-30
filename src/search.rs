@@ -6,10 +6,13 @@ use std::io;
 
 const MATCH_LIMIT: usize = 10_000;
 
+// Separate row IDs and columns avoid padding each coordinate pair.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct SearchMatch {
-    pub start: (u64, u16),
-    pub end: (u64, u16),
+    pub start_row: u64,
+    pub end_row: u64,
+    pub start_column: u16,
+    pub end_column: u16,
 }
 
 pub(crate) struct SearchResult {
@@ -70,9 +73,12 @@ impl Matcher {
             self.positions.clear();
         }
         if self.matched == self.pattern.len() {
+            let &(start_row, start_column) = self.positions.front().unwrap();
             self.matches.push_back(SearchMatch {
-                start: *self.positions.front().unwrap(),
-                end,
+                start_row,
+                end_row: end.0,
+                start_column,
+                end_column: end.1,
             });
             if self.matches.len() > MATCH_LIMIT {
                 self.matches.pop_front();
@@ -439,8 +445,10 @@ mod tests {
         assert_eq!(
             matcher.finish(4, false).matches,
             vec![SearchMatch {
-                start: (10, 2),
-                end: (11, 1)
+                start_row: 10,
+                end_row: 11,
+                start_column: 2,
+                end_column: 1,
             }]
         );
         let mut matcher = Matcher::new("中");
@@ -448,8 +456,10 @@ mod tests {
         assert_eq!(
             matcher.finish(4, false).matches,
             vec![SearchMatch {
-                start: (10, 0),
-                end: (10, 2)
+                start_row: 10,
+                end_row: 10,
+                start_column: 0,
+                end_column: 2,
             }]
         );
         let mut matcher = Matcher::new("\u{301}");
@@ -457,8 +467,10 @@ mod tests {
         assert_eq!(
             matcher.finish(4, false).matches,
             vec![SearchMatch {
-                start: (10, 2),
-                end: (10, 3)
+                start_row: 10,
+                end_row: 10,
+                start_column: 2,
+                end_column: 3,
             }]
         );
         crate::vt::Parser::new().advance(&mut core, b"\x1b[2J\x1b[Hababacaba");
@@ -471,7 +483,10 @@ mod tests {
                 .finish(4, false)
                 .matches
                 .iter()
-                .map(|found| (found.start, found.end))
+                .map(|found| (
+                    (found.start_row, found.start_column),
+                    (found.end_row, found.end_column)
+                ))
                 .collect::<Vec<_>>(),
             [((10, 0), (10, 3)), ((10, 2), (11, 1)), ((11, 2), (12, 1))]
         );
@@ -502,6 +517,9 @@ mod tests {
         let result = matcher.finish(20, false);
         assert_eq!(result.matches.len(), MATCH_LIMIT);
         assert!(result.truncated);
-        assert_eq!(result.matches[0].start, (2, 0));
+        assert_eq!(
+            (result.matches[0].start_row, result.matches[0].start_column),
+            (2, 0)
+        );
     }
 }
