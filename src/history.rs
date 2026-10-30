@@ -281,9 +281,9 @@ impl SearchWorker {
         std::thread::Builder::new()
             .name("history-search".into())
             .spawn(move || {
+                let (lock, changed) = &*worker;
+                let mut state = lock.lock().unwrap();
                 loop {
-                    let (lock, changed) = &*worker;
-                    let mut state = lock.lock().unwrap();
                     while state.pending.is_empty() && !state.closed {
                         state = changed.wait(state).unwrap();
                     }
@@ -313,7 +313,8 @@ impl SearchWorker {
                             }
                         }
                     }
-                    lock.lock().unwrap().active = None;
+                    state = lock.lock().unwrap();
+                    state.active = None;
                 }
             })?;
         Ok(Self(shared))
