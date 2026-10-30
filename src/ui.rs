@@ -1259,6 +1259,7 @@ impl AgentPanel {
             session.clear_selection();
             self.view_dirty = true;
         }
+        // sync_rendered kept only matching prefixes; equal lengths imply equal text.
         let messages: Vec<_> = session
             .model
             .messages
@@ -1269,7 +1270,7 @@ impl AgentPanel {
                     && message.id.is_none()
                     && session.rendered[index]
                         .as_ref()
-                        .is_none_or(|rendered| rendered.source != message.text)
+                        .is_none_or(|rendered| rendered.source.len() != message.text.len())
             })
             .map(|(index, message)| (index, message.turn, message.text.clone()))
             .collect();
@@ -2203,6 +2204,11 @@ mod tests {
         assert_eq!(panel.active().message_text(0), "first");
         panel.prepare_layout(40).unwrap();
         assert_eq!(panel.active().message_text(0), "first next");
+
+        owner.active_mut().model.messages[0].text = "**other** next".into();
+        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
+        panel.wait_layout(40);
+        assert_eq!(panel.active().message_text(0), "other next");
 
         owner.active_mut().model.busy = true;
         assert!(panel.restore_models(owner.model_snapshot()).unwrap());
