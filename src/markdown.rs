@@ -1,4 +1,5 @@
 use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use std::fmt::Write;
 use std::ops::Range;
 
 pub(crate) const BOLD: u8 = 1;
@@ -92,6 +93,7 @@ impl Markdown {
         let mut styles = Vec::with_capacity(8);
         styles.push(0);
         let mut lists = Vec::new();
+        let mut number_text = String::new();
         let mut links = Vec::new();
         let mut quote_depth = 0;
         for event in Parser::new(source) {
@@ -126,7 +128,9 @@ impl Markdown {
                                 output.push("  ", 0);
                             }
                             if let Some(Some(number)) = lists.last_mut() {
-                                output.push(&format!("{number}. "), 0);
+                                number_text.clear();
+                                write!(&mut number_text, "{number}. ").unwrap();
+                                output.push(&number_text, 0);
                                 *number += 1;
                             } else {
                                 output.push("• ", 0);
