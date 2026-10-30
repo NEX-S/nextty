@@ -696,8 +696,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
             return;
         }
         record_history(&mut state.history, point);
-        state.detail_result = None;
-        let previous = state.result.replace(sample);
+        let previous = (state.result.replace(sample), state.detail_result.take());
         if let Err(error) = crate::eventfd::notify(sampler.wakeup.as_raw_fd()) {
             eprintln!("notify system statistics: {error}");
             return;
