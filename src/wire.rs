@@ -1464,7 +1464,6 @@ fn encode_action(e: &mut Encoder, action: &Action) {
     }
 }
 fn encode_input(e: &mut Encoder, pane: u64, data: &[u8]) {
-    e.0.reserve(1 + 8 + 4 + data.len());
     e.u8(4);
     e.u64(pane);
     e.bytes(data);
