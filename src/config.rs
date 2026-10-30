@@ -317,14 +317,13 @@ impl<'a> Parser<'a> {
     }
 
     fn token(&mut self) -> &'a str {
-        let start = self.offset;
-        while self
-            .peek()
-            .is_some_and(|ch| !matches!(ch, ' ' | '\t' | '\r' | '\n' | '#'))
-        {
-            self.take();
-        }
-        &self.text[start..self.offset]
+        let rest = &self.text[self.offset..];
+        let length = rest
+            .bytes()
+            .position(|byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n' | b'#'))
+            .unwrap_or(rest.len());
+        self.offset += length;
+        &rest[..length]
     }
 
     fn color(&mut self) -> Result<u32> {
