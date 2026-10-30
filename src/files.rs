@@ -603,7 +603,12 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         });
     };
     let mut lines = Vec::new();
-    for line in text.split_terminator('\n') {
+    let mut ends = memchr::memchr_iter(b'\n', text.as_bytes());
+    let mut offset = 0;
+    while offset < text.len() {
+        let end = ends.next().unwrap_or(text.len());
+        let line = &text[offset..end];
+        offset = end + 1;
         if lines.len() == PREVIEW_LINE_LIMIT {
             truncated = true;
             break;

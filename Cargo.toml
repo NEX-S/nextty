@@ -12,7 +12,7 @@ gui = []
 tui = []
 monitor = ["tui"]
 agent = ["tui", "dep:serde_json", "dep:curl", "dep:pulldown-cmark", "dep:memchr"]
-files = ["tui"]
+files = ["tui", "dep:memchr"]
 
 [dependencies]
 memchr = { version = "2", optional = true }
