@@ -21,7 +21,8 @@ pub(crate) struct SearchResult {
 
 pub(crate) struct Matcher {
     pattern: Vec<char>,
-    prefix: Vec<usize>,
+    // Queries fit in a wire frame, so prefix lengths fit in u32.
+    prefix: Vec<u32>,
     matched: usize,
     positions: VecDeque<(u64, u16)>,
     matches: VecDeque<SearchMatch>,
@@ -32,14 +33,14 @@ impl Matcher {
         let pattern: Vec<char> = query.chars().collect();
         let mut prefix = vec![0; pattern.len()];
         for index in 1..pattern.len() {
-            let mut matched = prefix[index - 1];
+            let mut matched = prefix[index - 1] as usize;
             while matched > 0 && pattern[index] != pattern[matched] {
-                matched = prefix[matched - 1];
+                matched = prefix[matched - 1] as usize;
             }
             if pattern[index] == pattern[matched] {
                 matched += 1;
             }
-            prefix[index] = matched;
+            prefix[index] = matched as u32;
         }
         Self {
             positions: VecDeque::with_capacity(pattern.len()),
@@ -55,7 +56,7 @@ impl Matcher {
             return;
         }
         while self.matched > 0 && character != self.pattern[self.matched] {
-            self.matched = self.prefix[self.matched - 1];
+            self.matched = self.prefix[self.matched - 1] as usize;
         }
         if character == self.pattern[self.matched] {
             self.matched += 1;
@@ -77,7 +78,7 @@ impl Matcher {
                 self.matches.pop_front();
                 self.truncated = true;
             }
-            self.matched = self.prefix[self.matched - 1];
+            self.matched = self.prefix[self.matched - 1] as usize;
         }
     }
     pub fn line_break(&mut self) {
