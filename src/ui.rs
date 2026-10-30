@@ -1237,9 +1237,10 @@ impl AgentPanel {
             return Ok(());
         }
         let session = &mut self.sessions[self.current];
-        let selection = session.selection_checkpoint();
+        let selection = session.selection_prefixes().is_some();
         session.sync_rendered();
-        if selection.is_some() && !session.selection_matches(selection.as_ref()) {
+        // Cache invalidation only removes rendered text, so valid endpoints keep their prefixes.
+        if selection && session.selection_prefixes().is_none() {
             session.clear_selection();
             self.view_dirty = true;
         }
