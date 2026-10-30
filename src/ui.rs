@@ -2039,13 +2039,15 @@ impl AgentSession {
         }
         self.lines = lines;
         if let Some((anchor, gap)) = anchor {
-            if let Some(index) = self.lines.iter().enumerate().position(|(index, _)| {
-                self.line_text(index).is_some_and(|(point, range, _)| {
-                    point.message == anchor.message
-                        && point.part == anchor.part
-                        && (range.contains(&anchor.offset)
-                            || range.is_empty() && range.start == anchor.offset)
-                })
+            if let Some(index) = self.lines.iter().position(|line| match line {
+                AgentLine::Role(message) => *message as usize == anchor.message && anchor.part == 0,
+                AgentLine::Text { message, range } => {
+                    *message as usize == anchor.message
+                        && anchor.part == 1
+                        && (range.contains(&(anchor.offset as u32))
+                            || range.is_empty() && range.start as usize == anchor.offset)
+                }
+                AgentLine::Blank => false,
             }) {
                 self.model.scroll = self.lines.len().saturating_sub(index + gap + 1);
             }
