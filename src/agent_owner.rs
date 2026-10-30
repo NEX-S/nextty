@@ -298,19 +298,17 @@ pub fn run() -> io::Result<()> {
             && publish_models
             && (Instant::now() >= publish_at || sessions.iter().all(|session| !session.model.busy))
         {
-            let snapshots = sessions
-                .iter_mut()
-                .map(Session::snapshot)
-                .collect::<Result<Vec<_>, _>>()?;
-            let mut payload = Vec::with_capacity(
-                2 + snapshots.len() + snapshots.iter().map(|bytes| bytes.len()).sum::<usize>(),
-            );
+            let mut length = 2 + sessions.len();
+            for session in sessions.iter_mut() {
+                length += session.snapshot()?.len();
+            }
+            let mut payload = Vec::with_capacity(length);
             payload.push(b'[');
-            for (index, snapshot) in snapshots.iter().enumerate() {
+            for (index, session) in sessions.iter_mut().enumerate() {
                 if index != 0 {
                     payload.push(b',');
                 }
-                payload.extend_from_slice(snapshot);
+                payload.extend_from_slice(session.snapshot()?);
             }
             payload.push(b']');
             client.send(Action::AgentUpdate { kind: 1, payload })?;
