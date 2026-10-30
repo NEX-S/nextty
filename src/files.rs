@@ -638,8 +638,15 @@ fn preview_text(text: &str) -> String {
         match ch {
             '\t' => result.push_str("    "),
             ch => {
-                use std::fmt::Write;
-                write!(result, "\\u{{{:x}}}", u32::from(ch)).unwrap();
+                // C0 and C1 controls fit in two hexadecimal digits.
+                const HEX: &[u8; 16] = b"0123456789abcdef";
+                let value = ch as usize;
+                result.push_str("\\u{");
+                if value >= 16 {
+                    result.push(char::from(HEX[value >> 4]));
+                }
+                result.push(char::from(HEX[value & 15]));
+                result.push('}');
             }
         }
         start = index + ch.len_utf8();
