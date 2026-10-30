@@ -138,7 +138,7 @@ impl Session {
         if self.serialized.is_empty() {
             let mut model = self.model.snapshot();
             model["rewind_restore"] = json!(self.rewind_restore);
-            serde_json::to_writer(&mut self.serialized, &json!([self.id, model]))?;
+            serde_json::to_writer(&mut self.serialized, &(self.id, &model))?;
         }
         Ok(&self.serialized)
     }
