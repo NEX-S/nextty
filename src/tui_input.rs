@@ -139,10 +139,9 @@ impl Decoder {
     }
 
     pub fn expire(&mut self, now: Instant) -> Option<Input> {
-        if self.pending == [0x1b]
-            && self
-                .escape_since
-                .is_some_and(|start| now.duration_since(start) >= ESCAPE_WAIT)
+        if self
+            .escape_since
+            .is_some_and(|start| now.duration_since(start) >= ESCAPE_WAIT)
         {
             self.pending.clear();
             self.escape_since = None;
