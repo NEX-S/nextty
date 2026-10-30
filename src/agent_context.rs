@@ -104,8 +104,6 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         .filter_map(|(index, row)| row.wrapped.then_some(index))
         .collect();
     let mut result = json!({
-        "rows": rows,
-        "omitted": omitted,
         "columns": screen.columns(),
         "lines": screen.screen_lines(),
         "alternate_screen": screen.mode().contains(Mode::ALT_SCREEN),
@@ -118,6 +116,8 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         },
         "wrapped_rows": wrapped_rows,
     });
+    result["rows"] = Value::Array(rows);
+    result["omitted"] = Value::Array(omitted);
     if query.is_some() {
         result["matches"] = json!(
             matches
