@@ -50,16 +50,21 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     let mut matches = vec![false; row_ranges.len()];
     if let Some(query) = query {
         let mut offset = 0;
+        let mut first = 0;
+        let mut last = 0;
         while let Some(found) = text[offset..].find(query) {
             let start = offset + found;
             let end = start + query.len();
-            let first = row_ranges.partition_point(|row| row.start <= start) - 1;
-            let last = row_ranges
-                .partition_point(|row| {
-                    row.start < end || (query.ends_with('\n') && row.start == end)
-                })
-                .saturating_sub(1)
-                .max(first);
+            while first + 1 < row_ranges.len() && row_ranges[first + 1].start <= start {
+                first += 1;
+            }
+            last = last.max(first);
+            while last + 1 < row_ranges.len()
+                && (row_ranges[last + 1].start < end
+                    || query.ends_with('\n') && row_ranges[last + 1].start == end)
+            {
+                last += 1;
+            }
             matches[first..=last].fill(true);
             let Some(next) = text[start..].chars().next() else {
                 break;
@@ -275,6 +280,14 @@ mod tests {
             ])
         );
         assert_eq!(shape(&screen, Some("Gafter"))["matches"], json!([]));
+    }
+
+    #[test]
+    fn overlapping_queries_preserve_all_physical_rows() {
+        let screen = screen(2, 4, "aaaaa\r\n");
+        assert_eq!(shape(&screen, Some("aaa"))["matches"], json!([0, 1, 2]));
+        assert_eq!(shape(&screen, Some("aaa\n"))["matches"], json!([1, 2, 3]));
+        assert_eq!(shape(&screen, Some(""))["matches"], json!([0, 1, 2, 3]));
     }
 
     #[test]
