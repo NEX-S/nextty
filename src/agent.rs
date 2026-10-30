@@ -487,7 +487,7 @@ fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::
         .screens()
         .get(&pane)
         .ok_or_else(|| io::Error::other("No screen for pane"))?;
-    Ok(json!({
+    let mut observation = json!({
         "pane": pane,
         "process": {
             "foreground_pgid": view.process.foreground_pgid,
@@ -499,15 +499,24 @@ fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::
             "sampled_at_ms": view.process.sampled_at_ms,
             "unavailable": view.process.unavailable,
         },
-        "screen": crate::agent_context::shape(screen, query),
-        "command_blocks": view.command_blocks.iter().rev().map(|b| json!({
-            "id":b.id,"has_output":b.has_output,"exit_code":b.status,
-            "output_incomplete":!b.complete,
-        })).collect::<Vec<_>>(),
         "history_rows": screen.history,
         "input_generation": view.input_generation,
         "shell_prompt": view.shell_prompt,
-    }))
+    });
+    observation["screen"] = crate::agent_context::shape(screen, query);
+    observation["command_blocks"] = Value::Array(
+        view.command_blocks
+            .iter()
+            .rev()
+            .map(|b| {
+                json!({
+                    "id":b.id,"has_output":b.has_output,"exit_code":b.status,
+                    "output_incomplete":!b.complete,
+                })
+            })
+            .collect(),
+    );
+    Ok(observation)
 }
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
