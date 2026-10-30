@@ -47,12 +47,18 @@ impl Agent {
     }
 
     pub fn snapshot(&self) -> serde_json::Value {
-        serde_json::json!({
-            "messages": self.messages.iter().map(|m| (&m.role, &m.text, &m.id, m.turn)).collect::<Vec<_>>(),
+        let mut snapshot = serde_json::json!({
             "busy": self.busy,
             "revision": self.revision,
             "turn": self.turn,
-        })
+        });
+        snapshot["messages"] = serde_json::Value::Array(
+            self.messages
+                .iter()
+                .map(|m| serde_json::json!((&m.role, &m.text, &m.id, m.turn)))
+                .collect(),
+        );
+        snapshot
     }
 
     pub fn restore(&mut self, mut value: serde_json::Value) -> io::Result<bool> {
