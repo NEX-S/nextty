@@ -674,10 +674,7 @@ pub fn shell_quote(path: &OsStr) -> Vec<u8> {
     let mut quoted = Vec::with_capacity(path.len() + 2);
     quoted.push(b'\'');
     let bytes = path.as_bytes();
-    let first_quote = bytes
-        .iter()
-        .position(|&byte| byte == b'\'')
-        .unwrap_or(bytes.len());
+    let first_quote = memchr::memchr(b'\'', bytes).unwrap_or(bytes.len());
     quoted.extend_from_slice(&bytes[..first_quote]);
     for &byte in &bytes[first_quote..] {
         if byte == b'\'' {
