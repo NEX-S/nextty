@@ -3,12 +3,13 @@
 #[path = "tui_input.rs"]
 mod input;
 
-use crate::clipboard_reader::ClipboardReader;
-use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
-use crate::input::mouse_bytes;
-use crate::screen::Screen;
 #[cfg(feature = "agent")]
-use crate::ui::{AgentAction, AgentLine, column_offset};
+use crate::agent::panel::{AgentAction, AgentLine, column_offset, editor};
+use crate::clipboard_reader::ClipboardReader;
+use crate::config::Config;
+use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
+use crate::input::{PasteTarget, TextDecoder, mouse_bytes};
+use crate::screen::Screen;
 use crate::ui::{Focus, Ui};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 use crate::width::{fit_label, scalar_width, text_width};
@@ -23,7 +24,7 @@ use std::time::{Duration, Instant};
 
 const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J";
-const LEAVE: &[u8] = b"\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
+const LEAVE: &[u8] = b"\x1b[?2026l\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
 
 struct TerminalGuard {
     input: RawFd,
@@ -148,15 +149,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
         let mut output_ready = true;
         frontend.poll()?;
         while frontend.running {
-            if let Some(snapshot) = frontend.client.snapshot() {
-                let label = frontend.label().into_owned();
-                frontend.dots_dirty |= frontend.ui.update_tabs(
-                    snapshot,
-                    frontend.view_size().num_cols,
-                    &label,
-                    Instant::now(),
-                );
-            }
             #[cfg(feature = "agent")]
             {
                 let (changed, _) = frontend
@@ -166,42 +158,14 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     source.fd == frontend.ui.agent.layout_fd() && source.revents != 0
                 }) && frontend.ui.agent.poll_layout()?;
                 if (changed && frontend.ui.agent.open) || layout_changed {
-                    frontend.agent_dirty = true;
+                    frontend.agent.dirty = true;
                     frontend.dirty = true;
                 }
             }
-            #[cfg(feature = "monitor")]
-            if let Some(snapshot) = frontend.client.snapshot() {
-                let directory = if frontend.client.is_remote() {
-                    Some(std::path::Path::new("/"))
-                } else {
-                    snapshot
-                        .panes
-                        .iter()
-                        .find(|pane| pane.id == snapshot.focused)
-                        .and_then(|pane| pane.cwd.as_deref())
-                };
-                let changed = frontend
-                    .ui
-                    .resources
-                    .stats
-                    .refresh(directory, frontend.ui.resources.open)?;
-                frontend.resource_dirty |= changed;
-                frontend.dirty |= changed;
-            }
-            frontend.dirty |= frontend.ui.expire_status();
-            #[cfg(feature = "files")]
-            if frontend.ui.files_open
-                && let Some(files) = &mut frontend.ui.files
-            {
-                if fds
-                    .iter()
-                    .any(|source| source.fd == files.fd() && source.revents != 0)
-                {
-                    files.drain_notification()?;
-                }
-                frontend.dirty |= files.poll();
-            }
+
+            let (resources, changed) = frontend.ui.service(&frontend.client, &fds)?;
+            frontend.resource_dirty |= resources;
+            frontend.dirty |= changed;
             if frontend.running && output.is_empty() {
                 if let Some(transfer) = &mut frontend.clipboard {
                     if let Some(message) =
@@ -209,16 +173,11 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     {
                         frontend.clipboard = None;
                         frontend.message(message);
-                        frontend.full = true;
                     }
                 } else if frontend.dirty {
                     frontend.draw(&mut output.bytes)?;
                     frontend.dirty = false;
-                    frontend.dots_dirty = false;
-                } else if frontend.dots_dirty {
-                    frontend.draw_dots(&mut output.bytes)?;
-                    frontend.draw_active_cursor(&mut output.bytes)?;
-                    frontend.dots_dirty = false;
+                    frontend.client.request_screen()?;
                 }
             }
             if output_ready && let Err(error) = output.flush_available(libc::STDOUT_FILENO) {
@@ -227,9 +186,8 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     events: 0,
                     revents: 0,
                 };
-                if unsafe { libc::poll(&mut state, 1, 0) } >= 0
-                    && state.revents & libc::POLLHUP != 0
-                {
+                crate::poll::poll(std::slice::from_mut(&mut state), 0)?;
+                if state.revents & libc::POLLHUP != 0 {
                     break;
                 }
                 return Err(error);
@@ -240,11 +198,8 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             }
             let now = Instant::now();
             let mut timeout = decoder.timeout(now);
-            if let Some(deadline) = frontend.ui.tab_deadline {
-                let remaining = deadline.saturating_duration_since(now);
-                timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
-            }
-            if let Some((_, until)) = &frontend.ui.status {
+
+            if let Some(until) = frontend.ui.deadline() {
                 let remaining = until.saturating_duration_since(now);
                 timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
             }
@@ -261,6 +216,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             if frontend.client.needs_poll() {
                 timeout = Some(Duration::ZERO);
             }
+            frontend.client.flush()?;
             let socket_events = if frontend.client.wants_read() {
                 libc::POLLIN
             } else {
@@ -301,12 +257,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     events: libc::POLLIN,
                     revents: 0,
                 },
-                #[cfg(feature = "monitor")]
-                libc::pollfd {
-                    fd: frontend.ui.resources.stats.fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
                 libc::pollfd {
                     fd: frontend
                         .clipboard_reader
@@ -316,34 +266,12 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     events: libc::POLLIN,
                     revents: 0,
                 },
-                #[cfg(feature = "files")]
-                libc::pollfd {
-                    fd: frontend
-                        .ui
-                        .files
-                        .as_ref()
-                        .filter(|_| frontend.ui.files_open)
-                        .map_or(-1, |files| files.fd()),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                #[cfg(feature = "agent")]
-                libc::pollfd {
-                    fd: frontend.ui.agent.layout_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
             ]);
+            fds.extend(frontend.ui.fds());
             let milliseconds = timeout.map_or(-1, |timeout| {
                 timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
             });
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, milliseconds) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
+            crate::poll::poll(&mut fds, milliseconds)?;
             output_ready |= fds[3].revents & libc::POLLOUT != 0;
             if fds[1].revents & libc::POLLOUT != 0 {
                 frontend.client.flush()?;
@@ -391,6 +319,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             if let Some(event) = decoder.expire(Instant::now()) {
                 frontend.input(event)?;
             }
+            frontend.client.flush()?;
             if frontend.running
                 && (fds[1].revents
                     & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
@@ -410,7 +339,10 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             .poll_agent(&mut frontend.client, &frontend.config)?;
     }
     // Closing the connection also detaches if the last nonblocking send cannot flush.
-    let _ = frontend.client.send(Action::Detach);
+    let _ = frontend
+        .client
+        .send(Action::Detach)
+        .and_then(|()| frontend.client.flush());
     result
 }
 
@@ -453,16 +385,6 @@ impl Output {
     }
 }
 
-#[cfg(feature = "agent")]
-fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
-    [0, 8, 16].into_iter().fold(0, |rgb, shift| {
-        rgb | ((((foreground >> shift & 255) * weight
-            + (background >> shift & 255) * (255 - weight))
-            / 255)
-            << shift)
-    })
-}
-
 fn draw_text(
     output: &mut Vec<u8>,
     x: u16,
@@ -491,7 +413,6 @@ fn draw_text(
     Ok(())
 }
 
-#[cfg(feature = "monitor")]
 fn braille_trend(
     points: &[(f32, Option<f32>)],
     columns: usize,
@@ -544,106 +465,69 @@ fn terminal_size(fd: RawFd) -> io::Result<WindowSize> {
     })
 }
 
-enum PasteTarget {
-    Search,
-    #[cfg(feature = "agent")]
-    Agent(u64),
-    Pane {
-        pane: PaneId,
-        bracketed: bool,
-    },
-    #[cfg(feature = "files")]
-    Files,
-    #[cfg(feature = "monitor")]
-    Monitor,
-}
-
 struct Frontend {
     client: Client,
     size: WindowSize,
     running: bool,
     dirty: bool,
     full: bool,
+    damage: Vec<bool>,
+    overlays: smallvec::SmallVec<[Rect; 5]>,
+    frame_size: WindowSize,
     layout: Vec<(PaneId, Rect)>,
     header: Vec<u8>,
-    dots_dirty: bool,
     ui: Ui,
-    #[cfg(feature = "agent")]
     config: crate::config::Config,
-    #[cfg(feature = "agent")]
-    agent_hits: Vec<(Rect, AgentAction)>,
-    #[cfg(feature = "agent")]
-    agent_chat: Rect,
-    #[cfg(feature = "agent")]
-    agent_first: usize,
-    #[cfg(feature = "agent")]
-    agent_dirty: bool,
-    #[cfg(feature = "monitor")]
+
     resource_dirty: bool,
-    #[cfg(feature = "monitor")]
+
     footer: String,
-    #[cfg(feature = "agent")]
-    selecting_editor: bool,
-    #[cfg(feature = "agent")]
-    agent_utf8: Vec<u8>,
-    #[cfg(feature = "agent")]
-    last_click: Option<(Instant, PaneId, Point)>,
+    panel_utf8: TextDecoder,
+    panel_focus: Focus,
     paste: Option<PasteTarget>,
     selecting: Option<PaneId>,
     split_drag: Option<SplitDrag>,
     clipboard: Option<ClipboardTransfer>,
     clipboard_reader: Option<ClipboardReader>,
     copy_pending: bool,
-    request: u64,
     pointer: Option<(u16, u16)>,
-    #[cfg(feature = "files")]
-    file_utf8: Vec<u8>,
+    #[cfg(feature = "agent")]
+    agent: agent_ui::AgentState,
 }
 
 impl Frontend {
     fn new(client: Client, size: WindowSize, config: crate::config::Config) -> io::Result<Self> {
-        #[cfg(not(feature = "agent"))]
-        let _ = config;
         Ok(Self {
             client,
             size,
             running: true,
             dirty: true,
             full: true,
+            damage: vec![false; usize::from(size.num_lines)],
+            overlays: smallvec::SmallVec::new(),
+            frame_size: size,
             layout: Vec::new(),
             header: Vec::new(),
-            dots_dirty: false,
             ui: Ui::new()?,
-            #[cfg(feature = "agent")]
             config,
             #[cfg(feature = "agent")]
-            agent_hits: Vec::new(),
-            #[cfg(feature = "agent")]
-            agent_chat: Rect::default(),
-            #[cfg(feature = "agent")]
-            agent_first: 0,
-            #[cfg(feature = "agent")]
-            agent_dirty: true,
-            #[cfg(feature = "monitor")]
+            agent: agent_ui::AgentState {
+                dirty: true,
+                ..Default::default()
+            },
+
             resource_dirty: true,
-            #[cfg(feature = "monitor")]
+
             footer: String::new(),
-            #[cfg(feature = "agent")]
-            selecting_editor: false,
-            #[cfg(feature = "agent")]
-            agent_utf8: Vec::new(),
-            #[cfg(feature = "agent")]
-            last_click: None,
+            panel_utf8: TextDecoder::default(),
+            panel_focus: Focus::Terminal,
             paste: None,
             selecting: None,
             split_drag: None,
             clipboard: None,
             clipboard_reader: None,
             copy_pending: false,
-            request: 0,
             pointer: None,
-            #[cfg(feature = "files")]
-            file_utf8: Vec::new(),
         })
     }
 
@@ -662,6 +546,40 @@ impl Frontend {
         format!("Read-only  {status}").into()
     }
 
+    fn file_width(&self) -> u16 {
+        if !self.ui.files_open {
+            return 0;
+        }
+        let available = self.size.num_cols;
+        #[cfg(feature = "agent")]
+        let available = if self.ui.agent.open {
+            available.saturating_sub(self.agent_width())
+        } else {
+            available
+        };
+        (self.size.num_cols / 3)
+            .clamp(12, 32)
+            .min(available.saturating_sub(2))
+    }
+
+    fn file_rect(&self) -> Rect {
+        Rect {
+            x: 0,
+            y: 1,
+            cols: self.file_width(),
+            rows: self.view_size().num_lines.saturating_sub(1),
+        }
+    }
+
+    fn file_preview_rect(&self) -> Rect {
+        crate::file_panel::preview_rect(Rect {
+            x: 0,
+            y: 1,
+            cols: self.size.num_cols,
+            rows: self.view_size().num_lines.saturating_sub(1),
+        })
+    }
+
     fn view_size(&self) -> WindowSize {
         let size = self.size;
         #[cfg(feature = "agent")]
@@ -673,8 +591,9 @@ impl Frontend {
         } else {
             size
         };
-        #[cfg(feature = "monitor")]
-        let size = WindowSize {
+
+        WindowSize {
+            num_cols: size.num_cols.saturating_sub(self.file_width()).max(2),
             num_lines: size
                 .num_lines
                 .saturating_sub(
@@ -685,23 +604,22 @@ impl Frontend {
                 )
                 .max(2),
             ..size
-        };
-        size
+        }
     }
 
     fn resize(&mut self) -> io::Result<()> {
         if self.ui.search.open {
             self.ui.search.close(&mut self.client)?;
         }
-        self.full = true;
+        let size = self.view_size();
+        self.full |= size != self.frame_size;
         self.dirty = true;
-        if self.controller() {
-            self.client.send(Action::Resize(self.view_size()))?;
+        if self.controller() && size != self.frame_size {
+            self.client.send(Action::Resize(size))?;
         }
         Ok(())
     }
 
-    #[cfg(feature = "agent")]
     fn copy_text(&mut self, text: String) -> bool {
         if self.clipboard.is_some() {
             self.message("Clipboard transfer already in progress");
@@ -718,1321 +636,133 @@ impl Frontend {
         }
     }
 
-    #[cfg(feature = "agent")]
-    fn agent_width(&self) -> u16 {
-        (self.size.num_cols / 2)
-            .clamp(20, 80)
-            .min(self.size.num_cols.saturating_sub(2))
-    }
-
-    #[cfg(feature = "agent")]
-    fn agent_rect(&self) -> Rect {
-        let width = self.agent_width();
-        Rect {
-            x: self.size.num_cols - width,
-            y: 1,
-            cols: width,
-            rows: self.view_size().num_lines.saturating_sub(1),
-        }
-    }
-
-    #[cfg(feature = "agent")]
-    fn editor_rect(&self) -> Rect {
-        let side = self.agent_rect();
-        let layout = self.editor_layout();
-        let rows = layout
-            .lines
-            .len()
-            .min(usize::from((side.rows / 3).clamp(1, 8))) as u16;
-        Rect {
-            x: side.x + 1,
-            y: (side.y + side.rows).saturating_sub(rows),
-            cols: side.cols.saturating_sub(2),
-            rows,
-        }
-    }
-
-    #[cfg(feature = "agent")]
-    fn editor_layout(&self) -> crate::ui::EditorLines {
-        let side = self.agent_rect();
-        let columns = usize::from(
-            side.cols
-                .saturating_sub(2)
-                .saturating_sub(u16::from(self.ui.agent.active().model.busy) * 3)
-                .max(1),
+    fn panel_key(&mut self, symbol: u32, modifiers: u32, text: &str) -> io::Result<()> {
+        use crate::input::{Key, KeyResult};
+        let mut viewport = (
+            usize::from(self.size.num_cols),
+            usize::from(self.size.num_lines),
         );
-        self.ui
-            .agent
-            .active()
-            .editor_layout(columns, usize::from((side.rows / 3).clamp(1, 8)))
-    }
-
-    #[cfg(feature = "agent")]
-    fn editor_pointer(&mut self, mouse: Mouse, extend: bool) {
-        let rect = self.editor_rect();
-        let layout = self.editor_layout();
-        let (lines, mut first) = (layout.lines, layout.first);
-        if extend {
-            if mouse.row < rect.y {
-                first = first.saturating_sub(1);
-            } else if mouse.row >= rect.y + rect.rows {
-                first = (first + 1).min(lines.len().saturating_sub(usize::from(rect.rows)));
-            }
-        }
-        let row = usize::from(
-            mouse
-                .row
-                .saturating_sub(rect.y)
-                .min(rect.rows.saturating_sub(1)),
-        );
-        let range = lines.get(first + row).cloned().unwrap_or(
-            self.ui.agent.active().model.input.len()..self.ui.agent.active().model.input.len(),
-        );
-        let column = mouse.column.saturating_sub(rect.x).min(rect.cols) as f32;
-        let offset = column_offset(&self.ui.agent.active().model.input, range, column);
-        self.ui.agent.active_mut().editor_scroll = Some(first);
-        self.ui.agent.active_mut().model.set_cursor(offset, extend);
-        self.dirty = true;
-        self.agent_dirty = true;
-    }
-
-    #[cfg(feature = "agent")]
-    fn editor_vertical(&mut self, up: bool, shift: bool) {
-        let layout = self.editor_layout();
-        self.ui.agent.active_mut().move_vertical(layout, up, shift);
-    }
-
-    #[cfg(feature = "agent")]
-    fn agent_bytes(&mut self, bytes: &[u8], paste: Option<u64>) -> io::Result<()> {
-        if paste.is_none() && self.ui.focus == Focus::Output {
-            if bytes.contains(&3)
-                && let Some(text) = self.ui.agent.active().selected_text()
+        if self.ui.files_open && self.ui.focus == Focus::Files {
+            let rect = if self
+                .ui
+                .files
+                .as_ref()
+                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
             {
-                self.copy_text(text);
-                self.dirty = true;
-                return Ok(());
-            }
-            match bytes {
-                _ if bytes.contains(&3) && self.ui.agent.active_mut().model.busy => {
-                    self.ui.agent.active_mut().model.abort()?
-                }
-                b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => self.ui.agent.active_mut().model.scroll = 0,
-                b"\x1b[A" | b"\x1bOA" | b"\x1b[5~" => {
-                    self.ui.agent.active_mut().model.scroll = self
-                        .ui
-                        .agent
-                        .active()
-                        .model
-                        .scroll
-                        .saturating_add(if bytes.ends_with(b"~") { 10 } else { 1 })
-                }
-                b"\x1b[B" | b"\x1bOB" | b"\x1b[6~" => {
-                    self.ui.agent.active_mut().model.scroll = self
-                        .ui
-                        .agent
-                        .active()
-                        .model
-                        .scroll
-                        .saturating_sub(if bytes.ends_with(b"~") { 10 } else { 1 })
-                }
-                _ => (),
-            }
-            self.dirty = true;
-            self.agent_dirty = true;
-            return Ok(());
-        }
-        if paste.is_none() {
-            let key = match bytes {
-                b"\x1b[1;2A" => Some((0xff52, true)),
-                b"\x1b[1;2B" => Some((0xff54, true)),
-                b"\x1b[1;2C" => Some((0xff53, true)),
-                b"\x1b[1;2D" => Some((0xff51, true)),
-                b"\x1b[1;2H" => Some((0xff50, true)),
-                b"\x1b[1;2F" => Some((0xff57, true)),
-                b"\x1b[13;2u" | b"\x1b[27;2;13~" => {
-                    self.insert_agent("\n");
-                    self.dirty = true;
-                    self.agent_dirty = true;
-                    return Ok(());
-                }
-                _ => crate::input::editing_key(bytes).map(|symbol| (symbol, false)),
+                self.file_preview_rect()
+            } else {
+                self.file_rect()
             };
-            if let Some((symbol, shift)) = key {
-                if matches!(symbol, 0xff52 | 0xff54) {
-                    self.editor_vertical(symbol == 0xff52, shift);
-                } else {
-                    self.ui.agent.active_mut().model.key(symbol, shift);
+            viewport = (
+                usize::from(rect.cols),
+                usize::from(rect.rows.saturating_sub(2)),
+            );
+        } else {
+            #[cfg(feature = "agent")]
+            if self.ui.agent.open && self.ui.focus.is_agent() {
+                let rect = editor(&self.ui, self.agent_rect()).0;
+                viewport = (
+                    usize::from(rect.cols)
+                        .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
+                        .max(1),
+                    usize::from(rect.rows),
+                );
+            }
+        }
+        let target = self.ui.input_target();
+        let panels = self.ui.panel_state();
+        match self.ui.key(
+            &mut self.client,
+            Key {
+                symbol,
+                modifiers,
+                text,
+            },
+            viewport,
+        )? {
+            KeyResult::Unhandled => return Ok(()),
+            KeyResult::Copy(text, cut) => {
+                let copied = self.copy_text(text);
+                if copied && cut {
+                    #[cfg(feature = "agent")]
+                    self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
                 }
-                self.ui.agent.active_mut().editor_scroll = None;
-                self.dirty = true;
-                self.agent_dirty = true;
+            }
+            KeyResult::Paste => self.message("Paste with your host terminal's shortcut"),
+            KeyResult::Text | KeyResult::Handled => (),
+        }
+        #[cfg(feature = "agent")]
+        {
+            self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));
+        }
+        self.resource_dirty |= matches!(target, Some(PasteTarget::Monitor));
+        self.dirty = true;
+        if panels != self.ui.panel_state() {
+            self.resize()?;
+        }
+        Ok(())
+    }
+
+    fn panel_bytes(&mut self, bytes: &[u8], pasted: Option<PasteTarget>) -> io::Result<()> {
+        if pasted.is_none() {
+            if let Some((symbol, modifiers)) = crate::input::sequence_key(bytes) {
+                self.panel_utf8.clear();
+                self.panel_key(symbol, modifiers, "")?;
                 return Ok(());
             }
             if bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\x1bO") {
                 return Ok(());
             }
+            if self.panel_focus != self.ui.focus {
+                self.panel_utf8.clear();
+                self.panel_focus = self.ui.focus;
+            }
         }
-        self.agent_utf8.extend_from_slice(bytes);
-        let valid = match std::str::from_utf8(&self.agent_utf8) {
-            Ok(_) => self.agent_utf8.len(),
-            Err(error) if error.error_len().is_none() => error.valid_up_to(),
-            Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
+        let bytes = if pasted.is_none()
+            && bytes.first() == Some(&0x1b)
+            && bytes.get(1).is_some_and(|byte| !byte.is_ascii())
+        {
+            &bytes[1..]
+        } else {
+            bytes
         };
-        let text = String::from_utf8(self.agent_utf8.drain(..valid).collect()).unwrap();
-        if let Some(id) = paste {
-            if let Err(error) = self.ui.agent.paste(id, &text) {
-                self.message(error);
+        let text = self.panel_utf8.decode(bytes);
+        if let Some(target) = pasted {
+            self.ui.paste(&mut self.client, target, &text)?;
+            self.dirty = true;
+            self.resource_dirty = true;
+            #[cfg(feature = "agent")]
+            {
+                self.agent.dirty = true;
             }
         } else {
-            let mut printable = String::new();
-            for ch in text.chars() {
-                if !ch.is_control() {
-                    printable.push(ch);
-                    continue;
+            let mut offset = 0;
+            while offset < text.len() {
+                let remaining = &text[offset..];
+                if self.ui.text_target().is_some() {
+                    let end = remaining.find(char::is_control).unwrap_or(remaining.len());
+                    if end != 0 {
+                        self.panel_key(0, 0, &remaining[..end])?;
+                        offset += end;
+                        continue;
+                    }
                 }
-                if !printable.is_empty() {
-                    self.insert_agent(&printable);
-                    printable.clear();
-                }
-                match ch {
-                    '\u{1}' => self.ui.agent.active_mut().model.select_all(),
-                    '\u{3}' => {
-                        if let Some(range) = self.ui.agent.active().model.selection() {
-                            self.copy_text(self.ui.agent.active().model.input[range].to_owned());
-                        } else if self.ui.agent.active().model.busy {
-                            self.ui.agent.active_mut().model.abort()?;
-                        } else {
-                            self.ui.agent.active_mut().model.clear_input();
-                        }
-                    }
-                    '\u{18}' => {
-                        if let Some(range) = self.ui.agent.active().model.selection()
-                            && self.copy_text(self.ui.agent.active().model.input[range].to_owned())
-                        {
-                            self.ui.agent.active_mut().model.insert("").unwrap();
-                        }
-                    }
-                    '\u{8}' | '\u{7f}' => {
-                        self.ui.agent.active_mut().model.key(0xff08, false);
-                    }
-                    '\r' => {
-                        if let Err(error) = self.ui.agent.active_mut().send(&self.client) {
-                            self.message(format!("Agent: {error}"));
-                        }
-                    }
-                    '\n' => self.insert_agent("\n"),
-                    '\u{15}' => self.ui.agent.active_mut().model.clear_input(),
-                    _ => (),
-                }
-            }
-            if !printable.is_empty() {
-                self.insert_agent(&printable);
+                let ch = remaining.chars().next().unwrap();
+                let (symbol, modifiers) = crate::input::character_key(ch);
+                let key_text = if ch.is_control() {
+                    ""
+                } else {
+                    &remaining[..ch.len_utf8()]
+                };
+                self.panel_key(symbol, modifiers, key_text)?;
+                offset += ch.len_utf8();
             }
         }
-        if paste.is_none() {
-            self.ui.agent.active_mut().editor_scroll = None;
-        }
-        self.dirty = true;
-        self.agent_dirty = true;
         Ok(())
     }
 
-    #[cfg(feature = "agent")]
-    fn insert_agent(&mut self, text: &str) {
-        self.agent_dirty = true;
-        if let Err(error) = self.ui.agent.active_mut().model.insert(text) {
-            self.message(error);
-        }
-    }
-
-    #[cfg(feature = "agent")]
-    fn agent_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let pointer = Some((mouse.column, mouse.row));
-        if self.pointer != pointer {
-            self.pointer = pointer;
-            self.agent_dirty = true;
-            self.dirty = true;
-        }
-        if self.ui.agent.active().selecting() {
-            self.chat_pointer(mouse);
-            if mouse.release {
-                self.ui.agent.active_mut().end_selection();
-            }
-            return Ok(());
-        }
-        if self.selecting_editor {
-            if mouse.release {
-                self.selecting_editor = false;
-            } else {
-                self.editor_pointer(mouse, true);
-            }
-            return Ok(());
-        }
-        if mouse.release {
-            return Ok(());
-        }
-        if mouse.code & 64 != 0 {
-            let up = mouse.code & 1 == 0;
-            if let Some(crate::ui::ContextPreview { scroll, .. }) =
-                &mut self.ui.agent.active_mut().context.preview
-            {
-                *scroll = if up {
-                    scroll.saturating_sub(3)
-                } else {
-                    scroll.saturating_add(3)
-                };
-            } else if self.editor_rect().contains(mouse.column, mouse.row) {
-                let rect = self.editor_rect();
-                let layout = self.editor_layout();
-                let (lines, first) = (layout.lines, layout.first);
-                self.ui.agent.active_mut().editor_scroll = Some(if up {
-                    first.saturating_sub(3)
-                } else {
-                    first
-                        .saturating_add(3)
-                        .min(lines.len().saturating_sub(usize::from(rect.rows)))
-                });
-            } else {
-                self.ui.agent.active_mut().model.scroll = if up {
-                    self.ui.agent.active().model.scroll.saturating_add(3)
-                } else {
-                    self.ui.agent.active().model.scroll.saturating_sub(3)
-                };
-            }
-            self.dirty = true;
-            self.agent_dirty = true;
-            return Ok(());
-        }
-        if mouse.code & 32 != 0 {
-            return Ok(());
-        }
-        let hit = self
-            .agent_hits
-            .iter()
-            .rev()
-            .find(|(rect, _)| rect.contains(mouse.column, mouse.row))
-            .map(|(_, action)| *action);
-        let right = mouse.code & 3 == 2;
-        if right
-            && self.agent_chat.contains(mouse.column, mouse.row)
-            && self.ui.agent.active().context.preview.is_none()
-            && let Some(text) = self.ui.agent.active().selected_text()
-        {
-            self.copy_text(text);
-            return Ok(());
-        }
-        if !right && let Some(AgentAction::Copy(_) | AgentAction::Tool(_)) = hit {
-            let marker =
-                matches!(hit, Some(AgentAction::Tool(_))) && mouse.column < self.agent_chat.x + 2;
-            if !marker && let Some(point) = self.chat_point(mouse) {
-                self.ui.agent_rewind_key(0);
-                self.ui
-                    .agent
-                    .active_mut()
-                    .begin_selection(point, mouse.code & 4 != 0);
-                self.ui.focus = Focus::Output;
-                self.dirty = true;
-                self.agent_dirty = true;
-                return Ok(());
-            }
-        }
-        if let Some(action) = hit {
-            if right
-                && !matches!(
-                    action,
-                    AgentAction::Editor | AgentAction::Copy(_) | AgentAction::Tool(_)
-                )
-            {
-                return Ok(());
-            }
-            match action {
-                AgentAction::Editor if right => {
-                    self.ui.agent_rewind_key(0);
-                    self.ui.agent.active_mut().context.menu = !self.ui.agent.active().context.menu;
-                    self.ui.focus = Focus::Editor;
-                }
-                AgentAction::Editor => {
-                    self.ui.agent_rewind_key(0);
-                    self.ui.focus = Focus::Editor;
-                    self.ui.agent.active_mut().context.menu = false;
-                    self.editor_pointer(mouse, mouse.code & 4 != 0);
-                    self.selecting_editor = true;
-                }
-                AgentAction::Stop => self.ui.agent.active_mut().model.abort()?,
-                AgentAction::Output => {
-                    self.ui.agent_rewind_key(0);
-                    self.ui.agent.active_mut().clear_selection();
-                    self.ui.focus = Focus::Output;
-                    self.ui.agent.active_mut().context.menu = false;
-                }
-                AgentAction::Tool(index) if !right => {
-                    self.ui.focus = Focus::Output;
-                    self.ui.agent.active_mut().toggle_tool(index);
-                }
-                AgentAction::Tool(index) | AgentAction::Copy(index) if right => {
-                    self.ui.focus = Focus::Output;
-                    if let Some(message) = self.ui.agent.active().model.messages.get(index) {
-                        self.copy_text(message.text.clone());
-                    }
-                }
-                AgentAction::Copy(_) => self.ui.focus = Focus::Output,
-                AgentAction::Selection | AgentAction::Screen => {
-                    if let Some(pane) = self.focused()
-                        && let Err(error) = self.ui.agent.active_mut().attach_screen(
-                            &self.client,
-                            pane,
-                            matches!(action, AgentAction::Selection),
-                        )
-                    {
-                        self.message(error);
-                    }
-                    self.ui.agent.active_mut().context.menu = false;
-                }
-                AgentAction::Inspect(index) => {
-                    if let Some(item) = self.ui.agent.active().context.basket.get(index) {
-                        self.ui.agent.active_mut().context.preview =
-                            Some(crate::ui::ContextPreview::new(item.clone(), 0));
-                    }
-                }
-                AgentAction::Remove(index) => {
-                    self.ui.agent.active_mut().context.basket.remove(index);
-                }
-                AgentAction::ClosePreview => {
-                    self.ui.agent.active_mut().context.preview = None;
-                    self.full = true;
-                }
-                AgentAction::CopyPreview => {
-                    if let Some(crate::ui::ContextPreview { item, .. }) =
-                        &self.ui.agent.active().context.preview
-                    {
-                        self.copy_text(item.snapshot.text.clone());
-                    }
-                }
-                AgentAction::NewSession
-                | AgentAction::Session(_)
-                | AgentAction::CloseSession(_)
-                | AgentAction::ClosePanel
-                | AgentAction::Rewind(_) => {
-                    self.activate_agent(action)?;
-                }
-                _ => (),
-            }
-        }
-        self.dirty = true;
-        self.agent_dirty = true;
-        Ok(())
-    }
-
-    #[cfg(feature = "agent")]
-    fn chat_point(&self, mouse: Mouse) -> Option<crate::ui::TranscriptPoint> {
-        let session = self.ui.agent.active();
-        let row = mouse
-            .row
-            .saturating_sub(self.agent_chat.y)
-            .min(self.agent_chat.rows.saturating_sub(1));
-        let line = self.agent_first + usize::from(row);
-        if !matches!(
-            session.lines.get(line),
-            Some(AgentLine::Role(_) | AgentLine::Text { .. })
-        ) {
-            return (0..line.min(session.lines.len()))
-                .rev()
-                .find_map(|line| session.point(line, usize::MAX));
-        }
-        let indent = match session.lines.get(line)? {
-            AgentLine::Role(_) => 3,
-            AgentLine::Text { message, .. } => {
-                let message = session.model.messages.get(*message as usize)?;
-                if message.role == "You" {
-                    1
-                } else if message.id.is_some() {
-                    2
-                } else {
-                    0
-                }
-            }
-            AgentLine::Blank => return None,
-        };
-        session.point(
-            line,
-            usize::from(mouse.column.saturating_sub(self.agent_chat.x + indent)),
-        )
-    }
-
-    #[cfg(feature = "agent")]
-    fn chat_pointer(&mut self, mouse: Mouse) {
-        if mouse.row < self.agent_chat.y {
-            self.ui.agent.active_mut().model.scroll =
-                self.ui.agent.active().model.scroll.saturating_add(1);
-        } else if mouse.row >= self.agent_chat.y + self.agent_chat.rows {
-            self.ui.agent.active_mut().model.scroll =
-                self.ui.agent.active().model.scroll.saturating_sub(1);
-        }
-        if let Some(point) = self.chat_point(mouse) {
-            self.ui.agent.active_mut().extend_selection(point);
-        }
-        self.agent_dirty = true;
-        self.dirty = true;
-    }
-
-    #[cfg(feature = "agent")]
-    fn activate_agent(&mut self, action: AgentAction) -> io::Result<()> {
-        match self.ui.activate_agent(action, &self.client) {
-            Ok(Some(text)) => {
-                self.copy_text(text);
-            }
-            Ok(None) => (),
-            Err(error) => self.message(error.to_string()),
-        }
-        if matches!(
-            action,
-            AgentAction::ClosePreview
-                | AgentAction::ClosePanel
-                | AgentAction::NewSession
-                | AgentAction::Session(_)
-                | AgentAction::CloseSession(_)
-        ) {
-            self.full = true;
-            self.selecting_editor = false;
-            if !matches!(self.paste, Some(PasteTarget::Agent(_))) {
-                self.agent_utf8.clear();
-            }
-        }
-        self.ui.agent.active_mut().columns = 0;
-        self.agent_dirty = true;
-        self.dirty = true;
-        if action == AgentAction::ClosePanel {
-            self.resize()?;
-        }
-        Ok(())
-    }
-    #[cfg(feature = "agent")]
-    fn draw_agent(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        let side = self.agent_rect();
-        if side.cols < 12 || side.rows < 6 {
-            self.agent_hits.clear();
-            return draw_text(
-                output,
-                side.x,
-                side.y,
-                side.cols,
-                "Alt+a: close",
-                self.config.foreground,
-                self.config.background,
-            );
-        }
-        let editor = self.editor_rect();
-        let bg = self.config.background;
-        let foreground = self.config.foreground;
-        let muted = mix_color(foreground, bg, 180);
-        let user_bg = mix_color(foreground, bg, 20);
-        let selection_bg = mix_color(foreground, bg, 70);
-        let error = mix_color(0xe87575, foreground, 128);
-        self.agent_hits.clear();
-        for row in side.y..side.y + side.rows {
-            draw_text(output, side.x, row, side.cols, "│", muted, bg)?;
-        }
-        self.agent_hits.push((side, AgentAction::Output));
-        self.draw_agent_tabs(output, side, editor, bg)?;
-        let attachment_count = self.ui.agent.active().context.basket.len();
-        let attachment_rows = (attachment_count as u16)
-            .min(3)
-            .min(editor.y.saturating_sub(side.y + 6));
-        let attachment_first = match self.ui.agent.keyboard {
-            AgentAction::Inspect(index) | AgentAction::Remove(index) => {
-                index.saturating_sub(usize::from(attachment_rows.saturating_sub(1)))
-            }
-            _ => attachment_count.saturating_sub(usize::from(attachment_rows)),
-        };
-        let rewind = self.ui.agent.active().rewind_target.is_some();
-        let hint_rows = if rewind { 3 } else { 1 };
-        let chat_end = editor.y.saturating_sub(attachment_rows + hint_rows);
-        let chat_top = side.y + 1;
-        let rows = usize::from(chat_end.saturating_sub(chat_top));
-        let columns = usize::from(editor.cols);
-        self.ui.agent.prepare_layout(columns)?;
-        let scroll = self
-            .ui
-            .agent
-            .active()
-            .model
-            .scroll
-            .min(self.ui.agent.active().lines.len().saturating_sub(rows));
-        if scroll != self.ui.agent.active().model.scroll {
-            self.ui.agent.active_mut().model.scroll = scroll;
-            self.ui.agent.view_dirty = true;
-        }
-        let first = self
-            .ui
-            .agent
-            .active()
-            .lines
-            .len()
-            .saturating_sub(rows + self.ui.agent.active().model.scroll);
-        self.agent_chat = Rect {
-            x: editor.x,
-            y: chat_top,
-            cols: editor.cols,
-            rows: rows as u16,
-        };
-        self.agent_first = first;
-        for (row, line) in self
-            .ui
-            .agent
-            .active()
-            .lines
-            .iter()
-            .skip(first)
-            .take(rows)
-            .enumerate()
-        {
-            let y = chat_top + row as u16;
-            match line {
-                AgentLine::Blank => (),
-                AgentLine::Role(index) => {
-                    let message = &self.ui.agent.active().model.messages[*index as usize];
-                    let marker = if message
-                        .id
-                        .as_ref()
-                        .is_some_and(|id| self.ui.agent.active().expanded_tools.contains(id))
-                    {
-                        "▾"
-                    } else {
-                        "›"
-                    };
-                    draw_text(
-                        output,
-                        editor.x,
-                        y,
-                        editor.cols,
-                        &format!(" {marker} {} ", message.role),
-                        muted,
-                        bg,
-                    )?;
-                    if let Some(selected) = self.ui.agent.active().selection_columns(first + row) {
-                        let from = column_offset(
-                            &message.role,
-                            0..message.role.len(),
-                            selected.start as f32,
-                        );
-                        let to = column_offset(
-                            &message.role,
-                            0..message.role.len(),
-                            selected.end as f32,
-                        );
-                        draw_text(
-                            output,
-                            editor.x + 3 + selected.start as u16,
-                            y,
-                            (selected.end - selected.start) as u16,
-                            &message.role[from..to],
-                            self.config.foreground,
-                            selection_bg,
-                        )?;
-                    }
-                    self.agent_hits.push((
-                        Rect {
-                            x: editor.x,
-                            y,
-                            cols: editor.cols.min(text_width(&message.role) as u16 + 4),
-                            rows: 1,
-                        },
-                        AgentAction::Tool(*index as usize),
-                    ));
-                }
-                AgentLine::Text {
-                    message: index,
-                    range,
-                } => {
-                    let message = &self.ui.agent.active().model.messages[*index as usize];
-                    let user = message.role == "You";
-                    let message_bg =
-                        if user && self.ui.agent.active().rewind_target == Some(message.turn) {
-                            selection_bg
-                        } else if user {
-                            user_bg
-                        } else {
-                            bg
-                        };
-                    let indent = if user {
-                        1
-                    } else if message.id.is_some() {
-                        2
-                    } else {
-                        0
-                    };
-                    draw_text(
-                        output,
-                        editor.x,
-                        y,
-                        editor.cols,
-                        "",
-                        self.config.foreground,
-                        message_bg,
-                    )?;
-                    let text = self.ui.agent.active().message_text(*index as usize);
-                    let from = range.start as usize;
-                    let to = range.end as usize;
-                    if let Some(document) = self.ui.agent.active().markdown(*index as usize) {
-                        let mut x = editor.x + indent;
-                        for (span, style) in document.spans(from..to) {
-                            if style & crate::markdown::BOLD != 0 {
-                                output.write_all(b"\x1b[1m")?;
-                            }
-                            if style & crate::markdown::ITALIC != 0 {
-                                output.write_all(b"\x1b[3m")?;
-                            }
-                            let columns = text_width(&text[span.clone()]) as u16;
-                            let column = x;
-                            x += columns;
-                            draw_text(
-                                output,
-                                column,
-                                y,
-                                columns,
-                                &text[span],
-                                crate::markdown::color(style, self.config.foreground),
-                                if style & crate::markdown::CODE != 0 {
-                                    user_bg
-                                } else {
-                                    message_bg
-                                },
-                            )?;
-                            output.write_all(b"\x1b[22;23m")?;
-                        }
-                    } else {
-                        draw_text(
-                            output,
-                            editor.x + indent,
-                            y,
-                            editor.cols.saturating_sub(indent),
-                            &text[from..to],
-                            if message.role == "Error" {
-                                error
-                            } else {
-                                self.config.foreground
-                            },
-                            message_bg,
-                        )?;
-                    }
-                    if let Some(selected) = self.ui.agent.active().selection_columns(first + row) {
-                        let text = &text[from..to];
-                        let from = column_offset(text, 0..text.len(), selected.start as f32);
-                        let to = column_offset(text, 0..text.len(), selected.end as f32);
-                        draw_text(
-                            output,
-                            editor.x + indent + selected.start as u16,
-                            y,
-                            (selected.end - selected.start) as u16,
-                            &text[from..to],
-                            self.config.foreground,
-                            selection_bg,
-                        )?;
-                    }
-                    self.agent_hits.push((
-                        Rect {
-                            x: editor.x,
-                            y,
-                            cols: editor.cols,
-                            rows: 1,
-                        },
-                        AgentAction::Copy(*index as usize),
-                    ));
-                    if user
-                        && columns >= crate::width::text_width(crate::ui::REWIND_LABEL) + 5
-                        && (row + 1 == rows
-                            || !matches!(
-                                self.ui.agent.active().lines.get(first + row + 1),
-                                Some(AgentLine::Text { message: next, .. }) if next == index
-                            ))
-                    {
-                        let width = crate::width::text_width(crate::ui::REWIND_LABEL) as u16;
-                        let x = editor.x + editor.cols.saturating_sub(width);
-                        let hovered = self.pointer.is_some_and(|(column, row)| {
-                            row == y && column >= x && column < x + width
-                        });
-                        draw_text(
-                            output,
-                            x,
-                            y,
-                            width,
-                            crate::ui::REWIND_LABEL,
-                            if hovered {
-                                self.config.foreground
-                            } else {
-                                muted
-                            },
-                            message_bg,
-                        )?;
-                        self.agent_hits.push((
-                            Rect {
-                                x,
-                                y,
-                                cols: width,
-                                rows: 1,
-                            },
-                            AgentAction::Rewind(*index as usize),
-                        ));
-                    }
-                }
-            }
-        }
-        let hint = if rewind {
-            "Esc older · Enter confirm · type cancels"
-        } else if self.ui.focus == Focus::Output && self.ui.agent.active().model.scroll > 0 {
-            "History · End: latest"
-        } else {
-            match self.ui.focus {
-                Focus::Editor if self.ui.agent.active().model.busy => "Input · Ctrl+C: stop reply",
-                Focus::Editor => "Input · Enter: send · Ctrl+J: newline",
-                Focus::Output => "Output · Ctrl+C: copy / stop reply",
-                Focus::Controls => "Controls · Enter: activate",
-                _ => "Agent · Alt+o: focus",
-            }
-        };
-        draw_text(
-            output,
-            editor.x,
-            editor.y.saturating_sub(hint_rows),
-            editor.cols,
-            hint,
-            self.config.foreground,
-            bg,
-        )?;
-        if rewind {
-            let session = self.ui.agent.active();
-            let target = session.model.messages.iter().find(|message| {
-                Some(message.turn) == session.rewind_target && message.role == "You"
-            });
-            let label = target.map_or(String::new(), |message| {
-                format!(
-                    "Rewind {} turns: {}",
-                    session
-                        .model
-                        .messages
-                        .iter()
-                        .filter(
-                            |candidate| candidate.role == "You" && candidate.turn >= message.turn
-                        )
-                        .count(),
-                    message.text.lines().next().unwrap_or("")
-                )
-            });
-            draw_text(
-                output,
-                editor.x,
-                editor.y.saturating_sub(2),
-                editor.cols,
-                &label,
-                self.config.foreground,
-                bg,
-            )?;
-            draw_text(
-                output,
-                editor.x,
-                editor.y.saturating_sub(1),
-                editor.cols,
-                "Commands and file changes stay",
-                self.config.foreground,
-                bg,
-            )?;
-        }
-        for (row, (index, item)) in self
-            .ui
-            .agent
-            .active()
-            .context
-            .basket
-            .iter()
-            .enumerate()
-            .skip(attachment_first)
-            .take(usize::from(attachment_rows))
-            .enumerate()
-        {
-            let y = chat_end + row as u16;
-            draw_text(
-                output,
-                editor.x,
-                y,
-                editor.cols.saturating_sub(3),
-                &format!(" +{} ", item.label),
-                self.config.foreground,
-                bg,
-            )?;
-            draw_text(
-                output,
-                editor.x + editor.cols.saturating_sub(3),
-                y,
-                3,
-                " × ",
-                muted,
-                bg,
-            )?;
-            self.agent_hits.push((
-                Rect {
-                    x: editor.x,
-                    y,
-                    cols: editor
-                        .cols
-                        .saturating_sub(3)
-                        .min(text_width(&item.label) as u16 + 3),
-                    rows: 1,
-                },
-                AgentAction::Inspect(index),
-            ));
-            self.agent_hits.push((
-                Rect {
-                    x: editor.x + editor.cols.saturating_sub(3),
-                    y,
-                    cols: 3,
-                    rows: 1,
-                },
-                AgentAction::Remove(index),
-            ));
-        }
-        let layout = self.editor_layout();
-        let (lines, first) = (layout.lines, layout.first);
-        for row in 0..editor.rows {
-            if lines.get(first + usize::from(row)).is_none() {
-                draw_text(
-                    output,
-                    editor.x,
-                    editor.y + row,
-                    editor.cols,
-                    "",
-                    self.config.foreground,
-                    user_bg,
-                )?;
-            }
-            if let Some(range) = lines.get(first + usize::from(row)) {
-                let text = &self.ui.agent.active().model.input[range.clone()];
-                draw_text(
-                    output,
-                    editor.x,
-                    editor.y + row,
-                    editor.cols,
-                    text,
-                    self.config.foreground,
-                    user_bg,
-                )?;
-                if let Some(selected) = self.ui.agent.active().model.selection() {
-                    let start = range.start.max(selected.start);
-                    let end = range.end.min(selected.end);
-                    if start < end {
-                        let column =
-                            text_width(&self.ui.agent.active().model.input[range.start..start])
-                                as u16;
-                        draw_text(
-                            output,
-                            editor.x + column,
-                            editor.y + row,
-                            text_width(&self.ui.agent.active().model.input[start..end]) as u16,
-                            &self.ui.agent.active().model.input[start..end],
-                            self.config.foreground,
-                            selection_bg,
-                        )?;
-                    }
-                }
-            }
-        }
-        if self.ui.agent.active().model.input.is_empty() {
-            draw_text(
-                output,
-                editor.x,
-                editor.y,
-                editor.cols,
-                "Message…",
-                muted,
-                user_bg,
-            )?;
-        }
-        self.agent_hits.push((editor, AgentAction::Editor));
-        if self.ui.agent.active().model.busy {
-            draw_text(
-                output,
-                editor.x + editor.cols.saturating_sub(3),
-                editor.y,
-                3,
-                " ■ ",
-                self.config.foreground,
-                user_bg,
-            )?;
-            self.agent_hits.push((
-                Rect {
-                    x: editor.x + editor.cols.saturating_sub(3),
-                    y: editor.y,
-                    cols: 3,
-                    rows: 1,
-                },
-                AgentAction::Stop,
-            ));
-        }
-        if self.ui.agent.active().context.menu {
-            for (row, (label, action)) in [
-                ("Selection", AgentAction::Selection),
-                ("Visible screen", AgentAction::Screen),
-            ]
-            .into_iter()
-            .enumerate()
-            {
-                let y = editor.y.saturating_sub(3) + row as u16;
-                draw_text(
-                    output,
-                    editor.x,
-                    y,
-                    editor.cols,
-                    &format!(" {label} "),
-                    self.config.foreground,
-                    user_bg,
-                )?;
-                self.agent_hits.push((
-                    Rect {
-                        x: editor.x,
-                        y,
-                        cols: editor.cols.min(text_width(label) as u16 + 2),
-                        rows: 1,
-                    },
-                    action,
-                ));
-            }
-        }
-        if let Some(preview) = &mut self.ui.agent.active_mut().context.preview {
-            let columns = self.size.num_cols.saturating_sub(4);
-            let rows = usize::from(self.size.num_lines.saturating_sub(5));
-            preview.prepare(usize::from(columns));
-            let crate::ui::ContextPreview {
-                item,
-                scroll,
-                lines,
-                ..
-            } = preview;
-            let previous_scroll = *scroll;
-            *scroll = (*scroll).min(lines.len().saturating_sub(rows));
-            let scroll_changed = previous_scroll != *scroll;
-            for y in 1..self.size.num_lines.saturating_sub(1) {
-                draw_text(
-                    output,
-                    0,
-                    y,
-                    self.size.num_cols,
-                    "",
-                    self.config.foreground,
-                    bg,
-                )?;
-            }
-            draw_text(
-                output,
-                2,
-                1,
-                columns,
-                &format!("[ {} ]", item.label),
-                self.config.foreground,
-                bg,
-            )?;
-            draw_text(
-                output,
-                self.size.num_cols.saturating_sub(4),
-                1,
-                3,
-                " × ",
-                muted,
-                bg,
-            )?;
-            for (row, range) in lines.iter().skip(*scroll).take(rows).enumerate() {
-                draw_text(
-                    output,
-                    2,
-                    row as u16 + 3,
-                    columns,
-                    &item.snapshot.text[range.clone()],
-                    self.config.foreground,
-                    bg,
-                )?;
-            }
-            draw_text(
-                output,
-                2,
-                self.size.num_lines.saturating_sub(2),
-                columns,
-                " ⧉   Esc back",
-                self.config.foreground,
-                bg,
-            )?;
-            self.agent_hits.clear();
-            self.agent_hits.push((
-                Rect {
-                    x: self.size.num_cols.saturating_sub(4),
-                    y: 1,
-                    cols: 3,
-                    rows: 1,
-                },
-                AgentAction::ClosePreview,
-            ));
-            self.agent_hits.push((
-                Rect {
-                    x: 2,
-                    y: self.size.num_lines.saturating_sub(2),
-                    cols: text_width(" ⧉ ") as u16,
-                    rows: 1,
-                },
-                AgentAction::CopyPreview,
-            ));
-            output.write_all(b"\x1b[?25l")?;
-            self.ui.agent.view_dirty |= scroll_changed;
-        }
-        let hovered = self.pointer.and_then(|(x, y)| {
-            self.agent_hits
-                .iter()
-                .rev()
-                .find(|(rect, _)| rect.contains(x, y))
-                .map(|(_, action)| *action)
-        });
-        for (rect, action) in &self.agent_hits {
-            if hovered != Some(*action)
-                && !(self.ui.focus == Focus::Controls && self.ui.agent.keyboard == *action)
-            {
-                continue;
-            }
-            let session = self.ui.agent.active();
-            let mut foreground = self.config.foreground;
-            if matches!(action, AgentAction::Session(_)) {
-                continue;
-            }
-            if matches!(
-                action,
-                AgentAction::NewSession | AgentAction::CloseSession(_) | AgentAction::ClosePanel
-            ) {
-                let active = matches!(action, AgentAction::CloseSession(index) if *index == self.ui.agent.current);
-                let numerator = match action {
-                    AgentAction::CloseSession(_) if active => 10,
-                    AgentAction::CloseSession(_) => 9,
-                    _ => 8,
-                };
-                let mut tab_bg = 0;
-                for shift in [16, 8, 0] {
-                    tab_bg |= ((bg >> shift & 255) * numerator / 10) << shift;
-                }
-                let (icon, color) = if *action == AgentAction::NewSession {
-                    ("+", self.config.foreground)
-                } else {
-                    ("×", self.config.foreground)
-                };
-                draw_tab_icon(output, *rect, icon, (color, color), tab_bg, true, active)?;
-                continue;
-            }
-            let background = user_bg;
-            let label = match *action {
-                AgentAction::NewSession => " + ".into(),
-                AgentAction::Session(index) => format!(
-                    " {} ",
-                    fit_label(
-                        self.ui.agent.sessions[index].title(),
-                        rect.cols.saturating_sub(4)
-                    )
-                ),
-                AgentAction::CloseSession(_)
-                | AgentAction::ClosePanel
-                | AgentAction::Remove(_)
-                | AgentAction::ClosePreview => " × ".into(),
-                AgentAction::Tool(index) => {
-                    let message = &session.model.messages[index];
-                    let expanded = message
-                        .id
-                        .as_ref()
-                        .is_some_and(|id| session.expanded_tools.contains(id));
-                    format!(" {} {} ", if expanded { "▾" } else { "›" }, message.role)
-                }
-                AgentAction::Rewind(_) => crate::ui::REWIND_LABEL.into(),
-                AgentAction::Stop => {
-                    foreground = error;
-                    " ■ ".into()
-                }
-                AgentAction::Inspect(index) => {
-                    format!(" +{} ", session.context.basket[index].label)
-                }
-                AgentAction::CopyPreview => " ⧉ ".into(),
-                AgentAction::Selection => " Selection ".into(),
-                AgentAction::Screen => " Visible screen ".into(),
-                _ => continue,
-            };
-            draw_text(
-                output,
-                rect.x,
-                rect.y,
-                rect.cols.min(text_width(&label) as u16),
-                &label,
-                foreground,
-                background,
-            )?;
-        }
-        if self.ui.focus.is_agent() {
-            let row = match self.ui.focus {
-                Focus::Editor => editor.y,
-                Focus::Output => chat_top,
-                _ => self
-                    .agent_hits
-                    .iter()
-                    .find(|(_, action)| *action == self.ui.agent.keyboard)
-                    .map_or(editor.y, |(rect, _)| rect.y),
-            };
-            draw_text(output, side.x, row, 1, "›", self.config.foreground, bg)?;
-        }
-        output.write_all(b"\x1b[0m")
-    }
-
-    #[cfg(feature = "agent")]
-    fn draw_agent_tabs(
-        &mut self,
-        output: &mut Vec<u8>,
-        side: Rect,
-        editor: Rect,
-        bg: u32,
-    ) -> io::Result<()> {
-        let muted = mix_color(self.config.foreground, bg, 180);
-        let mut line_bg = 0;
-        for shift in [16, 8, 0] {
-            line_bg |= ((bg >> shift & 255) * 4 / 5) << shift;
-        }
-        draw_text(
-            output,
-            side.x,
-            side.y,
-            side.cols,
-            "",
-            self.config.foreground,
-            line_bg,
-        )?;
-        draw_text(output, side.x, side.y, 1, "│", muted, line_bg)?;
-        let mut x = editor.x;
-        for (index, column, columns) in self.ui.agent.tabs(usize::from(side.cols.saturating_sub(1)))
-        {
-            x = editor.x + column as u16;
-            let width = columns as u16;
-            let active = index == self.ui.agent.current;
-            let mut tab_bg = bg;
-            if !active {
-                tab_bg = 0;
-                for shift in [16, 8, 0] {
-                    tab_bg |= ((bg >> shift & 255) * 9 / 10) << shift;
-                }
-            }
-            let color = if active {
-                self.config.foreground
-            } else {
-                muted
-            };
-            if active {
-                output.write_all(b"\x1b[4m")?;
-            }
-            draw_text(
-                output,
-                x,
-                side.y,
-                width,
-                &format!(
-                    " {}",
-                    fit_label(
-                        self.ui.agent.sessions[index].title(),
-                        width.saturating_sub(4)
-                    )
-                ),
-                color,
-                tab_bg,
-            )?;
-            output.write_all(b"\x1b[24m")?;
-            self.agent_hits.push((
-                Rect {
-                    x,
-                    y: side.y,
-                    cols: width,
-                    rows: 1,
-                },
-                AgentAction::Session(index),
-            ));
-            if active
-                || self
-                    .pointer
-                    .is_some_and(|(column, row)| row == side.y && column >= x && column < x + width)
-            {
-                let close = x + width.saturating_sub(3);
-                let hovered = self.pointer.is_some_and(|(column, row)| {
-                    row == side.y && column >= close && column < close + 3
-                });
-                draw_tab_icon(
-                    output,
-                    Rect {
-                        x: close,
-                        y: side.y,
-                        cols: 3,
-                        rows: 1,
-                    },
-                    "×",
-                    (muted, self.config.foreground),
-                    tab_bg,
-                    hovered,
-                    active,
-                )?;
-                self.agent_hits.push((
-                    Rect {
-                        x: close,
-                        y: side.y,
-                        cols: 3.min(width),
-                        rows: 1,
-                    },
-                    AgentAction::CloseSession(index),
-                ));
-            }
-            x += width;
-        }
-        let hovered = self
-            .pointer
-            .is_some_and(|(column, row)| row == side.y && column >= x && column < x + 3);
-        draw_tab_icon(
-            output,
-            Rect {
-                x,
-                y: side.y,
-                cols: 3,
-                rows: 1,
-            },
-            "+",
-            (self.config.foreground, self.config.foreground),
-            line_bg,
-            hovered,
-            false,
-        )?;
-        self.agent_hits.push((
-            Rect {
-                x,
-                y: side.y,
-                cols: 3,
-                rows: 1,
-            },
-            AgentAction::NewSession,
-        ));
-        let close = Rect {
-            x: side.x + side.cols.saturating_sub(3),
-            y: side.y,
-            cols: 3,
-            rows: 1,
-        };
-        let hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
-        draw_tab_icon(
-            output,
-            close,
-            "×",
-            (muted, self.config.foreground),
-            line_bg,
-            hovered,
-            false,
-        )?;
-        self.agent_hits.push((close, AgentAction::ClosePanel));
-        Ok(())
-    }
-
-    #[cfg(feature = "monitor")]
     fn draw_resources(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        use crate::monitor::{BACKGROUND, GREEN, MUTED, PURPLE};
+        use crate::monitor::{BACKGROUND, Emphasis, GREEN, MUTED};
         let top = self.view_size().num_lines;
         let last = self.size.num_lines - 1;
         for row in top..self.size.num_lines {
@@ -2049,10 +779,9 @@ impl Frontend {
                 BACKGROUND,
             )?;
             let origin = i32::from(top) + 1;
-            let height = last.saturating_sub(top + 2);
+            let height = last.saturating_sub(top + 1);
             let view = self.ui.resources.view(self.size.num_cols, height);
             for plot in view.plots {
-                let colors = [GREEN, PURPLE];
                 let width = usize::from(plot.width);
                 let graphs: Vec<Vec<u8>> = plot
                     .series
@@ -2071,7 +800,7 @@ impl Frontend {
                 let mut text = String::new();
                 for row in 0..usize::from(plot.height) {
                     let y = origin + plot.y + row as i32;
-                    if y < origin + 2 || y >= i32::from(last.saturating_sub(1)) {
+                    if y < origin || y >= i32::from(last) {
                         continue;
                     }
                     cells.clear();
@@ -2082,7 +811,8 @@ impl Frontend {
                         {
                             if bits != 0 {
                                 cells[column].0 |= u32::from(bits);
-                                cells[column].1 = colors[series % colors.len()];
+                                cells[column].1 =
+                                    crate::monitor::series_color(plot.series[series].name);
                             }
                         }
                     }
@@ -2115,10 +845,7 @@ impl Frontend {
             }
             for text in view.texts {
                 let y = origin + text.y;
-                if y >= origin
-                    && y < i32::from(last.saturating_sub(1))
-                    && text.x < self.size.num_cols
-                {
+                if y >= origin && y < i32::from(last) && text.x < self.size.num_cols {
                     draw_text(
                         output,
                         text.x,
@@ -2126,97 +853,66 @@ impl Frontend {
                         text.width.min(self.size.num_cols - text.x),
                         &text.text,
                         text.color,
-                        if text.selected {
-                            0x29322b
-                        } else if text.highlighted
-                            || text.focused && self.ui.focus == Focus::Monitor
-                        {
-                            0x343c34
-                        } else {
-                            BACKGROUND
+                        match text.emphasis(self.ui.focus == Focus::Monitor) {
+                            Emphasis::Selected => 0x29322b,
+                            Emphasis::Highlighted => 0x343c34,
+                            Emphasis::None => BACKGROUND,
                         },
                     )?;
                 }
             }
+        }
+        let view = self.ui.resources.footer(
+            self.size.num_cols,
+            self.controller(),
+            self.client.is_remote(),
+        );
+        let right = view
+            .texts
+            .iter()
+            .map(|text| text.x)
+            .min()
+            .unwrap_or(self.size.num_cols);
+        for text in view.texts {
+            let hovered = self
+                .pointer
+                .is_some_and(|(x, y)| y == last && (text.x..text.x + text.width).contains(&x))
+                && view.hits.iter().any(|hit| hit.x == text.x);
             draw_text(
                 output,
-                0,
-                last.saturating_sub(1),
-                self.size.num_cols,
-                &"─".repeat(usize::from(self.size.num_cols)),
-                0x363d38,
-                BACKGROUND,
+                text.x,
+                last,
+                text.width,
+                &text.text,
+                text.color,
+                if hovered || text.emphasis(self.ui.focus == Focus::Monitor) != Emphasis::None {
+                    0x343c34
+                } else {
+                    BACKGROUND
+                },
             )?;
+        }
+        if let Some(snapshot) = self.client.snapshot() {
+            let context = self.ui.footer(snapshot, self.client.is_remote());
             draw_text(
                 output,
                 1,
                 last,
-                self.size.num_cols.saturating_sub(2),
-                if self.client.is_remote() {
-                    "Local system · 1s · terminal is remote"
-                } else {
-                    "Local system · 1s"
-                },
+                right.saturating_sub(2),
+                &context,
                 MUTED,
                 BACKGROUND,
-            )?;
-            let hovered = self.pointer.is_some_and(|(_, y)| y == last);
-            draw_text(
-                output,
-                self.size.num_cols.saturating_sub(3),
-                last,
-                3,
-                " ⌄ ",
-                if hovered { GREEN } else { MUTED },
-                if hovered { 0x343c34 } else { BACKGROUND },
-            )?;
-        } else {
-            let label =
-                self.ui
-                    .resources
-                    .stats
-                    .label(self.controller(), None, self.client.is_remote());
-            let label = format!(
-                " {} ",
-                fit_label(&label, self.size.num_cols.saturating_sub(4))
-            );
-            let width = text_width(&label) as u16;
-            let x = self.size.num_cols.saturating_sub(width + 1);
-            if let Some(snapshot) = self.client.snapshot() {
-                let context = self.ui.footer(snapshot, self.client.is_remote());
-                draw_text(
-                    output,
-                    1,
-                    last,
-                    x.saturating_sub(2),
-                    &context,
-                    MUTED,
-                    BACKGROUND,
-                )?;
-            }
-            let hovered = self
-                .pointer
-                .is_some_and(|(column, row)| row == last && column >= x);
-            draw_text(
-                output,
-                x,
-                last,
-                width,
-                &label,
-                if hovered { GREEN } else { MUTED },
-                if hovered { 0x343c34 } else { BACKGROUND },
             )?;
         }
         Ok(())
     }
 
-    #[cfg(feature = "monitor")]
     fn resource_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
+        let files_open = self.ui.files_open;
         let top = self.view_size().num_lines;
         let last = self.size.num_lines - 1;
-        let pointer =
-            (self.ui.resources.open && mouse.row > top && mouse.row < last.saturating_sub(1))
-                .then_some((mouse.column, i32::from(mouse.row) - i32::from(top) - 1));
+        let pointer = (self.ui.resources.open && mouse.row > top && mouse.row < last)
+            .then_some((mouse.column, i32::from(mouse.row) - i32::from(top) - 1));
         let pointer_changed =
             self.ui.resources.pointer != pointer || self.pointer != Some((mouse.column, mouse.row));
         self.pointer = Some((mouse.column, mouse.row));
@@ -2246,9 +942,29 @@ impl Frontend {
                 scroll.saturating_add(3)
             };
         } else if !mouse.release && mouse.code & 0b1110_0011 == 0 {
-            if !self.ui.resources.open || mouse.row == last {
-                self.ui.toggle_monitor();
-                return self.resize();
+            self.ui.files_open = false;
+            if mouse.row == last {
+                let view = self.ui.resources.footer(
+                    self.size.num_cols,
+                    self.controller(),
+                    self.client.is_remote(),
+                );
+                if let Some(hit) = view
+                    .hits
+                    .iter()
+                    .find(|hit| (hit.x..hit.x + hit.width).contains(&mouse.column))
+                {
+                    let open = self.ui.resources.open;
+                    self.ui.resources.action(hit.action);
+                    self.ui.focus = if self.ui.resources.open {
+                        Focus::Monitor
+                    } else {
+                        Focus::Terminal
+                    };
+                    if open != self.ui.resources.open {
+                        return self.resize();
+                    }
+                }
             } else if mouse.row == top {
                 self.ui.resources.dragging = true;
                 self.ui.focus = Focus::Monitor;
@@ -2257,7 +973,7 @@ impl Frontend {
                 let view = self
                     .ui
                     .resources
-                    .view(self.size.num_cols, last.saturating_sub(top + 2));
+                    .view(self.size.num_cols, last.saturating_sub(top + 1));
                 if let Some(hit) = view.hits.iter().rev().find(|hit| {
                     mouse.row as i32 == i32::from(top) + 1 + hit.y
                         && (hit.x..hit.x.saturating_add(hit.width)).contains(&mouse.column)
@@ -2270,13 +986,16 @@ impl Frontend {
                 }
             }
         }
+        if files_open != self.ui.files_open {
+            self.resize()?;
+        }
         self.resource_dirty = true;
         self.dirty = true;
         Ok(())
     }
 
     fn draw_active_cursor(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        if self.ui.help || self.ui.close_tab.is_some() {
+        if self.ui.help || self.ui.close_prompt.is_some() {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         if self.ui.search.open {
@@ -2288,11 +1007,10 @@ impl Frontend {
             );
         }
 
-        #[cfg(feature = "monitor")]
         if self.ui.resources.open && (self.ui.focus == Focus::Monitor) {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
-        #[cfg(feature = "files")]
+
         if self.ui.files_open {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
@@ -2307,8 +1025,7 @@ impl Frontend {
                 return output.write_all(b"\x1b[?25l");
             }
             if self.ui.focus == Focus::Editor {
-                let layout = self.editor_layout();
-                let rect = self.editor_rect();
+                let (rect, layout) = editor(&self.ui, self.agent_rect());
                 if (layout.first..layout.first + usize::from(rect.rows)).contains(&layout.caret_row)
                 {
                     return write!(
@@ -2356,16 +1073,18 @@ impl Frontend {
             self.event(event)?;
         }
         if old_hover != self.hovered_block() {
-            self.full = true;
+            self.damage_block(old_hover);
+            self.damage_block(self.hovered_block());
         }
         Ok(())
     }
 
     fn event(&mut self, event: ClientEvent) -> io::Result<()> {
         match event {
+            ClientEvent::AgentUpdated => {}
             ClientEvent::Updated => {
-                if self.ui.search.open && self.ui.search.observe(&mut self.client)? {
-                    self.full = true;
+                if self.ui.search.open {
+                    self.ui.search.observe(&mut self.client)?;
                 }
                 self.dirty = true;
                 let Some(snapshot) = self.client.snapshot() else {
@@ -2435,7 +1154,6 @@ impl Frontend {
                     .result(&mut self.client, pane, request, count, truncated)?
                 {
                     self.dirty = true;
-                    self.full = true;
                 }
             }
             ClientEvent::List(_) | ClientEvent::AgentInput { .. } | ClientEvent::History { .. } => {
@@ -2445,19 +1163,20 @@ impl Frontend {
     }
 
     fn input(&mut self, event: Input) -> io::Result<()> {
-        if let Some(tab) = self.ui.close_tab {
+        if let Some(prompt) = self.ui.close_prompt.as_mut() {
+            let tab = prompt.tab.unwrap();
             match &event {
-                Input::Escape => self.ui.close_tab = None,
+                Input::Escape => self.ui.close_prompt = None,
                 Input::Bytes(bytes)
                     if matches!(bytes.as_slice(), b"\t" | b"\x1b[D" | b"\x1b[C" | b"\x1b[Z") =>
                 {
-                    self.ui.close_confirm = !self.ui.close_confirm
+                    prompt.terminate = !prompt.terminate
                 }
                 Input::Bytes(bytes) if bytes == b"\r" => {
-                    if self.ui.close_confirm {
+                    if prompt.terminate {
                         self.client.send(Action::CloseTab(tab))?;
                     }
-                    self.ui.close_tab = None;
+                    self.ui.close_prompt = None;
                 }
                 Input::Mouse(mouse)
                     if mouse.code & 3 == 0
@@ -2466,25 +1185,23 @@ impl Frontend {
                 {
                     let left = (self.size.num_cols - self.size.num_cols.min(64)) / 2;
                     if mouse.column >= left && mouse.column < left.saturating_add(16) {
-                        self.ui.close_tab = None;
+                        self.ui.close_prompt = None;
                     } else if mouse.column >= left.saturating_add(16)
                         && mouse.column < left.saturating_add(32)
                     {
                         self.client.send(Action::CloseTab(tab))?;
-                        self.ui.close_tab = None;
+                        self.ui.close_prompt = None;
                     }
                 }
                 _ => (),
             }
-            self.full = true;
             self.dirty = true;
             return Ok(());
         }
         #[cfg(feature = "agent")]
         {
-            self.ui.agent.view_dirty = true;
             if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
-                self.ui.agent_rewind_key(0);
+                self.ui.cancel_rewind();
             }
         }
         if let Input::Alt(key) = event {
@@ -2494,7 +1211,6 @@ impl Frontend {
             }
             if self.ui.help {
                 self.ui.help = false;
-                self.full = true;
                 self.dirty = true;
                 return Ok(());
             }
@@ -2525,7 +1241,6 @@ impl Frontend {
                 b'?' => {
                     self.ui.help = true;
                     self.ui.help_scroll = 0;
-                    self.full = true;
                     self.dirty = true;
                     return Ok(());
                 }
@@ -2537,7 +1252,6 @@ impl Frontend {
                     if let Some(pane) = self.focused() {
                         self.ui.search.begin(&mut self.client, pane)?;
                     }
-                    self.full = true;
                     self.dirty = true;
                     return Ok(());
                 }
@@ -2546,14 +1260,10 @@ impl Frontend {
                     self.ui.toggle_agent();
                     return self.resize();
                 }
-                #[cfg(feature = "files")]
+
                 b'f' => return self.toggle_files(),
-                #[cfg(feature = "monitor")]
+
                 b'm' => {
-                    #[cfg(feature = "files")]
-                    {
-                        self.ui.files_open = false;
-                    }
                     self.ui.toggle_monitor();
                     return self.resize();
                 }
@@ -2578,242 +1288,30 @@ impl Frontend {
                 },
                 _ => (),
             }
-            self.full = true;
             self.dirty = true;
             return Ok(());
         }
-        if self.ui.search.open {
+        if self.ui.input_target().is_some() {
             match &event {
                 Input::Escape => {
-                    self.ui.search.close(&mut self.client)?;
-                    self.full = true;
-                    self.dirty = true;
-                }
-                Input::Bytes(bytes) => {
-                    self.ui.search.bytes(&mut self.client, bytes, false)?;
-                    self.full = true;
-                    self.dirty = true;
-                }
-                Input::PasteStart => self.paste = Some(PasteTarget::Search),
-                Input::Focus(_) | Input::PasteData(_) | Input::PasteEnd => (),
-                _ => return Ok(()),
-            }
-            if !matches!(
-                event,
-                Input::PasteData(_) | Input::PasteEnd | Input::Focus(_)
-            ) {
-                return Ok(());
-            }
-        }
-
-        #[cfg(feature = "monitor")]
-        {
-            #[cfg(feature = "agent")]
-            let preview = self.ui.agent.active().context.preview.is_some();
-            #[cfg(not(feature = "agent"))]
-            let preview = false;
-            if self.ui.resources.open && (self.ui.focus == Focus::Monitor) && !preview {
-                let handled = match &event {
-                    Input::Bytes(bytes) => self.ui.resources.bytes(bytes),
-                    Input::Escape => self.ui.resources.bytes(b"\x1b"),
-                    Input::PasteStart => {
-                        self.paste = self.ui.resources.searching.then_some(PasteTarget::Monitor);
-                        true
-                    }
-                    _ => false,
-                };
-                if handled {
-                    if !self.ui.resources.open {
-                        self.ui.focus = Focus::Terminal;
-                        return self.resize();
-                    }
-                    self.dirty = true;
-                    self.resource_dirty = true;
+                    self.panel_key(crate::input::keysym::ESCAPE, 0, "")?;
                     return Ok(());
                 }
-            }
-            if matches!(event, Input::Alt(b'a' | b'f')) {
-                self.ui.focus = Focus::Terminal;
-            }
-        }
-
-        #[cfg(feature = "agent")]
-        {
-            if self.ui.agent.open
-                && self.ui.focus.is_agent()
-                && let Input::Bytes(bytes) = &event
-                && bytes.len() > 1
-                && !bytes.starts_with(b"\x1b")
-                && bytes.iter().any(u8::is_ascii_control)
-            {
-                let mut start = 0;
-                for (index, byte) in bytes.iter().enumerate() {
-                    if byte.is_ascii_control() {
-                        if start < index {
-                            self.input(Input::Bytes(bytes[start..index].to_vec()))?;
-                        }
-                        self.input(Input::Bytes(vec![*byte]))?;
-                        start = index + 1;
-                    }
-                }
-                if start < bytes.len() {
-                    self.input(Input::Bytes(bytes[start..].to_vec()))?;
-                }
-                return Ok(());
-            }
-            if matches!(event, Input::Alt(b'a')) {
-                self.ui.toggle_agent();
-                return self.resize();
-            }
-            let rewind_key = match &event {
-                Input::Escape => Some(0xff1b),
-                Input::Bytes(bytes) if bytes == b"\r" => Some(0xff0d),
-                Input::Bytes(_) | Input::PasteStart => Some(0),
-                _ => None,
-            };
-            if let Some(symbol) = rewind_key {
-                let selected = self.ui.agent.active().rewind_target.is_some();
-                let handled = self.ui.agent_rewind_key(symbol);
-                if selected || handled {
-                    self.dirty = true;
-                    self.agent_dirty = true;
-                }
-                if handled {
+                Input::Bytes(bytes) => return self.panel_bytes(bytes, None),
+                Input::Alt(key) => {
+                    self.panel_key(u32::from(*key), crate::input::ALT, "")?;
                     return Ok(());
                 }
-            }
-            if self.ui.agent.active().context.preview.is_some()
-                && !matches!(
-                    event,
-                    Input::Mouse(_) | Input::Alt(b'q') | Input::PasteData(_) | Input::PasteEnd
-                )
-            {
-                if let Input::Bytes(ref bytes) = event {
-                    if matches!(bytes.as_slice(), b"\t" | b"\x1b[Z") {
-                        self.ui.agent_tab(bytes == b"\x1b[Z");
-                        self.agent_dirty = true;
-                        self.dirty = true;
-                        return Ok(());
-                    }
-                    if matches!(bytes.as_slice(), b"\r" | b" ") && self.ui.focus == Focus::Controls
-                    {
-                        self.activate_agent(self.ui.agent.keyboard)?;
-                        return Ok(());
-                    }
-                }
-                match event {
-                    Input::Escape => {
-                        self.ui.agent.active_mut().context.preview = None;
-                        self.full = true;
-                    }
-                    Input::Bytes(ref bytes) if bytes == b"\x03" => {
-                        let text = self
-                            .ui
-                            .agent
-                            .active()
-                            .context
-                            .preview
-                            .as_ref()
-                            .unwrap()
-                            .item
-                            .snapshot
-                            .text
-                            .clone();
-                        self.copy_text(text);
-                    }
-                    Input::Bytes(ref bytes) => {
-                        let scroll = &mut self
-                            .ui
-                            .agent
-                            .active_mut()
-                            .context
-                            .preview
-                            .as_mut()
-                            .unwrap()
-                            .scroll;
-                        if matches!(bytes.as_slice(), b"\x1b[A" | b"\x1b[5~") {
-                            *scroll = scroll.saturating_sub(3);
-                        } else if matches!(bytes.as_slice(), b"\x1b[B" | b"\x1b[6~") {
-                            *scroll = scroll.saturating_add(3);
-                        }
-                    }
-                    _ => (),
-                }
-                self.dirty = true;
-                self.agent_dirty = true;
-                return Ok(());
-            }
-            if self.ui.agent.open && self.ui.focus.is_agent() {
-                let key = match &event {
-                    Input::Bytes(bytes) => match bytes.as_slice() {
-                        b"\t" => Some((0xff09, false, false)),
-                        b"\x1b[Z" => Some((0xfe20, true, false)),
-                        b"\0" => Some((32, false, true)),
-                        b"\x1b[A" => Some((0xff52, false, false)),
-                        b"\x1b[B" => Some((0xff54, false, false)),
-                        b"\x1b[3~" => Some((0xffff, false, false)),
-                        b"\r" => Some((0xff0d, false, false)),
-                        b" " => Some((32, false, false)),
-                        _ => None,
-                    },
-                    Input::Escape => Some((0xff1b, false, false)),
-                    _ => None,
-                };
-                if let Some((symbol, shift, control)) = key
-                    && (matches!(symbol, 0xff09 | 0xfe20)
-                        || control
-                        || self.ui.focus == Focus::Controls)
-                {
-                    if let Some(action) = self.ui.agent_key(symbol, shift, control) {
-                        self.activate_agent(action)?;
-                    }
-                    self.dirty = true;
-                    self.agent_dirty = true;
+                Input::PasteStart => {
+                    self.panel_utf8.clear();
+                    self.paste = self.ui.paste_target();
                     return Ok(());
                 }
-            }
-            if self.ui.agent.open && self.ui.focus.is_agent() {
-                match event {
-                    Input::Escape => {
-                        if self.ui.agent.active().context.menu {
-                            self.ui.agent.active_mut().context.menu = false;
-                        } else {
-                            self.ui.focus = Focus::Terminal;
-                        }
-                        self.dirty = true;
-                        self.agent_dirty = true;
-                        return Ok(());
-                    }
-                    Input::Bytes(_) if self.ui.focus == Focus::Controls => return Ok(()),
-                    Input::Bytes(ref bytes) => return self.agent_bytes(bytes, None),
-                    Input::PasteStart => {
-                        self.paste = (self.ui.focus == Focus::Editor)
-                            .then_some(PasteTarget::Agent(self.ui.agent.active().id));
-                        return Ok(());
-                    }
-                    Input::Alt(b'q')
-                    | Input::Mouse(_)
-                    | Input::PasteData(_)
-                    | Input::PasteEnd
-                    | Input::Focus(_) => {}
-                    _ => return Ok(()),
-                }
+                _ => (),
             }
         }
         match event {
-            Input::Alt(b'q') => {
-                self.running = false;
-                return Ok(());
-            }
-            #[cfg(feature = "files")]
-            Input::Alt(b'f') => {
-                return self.toggle_files();
-            }
             Input::Alt(key) => {
-                if self.shortcut(key)? {
-                    return Ok(());
-                }
-                #[cfg(feature = "files")]
                 if self.ui.files_open {
                     return Ok(());
                 }
@@ -2822,39 +1320,11 @@ impl Frontend {
                 }
             }
             Input::Escape => {
-                #[cfg(feature = "files")]
-                if self.ui.files_open {
-                    if self
-                        .ui
-                        .files
-                        .as_ref()
-                        .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
-                    {
-                        self.ui.files.as_mut().unwrap().focus_list();
-                    } else if self
-                        .ui
-                        .files
-                        .as_ref()
-                        .is_some_and(|files| files.is_search())
-                    {
-                        self.ui.files.as_mut().unwrap().stop_search();
-                    } else {
-                        self.ui.files_open = false;
-                        self.ui.focus = Focus::Terminal;
-                    }
-                    self.full = true;
-                    self.dirty = true;
-                    return Ok(());
-                }
                 if let Some(pane) = self.focused() {
                     self.send_input(pane, vec![0x1b])?;
                 }
             }
             Input::Bytes(bytes) => {
-                #[cfg(feature = "files")]
-                if self.ui.files_open {
-                    return self.file_input(&bytes, false);
-                }
                 if let Some(pane) = self.focused() {
                     let mode = self
                         .client
@@ -2878,9 +1348,10 @@ impl Frontend {
             Input::Mouse(mouse) => {
                 #[cfg(feature = "agent")]
                 if self.ui.agent.active().context.preview.is_some() {
-                    return self.agent_mouse(mouse);
+                    self.agent_mouse(mouse)?;
+                    return Ok(());
                 }
-                #[cfg(feature = "monitor")]
+
                 if mouse.row < self.view_size().num_lines
                     && (self.ui.resources.pointer.take().is_some()
                         || self
@@ -2890,41 +1361,19 @@ impl Frontend {
                     self.resource_dirty = true;
                     self.dirty = true;
                 }
-                #[cfg(feature = "monitor")]
+
                 if self.ui.resources.dragging || mouse.row >= self.view_size().num_lines {
                     return self.resource_mouse(mouse);
                 }
-                #[cfg(feature = "monitor")]
+
                 if !mouse.release && mouse.code & 0b1110_0011 == 0 {
                     self.ui.focus = Focus::Terminal;
                 }
                 #[cfg(feature = "agent")]
-                if self.ui.agent.active().context.preview.is_some()
-                    || self.selecting_editor
-                    || self.ui.agent.active().selecting()
-                    || self.ui.agent.open && mouse.column >= self.agent_rect().x
-                {
-                    return self.agent_mouse(mouse);
+                if self.agent_mouse(mouse)? {
+                    return Ok(());
                 }
-                #[cfg(feature = "agent")]
-                if !mouse.release && mouse.code & 0b1110_0011 == 0 {
-                    if self.ui.agent.active().rewind_target.is_some() {
-                        self.ui.agent_rewind_key(0);
-                        self.agent_dirty = true;
-                        self.dirty = true;
-                    }
-                    self.ui.focus = Focus::Terminal;
-                }
-                #[cfg(feature = "agent")]
-                if self.ui.agent.open
-                    && self
-                        .pointer
-                        .is_some_and(|(column, row)| self.agent_rect().contains(column, row))
-                {
-                    self.agent_dirty = true;
-                    self.dirty = true;
-                }
-                #[cfg(feature = "files")]
+
                 if self.ui.files_open {
                     self.ui.focus = Focus::Files;
                     return self.file_mouse(mouse);
@@ -2932,7 +1381,6 @@ impl Frontend {
                 self.mouse(mouse)?;
             }
             Input::PasteStart => {
-                #[cfg(feature = "files")]
                 if self.ui.files_open {
                     self.paste = Some(PasteTarget::Files);
                     return Ok(());
@@ -2950,26 +1398,12 @@ impl Frontend {
                 }
             }
             Input::PasteData(bytes) => match self.paste {
-                Some(PasteTarget::Search) => {
-                    self.ui.search.bytes(&mut self.client, &bytes, true)?;
-                    self.full = true;
-                    self.dirty = true;
-                }
-
-                #[cfg(feature = "monitor")]
-                Some(PasteTarget::Monitor) => {
-                    self.ui.resources.query_bytes(&bytes);
-                    self.resource_dirty = true;
-                    self.dirty = true;
-                }
-                #[cfg(feature = "agent")]
-                Some(PasteTarget::Agent(id)) => self.agent_bytes(&bytes, Some(id))?,
                 Some(PasteTarget::Pane { pane, .. }) => self.send_input(pane, bytes)?,
-                #[cfg(feature = "files")]
-                Some(PasteTarget::Files) => self.file_input(&bytes, true)?,
-                None => {}
+                Some(target) => self.panel_bytes(&bytes, Some(target))?,
+                None => (),
             },
             Input::PasteEnd => {
+                self.panel_utf8.clear();
                 if let Some(PasteTarget::Pane {
                     pane,
                     bracketed: true,
@@ -3042,11 +1476,10 @@ impl Frontend {
                     self.message("No command output block available; enable shell integration");
                     return Ok(true);
                 };
-                self.request += 1;
                 Action::CopyBlock {
                     pane,
                     block: block.id,
-                    request: self.request,
+                    request: 0,
                 }
             }
             _ => return Ok(false),
@@ -3055,12 +1488,12 @@ impl Frontend {
             self.message("READ ONLY — attach again to take control; Alt+q detach");
             return Ok(true);
         }
-        #[cfg(feature = "files")]
-        {
-            self.ui.files_open = false;
-            self.ui.focus = Focus::Terminal;
+
+        let files_open = std::mem::take(&mut self.ui.files_open);
+        self.ui.focus = Focus::Terminal;
+        if files_open {
+            self.resize()?;
         }
-        self.full = true;
         self.client.send(action)?;
         if key == b'c' {
             self.copy_pending = true;
@@ -3076,8 +1509,8 @@ impl Frontend {
             self.dirty = true;
         }
         if old_hover != self.hovered_block() {
-            self.full = true;
-            self.dirty = true;
+            self.damage_block(old_hover);
+            self.damage_block(self.hovered_block());
         }
         if let Some(drag) = self.split_drag {
             if mouse.release {
@@ -3129,7 +1562,6 @@ impl Frontend {
                                 .unwrap();
                             Action::Tab(index as i32 - active as i32)
                         };
-                        self.full = true;
                         return self.client.send(action);
                     }
                 }
@@ -3143,7 +1575,6 @@ impl Frontend {
                     if count > 0 {
                         let width = count.ilog10() as u16 + 2;
                         if (column..column + width).contains(&mouse.column) {
-                            self.full = true;
                             return self.client.send(Action::Tab(direction));
                         }
                         column += width + 1;
@@ -3152,7 +1583,6 @@ impl Frontend {
                 if (plus.saturating_sub(1)..plus.saturating_add(2)).contains(&mouse.column)
                     && plus.saturating_add(1) < self.size.num_cols
                 {
-                    self.full = true;
                     return self.client.send(Action::NewTab {
                         pane: snapshot.focused,
                     });
@@ -3185,14 +1615,6 @@ impl Frontend {
             .iter()
             .find_map(|(&pane, screen)| screen.selection_range().map(|_| pane));
         let x = usize::from(physical_x).min(screen.columns().saturating_sub(1)) as u16;
-        #[cfg(feature = "agent")]
-        let object = crate::context::object_at(
-            screen,
-            Point {
-                line: i32::from(y) - offset as i32,
-                column: usize::from(x),
-            },
-        );
         if !self.controller() {
             return Ok(());
         }
@@ -3206,26 +1628,27 @@ impl Frontend {
                 column: usize::from(x),
             };
             let now = Instant::now();
-            let double = self.last_click.is_some_and(|(at, old_pane, old_point)| {
-                old_pane == pane
-                    && old_point == point
-                    && now.duration_since(at) < Duration::from_millis(400)
-            });
-            self.last_click = Some((now, pane, point));
-            if double && let Some(object) = object {
-                if let Err(error) =
-                    self.ui
-                        .agent
-                        .active_mut()
-                        .attach_object(&self.client, pane, object)
-                {
-                    self.message(error);
-                }
-                self.ui.agent.open = true;
-                self.ui.focus = Focus::Editor;
+            let double = self
+                .agent
+                .last_click
+                .is_some_and(|(at, old_pane, old_point)| {
+                    old_pane == pane
+                        && old_point == point
+                        && now.duration_since(at) < Duration::from_millis(400)
+                });
+            self.agent.last_click = Some((now, pane, point));
+            if double
+                && let Some(object) = self
+                    .client
+                    .screens()
+                    .get(&pane)
+                    .and_then(|screen| crate::context::object_at(screen, point))
+            {
+                self.ui.attach_object(&self.client, pane, object);
                 return self.resize();
             }
         }
+
         if mode.intersects(Mode::MOUSE_MODE) && mouse.code & 4 == 0 {
             if mouse.code & 32 != 0
                 && !mode.contains(Mode::MOUSE_MOTION)
@@ -3258,17 +1681,13 @@ impl Frontend {
                 self.message("Clipboard transfer already in progress");
                 return Ok(());
             }
-            self.request += 1;
             let action = if let Some(pane) = selected_pane {
-                Some(Action::CopySelection {
-                    pane,
-                    request: self.request,
-                })
+                Some(Action::CopySelection { pane, request: 0 })
             } else {
                 output_block.map(|block| Action::CopyBlock {
                     pane,
                     block,
-                    request: self.request,
+                    request: 0,
                 })
             };
             if let Some(action) = action {
@@ -3307,6 +1726,98 @@ impl Frontend {
         Ok(())
     }
 
+    fn damage_block(&mut self, target: Option<(PaneId, u64)>) {
+        let Some((id, block)) = target else {
+            return;
+        };
+        let Some((snapshot, screens)) = self.client.snapshot_and_screens_mut() else {
+            return;
+        };
+        let Some(pane) = snapshot.panes.iter().find(|pane| pane.id == id) else {
+            return;
+        };
+        let Some(screen) = screens.get_mut(&id) else {
+            return;
+        };
+        for row in 0..screen.screen_lines().min(usize::from(pane.rect.rows)) {
+            if screen
+                .row_output(pane, row)
+                .is_some_and(|current| current.id == block)
+            {
+                screen.dirty[row] = true;
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn help_rect(&self) -> Rect {
+        let cols = self.size.num_cols.saturating_sub(4).min(78);
+        let rows =
+            (self.ui.help_lines().count() as u16 + 3).min(self.size.num_lines.saturating_sub(2));
+        Rect {
+            x: (self.size.num_cols - cols) / 2,
+            y: (self.size.num_lines - rows) / 2,
+            cols,
+            rows,
+        }
+    }
+
+    fn close_rect(&self) -> Rect {
+        let cols = self.size.num_cols.min(64);
+        let y = (self.size.num_lines / 2).saturating_sub(1);
+        Rect {
+            x: (self.size.num_cols - cols) / 2,
+            y,
+            cols,
+            rows: 3.min(self.size.num_lines - y),
+        }
+    }
+
+    fn damage_overlays(&mut self) {
+        self.damage.resize(usize::from(self.size.num_lines), false);
+        let mut overlays = smallvec::SmallVec::new();
+        if self.ui.files_open
+            && self
+                .ui
+                .files
+                .as_ref()
+                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
+        {
+            overlays.push(self.file_preview_rect());
+        }
+        #[cfg(feature = "agent")]
+        if self.ui.agent.active().context.preview.is_some() {
+            overlays.push(Rect {
+                x: 0,
+                y: 1,
+                cols: self.size.num_cols,
+                rows: self.size.num_lines.saturating_sub(2),
+            });
+        }
+        if self.ui.search.open {
+            overlays.push(Rect {
+                x: 0,
+                y: 0,
+                cols: self.size.num_cols,
+                rows: 1,
+            });
+        }
+        if self.ui.help {
+            overlays.push(self.help_rect());
+        }
+        if self.ui.close_prompt.is_some() {
+            overlays.push(self.close_rect());
+        }
+        if self.overlays != overlays {
+            for rect in self.overlays.iter().chain(&overlays) {
+                for row in rect.y..rect.y.saturating_add(rect.rows).min(self.size.num_lines) {
+                    self.damage[usize::from(row)] = true;
+                }
+            }
+            self.overlays = overlays;
+        }
+    }
+
     fn hovered_block(&self) -> Option<(PaneId, u64)> {
         let (x, y) = self.pointer?;
         let pane = self
@@ -3321,28 +1832,13 @@ impl Frontend {
             .map(|block| (pane.id, block.id))
     }
 
-    fn draw_dots(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        let Some(snapshot) = self.client.snapshot() else {
-            return Ok(());
-        };
-        for (index, x, _) in tab_chrome(snapshot, self.view_size().num_cols, &self.label()).0 {
-            let tab = &snapshot.tabs[index];
-            let color = self.ui.tab_color(tab, 0xcccccc, 0x202020);
-            let bg = if tab.id == snapshot.active_tab {
-                32
-            } else {
-                28
-            };
-            draw_text(output, x + 2, 0, 1, "•", color, bg)?;
-        }
-        output.write_all(b"\x1b[0m")
-    }
-
     fn draw(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        self.damage_overlays();
         let Some(snapshot) = self.client.snapshot() else {
             write!(output, "\x1b[H\x1b[0mWaiting for workspace — Alt+q detach")?;
             return Ok(());
         };
+        output.write_all(b"\x1b[?2026h")?;
         if self.full {
             output.write_all(b"\x1b[2J")?;
         }
@@ -3352,12 +1848,13 @@ impl Frontend {
         draw_tabs(
             output,
             snapshot,
-            size.num_cols,
+            size.num_cols + self.file_width(),
             &label,
             self.pointer,
             &self.ui,
+            &self.config,
         )?;
-        if self.full || self.header != output[start..] {
+        if self.full || self.damage[0] || self.header != output[start..] {
             self.header.clear();
             self.header.extend_from_slice(&output[start..]);
         } else {
@@ -3366,10 +1863,14 @@ impl Frontend {
         let hovered = self.hovered_block();
         for pane in &snapshot.panes {
             if let Some(screen) = self.client.screens().get(&pane.id) {
-                for row in 0..screen.screen_lines() {
-                    if (!self.full && !screen.dirty[row])
-                        || row >= usize::from(pane.rect.rows)
-                        || pane.rect.y.saturating_add(row as u16) >= size.num_lines
+                let rows = screen
+                    .screen_lines()
+                    .min(usize::from(pane.rect.rows))
+                    .min(usize::from(size.num_lines.saturating_sub(pane.rect.y)));
+                for row in 0..rows {
+                    if !self.full
+                        && !screen.dirty[row]
+                        && !self.damage[usize::from(pane.rect.y) + row]
                     {
                         continue;
                     }
@@ -3379,30 +1880,55 @@ impl Frontend {
                                 .row_output(pane, row)
                                 .is_some_and(|current| current.id == block)
                     });
-                    draw_row(output, screen, pane, row, size.num_cols, highlight)?;
+                    draw_row(
+                        output,
+                        screen,
+                        pane,
+                        row,
+                        size.num_cols + self.file_width(),
+                        highlight,
+                        self.file_width(),
+                    )?;
                 }
             }
         }
-        if self.full {
-            draw_separators(output, snapshot, size)?;
-        }
-        #[cfg(feature = "files")]
-        if self.ui.files_open {
-            self.draw_files(output)?;
-        }
-        #[cfg(feature = "monitor")]
-        {
+        draw_separators(
+            output,
+            snapshot,
+            size,
+            self.full,
+            &self.damage,
+            self.file_width(),
+        )?;
+
+        let footer_changed = {
             let footer = self.ui.footer(snapshot, self.client.is_remote());
-            if self.full || self.resource_dirty || self.footer != footer {
-                self.footer = footer;
-                self.draw_resources(output)?;
-                self.resource_dirty = false;
+            let changed = self.footer != footer;
+            if changed {
+                self.footer = footer.into_owned();
             }
+            changed
+        };
+        if self.full
+            || self.resource_dirty
+            || footer_changed
+            || self.damage[usize::from(size.num_lines)..]
+                .iter()
+                .any(|dirty| *dirty)
+        {
+            self.draw_resources(output)?;
+            self.resource_dirty = false;
         }
         #[cfg(feature = "agent")]
-        if self.ui.agent.open && (self.full || self.agent_dirty) {
+        if self.ui.agent.open
+            && (self.full || self.agent.dirty || self.damage.iter().any(|dirty| *dirty))
+        {
             self.draw_agent(output)?;
-            self.agent_dirty = false;
+            self.agent.dirty = false;
+        }
+
+        if self.ui.files_open {
+            self.draw_files(output)?;
         }
         if self.ui.search.open {
             draw_text(
@@ -3416,11 +1942,13 @@ impl Frontend {
             )?;
         }
         if self.ui.help {
-            let width = self.size.num_cols.saturating_sub(4).min(78);
+            let Rect {
+                x,
+                y,
+                cols: width,
+                rows: height,
+            } = self.help_rect();
             let lines = self.ui.help_lines();
-            let height = (lines.len() as u16 + 3).min(self.size.num_lines.saturating_sub(2));
-            let x = (self.size.num_cols - width) / 2;
-            let y = (self.size.num_lines - height) / 2;
             for row in 0..height {
                 draw_text(output, x, y + row, width, "", 0xcbd0c9, 0x29322b)?;
             }
@@ -3435,11 +1963,11 @@ impl Frontend {
             )?;
             self.ui.help_scroll = self.ui.help_scroll.min(
                 lines
-                    .len()
+                    .clone()
+                    .count()
                     .saturating_sub(height.saturating_sub(2) as usize),
             );
             for (index, line) in lines
-                .iter()
                 .skip(self.ui.help_scroll)
                 .take(height.saturating_sub(2) as usize)
                 .enumerate()
@@ -3455,30 +1983,34 @@ impl Frontend {
                 )?;
             }
         }
-        if self.ui.close_tab.is_some() {
-            let width = self.size.num_cols.min(64);
-            let x = (self.size.num_cols - width) / 2;
-            let y = self.size.num_lines / 2;
+        if let Some(prompt) = self.ui.close_prompt {
+            let Rect {
+                x,
+                y,
+                cols: width,
+                rows: height,
+            } = self.close_rect();
             for (offset, text) in [
                 "Close tab? Programs are running or state is unknown.",
                 "Closing terminates every pane in this tab.",
-                if self.ui.close_confirm {
+                if prompt.terminate {
                     "    Cancel       [ Close tab ]"
                 } else {
                     "  [ Cancel ]       Close tab"
                 },
             ]
             .into_iter()
+            .take(usize::from(height))
             .enumerate()
             {
                 draw_text(
                     output,
                     x,
-                    y.saturating_sub(1) + offset as u16,
+                    y + offset as u16,
                     width,
                     text,
-                    0xcccccc,
-                    0x303030,
+                    self.config.foreground,
+                    crate::ui::mix_color(self.config.foreground, self.config.background, 24),
                 )?;
             }
         }
@@ -3490,10 +2022,12 @@ impl Frontend {
             }
         }
         self.full = false;
+        self.damage.fill(false);
+        self.frame_size = size;
+        output.write_all(b"\x1b[?2026l")?;
         Ok(())
     }
 
-    #[cfg(feature = "files")]
     fn toggle_files(&mut self) -> io::Result<()> {
         if self.client.is_remote() {
             self.message("Files are unavailable in remote sessions");
@@ -3502,9 +2036,7 @@ impl Frontend {
         if self.ui.files_open {
             self.ui.files_open = false;
             self.ui.focus = Focus::Terminal;
-            self.full = true;
-            self.dirty = true;
-            return Ok(());
+            return self.resize();
         }
         let directory = self
             .client
@@ -3525,304 +2057,59 @@ impl Frontend {
         } else {
             self.ui.files = Some(crate::files::FileNav::new(directory)?);
         }
-        self.file_utf8.clear();
+        self.panel_utf8.clear();
         self.ui.files_open = true;
         self.ui.focus = Focus::Files;
-        self.full = true;
-        self.dirty = true;
-        Ok(())
+        self.resize()
     }
 
-    #[cfg(feature = "files")]
-    fn file_input(&mut self, bytes: &[u8], pasted: bool) -> io::Result<()> {
-        use crate::files::FileFocus;
-        if pasted
-            && !bytes.is_empty()
-            && self.file_utf8.is_empty()
-            && let Ok(text) = std::str::from_utf8(bytes)
-        {
-            let files = self.ui.files.as_mut().unwrap();
-            files.insert_query(text);
-            self.dirty = true;
-            return Ok(());
-        }
-        if !pasted && matches!(bytes, b"\t" | b"\x1b[Z") {
-            let files = self.ui.files.as_mut().unwrap();
-            if files.focus() == crate::files::FileFocus::List {
-                files.focus_preview();
-            } else {
-                files.focus_list();
-            }
-            self.dirty = true;
-            return Ok(());
-        }
-        let visible = file_geometry(self.view_size()).rows.saturating_sub(2) as usize;
-        if !pasted && bytes.starts_with(b"\x1b") {
-            if matches!(bytes, b"\x1b[C" | b"\x1bOC") {
-                let files = self.ui.files.as_mut().unwrap();
-                if !files.enter_selected() {
-                    files.focus_preview();
-                }
-                self.dirty = true;
-                return Ok(());
-            }
-            if matches!(bytes, b"\x1b[D" | b"\x1bOD") {
-                let files = self.ui.files.as_mut().unwrap();
-                if files.focus() == FileFocus::Preview {
-                    files.focus_list();
-                } else if !files.is_search() {
-                    files.parent();
-                }
-                self.dirty = true;
-                return Ok(());
-            }
-            let delta = match bytes {
-                b"\x1b[A" | b"\x1bOA" => -1,
-                b"\x1b[B" | b"\x1bOB" => 1,
-                _ => 0,
-            };
-            let files = self.ui.files.as_mut().unwrap();
-            if files.focus() == FileFocus::Preview {
-                files.scroll_preview(delta, visible);
-            } else {
-                files.move_selection(delta);
-            }
-            self.dirty = true;
-            return Ok(());
-        }
-        let mut query = None;
-        for &byte in bytes {
-            let files = self.ui.files.as_mut().unwrap();
-            if !pasted && matches!(byte, b'\r' | b'\n') {
-                if let Some(query) = query.take() {
-                    files.set_query(query);
-                }
-                if !files.enter_selected()
-                    && let Some(path) = files.selected_shell_path()
-                {
-                    self.ui.files_open = false;
-                    self.ui.focus = Focus::Terminal;
-                    self.full = true;
-                    if let Some(pane) = self.focused() {
-                        self.send_input(pane, path)?;
-                    }
-                    self.dirty = true;
-                    return Ok(());
-                }
-            } else if !pasted && files.focus() == FileFocus::Preview {
-                match byte {
-                    b'h' => files.focus_list(),
-                    b'j' => files.scroll_preview(1, visible),
-                    b'k' => files.scroll_preview(-1, visible),
-                    _ => {}
-                }
-            } else if !files.is_search() && !pasted {
-                match byte {
-                    b'h' => {
-                        files.parent();
-                    }
-                    b'j' => files.move_selection(1),
-                    b'k' => files.move_selection(-1),
-                    b'l' => {
-                        if !files.enter_selected() {
-                            files.focus_preview();
-                        }
-                    }
-                    b'/' => files.start_search(),
-                    _ => {}
-                }
-            } else {
-                let query = query.get_or_insert_with(|| files.query().to_owned());
-                if !pasted && matches!(byte, 8 | 127) {
-                    self.file_utf8.clear();
-                    query.pop();
-                } else if pasted || byte >= 0x20 {
-                    self.file_utf8.push(byte);
-                    match std::str::from_utf8(&self.file_utf8) {
-                        Ok(text) => {
-                            query.push_str(text);
-                            self.file_utf8.clear();
-                        }
-                        Err(error) if error.error_len().is_none() => continue,
-                        Err(_) => {
-                            self.file_utf8.clear();
-                            self.message("File search requires UTF-8 input");
-                            continue;
-                        }
-                    }
-                }
-            }
-        }
-        if let Some(query) = query {
-            self.ui.files.as_mut().unwrap().set_query(query);
-        }
-        self.dirty = true;
-        Ok(())
-    }
-
-    #[cfg(feature = "files")]
     fn file_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        use crate::files::FileFocus;
-        let rect = file_geometry(self.view_size());
+        let rect = self.file_rect();
+        let preview = self.file_preview_rect();
         let files = self.ui.files.as_mut().unwrap();
-        if !rect.contains(mouse.column, mouse.row) {
-            return Ok(());
-        }
-        let (left, visible, first) = file_list_geometry(rect, files);
-        let body_y = rect.y + 1 + u16::from(files.is_search());
-        let in_preview = mouse.column > rect.x + 1 + left;
-        if !mouse.release && mouse.code & 64 != 0 {
-            let delta = if mouse.code & 1 == 0 { -3 } else { 3 };
-            if in_preview && files.focus_preview() {
-                files.scroll_preview(delta, visible);
-            } else {
-                files.focus_list();
-                files.move_selection(delta);
+        if files.focus() == crate::files::FileFocus::Preview {
+            if preview.contains(mouse.column, mouse.row) && !mouse.release && mouse.code & 64 != 0 {
+                files.scroll_preview(
+                    if mouse.code & 1 == 0 { -3 } else { 3 },
+                    usize::from(preview.rows.saturating_sub(2)),
+                );
             }
-        } else if !mouse.release && mouse.code & 0b1100_0011 == 0 {
-            if in_preview {
-                files.focus_preview();
-            } else if mouse.row >= body_y && mouse.row < body_y + visible as u16 {
-                files.focus_list();
-                let index = first + usize::from(mouse.row - body_y);
-                if index < files.entries().len() {
-                    files.move_selection(index as isize - files.selection() as isize);
-                }
+        } else if rect.contains(mouse.column, mouse.row) {
+            if !mouse.release && mouse.code & 64 != 0 {
+                files.move_selection(if mouse.code & 1 == 0 { -3 } else { 3 });
+            } else if !mouse.release
+                && mouse.code & 0b1100_0011 == 0
+                && let Some(index) = crate::file_panel::Layout::new(rect, files).entry_at(
+                    files,
+                    mouse.column,
+                    mouse.row,
+                )
+            {
+                files.move_selection(index as isize - files.selection() as isize);
             }
-        } else if files.focus() == FileFocus::Preview {
-            return Ok(());
         }
         self.dirty = true;
         Ok(())
     }
 
-    #[cfg(feature = "files")]
     fn draw_files(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        use crate::files::FileFocus;
         let Some(files) = &self.ui.files else {
             return Ok(());
         };
-        let rect = file_geometry(self.view_size());
-        if rect.cols < 5 || rect.rows < 3 {
-            write!(output, "\x1b[{};{}H\x1b[0m", rect.y + 1, rect.x + 1)?;
-            fit_text(output, "Files", rect.cols);
-            return Ok(());
-        }
-        let (left, _visible, first) = file_list_geometry(rect, files);
-        let right = rect.cols.saturating_sub(left + 3);
-        let preview_focus = files.focus() == FileFocus::Preview;
-        let title = format!(" {} ", files.directory().display());
-        let label = fit_label(&title, rect.cols - 2);
-        let padding = usize::from(rect.cols - 2) - text_width(&label);
-        write!(
+        crate::file_panel::list(files, self.file_rect(), "", &self.config).ansi(
             output,
-            "\x1b[{};{}H\x1b[0;38;2;80;80;80;48;2;32;32;32m╭{}{}╮",
-            rect.y + 1,
-            rect.x + 1,
-            label,
-            "─".repeat(padding)
+            None,
+            &[],
         )?;
-        let search_rows = u16::from(files.is_search());
-        let mut text = String::new();
-        for row in 0..rect.rows.saturating_sub(2) {
-            let content_row = row.saturating_sub(search_rows);
-            let selected = row >= search_rows
-                && first + usize::from(content_row) == files.selection()
-                && !files.entries().is_empty();
-            let bg = if selected {
-                if preview_focus { 35 } else { 38 }
-            } else {
-                32
-            };
-            text.clear();
-            if row == 0 && files.is_search() {
-                text.push_str(" ⌕ ");
-                text.push_str(files.query());
-            } else if row >= search_rows
-                && let Some(entry) = files.entries().get(first + usize::from(content_row))
-            {
-                text.push(' ');
-                text.push_str(&if files.is_search() {
-                    entry.display_path(files.directory())
-                } else {
-                    entry.display_name()
-                });
-                if entry.is_dir {
-                    text.push('/');
-                }
-            }
-            write!(
+        if files.focus() == crate::files::FileFocus::Preview {
+            crate::file_panel::preview(files, self.file_preview_rect(), &self.config).ansi(
                 output,
-                "\x1b[{};{}H\x1b[0;38;2;80;80;80;48;2;32;32;32m│\x1b[38;2;102;102;102;48;2;{bg};{bg};{bg}m",
-                rect.y + row + 2,
-                rect.x + 1
+                None,
+                &[],
             )?;
-            fit_text(output, &text, left);
-            output.extend_from_slice("\x1b[38;2;64;64;64;48;2;32;32;32m│".as_bytes());
-            let preview_row = usize::from(row) + files.preview_scroll();
-            let preview: std::borrow::Cow<'_, str> =
-                if row == rect.rows.saturating_sub(3) && files.preview_truncated() {
-                    "… preview limited to 256 KiB / 4096 lines".into()
-                } else if row == 0 && files.preview_loading() {
-                    "Loading…".into()
-                } else if row == 0 && files.preview_error().is_some() {
-                    files.preview_error().unwrap().to_string().into()
-                } else {
-                    files
-                        .preview_lines()
-                        .get(preview_row)
-                        .map(String::as_str)
-                        .unwrap_or_default()
-                        .into()
-                };
-            let bg = if preview_focus { 38 } else { 32 };
-            write!(output, "\x1b[38;2;102;102;102;48;2;{bg};{bg};{bg}m ")?;
-            fit_text(output, &preview, right - 1);
-            output.extend_from_slice("\x1b[38;2;80;80;80;48;2;32;32;32m│".as_bytes());
-        }
-        write!(
-            output,
-            "\x1b[{};{}H\x1b[0;38;2;80;80;80;48;2;32;32;32m╰{}╯\x1b[0m",
-            rect.y + rect.rows,
-            rect.x + 1,
-            "─".repeat(usize::from(rect.cols.saturating_sub(2)))
-        )?;
-        if let Some(error) = files.error() {
-            write!(
-                output,
-                "\x1b[{};{}H\x1b[0;38;2;224;91;101;48;2;32;32;32m",
-                rect.y + rect.rows - 1,
-                rect.x + 2
-            )?;
-            fit_text(output, &error.to_string(), left);
-            output.extend_from_slice(b"\x1b[0m");
         }
         Ok(())
     }
-}
-
-#[cfg(feature = "files")]
-fn file_geometry(size: WindowSize) -> Rect {
-    let cols = (size.num_cols.saturating_mul(7) / 10)
-        .max(12)
-        .min(size.num_cols);
-    let rows = (size.num_lines.saturating_mul(7) / 10)
-        .max(5)
-        .min(size.num_lines);
-    Rect {
-        x: (size.num_cols - cols) / 2,
-        y: (size.num_lines - rows) * 2 / 5,
-        cols,
-        rows,
-    }
-}
-
-#[cfg(feature = "files")]
-fn file_list_geometry(rect: Rect, files: &crate::files::FileNav) -> (u16, usize, usize) {
-    let left = rect.cols.saturating_sub(3) * 42 / 100;
-    let visible = usize::from(rect.rows.saturating_sub(2 + u16::from(files.is_search())));
-    let first = files.selection().saturating_sub(visible.saturating_sub(1));
-    (left, visible, first)
 }
 
 fn draw_tab_icon(
@@ -3860,7 +2147,9 @@ fn draw_tabs(
     label: &str,
     pointer: Option<(u16, u16)>,
     ui: &Ui,
+    config: &Config,
 ) -> io::Result<()> {
+    let style = config.tab_style;
     output.write_all(b"\x1b[H\x1b[0;48;2;25;25;25m\x1b[2K")?;
     let marker = if snapshot.controller {
         "156;143;220"
@@ -3874,17 +2163,33 @@ fn draw_tabs(
         let tab = &snapshot.tabs[index];
         let active = tab.id == snapshot.active_tab;
         let bg = if active { 32 } else { 28 };
-        let fg = if active { 148 } else { 96 };
-        let color = ui.tab_color(tab, 0xcccccc, 0x202020);
-        let dot = format!("{};{};{}", color >> 16 & 255, color >> 8 & 255, color & 255);
-        let close = if active { "156;143;220" } else { "64;64;64" };
+        let fg = if active && style == crate::config::TabStyle::Flat {
+            204
+        } else if active {
+            148
+        } else {
+            96
+        };
+        let color = ui.tab_color(tab, config.foreground, config.background);
+        let close = if active { "148;148;148" } else { "96;96;96" };
         let hovered =
             pointer.is_some_and(|(column, row)| row == 0 && (x..x + width).contains(&column));
+        let (left, right) = if style == crate::config::TabStyle::Angled {
+            ("◢", "◣")
+        } else {
+            (" ", " ")
+        };
         write!(
             output,
-            "\x1b[1;{}H\x1b[0;38;2;{bg};{bg};{bg};48;2;25;25;25m◢\x1b[38;2;{dot};48;2;{bg};{bg};{bg}m • \x1b[38;2;{fg};{fg};{fg}m",
-            x + 1
+            "\x1b[1;{}H\x1b[0;38;2;{bg};{bg};{bg};48;2;25;25;25m{left}\x1b[38;2;{};{};{};48;2;{bg};{bg};{bg}m • \x1b[38;2;{fg};{fg};{fg}m",
+            x + 1,
+            color >> 16 & 255,
+            color >> 8 & 255,
+            color & 255
         )?;
+        if style == crate::config::TabStyle::Flat && active {
+            output.write_all(b"\x1b[4;58;2;181;210;162m")?;
+        }
         if hovered {
             output.write_all(b"\x1b[38;2;212;217;216m")?;
         }
@@ -3892,15 +2197,15 @@ fn draw_tabs(
         let close_hovered = pointer.is_some_and(|(column, row)| {
             row == 0 && (x + width - 4..x + width - 1).contains(&column)
         });
-        let close = if close_hovered { "232;117;117" } else { close };
+        let close = if close_hovered { "204;204;204" } else { close };
         let underline = if close_hovered {
-            "4;58;2;232;117;117"
+            "4;58;2;148;148;148"
         } else {
             "24;59"
         };
         write!(
             output,
-            "\x1b[38;2;{close};48;2;{bg};{bg};{bg}m \x1b[{underline}m×\x1b[24;59m \x1b[38;2;{bg};{bg};{bg};48;2;25;25;25m◣\x1b[24;59m"
+            "\x1b[38;2;{close};48;2;{bg};{bg};{bg}m \x1b[{underline}m×\x1b[24;59m \x1b[38;2;{bg};{bg};{bg};48;2;25;25;25m{right}\x1b[24;59m"
         )?;
         end = x + width + 1;
     }
@@ -3964,8 +2269,10 @@ fn draw_row(
     row: usize,
     host_columns: u16,
     highlight: bool,
+    left: u16,
 ) -> io::Result<()> {
-    let rect = pane.rect;
+    let mut rect = pane.rect;
+    rect.x += left;
     if rect.x >= host_columns {
         return Ok(());
     }
@@ -4097,6 +2404,9 @@ fn draw_separators(
     output: &mut impl Write,
     snapshot: &Snapshot,
     size: WindowSize,
+    full: bool,
+    damage: &[bool],
+    left: u16,
 ) -> io::Result<()> {
     output.write_all(b"\x1b[0;38;5;240m")?;
     for pane in &snapshot.panes {
@@ -4108,15 +2418,20 @@ fn draw_separators(
                     .saturating_add(pane.rect.rows)
                     .min(size.num_lines)
             {
-                write!(output, "\x1b[{};{}H│", row + 1, pane.rect.x)?;
+                if full || damage[usize::from(row)] {
+                    write!(output, "\x1b[{};{}H│", row + 1, pane.rect.x + left)?;
+                }
             }
         }
-        if pane.rect.y > 1 && pane.rect.y <= size.num_lines {
+        if pane.rect.y > 1
+            && pane.rect.y <= size.num_lines
+            && (full || damage[usize::from(pane.rect.y - 1)])
+        {
             write!(
                 output,
                 "\x1b[{};{}H{}",
                 pane.rect.y,
-                pane.rect.x + 1,
+                pane.rect.x + left + 1,
                 "─".repeat(usize::from(
                     pane.rect
                         .cols
@@ -4280,5 +2595,7 @@ impl ClipboardTransfer {
     }
 }
 
+#[cfg(feature = "agent")]
+mod agent_ui;
 #[cfg(test)]
 mod tests;

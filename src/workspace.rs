@@ -78,9 +78,74 @@ impl Default for CreateOptions {
         }
     }
 }
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub turn: u64,
+    pub role: String,
+    pub text: String,
+    pub id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AgentModelPatch {
+    pub session: u64,
+    pub busy: bool,
+    pub revision: u64,
+    pub turn: u64,
+    pub start: u32,
+    pub prefix_bytes: u32,
+    pub messages: Vec<AgentMessage>,
+    pub recovery: Vec<u8>,
+}
+impl AgentModelPatch {
+    pub(crate) fn apply_messages(&self, messages: &mut Vec<AgentMessage>) -> io::Result<()> {
+        let start = self.start as usize;
+        let prefix = self.prefix_bytes as usize;
+        if start > messages.len()
+            || (prefix != 0
+                && (self.messages.is_empty()
+                    || messages
+                        .get(start)
+                        .is_none_or(|message| !message.text.is_char_boundary(prefix))))
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid Agent message patch",
+            ));
+        }
+        if prefix == 0 {
+            messages.truncate(start);
+            messages.extend_from_slice(&self.messages);
+        } else {
+            let message = &mut messages[start];
+            message.text.truncate(prefix);
+            message.text.push_str(&self.messages[0].text);
+            message.role.clone_from(&self.messages[0].role);
+            message.id.clone_from(&self.messages[0].id);
+            message.turn = self.messages[0].turn;
+            messages.truncate(start + 1);
+            messages.extend_from_slice(&self.messages[1..]);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum AgentEvent {
+    Draft(Vec<u8>),
+    Model(AgentModelPatch),
+    Request(Vec<u8>),
+    Start(Vec<u8>),
+    Attached,
+    Ready,
+}
+
 #[derive(Clone, Debug)]
 pub enum Action {
-    ScreenRequest,
+    ScreenRequest {
+        request: u64,
+        wait: bool,
+    },
     AgentOpen,
     AgentView(Vec<u8>),
     AgentRequest(Vec<u8>),
@@ -88,10 +153,8 @@ pub enum Action {
         name: String,
         token: Vec<u8>,
     },
-    AgentUpdate {
-        kind: u8,
-        payload: Vec<u8>,
-    },
+    AgentUpdate(AgentModelPatch),
+    AgentRemove(u64),
     Create {
         /// An empty name requests the lowest available nonnegative integer.
         name: String,
@@ -356,20 +419,17 @@ pub fn tab_chrome<'a>(
         )
     };
     let label = |before, after| {
-        if before == 0 && after == 0 {
-            return Cow::Borrowed(base);
-        }
-        let mut parts = Vec::new();
-        if before > 0 {
-            parts.push(format!("‹{before}"));
-        }
-        if after > 0 {
-            parts.push(format!("{after}›"));
-        }
+        let mut label = match (before, after) {
+            (0, 0) => return Cow::Borrowed(base),
+            (0, _) => format!("{after}›"),
+            (_, 0) => format!("‹{before}"),
+            _ => format!("‹{before} {after}›"),
+        };
         if !base.is_empty() {
-            parts.push(base.to_owned());
+            label.push(' ');
+            label.push_str(base);
         }
-        parts.join(" ").into()
+        Cow::Owned(label)
     };
     let (before, after) = counts(&tabs);
     if before > 0 || after > 0 {
@@ -381,6 +441,7 @@ pub fn tab_chrome<'a>(
 
 pub enum ClientEvent {
     Updated,
+    AgentUpdated,
     AgentInput {
         request: u64,
         result: Result<Option<u64>, String>,
@@ -424,20 +485,13 @@ pub(crate) enum ClientEndpoint {
         target: String,
     },
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum ScreenFlow {
-    Streaming,
-    Clean,
-    Dirty,
-    Requested,
-    Received { dirty_again: bool },
-}
-
 pub struct Client {
-    screen_flow: ScreenFlow,
+    screen_wait: Option<bool>,
+    screen_request: u64,
+    screen_dirty: bool,
     #[cfg(feature = "agent")]
     endpoint: ClientEndpoint,
-    agent_events: Vec<(u8, Vec<u8>)>,
+    agent_events: Vec<AgentEvent>,
     agent_delegate: bool,
     peer: Peer,
     snapshot: Option<Snapshot>,
@@ -446,21 +500,36 @@ pub struct Client {
     ssh: Option<(Child, String)>,
 }
 impl Client {
-    pub fn connect(path: &Path) -> io::Result<Self> {
-        let stream = UnixStream::connect(path)?;
-        check_peer(stream.as_raw_fd())?;
-        Ok(Self {
-            peer: Peer::new(stream)?,
+    fn new(
+        peer: Peer,
+        ssh: Option<(Child, String)>,
+        #[cfg(feature = "agent")] endpoint: ClientEndpoint,
+    ) -> Self {
+        Self {
+            peer,
+            ssh,
             #[cfg(feature = "agent")]
-            endpoint: ClientEndpoint::Local(path.to_path_buf()),
-            screen_flow: ScreenFlow::Streaming,
+            endpoint,
+            screen_wait: None,
+            screen_request: 0,
+            screen_dirty: true,
             agent_events: Vec::new(),
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
             write_error: None,
-            ssh: None,
-        })
+        }
+    }
+
+    pub fn connect(path: &Path) -> io::Result<Self> {
+        let stream = UnixStream::connect(path)?;
+        check_peer(stream.as_raw_fd())?;
+        Ok(Self::new(
+            Peer::new(stream)?,
+            None,
+            #[cfg(feature = "agent")]
+            ClientEndpoint::Local(path.to_path_buf()),
+        ))
     }
     pub fn connect_remote(mut command: Command, target: String) -> io::Result<Self> {
         #[cfg(feature = "agent")]
@@ -480,18 +549,12 @@ impl Client {
         command.stdout(Stdio::from(OwnedFd::from(ssh)));
         let child = command.spawn()?;
         drop(command);
-        let mut client = Self {
+        let mut client = Self::new(
             peer,
+            Some((child, target)),
             #[cfg(feature = "agent")]
             endpoint,
-            screen_flow: ScreenFlow::Streaming,
-            agent_events: Vec::new(),
-            agent_delegate: false,
-            snapshot: None,
-            screens: HashMap::new(),
-            write_error: None,
-            ssh: Some((child, target)),
-        };
+        );
         loop {
             match client.peer.hello() {
                 Ok(Some(BRIDGE_VERSION)) => return Ok(client),
@@ -511,12 +574,7 @@ impl Client {
                 events: libc::POLLIN,
                 revents: 0,
             };
-            if unsafe { libc::poll(&mut fd, 1, -1) } < 0 {
-                let error = io::Error::last_os_error();
-                if error.kind() != io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
+            crate::poll::poll(std::slice::from_mut(&mut fd), -1)?;
         }
     }
     fn ssh_error(&mut self, error: io::Error) -> io::Result<io::Error> {
@@ -541,43 +599,65 @@ impl Client {
         self.peer.fd()
     }
     pub fn send(&mut self, action: Action) -> io::Result<()> {
+        let screen = !matches!(
+            action,
+            Action::ScreenRequest { .. }
+                | Action::AgentOpen
+                | Action::AgentView(_)
+                | Action::AgentRequest(_)
+                | Action::AgentUpdate(_)
+                | Action::AgentRemove(_)
+                | Action::ReadHistory { .. }
+                | Action::CancelHistory { .. }
+                | Action::List
+                | Action::CopyBlock { .. }
+                | Action::CopySelection { .. }
+        );
         match action {
-            Action::Input { pane, data } => self.peer.send_input(pane, &data)?,
+            Action::Input { pane, data } => {
+                // An older response may already be in flight; keep a fresh request
+                // ahead of input, including chunks that PTY backpressure may block.
+                self.screen_wait = Some(true);
+                self.screen_request += 1;
+                self.peer.send_action(&Action::ScreenRequest {
+                    request: self.screen_request,
+                    wait: true,
+                })?;
+                self.peer.send_input(pane, &data)?;
+            }
             action => self.peer.send_action(&action)?,
         }
-        self.flush()
-    }
-    pub fn enable_screen_requests(&mut self) -> io::Result<()> {
-        self.screen_flow = ScreenFlow::Requested;
-        self.send(Action::ScreenRequest)
-    }
-    #[cfg(any(feature = "gui", test))]
-    pub(crate) fn screen_waiting(&self) -> bool {
-        self.screen_flow == ScreenFlow::Requested
-    }
-    #[cfg(any(feature = "gui", test))]
-    pub(crate) fn prepare_screen(&mut self) -> io::Result<bool> {
-        if self.screen_flow == ScreenFlow::Dirty {
-            self.screen_flow = ScreenFlow::Requested;
-            self.send(Action::ScreenRequest)?;
+        if screen {
+            self.request_screen()?;
         }
-        Ok(!self.screen_waiting())
+        Ok(())
     }
-    #[cfg(any(feature = "gui", test))]
-    pub(crate) fn screen_drawn(&mut self) -> bool {
-        if let ScreenFlow::Received { dirty_again } = self.screen_flow {
-            self.screen_flow = if dirty_again {
-                ScreenFlow::Dirty
-            } else {
-                ScreenFlow::Clean
-            };
-            dirty_again
-        } else {
-            false
+    pub fn request_screen(&mut self) -> io::Result<()> {
+        if self.screen_wait.is_none() {
+            self.screen_wait = Some(true);
+            self.screen_request += 1;
+            self.peer.send_action(&Action::ScreenRequest {
+                request: self.screen_request,
+                wait: true,
+            })?;
         }
+        Ok(())
     }
+    pub fn refresh_screen(&mut self) -> io::Result<()> {
+        if self.screen_wait != Some(false) {
+            self.screen_wait = Some(false);
+            self.screen_dirty = true;
+            self.screen_request += 1;
+            self.peer.send_action(&Action::ScreenRequest {
+                request: self.screen_request,
+                wait: false,
+            })?;
+        }
+        Ok(())
+    }
+
     pub fn scroll_to(&mut self, pane: PaneId, mut offset: usize) -> io::Result<()> {
-        // Queue both actions before flushing: live output must not skew a drag delta.
+        // Live output must not skew the delta between these actions.
         self.peer.send_action(&Action::Scroll {
             pane,
             scroll: Scroll::Bottom,
@@ -590,7 +670,7 @@ impl Client {
             })?;
             offset -= lines;
         }
-        self.flush()
+        Ok(())
     }
     pub fn flush(&mut self) -> io::Result<()> {
         if self.write_error.is_none()
@@ -636,30 +716,9 @@ impl Client {
     pub fn screen_mut(&mut self, pane: PaneId) -> Option<&mut Screen> {
         self.screens.get_mut(&pane)
     }
-    #[cfg(feature = "agent")]
-    pub(crate) fn endpoint(&self) -> &ClientEndpoint {
-        &self.endpoint
-    }
-    #[cfg(any(test, feature = "agent"))]
-    pub(crate) fn take_agent_events(&mut self) -> Vec<(u8, Vec<u8>)> {
-        std::mem::take(&mut self.agent_events)
-    }
-    #[cfg(any(test, feature = "agent"))]
-    pub(crate) fn can_agent_input(&self) -> bool {
-        self.agent_delegate
-            || self
-                .snapshot
-                .as_ref()
-                .is_some_and(|snapshot| snapshot.controller)
-    }
-    #[cfg(any(test, feature = "agent"))]
-    pub(crate) fn terminal_revision(&self, pane: PaneId) -> io::Result<u64> {
-        self.screens
-            .get(&pane)
-            .map(|screen| screen.activity)
-            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
-    }
+
     pub fn poll(&mut self) -> io::Result<Vec<ClientEvent>> {
+        self.flush()?;
         let responses = match self.peer.responses(self.snapshot.as_ref()) {
             Ok(responses) => responses,
             Err(error) => {
@@ -670,7 +729,7 @@ impl Client {
         let mut events = Vec::with_capacity(responses.len().min(4));
         for response in responses {
             let event = match response {
-                Response::State(snapshot, updates) => {
+                Response::State(snapshot, updates, request) => {
                     self.screens
                         .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
                     for (id, update) in updates {
@@ -680,62 +739,49 @@ impl Client {
                         }
                         screen.apply(update)?;
                     }
-                    if self.agent_delegate {
-                        for pane in &snapshot.panes {
-                            let previous = self.snapshot.as_ref().and_then(|snapshot| {
-                                snapshot.panes.iter().find(|old| old.id == pane.id)
-                            });
-                            if previous.is_none_or(|old| {
+                    for pane in &snapshot.panes {
+                        let previous = self.snapshot.as_ref().and_then(|snapshot| {
+                            snapshot.panes.iter().find(|old| old.id == pane.id)
+                        });
+                        let Some(screen) = self.screens.get_mut(&pane.id) else {
+                            continue;
+                        };
+                        if self.agent_delegate
+                            && previous.is_none_or(|old| {
                                 old.input_generation != pane.input_generation
                                     || old.shell_prompt != pane.shell_prompt
                                     || old.command_blocks != pane.command_blocks
-                            }) && let Some(screen) = self.screens.get_mut(&pane.id)
-                            {
-                                screen.activity += 1;
-                            }
+                            })
+                        {
+                            screen.activity += 1;
                         }
-                    }
-                    if let Some(previous) = &self.snapshot {
-                        for pane in &snapshot.panes {
-                            if let Some(old) = previous.panes.iter().find(|old| old.id == pane.id)
-                                && old.blocks != pane.blocks
-                                && let Some(screen) = self.screens.get_mut(&pane.id)
-                            {
-                                for row in 0..screen.screen_lines() {
-                                    if !screen.dirty[row] && screen.output_changed(old, pane, row) {
-                                        screen.dirty[row] = true;
-                                    }
+                        if let Some(old) = previous
+                            && old.blocks != pane.blocks
+                        {
+                            for row in 0..screen.screen_lines() {
+                                if !screen.dirty[row] && screen.output_changed(old, pane, row) {
+                                    screen.dirty[row] = true;
                                 }
                             }
                         }
                     }
                     self.snapshot = Some(snapshot);
-                    if self.screen_flow != ScreenFlow::Streaming {
-                        self.screen_flow = ScreenFlow::Received { dirty_again: false };
+                    if request == self.screen_request {
+                        self.screen_wait = None;
+                        self.screen_dirty = false;
                     }
                     ClientEvent::Updated
                 }
                 Response::ScreenDirty => {
-                    self.screen_flow = match self.screen_flow {
-                        ScreenFlow::Received { .. } => ScreenFlow::Received { dirty_again: true },
-                        ScreenFlow::Clean => ScreenFlow::Dirty,
-                        flow => flow,
-                    };
+                    self.screen_dirty = true;
                     ClientEvent::Updated
                 }
-                Response::Agent { kind, payload } => {
-                    let payload = payload.into_owned();
-                    if kind == 4 {
+                Response::Agent(event) => {
+                    if event == AgentEvent::Attached {
                         self.agent_delegate = true;
                     }
-                    if kind == 1
-                        && let Some((1, previous)) = self.agent_events.last_mut()
-                    {
-                        *previous = payload;
-                    } else {
-                        self.agent_events.push((kind, payload));
-                    }
-                    ClientEvent::Updated
+                    self.agent_events.push(event);
+                    ClientEvent::AgentUpdated
                 }
                 Response::List(list) => ClientEvent::List(list),
                 Response::AgentInput { request, result } => {
@@ -767,8 +813,8 @@ impl Client {
                     truncated,
                 },
                 Response::Error(error) => {
-                    if self.snapshot.is_none() && self.screen_flow == ScreenFlow::Requested {
-                        self.screen_flow = ScreenFlow::Clean;
+                    if self.snapshot.is_none() {
+                        self.screen_wait = None;
                     }
                     ClientEvent::Error(error)
                 }
@@ -956,6 +1002,15 @@ enum Node {
     },
 }
 impl Node {
+    fn for_each_pane(&self, visit: &mut impl FnMut(PaneId) -> io::Result<()>) -> io::Result<()> {
+        match self {
+            Self::Pane(id) => visit(*id),
+            Self::Split { first, second, .. } => {
+                first.for_each_pane(visit)?;
+                second.for_each_pane(visit)
+            }
+        }
+    }
     fn layout(&self, rect: Rect, output: &mut Vec<(PaneId, Rect)>) {
         match self {
             Self::Pane(id) => output.push((*id, rect)),
@@ -1058,15 +1113,19 @@ impl Node {
             Self::Split {
                 axis,
                 ratio,
-                first,
-                second,
-            } => match (first.remove(target), second.remove(target)) {
-                (Some(first), Some(second)) => Some(Self::Split {
-                    axis,
-                    ratio,
-                    first: Box::new(first),
-                    second: Box::new(second),
-                }),
+                mut first,
+                mut second,
+            } => match ((*first).remove(target), (*second).remove(target)) {
+                (Some(a), Some(b)) => {
+                    *first = a;
+                    *second = b;
+                    Some(Self::Split {
+                        axis,
+                        ratio,
+                        first,
+                        second,
+                    })
+                }
                 (one, None) | (None, one) => one,
             },
         }
@@ -1111,7 +1170,7 @@ struct AgentState {
     token: Option<Vec<u8>>,
     pending: Vec<Vec<u8>>,
     view: Option<Vec<u8>>,
-    models: Option<Vec<u8>>,
+    models: HashMap<u64, AgentModelPatch>,
 }
 struct Workspace {
     agent: AgentState,
@@ -1248,61 +1307,73 @@ impl Workspace {
                     };
                     let title = match panes.iter().find(|pane| pane.id == tab.focused) {
                         Some(pane) => pane.cwd.as_deref().map(title),
-                        None => pane_directory(&pane.terminal)?.as_deref().map(title),
-                    }
-                    .unwrap_or_else(|| pane.title.clone());
-                    let mut layout = Vec::new();
-                    tab.root.layout(self.area(), &mut layout);
-                    let mut activity = TabActivity::Idle;
-                    for (id, _) in layout {
-                        let terminal = &self.panes[&id].terminal;
-                        let process = terminal.process_metadata();
-                        let core = terminal
-                            .core
-                            .lock()
-                            .map_err(|error| io::Error::other(error.to_string()))?;
-                        let latest = core.latest_command();
-                        let latest = latest.as_ref();
-                        let state = if process
-                            .foreground_pgid
-                            .is_some_and(|pgid| pgid != process.child_pid)
-                            || process.has_children == Some(true)
-                            || latest.is_some_and(|block| block.status.is_none())
-                        {
-                            TabActivity::Running
-                        } else if process.has_children.is_none()
-                            || core.shell_prompt().is_none() && !core.shell_editing()
-                        {
-                            TabActivity::Unknown
-                        } else if latest
-                            .is_some_and(|block| block.status.is_some_and(|status| status != 0))
-                        {
-                            TabActivity::Failed
-                        } else if latest.is_some() {
-                            TabActivity::Finished
-                        } else {
-                            TabActivity::Idle
-                        };
-                        let priority = |state| match state {
-                            TabActivity::Idle => 0,
-                            TabActivity::Finished => 1,
-                            TabActivity::Failed => 2,
-                            TabActivity::Unknown => 3,
-                            TabActivity::Running => 4,
-                        };
-                        if priority(state) > priority(activity) {
-                            activity = state;
+                        None => {
+                            let core = pane
+                                .terminal
+                                .core
+                                .lock()
+                                .map_err(|error| io::Error::other(error.to_string()))?;
+                            match core.current_directory() {
+                                Some(directory) => Some(title(directory)),
+                                None => {
+                                    drop(core);
+                                    pane_directory(&pane.terminal)?.as_deref().map(title)
+                                }
+                            }
                         }
                     }
+                    .unwrap_or_else(|| pane.title.clone());
                     Ok(TabView {
                         id: tab.id,
                         title,
-                        activity,
+                        activity: self.tab_activity(&tab.root)?,
                     })
                 })
                 .collect::<io::Result<Vec<_>>>()?,
             panes,
         })
+    }
+    fn tab_activity(&self, node: &Node) -> io::Result<TabActivity> {
+        let mut activity = TabActivity::Idle;
+        node.for_each_pane(&mut |id| {
+            let terminal = &self.panes[&id].terminal;
+            let process = terminal.process_metadata();
+            let core = terminal
+                .core
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let latest = core.latest_command_status();
+            let state = if process
+                .foreground_pgid
+                .is_some_and(|pgid| pgid != process.child_pid)
+                || process.has_children == Some(true)
+                || latest == Some(None)
+            {
+                TabActivity::Running
+            } else if process.has_children.is_none()
+                || core.shell_prompt().is_none() && !core.shell_editing()
+            {
+                TabActivity::Unknown
+            } else if matches!(latest, Some(Some(status)) if status != 0) {
+                TabActivity::Failed
+            } else if latest.is_some() {
+                TabActivity::Finished
+            } else {
+                TabActivity::Idle
+            };
+            let priority = |state| match state {
+                TabActivity::Idle => 0,
+                TabActivity::Finished => 1,
+                TabActivity::Failed => 2,
+                TabActivity::Unknown => 3,
+                TabActivity::Running => 4,
+            };
+            if priority(state) > priority(activity) {
+                activity = state;
+            }
+            Ok(())
+        })?;
+        Ok(activity)
     }
     fn navigate(&mut self, direction: Direction) {
         let layout = self.layout();
@@ -1392,8 +1463,10 @@ impl Drop for PendingRead {
 }
 
 struct Connection {
-    screen_flow: ScreenFlow,
+    screen_request: Option<u64>,
+    screen_dirty: bool,
     agent: bool,
+    agent_open: bool,
     id: u64,
     peer: Peer,
     workspace: Option<String>,
@@ -1412,20 +1485,16 @@ struct Connection {
 
 impl Connection {
     fn screen_eligible(&self) -> bool {
-        matches!(
-            self.screen_flow,
-            ScreenFlow::Streaming | ScreenFlow::Requested
-        )
-    }
-    fn screen_retry(&self) -> bool {
-        self.screen_eligible() && (self.full || self.screen_flow == ScreenFlow::Requested)
+        self.screen_request.is_some() && self.screen_dirty
     }
 
     fn new(id: u64, stream: UnixStream) -> io::Result<Self> {
         Ok(Self {
             id,
-            screen_flow: ScreenFlow::Streaming,
+            screen_request: None,
+            screen_dirty: true,
             agent: false,
+            agent_open: false,
             peer: Peer::new(stream)?,
             workspace: None,
             size: CreateOptions::default().size,
@@ -1484,7 +1553,7 @@ impl Connection {
         self.respond(Response::Detached);
     }
 
-    fn respond(&mut self, response: Response<'_>) {
+    fn respond(&mut self, response: Response) {
         if let Err(error) = self.peer.send_response(response) {
             eprintln!("workspace client {}: {error}", self.id);
             self.failed = true;
@@ -1567,7 +1636,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         clients.retain(|client| !client.failed);
         let requested: HashSet<_> = clients
             .iter()
-            .filter(|client| client.screen_retry() && !client.peer.pending())
+            .filter(|client| client.screen_eligible() && !client.peer.pending())
             .filter_map(|client| client.workspace.clone())
             .collect();
         for name in requested {
@@ -1659,14 +1728,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         } else {
             -1
         };
-        let result = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) };
-        if result < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
+        crate::poll::poll(&mut fds, timeout)?;
         // Both client passes use this poll's order; remove failed clients next iteration.
         let client_count = clients.len();
         for index in 0..client_count {
@@ -1691,6 +1753,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     || clients[index].peer.buffered_action())
             {
                 for _ in 0..256 {
+                    let was_deferred = clients[index].deferred.is_some();
                     let action = match clients[index].deferred.take() {
                         Some(action) => Some(action),
                         None => match clients[index].peer.next_action() {
@@ -1711,6 +1774,13 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                     }
                     let result = match clients[index].action_blocked(&action, &workspaces) {
                         Ok(true) => {
+                            // Accepted input generations must remain observable during backpressure.
+                            if !was_deferred
+                                && matches!(action, Action::Input { .. })
+                                && let Some(name) = &clients[index].workspace
+                            {
+                                dirty.insert(name.clone());
+                            }
                             clients[index].deferred = Some(action);
                             break;
                         }
@@ -1760,6 +1830,15 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                         eprintln!("workspace {name}: {error}");
                         exit = true;
                     }
+                    Event::HistoryError(error) => {
+                        eprintln!("workspace {name}: {error}");
+                        for client in clients.iter_mut().filter(|client| {
+                            !client.agent && client.workspace.as_ref() == Some(name)
+                        }) {
+                            client.respond(Response::Error(error.to_string()));
+                        }
+                        changed = true;
+                    }
                     Event::ClipboardStore { primary, text } => {
                         if let Some(controller) = clients
                             .iter_mut()
@@ -1798,155 +1877,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                 broadcast(workspace, &mut clients, true)?;
             }
         }
-        for client in &mut clients {
-            let ready = client.copy.as_ref().and_then(|(_, receiver)| {
-                worker_result(receiver, "history copy worker disconnected")
-            });
-            if let Some(result) = ready {
-                let (request, _) = client.copy.take().unwrap();
-                match result {
-                    Ok(copy) => client.respond(Response::Clipboard {
-                        request,
-                        file: copy.file,
-                        incomplete: copy.incomplete,
-                    }),
-                    Err(error) => client.respond(Response::CopyError {
-                        request,
-                        error: error.to_string(),
-                    }),
-                }
-            }
-            while client.copy.is_none()
-                && let Some((name, action)) = client.copy_requests.pop_front()
-            {
-                let request = copy_request(&action);
-                let pane = match action {
-                    Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. } => pane,
-                    _ => unreachable!(),
-                };
-                let result = workspaces
-                    .get(&name)
-                    .and_then(|workspace| workspace.panes.get(&pane))
-                    .ok_or_else(|| {
-                        io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
-                    })
-                    .and_then(|pane| queue_copy(client, Cow::Owned(name), &pane.terminal, action));
-                match result {
-                    Ok(true) => (),
-                    Ok(false) => break,
-                    Err(error) => client.respond(Response::CopyError {
-                        request,
-                        error: error.to_string(),
-                    }),
-                }
-            }
-        }
-        for client in &mut clients {
-            for index in (0..client.reads.len()).rev() {
-                if client
-                    .workspace
-                    .as_ref()
-                    .and_then(|name| workspaces.get(name))
-                    .is_none_or(|workspace| {
-                        !workspace.panes.contains_key(&client.reads[index].pane)
-                    })
-                {
-                    let read = client.reads.swap_remove(index);
-                    client.respond(Response::History {
-                        request: read.request,
-                        result: Err("history source pane no longer exists".into()),
-                    });
-                    continue;
-                }
-                let ready =
-                    worker_result(&client.reads[index].receiver, "history reader disconnected");
-                if let Some(result) = ready {
-                    let read = client.reads.swap_remove(index);
-                    client.respond(Response::History {
-                        request: read.request,
-                        result: result.map_err(|error| error.to_string()),
-                    });
-                }
-            }
-            for _ in 0..client.read_requests.len() {
-                let (name, action) = client.read_requests.pop_front().unwrap();
-                let (pane, request) = match &action {
-                    Action::ReadHistory { pane, request, .. } => (*pane, *request),
-                    _ => unreachable!(),
-                };
-                match workspaces
-                    .get(&name)
-                    .and_then(|workspace| workspace.panes.get(&pane))
-                {
-                    Some(pane) => queue_read(client, Cow::Owned(name), &pane.terminal, action),
-                    None => client.respond(Response::History {
-                        request,
-                        result: Err("history source pane no longer exists".into()),
-                    }),
-                }
-            }
-        }
-        for client in &mut clients {
-            let Some(search) = client.search.as_mut() else {
-                continue;
-            };
-            let Some(terminal) = client
-                .workspace
-                .as_ref()
-                .and_then(|name| workspaces.get(name))
-                .and_then(|workspace| workspace.panes.get(&search.pane))
-                .map(|pane| &pane.terminal)
-            else {
-                client.search = None;
-                if let Some(name) = &client.workspace {
-                    dirty.insert(name.clone());
-                }
-                continue;
-            };
-            let submission_error =
-                if search.receiver.is_none() && search.result.is_none() && !search.query.is_empty()
-                {
-                    try_search(search, terminal).err()
-                } else {
-                    None
-                };
-            let ready = if let Some(error) = submission_error {
-                Some(Err(error))
-            } else {
-                search
-                    .receiver
-                    .as_ref()
-                    .and_then(|receiver| worker_result(receiver, "pane search worker stopped"))
-            };
-            if let Some(result) = ready {
-                search.receiver = None;
-                let (pane, request) = (search.pane, search.request);
-                match result {
-                    Ok(result) => {
-                        client.respond(Response::Search {
-                            pane,
-                            request,
-                            count: result.matches.len() as u32,
-                            truncated: result.truncated,
-                        });
-                        client.search.as_mut().unwrap().result = Some(result);
-                    }
-                    Err(error) => {
-                        client.respond(Response::Search {
-                            pane,
-                            request,
-                            count: 0,
-                            truncated: true,
-                        });
-                        client.respond(Response::Error(error.to_string()));
-                        client.search = None;
-                        if let Some(name) = &client.workspace {
-                            dirty.insert(name.clone());
-                        }
-                    }
-                }
-            }
-        }
+        complete_requests(&mut clients, &workspaces, &mut dirty);
         if fds[0].revents & libc::POLLIN != 0 {
             loop {
                 match listener.accept() {
@@ -1982,6 +1913,159 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
         }
     }
 }
+fn complete_requests(
+    clients: &mut [Connection],
+    workspaces: &HashMap<String, Workspace>,
+    dirty: &mut HashSet<String>,
+) {
+    for client in clients.iter_mut() {
+        let ready = client
+            .copy
+            .as_ref()
+            .and_then(|(_, receiver)| worker_result(receiver, "history copy worker disconnected"));
+        if let Some(result) = ready {
+            let (request, _) = client.copy.take().unwrap();
+            match result {
+                Ok(copy) => client.respond(Response::Clipboard {
+                    request,
+                    file: copy.file,
+                    incomplete: copy.incomplete,
+                }),
+                Err(error) => client.respond(Response::CopyError {
+                    request,
+                    error: error.to_string(),
+                }),
+            }
+        }
+        while client.copy.is_none()
+            && let Some((name, action)) = client.copy_requests.pop_front()
+        {
+            let request = copy_request(&action);
+            let pane = match action {
+                Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. } => pane,
+                _ => unreachable!(),
+            };
+            let result = workspaces
+                .get(&name)
+                .and_then(|workspace| workspace.panes.get(&pane))
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
+                })
+                .map(|pane| queue_copy(client, Cow::Owned(name), &pane.terminal, action));
+            match result {
+                Ok(true) => (),
+                Ok(false) => break,
+                Err(error) => client.respond(Response::CopyError {
+                    request,
+                    error: error.to_string(),
+                }),
+            }
+        }
+    }
+    for client in clients.iter_mut() {
+        for index in (0..client.reads.len()).rev() {
+            if client
+                .workspace
+                .as_ref()
+                .and_then(|name| workspaces.get(name))
+                .is_none_or(|workspace| !workspace.panes.contains_key(&client.reads[index].pane))
+            {
+                let read = client.reads.swap_remove(index);
+                client.respond(Response::History {
+                    request: read.request,
+                    result: Err("history source pane no longer exists".into()),
+                });
+                continue;
+            }
+            let ready = worker_result(&client.reads[index].receiver, "history reader disconnected");
+            if let Some(result) = ready {
+                let read = client.reads.swap_remove(index);
+                client.respond(Response::History {
+                    request: read.request,
+                    result: result.map_err(|error| error.to_string()),
+                });
+            }
+        }
+        for _ in 0..client.read_requests.len() {
+            let (name, action) = client.read_requests.pop_front().unwrap();
+            let (pane, request) = match &action {
+                Action::ReadHistory { pane, request, .. } => (*pane, *request),
+                _ => unreachable!(),
+            };
+            match workspaces
+                .get(&name)
+                .and_then(|workspace| workspace.panes.get(&pane))
+            {
+                Some(pane) => queue_read(client, Cow::Owned(name), &pane.terminal, action),
+                None => client.respond(Response::History {
+                    request,
+                    result: Err("history source pane no longer exists".into()),
+                }),
+            }
+        }
+    }
+    for client in clients.iter_mut() {
+        let Some(search) = client.search.as_mut() else {
+            continue;
+        };
+        let Some(terminal) = client
+            .workspace
+            .as_ref()
+            .and_then(|name| workspaces.get(name))
+            .and_then(|workspace| workspace.panes.get(&search.pane))
+            .map(|pane| &pane.terminal)
+        else {
+            client.search = None;
+            if let Some(name) = &client.workspace {
+                dirty.insert(name.clone());
+            }
+            continue;
+        };
+        let submission_error =
+            if search.receiver.is_none() && search.result.is_none() && !search.query.is_empty() {
+                try_search(search, terminal).err()
+            } else {
+                None
+            };
+        let ready = if let Some(error) = submission_error {
+            Some(Err(error))
+        } else {
+            search
+                .receiver
+                .as_ref()
+                .and_then(|receiver| worker_result(receiver, "pane search worker stopped"))
+        };
+        if let Some(result) = ready {
+            search.receiver = None;
+            let (pane, request) = (search.pane, search.request);
+            match result {
+                Ok(result) => {
+                    client.respond(Response::Search {
+                        pane,
+                        request,
+                        count: result.matches.len() as u32,
+                        truncated: result.truncated,
+                    });
+                    client.search.as_mut().unwrap().result = Some(result);
+                }
+                Err(error) => {
+                    client.respond(Response::Search {
+                        pane,
+                        request,
+                        count: 0,
+                        truncated: true,
+                    });
+                    client.respond(Response::Error(error.to_string()));
+                    client.search = None;
+                    if let Some(name) = &client.workspace {
+                        dirty.insert(name.clone());
+                    }
+                }
+            }
+        }
+    }
+}
+
 fn worker_result<T>(
     receiver: &std::sync::mpsc::Receiver<io::Result<T>>,
     disconnected: &'static str,
@@ -2000,14 +2084,15 @@ fn broadcast(
     clients: &mut [Connection],
     changed: bool,
 ) -> io::Result<()> {
-    for client in clients.iter_mut() {
-        if client.workspace.as_deref() == Some(&workspace.name)
-            && !client.failed
-            && changed
-            && client.screen_flow == ScreenFlow::Clean
-        {
-            client.screen_flow = ScreenFlow::Dirty;
-            client.respond(Response::ScreenDirty);
+    for client in clients
+        .iter_mut()
+        .filter(|client| client.workspace.as_deref() == Some(&workspace.name) && !client.failed)
+    {
+        if changed && !client.screen_dirty {
+            client.screen_dirty = true;
+            if client.screen_request.is_none() {
+                client.respond(Response::ScreenDirty);
+            }
         }
     }
     if !clients.iter().any(|client| {
@@ -2016,20 +2101,18 @@ fn broadcast(
             && !client.peer.pending()
             && !client.failed
     }) {
-        for client in clients {
-            if client.workspace.as_deref() == Some(&workspace.name)
-                && client.screen_flow == ScreenFlow::Streaming
-            {
-                client.full = true;
-            }
-        }
         return Ok(());
     }
     let active = workspace.layout();
+    let has_agent = clients.iter().any(|client| {
+        client.agent
+            && client.screen_eligible()
+            && !client.peer.pending()
+            && client.workspace.as_deref() == Some(&workspace.name)
+            && !client.failed
+    });
     let all_layouts;
-    let visible = if clients.iter().any(|client| {
-        client.agent && client.workspace.as_deref() == Some(&workspace.name) && !client.failed
-    }) {
+    let visible = if has_agent {
         all_layouts = workspace.all_layouts();
         &all_layouts
     } else {
@@ -2050,32 +2133,37 @@ fn broadcast(
         let input_generation = core.input_generation();
         let shell_prompt = core.shell_prompt();
         let cwd = core.current_directory().map(Path::to_path_buf);
-        if !core.mode().contains(Mode::SYNC_UPDATE) {
-            let eligible = || {
-                clients.iter().filter(|client| {
-                    client.workspace.as_deref() == Some(&workspace.name)
-                        && client.screen_eligible()
-                        && !client.peer.pending()
-                        && !client.failed
-                        && (client.agent || active.iter().any(|(pane, _)| *pane == id))
-                })
-            };
+        let synchronized = core.mode().contains(Mode::SYNC_UPDATE);
+        if !synchronized || has_agent {
             let offset = core.display_offset();
-            let full = eligible()
-                .any(|client| {
-                    (!client.agent || offset == 0)
-                        && (client.full || !client.known.contains_key(&id))
-                })
-                .then(|| Update::capture(&core, true));
-            let delta = (eligible().any(|client| {
-                (!client.agent || offset == 0) && !client.full && client.known.contains_key(&id)
-            }) && (full.is_none()
-                || core.dirty_rows().count() != core.screen_lines()))
+            let mut needs_full = false;
+            let mut needs_delta = false;
+            for client in clients.iter().filter(|client| {
+                client.workspace.as_deref() == Some(&workspace.name)
+                    && client.screen_eligible()
+                    && !client.peer.pending()
+                    && !client.failed
+                    && (client.agent || active.iter().any(|(pane, _)| *pane == id))
+                    && (!client.agent || offset == 0)
+            }) {
+                if client.full || !client.known.contains_key(&id) {
+                    needs_full = true;
+                } else {
+                    needs_delta = true;
+                }
+                if needs_full && needs_delta {
+                    break;
+                }
+            }
+            let full = needs_full.then(|| Update::capture(&core, true));
+            let delta = (needs_delta
+                && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
             .then(|| Update::capture(&core, false));
-            let live = (offset != 0 && eligible().any(|client| client.agent))
-                .then(|| Update::capture_live(&core));
-            frames.push((id, full, delta, live));
-            core.reset_damage();
+            let live = (offset != 0 && has_agent).then(|| Update::capture_live(&core));
+            frames.push((id, full, delta, live, synchronized));
+            if !synchronized {
+                core.reset_damage();
+            }
         }
         drop(core);
         panes.push(PaneView {
@@ -2116,23 +2204,34 @@ fn broadcast(
             })
         };
         updates.clear();
-        updates.extend(frames.iter().filter_map(|(id, full, delta, live)| {
-            if !client.agent && !active.iter().any(|(pane, _)| pane == id) {
-                return None;
-            }
-            let update = if client.agent
-                && let Some(live) = live
-            {
-                live
-            } else if !client.known.contains_key(id) || client.full {
-                full.as_ref()?
-            } else {
-                delta.as_ref().or(full.as_ref())?
-            };
-            Some((*id, update))
-        }));
+        updates.extend(
+            frames
+                .iter()
+                .filter_map(|(id, full, delta, live, synchronized)| {
+                    if !client.agent
+                        && (*synchronized || !active.iter().any(|(pane, _)| pane == id))
+                    {
+                        return None;
+                    }
+                    let update = if client.agent
+                        && let Some(live) = live
+                    {
+                        live
+                    } else if !client.known.contains_key(id) || client.full {
+                        full.as_ref()?
+                    } else {
+                        delta.as_ref().or(full.as_ref())?
+                    };
+                    Some((*id, update))
+                }),
+        );
         snapshot.controller = workspace.controller == Some(client.id);
-        if let Err(error) = client.peer.send_state(snapshot, &updates, &client.known) {
+        if let Err(error) = client.peer.send_state(
+            snapshot,
+            &updates,
+            &client.known,
+            client.screen_request.unwrap(),
+        ) {
             eprintln!("workspace client {}: {error}", client.id);
             client.failed = true;
         } else {
@@ -2143,16 +2242,13 @@ fn broadcast(
                 snapshot
                     .panes
                     .iter()
-                    .filter(|pane| frames.iter().any(|(id, _, _, _)| *id == pane.id))
+                    .filter(|pane| frames.iter().any(|(id, _, _, _, _)| *id == pane.id))
                     .map(|pane| (pane.id, Arc::clone(&pane.process))),
             );
         }
-        client.full = client.full
-            && client.screen_flow != ScreenFlow::Streaming
-            && updates.len() < snapshot.panes.len();
-        if client.screen_flow == ScreenFlow::Requested {
-            client.screen_flow = ScreenFlow::Clean;
-        }
+        client.full = client.full && updates.len() < snapshot.panes.len();
+        client.screen_request = None;
+        client.screen_dirty = false;
     }
     Ok(())
 }
@@ -2173,9 +2269,10 @@ fn apply_action(
                 | Action::CopyBlock { .. }
                 | Action::ReadHistory { .. }
                 | Action::CancelHistory { .. }
-                | Action::AgentUpdate { .. }
+                | Action::AgentUpdate(_)
+                | Action::AgentRemove(_)
                 | Action::Detach
-                | Action::ScreenRequest
+                | Action::ScreenRequest { .. }
         )
     {
         return Err(io::Error::new(
@@ -2183,282 +2280,34 @@ fn apply_action(
             "agent owner action is not authorized",
         ));
     }
-    match action {
-        Action::CancelHistory { request } => {
-            clients[index].read_requests.retain(
-                |(_, action)| !matches!(action,Action::ReadHistory {request:id,..} if *id==request),
-            );
-            if let Some(position) = clients[index]
-                .reads
-                .iter()
-                .position(|read| read.request == request)
-            {
-                clients[index].reads.swap_remove(position);
-            }
-            return Ok(());
-        }
-        Action::ScreenRequest => {
-            clients[index].screen_flow = ScreenFlow::Requested;
-            return Ok(());
-        }
-        Action::AgentAttach { name, token } => {
-            let workspace = workspaces.get_mut(&name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
-            })?;
-            if workspace.agent.owner.is_some() || workspace.agent.token.as_ref() != Some(&token) {
-                return Err(io::Error::new(
-                    io::ErrorKind::PermissionDenied,
-                    "invalid agent owner token",
-                ));
-            }
-            workspace.agent.token = None;
-            workspace.agent.owner = Some(client_id);
-            let client = &mut clients[index];
-            client.agent = true;
-            client.workspace = Some(name.clone());
-            client.full = true;
-            client.respond(Response::Agent {
-                kind: 4,
-                payload: Vec::new().into(),
-            });
-            if let Some(payload) = &workspace.agent.view {
-                client.respond(Response::Agent {
-                    kind: 0,
-                    payload: payload.as_slice().into(),
-                });
-            }
-            for payload in workspace.agent.pending.drain(..) {
-                client.respond(Response::Agent {
-                    kind: 2,
-                    payload: payload.into(),
-                });
-            }
-            dirty.insert(name);
-            return Ok(());
-        }
-        Action::List => {
-            let mut list: Vec<_> = workspaces
-                .values()
-                .map(|workspace| WorkspaceInfo {
-                    name: workspace.name.clone(),
-                    tabs: workspace.tabs.len(),
-                    panes: workspace.panes.len(),
-                    attached: clients
-                        .iter()
-                        .filter(|client| {
-                            !client.agent && client.workspace.as_deref() == Some(&workspace.name)
-                        })
-                        .count(),
-                })
-                .collect();
-            list.sort_by(|a, b| a.name.cmp(&b.name));
-            clients[index].respond(Response::List(list));
-            return Ok(());
-        }
-        Action::Create { mut name, options } => {
-            if name.is_empty() {
-                let mut number = 0usize;
-                while workspaces.contains_key(&number.to_string()) {
-                    number += 1;
-                }
-                name = number.to_string();
-            }
-            validate_name(&name)?;
-            validate_size(options.size)?;
-            if options.foreground > 0xffffff
-                || options.background > 0xffffff
-                || options
-                    .directory
-                    .as_ref()
-                    .is_some_and(|path| !path.is_absolute())
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "workspace colors must be 24-bit RGB and its directory must be absolute",
-                ));
-            }
-            if workspaces.contains_key(&name) {
-                return Err(io::Error::new(
-                    io::ErrorKind::AlreadyExists,
-                    "workspace already exists",
-                ));
-            }
-            let timestamp = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map_err(io::Error::other)?
-                .as_nanos();
-            let budget = HistoryBudget::new(
-                history_root.join(format!("workspace-{}-{timestamp}", std::process::id())),
-                options.history_capacity,
-            )?;
-            let mut workspace = Workspace {
-                agent: AgentState::default(),
-                name: name.clone(),
-                size: options.size,
-                foreground: options.foreground,
-                background: options.background,
-                tabs: Vec::new(),
-                active: 0,
-                panes: HashMap::new(),
-                controller: Some(client_id),
-                next_id: 1,
-                budget,
-            };
-            let pane = workspace.new_pane(options.directory, options.program)?;
-            workspace.tabs.push(Tab {
-                id: pane,
-                root: Node::Pane(pane),
-                focused: pane,
-            });
-            workspaces.insert(name.clone(), workspace);
-            clients[index].workspace = Some(name.clone());
-            clients[index].size = options.size;
-            clients[index].full = true;
-            dirty.insert(name);
-            return Ok(());
-        }
-        Action::Attach { name, size } => {
-            validate_size(size)?;
-            clients[index].search = None;
-            for client in clients.iter_mut().filter(|client| {
-                client.workspace.as_deref() == Some(&name)
-                    && client
-                        .search
-                        .as_ref()
-                        .is_some_and(|search| search.origin.is_some())
-            }) {
-                client.search = None;
-            }
-
-            let workspace = workspaces.get_mut(&name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
-            })?;
-            workspace.controller = Some(client_id);
-            workspace.resize(size)?;
-            clients[index].workspace = Some(name.clone());
-            clients[index].size = size;
-            mark_full(clients, &name);
-            dirty.insert(name);
-            return Ok(());
-        }
-        Action::TerminateName(name) => {
-            let notify_requester = clients[index].workspace.is_none();
-            let workspace = workspaces.remove(&name).ok_or_else(|| {
-                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
-            })?;
-            closing.0.extend(
-                workspace
-                    .panes
-                    .into_values()
-                    .map(|pane| pane.terminal.shutdown()),
-            );
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.finish();
-                }
-            }
-            if notify_requester {
-                clients[index].respond(Response::Detached);
-            }
-            return Ok(());
-        }
-        _ => (),
-    }
+    let Some(action) = apply_session_action(
+        index,
+        action,
+        clients,
+        workspaces,
+        dirty,
+        history_root,
+        closing,
+    )?
+    else {
+        return Ok(());
+    };
     let name = clients[index].workspace.as_ref().ok_or_else(|| {
         io::Error::new(io::ErrorKind::NotConnected, "attach to a workspace first")
     })?;
     let workspace = workspaces
         .get_mut(name)
         .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "workspace does not exist"))?;
-    let action = match action {
-        Action::AgentOpen => {
-            for (kind, payload) in [(0, &workspace.agent.view), (1, &workspace.agent.models)] {
-                if let Some(payload) = payload {
-                    clients[index].respond(Response::Agent {
-                        kind,
-                        payload: payload.as_slice().into(),
-                    });
-                }
-            }
-            clients[index].respond(Response::Agent {
-                kind: 5,
-                payload: Vec::new().into(),
-            });
-            return Ok(());
-        }
-        Action::AgentView(payload) if workspace.controller == Some(client_id) => {
-            for client in clients.iter_mut().filter(|client| {
-                client.id != client_id && client.workspace.as_deref() == Some(&workspace.name)
-            }) {
-                client.respond(Response::Agent {
-                    kind: 0,
-                    payload: payload.as_slice().into(),
-                });
-            }
-            workspace.agent.view = Some(payload);
-            return Ok(());
-        }
-        Action::AgentRequest(payload) if workspace.controller == Some(client_id) => {
-            if let Some(owner) = workspace.agent.owner.and_then(|id| {
-                clients
-                    .iter_mut()
-                    .find(|client| client.id == id && !client.failed)
-            }) {
-                owner.respond(Response::Agent {
-                    kind: 2,
-                    payload: payload.into(),
-                });
-            } else {
-                let bytes: usize = workspace
-                    .agent
-                    .pending
-                    .iter()
-                    .map(|payload| payload.len() + 6)
-                    .sum();
-                if bytes + payload.len() + 6 > crate::wire::MAX_FRAME {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WouldBlock,
-                        "agent command queue is full",
-                    ));
-                }
-                workspace.agent.pending.push(payload);
-                if workspace.agent.token.is_none() {
-                    use std::io::Read;
-                    let mut token = vec![0; 32];
-                    File::open("/dev/urandom")?.read_exact(&mut token)?;
-                    workspace.agent.token = Some(token.clone());
-                    clients[index].respond(Response::Agent {
-                        kind: 3,
-                        payload: token.into(),
-                    });
-                }
-            }
-            return Ok(());
-        }
-        Action::AgentUpdate { kind, payload } if clients[index].agent && matches!(kind, 0 | 1) => {
-            for client in clients.iter_mut().filter(|client| {
-                !client.agent && client.workspace.as_deref() == Some(&workspace.name)
-            }) {
-                client.respond(Response::Agent {
-                    kind,
-                    payload: payload.as_slice().into(),
-                });
-            }
-            if kind == 0 {
-                workspace.agent.view = Some(payload);
-            } else {
-                workspace.agent.models = Some(payload);
-            }
-            return Ok(());
-        }
-        Action::AgentView(_) | Action::AgentRequest(_) | Action::AgentUpdate { .. } => {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "agent action is not authorized",
-            ));
-        }
-        action => action,
-    };
+    if matches!(
+        action,
+        Action::AgentOpen
+            | Action::AgentView(_)
+            | Action::AgentRequest(_)
+            | Action::AgentUpdate(_)
+            | Action::AgentRemove(_)
+    ) {
+        return apply_agent_action(index, action, clients, workspace);
+    }
     if let Action::Resize(size) = action {
         validate_size(size)?;
         clients[index].size = size;
@@ -2498,39 +2347,9 @@ fn apply_action(
         data,
     } = action
     {
-        let result = (|| -> io::Result<Option<u64>> {
-            let terminal = &pane_ref(pane)?.terminal;
-            let mut core = terminal
-                .core
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            if core.input_generation() != generation {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "Terminal input changed; observe it again before sending input",
-                ));
-            }
-            if core.shell_editing() {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "The shell already has pending input",
-                ));
-            }
-            if let Some(prompt) = prompt
-                && core.shell_prompt() != Some(prompt)
-            {
-                return Err(io::Error::new(
-                    io::ErrorKind::WouldBlock,
-                    "The shell is not at an untouched prompt",
-                ));
-            }
-            terminal.try_write(data)?;
-            core.note_input();
-            core.clear_selection();
-            core.scroll_display(Scroll::Bottom);
-            Ok(prompt)
-        })()
-        .map_err(|error| error.to_string());
+        let result = pane_ref(pane)
+            .and_then(|pane| agent_input(&pane.terminal, generation, prompt, data))
+            .map_err(|error| error.to_string());
         clients[index].respond(Response::AgentInput { request, result });
         dirty.insert(workspace.name.clone());
         return Ok(());
@@ -2544,10 +2363,13 @@ fn apply_action(
             .map_err(|error| io::Error::other(error.to_string()))?;
         terminal.try_write(data)?;
         if !focus_report {
+            let changed = core.selection_range().is_some() || core.display_offset() != 0;
             core.note_input();
             core.clear_selection();
             core.scroll_display(Scroll::Bottom);
-            dirty.insert(workspace.name.clone());
+            if changed {
+                dirty.insert(workspace.name.clone());
+            }
         }
         return Ok(());
     }
@@ -2659,20 +2481,12 @@ fn apply_action(
                 .position(|tab| tab.id == id)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tab no longer exists"))?;
             let tab = workspace.tabs.remove(index);
-            let mut panes = Vec::new();
-            tab.root.layout(
-                Rect {
-                    cols: workspace.size.num_cols,
-                    rows: workspace.size.num_lines - 1,
-                    ..Rect::default()
-                },
-                &mut panes,
-            );
-            for (pane, _) in panes {
+            tab.root.for_each_pane(&mut |pane| {
                 closing
                     .0
                     .push(workspace.panes.remove(&pane).unwrap().terminal.shutdown());
-            }
+                Ok(())
+            })?;
             if index < workspace.active {
                 workspace.active -= 1;
             }
@@ -2681,6 +2495,103 @@ fn apply_action(
                 workspace.resize(workspace.size)?;
             }
         }
+        Action::Terminate => {
+            let workspace = workspaces.remove(&name).unwrap();
+            closing.0.extend(
+                workspace
+                    .panes
+                    .into_values()
+                    .map(|pane| pane.terminal.shutdown()),
+            );
+            for client in clients {
+                if client.workspace.as_deref() == Some(&name) {
+                    client.finish();
+                }
+            }
+            return Ok(());
+        }
+        action => {
+            if !apply_pane_action(index, action, clients, workspace, &name)? {
+                return Ok(());
+            }
+        }
+    }
+    if !workspace.tabs.is_empty() && previous_focus != workspace.focused() {
+        for (id, bytes) in [
+            (previous_focus, b"\x1b[O".as_slice()),
+            (workspace.focused(), b"\x1b[I".as_slice()),
+        ] {
+            if let Some(pane) = workspace.panes.get(&id)
+                && pane
+                    .terminal
+                    .core
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .mode()
+                    .contains(Mode::FOCUS_IN_OUT)
+            {
+                pane.terminal.write(bytes)?;
+            }
+        }
+    }
+    dirty.insert(name);
+    Ok(())
+}
+
+/// Writes Agent input only while the terminal is still in the state the Agent observed.
+fn agent_input(
+    terminal: &Terminal,
+    generation: u64,
+    prompt: Option<u64>,
+    data: Vec<u8>,
+) -> io::Result<Option<u64>> {
+    let mut core = terminal
+        .core
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))?;
+    if core.input_generation() != generation {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "Terminal input changed; observe it again before sending input",
+        ));
+    }
+    if core.shell_editing() {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "The shell already has pending input",
+        ));
+    }
+    if let Some(prompt) = prompt
+        && core.shell_prompt() != Some(prompt)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "The shell is not at an untouched prompt",
+        ));
+    }
+    terminal.try_write(data)?;
+    core.note_input();
+    core.clear_selection();
+    core.scroll_display(Scroll::Bottom);
+    Ok(prompt)
+}
+
+/// Pane view actions; returns false when nothing changed for other clients.
+fn apply_pane_action(
+    index: usize,
+    action: Action,
+    clients: &mut [Connection],
+    workspace: &mut Workspace,
+    name: &str,
+) -> io::Result<bool> {
+    let client_id = clients[index].id;
+    let pane_ref = |id: PaneId| {
+        workspace
+            .panes
+            .get(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane does not exist"))
+    };
+    match action {
         Action::Scroll { pane, scroll } => {
             if !pane_ref(pane)?
                 .terminal
@@ -2689,7 +2600,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .scroll_display(scroll)
             {
-                return Ok(());
+                return Ok(false);
             }
         }
         Action::SelectionStart {
@@ -2726,7 +2637,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?;
             validate_point(&core, point)?;
             if !core.selection_update(point, side) {
-                return Ok(());
+                return Ok(false);
             }
         }
         Action::SelectionClear { pane } => {
@@ -2737,7 +2648,7 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .clear_selection()
             {
-                return Ok(());
+                return Ok(false);
             }
         }
         Action::PromptJump { pane, previous } => {
@@ -2748,15 +2659,15 @@ fn apply_action(
                 .map_err(|error| io::Error::other(error.to_string()))?
                 .prompt_jump(previous)
             {
-                return Ok(());
+                return Ok(false);
             }
         }
         action @ (Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. }) => {
             let request = copy_request(&action);
-            if let Err(error) = pane_ref(pane).and_then(|pane| {
+            if let Err(error) = pane_ref(pane).map(|pane| {
                 queue_copy(
                     &mut clients[index],
-                    Cow::Borrowed(&name),
+                    Cow::Borrowed(name),
                     &pane.terminal,
                     action,
                 )
@@ -2770,7 +2681,7 @@ fn apply_action(
         action @ Action::ReadHistory { pane, request, .. } => match pane_ref(pane) {
             Ok(pane) => queue_read(
                 &mut clients[index],
-                Cow::Borrowed(&name),
+                Cow::Borrowed(name),
                 &pane.terminal,
                 action,
             ),
@@ -2862,44 +2773,291 @@ fn apply_action(
                 clients[index].search = None;
             }
         }
-        Action::Terminate => {
-            let workspace = workspaces.remove(&name).unwrap();
+        _ => unreachable!(),
+    }
+    Ok(true)
+}
+
+/// Handles actions that need no attached workspace; returns every other action.
+fn apply_session_action(
+    index: usize,
+    action: Action,
+    clients: &mut [Connection],
+    workspaces: &mut HashMap<String, Workspace>,
+    dirty: &mut HashSet<String>,
+    history_root: &Path,
+    closing: &mut ClosingTerminals,
+) -> io::Result<Option<Action>> {
+    let client_id = clients[index].id;
+    match action {
+        Action::CancelHistory { request } => {
+            clients[index].read_requests.retain(
+                |(_, action)| !matches!(action,Action::ReadHistory {request:id,..} if *id==request),
+            );
+            if let Some(position) = clients[index]
+                .reads
+                .iter()
+                .position(|read| read.request == request)
+            {
+                clients[index].reads.swap_remove(position);
+            }
+            Ok(None)
+        }
+        Action::ScreenRequest { request, wait } => {
+            clients[index].screen_request = Some(request);
+            clients[index].screen_dirty |= !wait;
+            Ok(None)
+        }
+        Action::AgentAttach { name, token } => {
+            let workspace = workspaces.get_mut(&name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
+            })?;
+            if workspace.agent.owner.is_some() || workspace.agent.token.as_ref() != Some(&token) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "invalid agent owner token",
+                ));
+            }
+            workspace.agent.token = None;
+            workspace.agent.owner = Some(client_id);
+            let client = &mut clients[index];
+            client.agent = true;
+            client.workspace = Some(name.clone());
+            client.full = true;
+            client.respond(Response::Agent(AgentEvent::Attached));
+            if let Some(payload) = &workspace.agent.view {
+                client.respond(Response::Agent(AgentEvent::Draft(payload.clone())));
+            }
+            for payload in workspace.agent.pending.drain(..) {
+                client.respond(Response::Agent(AgentEvent::Request(payload)));
+            }
+            dirty.insert(name);
+            Ok(None)
+        }
+        Action::List => {
+            let mut list: Vec<_> = workspaces
+                .values()
+                .map(|workspace| WorkspaceInfo {
+                    name: workspace.name.clone(),
+                    tabs: workspace.tabs.len(),
+                    panes: workspace.panes.len(),
+                    attached: clients
+                        .iter()
+                        .filter(|client| {
+                            !client.agent && client.workspace.as_deref() == Some(&workspace.name)
+                        })
+                        .count(),
+                })
+                .collect();
+            list.sort_by(|a, b| a.name.cmp(&b.name));
+            clients[index].respond(Response::List(list));
+            Ok(None)
+        }
+        Action::Create { mut name, options } => {
+            if name.is_empty() {
+                let mut number = 0usize;
+                while workspaces.contains_key(&number.to_string()) {
+                    number += 1;
+                }
+                name = number.to_string();
+            }
+            validate_name(&name)?;
+            validate_size(options.size)?;
+            if options.foreground > 0xffffff
+                || options.background > 0xffffff
+                || options
+                    .directory
+                    .as_ref()
+                    .is_some_and(|path| !path.is_absolute())
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "workspace colors must be 24-bit RGB and its directory must be absolute",
+                ));
+            }
+            if workspaces.contains_key(&name) {
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    "workspace already exists",
+                ));
+            }
+            let timestamp = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(io::Error::other)?
+                .as_nanos();
+            let budget = HistoryBudget::new(
+                history_root.join(format!("workspace-{}-{timestamp}", std::process::id())),
+                options.history_capacity,
+            )?;
+            let mut workspace = Workspace {
+                agent: AgentState::default(),
+                name: name.clone(),
+                size: options.size,
+                foreground: options.foreground,
+                background: options.background,
+                tabs: Vec::new(),
+                active: 0,
+                panes: HashMap::new(),
+                controller: Some(client_id),
+                next_id: 1,
+                budget,
+            };
+            let pane = workspace.new_pane(options.directory, options.program)?;
+            workspace.tabs.push(Tab {
+                id: pane,
+                root: Node::Pane(pane),
+                focused: pane,
+            });
+            workspaces.insert(name.clone(), workspace);
+            clients[index].workspace = Some(name.clone());
+            clients[index].agent_open = false;
+            clients[index].size = options.size;
+            clients[index].full = true;
+            dirty.insert(name);
+            Ok(None)
+        }
+        Action::Attach { name, size } => {
+            validate_size(size)?;
+            clients[index].search = None;
+            for client in clients.iter_mut().filter(|client| {
+                client.workspace.as_deref() == Some(&name)
+                    && client
+                        .search
+                        .as_ref()
+                        .is_some_and(|search| search.origin.is_some())
+            }) {
+                client.search = None;
+            }
+
+            let workspace = workspaces.get_mut(&name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
+            })?;
+            workspace.controller = Some(client_id);
+            workspace.resize(size)?;
+            clients[index].workspace = Some(name.clone());
+            clients[index].agent_open = false;
+            clients[index].size = size;
+            mark_full(clients, &name);
+            dirty.insert(name);
+            Ok(None)
+        }
+        Action::TerminateName(name) => {
+            let notify_requester = clients[index].workspace.is_none();
+            let workspace = workspaces.remove(&name).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
+            })?;
             closing.0.extend(
                 workspace
                     .panes
                     .into_values()
                     .map(|pane| pane.terminal.shutdown()),
             );
-            for client in clients {
+            for client in clients.iter_mut() {
                 if client.workspace.as_deref() == Some(&name) {
                     client.finish();
                 }
             }
-            return Ok(());
+            if notify_requester {
+                clients[index].respond(Response::Detached);
+            }
+            Ok(None)
         }
+        action => Ok(Some(action)),
+    }
+}
+fn apply_agent_action(
+    index: usize,
+    action: Action,
+    clients: &mut [Connection],
+    workspace: &mut Workspace,
+) -> io::Result<()> {
+    let client_id = clients[index].id;
+    match action {
+        Action::AgentOpen => {
+            clients[index].agent_open = true;
+            if let Some(payload) = &workspace.agent.view {
+                clients[index].respond(Response::Agent(AgentEvent::Draft(payload.clone())));
+            }
+            for model in workspace.agent.models.values() {
+                clients[index].respond(Response::Agent(AgentEvent::Model(model.clone())));
+            }
+            clients[index].respond(Response::Agent(AgentEvent::Ready));
+            Ok(())
+        }
+        Action::AgentView(payload) if workspace.controller == Some(client_id) => {
+            clients[index].agent_open = true;
+            for client in clients.iter_mut().filter(|client| {
+                client.id != client_id
+                    && (client.agent || client.agent_open)
+                    && client.workspace.as_deref() == Some(&workspace.name)
+            }) {
+                client.respond(Response::Agent(AgentEvent::Draft(payload.clone())));
+            }
+            workspace.agent.view = Some(payload);
+            Ok(())
+        }
+        Action::AgentRequest(payload) if workspace.controller == Some(client_id) => {
+            clients[index].agent_open = true;
+            if let Some(owner) = workspace.agent.owner.and_then(|id| {
+                clients
+                    .iter_mut()
+                    .find(|client| client.id == id && !client.failed)
+            }) {
+                owner.respond(Response::Agent(AgentEvent::Request(payload)));
+            } else {
+                let bytes: usize = workspace
+                    .agent
+                    .pending
+                    .iter()
+                    .map(|payload| payload.len() + 6)
+                    .sum();
+                if bytes + payload.len() + 6 > crate::wire::MAX_FRAME {
+                    return Err(io::Error::new(
+                        io::ErrorKind::WouldBlock,
+                        "agent command queue is full",
+                    ));
+                }
+                workspace.agent.pending.push(payload);
+                if workspace.agent.token.is_none() {
+                    use std::io::Read;
+                    let mut token = vec![0; 32];
+                    File::open("/dev/urandom")?.read_exact(&mut token)?;
+                    workspace.agent.token = Some(token.clone());
+                    clients[index].respond(Response::Agent(AgentEvent::Start(token)));
+                }
+            }
+            Ok(())
+        }
+        Action::AgentUpdate(patch) if clients[index].agent => {
+            let model = workspace.agent.models.entry(patch.session).or_default();
+            patch.apply_messages(&mut model.messages)?;
+            model.session = patch.session;
+            model.busy = patch.busy;
+            model.revision = patch.revision;
+            model.turn = patch.turn;
+            model.recovery.clone_from(&patch.recovery);
+            for client in clients.iter_mut().filter(|client| {
+                client.agent_open && client.workspace.as_deref() == Some(&workspace.name)
+            }) {
+                client.respond(Response::Agent(AgentEvent::Model(patch.clone())));
+            }
+            Ok(())
+        }
+        Action::AgentRemove(session) if clients[index].agent => {
+            workspace.agent.models.remove(&session);
+            Ok(())
+        }
+        Action::AgentView(_)
+        | Action::AgentRequest(_)
+        | Action::AgentUpdate(_)
+        | Action::AgentRemove(_) => Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "agent action is not authorized",
+        )),
         _ => unreachable!(),
     }
-    if !workspace.tabs.is_empty() && previous_focus != workspace.focused() {
-        for (id, bytes) in [
-            (previous_focus, b"\x1b[O".as_slice()),
-            (workspace.focused(), b"\x1b[I".as_slice()),
-        ] {
-            if let Some(pane) = workspace.panes.get(&id)
-                && pane
-                    .terminal
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?
-                    .mode()
-                    .contains(Mode::FOCUS_IN_OUT)
-            {
-                pane.terminal.write(bytes)?;
-            }
-        }
-    }
-    dirty.insert(name);
-    Ok(())
 }
+
 fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
     let wake = unsafe { BorrowedFd::borrow_raw(terminal.event_fd()) };
     match search
@@ -2919,17 +3077,22 @@ fn queue_copy(
     name: Cow<'_, str>,
     terminal: &Terminal,
     action: Action,
-) -> io::Result<bool> {
+) -> bool {
     if client.copy.is_some() {
         client.copy_requests.push_back((name.into_owned(), action));
-        return Ok(false);
+        return false;
     }
-    let (request, result) = match action {
-        Action::CopySelection { request, .. } => (request, terminal.copy_selection()),
-        Action::CopyBlock { request, block, .. } => (request, terminal.copy_block(block)),
-        _ => unreachable!(),
-    };
-    let progressed = match result {
+    let request = copy_request(&action);
+    let result = terminal
+        .core
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))
+        .and_then(|mut core| match action {
+            Action::CopySelection { .. } => core.copy_selection(),
+            Action::CopyBlock { block, .. } => core.copy_block(block),
+            _ => unreachable!(),
+        });
+    match result {
         Ok(receiver) => {
             client.copy = Some((request, receiver));
             true
@@ -2945,8 +3108,7 @@ fn queue_copy(
             });
             true
         }
-    };
-    Ok(progressed)
+    }
 }
 fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, action: Action) {
     let Action::ReadHistory {
@@ -2960,7 +3122,12 @@ fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, 
     else {
         unreachable!()
     };
-    match terminal.read_history(block, cursor, query.as_deref()) {
+    let result = terminal
+        .core
+        .lock()
+        .map_err(|error| io::Error::other(error.to_string()))
+        .and_then(|mut core| core.read_history(block, cursor, query.as_deref()));
+    match result {
         Ok((receiver, cancelled)) => client.reads.push(PendingRead {
             request,
             pane,
@@ -3017,6 +3184,39 @@ fn pane_directory(terminal: &Terminal) -> io::Result<Option<PathBuf>> {
         Ok(directory) => Ok(Some(directory)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error),
+    }
+}
+
+#[cfg(feature = "agent")]
+impl Client {
+    pub(crate) fn screen_stale(&self) -> bool {
+        self.screen_dirty
+    }
+
+    pub(crate) fn endpoint(&self) -> &ClientEndpoint {
+        &self.endpoint
+    }
+}
+
+#[cfg(any(test, feature = "agent"))]
+impl Client {
+    pub(crate) fn take_agent_events(&mut self) -> Vec<AgentEvent> {
+        std::mem::take(&mut self.agent_events)
+    }
+
+    pub(crate) fn can_agent_input(&self) -> bool {
+        self.agent_delegate
+            || self
+                .snapshot
+                .as_ref()
+                .is_some_and(|snapshot| snapshot.controller)
+    }
+
+    pub(crate) fn terminal_revision(&self, pane: PaneId) -> io::Result<u64> {
+        self.screens
+            .get(&pane)
+            .map(|screen| screen.activity)
+            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
     }
 }
 

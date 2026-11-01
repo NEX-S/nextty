@@ -1,5 +1,5 @@
 //! Visible grid snapshots shared by desktop and workspace frontends.
-#[cfg(feature = "tui")]
+
 use crate::core::{BlockMarker, Flags};
 use crate::core::{Core, Mode, Point, Row, SelectionRange};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
@@ -15,7 +15,7 @@ pub struct Screen {
     pub(crate) selection: Option<SelectionRange>,
     pub(crate) offset: usize,
     pub(crate) history: usize,
-    #[cfg(feature = "tui")]
+
     pub(crate) activity: u64,
 }
 
@@ -44,7 +44,7 @@ impl Default for Screen {
             selection: None,
             offset: 0,
             history: 0,
-            #[cfg(feature = "tui")]
+
             activity: 0,
         }
     }
@@ -61,19 +61,22 @@ impl Update {
                 .map(|index| (index, core.row(index).clone()))
                 .collect()
         };
-        Self::from_rows(core, rows, core.display_offset())
+        Self::from_rows(
+            core,
+            rows,
+            core.display_offset(),
+            full || core.palette_dirty(),
+        )
     }
-    #[cfg(feature = "tui")]
+
     pub fn capture_live(core: &Core) -> Self {
         let rows = (0..core.screen_lines())
             .map(|index| (index, core.screen_row(index).clone()))
             .collect();
-        Self::from_rows(core, rows, 0)
+        Self::from_rows(core, rows, 0, true)
     }
-    fn from_rows(core: &Core, rows: Vec<(usize, Row)>, offset: usize) -> Self {
-        // Every Core palette mutation damages all rows. Sparse updates can reuse
-        // the frontend's existing palette, without a second palette or revision.
-        let palette = (rows.len() == core.screen_lines()).then(|| {
+    fn from_rows(core: &Core, rows: Vec<(usize, Row)>, offset: usize, palette: bool) -> Self {
+        let palette = palette.then(|| {
             let mut palette = [Rgb::default(); 269];
             for (index, color) in palette.iter_mut().enumerate() {
                 *color = if index < 256 {
@@ -99,7 +102,6 @@ impl Update {
 }
 
 impl Screen {
-    #[cfg(feature = "tui")]
     pub(crate) fn changes_activity(&self, update: &Update) -> bool {
         self.columns != update.columns
             || self.rows.len() != update.lines
@@ -189,7 +191,7 @@ impl Screen {
         self.history = update.history;
         Ok(())
     }
-    #[cfg(feature = "tui")]
+
     pub fn row_output<'a>(
         &self,
         pane: &'a crate::workspace::PaneView,
@@ -213,7 +215,7 @@ impl Screen {
         let block = output_block(&pane.blocks, line, cells.used())?;
         (!prompt_cells.any(|cell| cell.flags.contains(Flags::PROMPT))).then_some(block)
     }
-    #[cfg(feature = "tui")]
+
     pub(crate) fn output_changed(
         &self,
         old: &crate::workspace::PaneView,
@@ -290,7 +292,6 @@ impl Screen {
     }
 }
 
-#[cfg(feature = "tui")]
 fn output_block(blocks: &[BlockMarker], line: i32, used: usize) -> Option<&BlockMarker> {
     blocks.iter().find(|block| {
         let Some((start, end)) = block.output else {
@@ -304,7 +305,7 @@ fn output_block(blocks: &[BlockMarker], line: i32, used: usize) -> Option<&Block
 }
 
 #[test]
-#[cfg(feature = "tui")]
+
 fn activity_compares_text_independently_of_render_damage_and_colors() {
     let mut core = Core::new(
         crate::core::WindowSize {
@@ -404,7 +405,7 @@ fn selection_damage_matches_visible_highlight_changes() {
     }
 }
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::core::WindowSize;

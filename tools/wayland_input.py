@@ -116,8 +116,6 @@ def main():
     if args.samples < 1 or not 0 < args.busy_hz <= 10000:
         parser.error("samples must be positive and busy-hz in (0, 10000]")
     binary = args.binary.resolve()
-    help_text = subprocess.run([str(binary), "--help"], check=True, capture_output=True, text=True).stdout
-    workspace = "\nWorkspace input:\n" in help_text
     workspace_name = f"input-bench-{os.getpid()}"
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True)
@@ -157,8 +155,8 @@ def main():
         # Mutter creates the session's virtual keyboard on the first key press.
         tap(0xffe1)
         with (directory / "app.log").open("w") as log:
-            command = [str(binary)] + (["new", workspace_name] if workspace else []) + ["--gui"]
-            command += ["--config", str(config), "-e", sys.executable, __file__, "--fixture", str(directory), str(args.busy_hz), args.busy_pattern]
+            command = [str(binary), "new", workspace_name, "--gui", "--config", str(config),
+                       "-e", sys.executable, __file__, "--fixture", str(directory), str(args.busy_hz), args.busy_pattern]
             app = subprocess.Popen(command, env=env, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
 
             def wait(predicate, label, seconds=8):
@@ -178,7 +176,7 @@ def main():
             for child in Path(f"/proc/{app.pid}/task/{app.pid}/children").read_text().split():
                 if b"--server\0" in Path(f"/proc/{child}/cmdline").read_bytes():
                     pids["daemon"] = int(child)
-            if workspace and "daemon" not in pids:
+            if "daemon" not in pids:
                 raise RuntimeError("benchmark requires a fresh private daemon for complete process accounting")
             report["pids"] = pids
             control = os.open(control_path, os.O_WRONLY | os.O_NONBLOCK)
@@ -271,7 +269,7 @@ def main():
         if control is not None:
             os.close(control)
         control_path.unlink()
-        if app and workspace:
+        if app:
             subprocess.run([str(binary), "terminate", workspace_name], env=env, capture_output=True, timeout=5)
         if app and app.poll() is None:
             os.killpg(app.pid, signal.SIGTERM)

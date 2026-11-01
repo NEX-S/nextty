@@ -1,3 +1,4 @@
+use crate::input::keysym;
 use crate::system_stats::{Process, ResourceTrend, SystemStats};
 use crate::width::{fit_label, scalar_width, text_width};
 use std::{borrow::Cow, io};
@@ -8,12 +9,32 @@ pub(crate) const MUTED: u32 = 0x8b9690;
 pub(crate) const GREEN: u32 = 0xb1c99c;
 pub(crate) const PURPLE: u32 = 0xb3a2ca;
 
+pub(crate) fn series_color(name: &str) -> u32 {
+    match name {
+        "MEMORY" => 0x8fb5c7,
+        "SWAP" | "WRITE" | "TX" | "OUT" => PURPLE,
+        _ => GREEN,
+    }
+}
+
+fn trend_value(value: Option<f32>, unit: &str) -> String {
+    value.map_or_else(
+        || "—".into(),
+        |v| {
+            if unit == "MiB/s" && v < 1. {
+                format!("{:.0}KiB/s", v * 1024.)
+            } else {
+                format!("{v:.1}{unit}")
+            }
+        },
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Action {
     Close,
     Tab(u8),
     Range(u32),
-    Interface,
     Sort(u8),
     Search,
     Process(u32),
@@ -28,6 +49,25 @@ pub(crate) struct Text {
     pub selected: bool,
     pub focused: bool,
     pub highlighted: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Emphasis {
+    None,
+    Selected,
+    Highlighted,
+}
+
+impl Text {
+    pub fn emphasis(&self, monitor_focused: bool) -> Emphasis {
+        if self.selected {
+            Emphasis::Selected
+        } else if self.highlighted || self.focused && monitor_focused {
+            Emphasis::Highlighted
+        } else {
+            Emphasis::None
+        }
+    }
 }
 pub(crate) struct Plot {
     pub x: u16,
@@ -64,7 +104,7 @@ impl View {
         });
     }
     fn button(&mut self, x: u16, y: i32, width: u16, text: &str, action: Action, selected: bool) {
-        let width = if matches!(action, Action::Process(_) | Action::Search) {
+        let width = if matches!(action, Action::Process(_) | Action::Search | Action::Tab(_)) {
             width
         } else {
             width.min(text_width(text) as u16 + 2)
@@ -107,9 +147,15 @@ impl View {
         }
         y
     }
-    fn details(&mut self, x: u16, mut y: i32, width: u16, rows: Vec<(String, String)>) {
+    fn details(
+        &mut self,
+        x: u16,
+        mut y: i32,
+        width: u16,
+        rows: impl IntoIterator<Item = (String, String)>,
+    ) -> i32 {
+        let key_width = (width / 2).min(24);
         for (key, value) in rows {
-            let key_width = (width / 2).min(24);
             if text_width(&value) > usize::from(width.saturating_sub(key_width))
                 || text_width(&key) >= usize::from(key_width)
             {
@@ -127,6 +173,7 @@ impl View {
                 y += 1;
             }
         }
+        y
     }
 }
 
@@ -141,7 +188,6 @@ pub(crate) struct Monitor {
     pub scroll: usize,
     pub pointer: Option<(u16, i32)>,
     range: u32,
-    interface: Option<String>,
     sort: u8,
     descending: bool,
     query: String,
@@ -149,7 +195,6 @@ pub(crate) struct Monitor {
     selected: Option<(u32, u64)>,
     process_order: Vec<usize>,
     process_revision: Option<u64>,
-    pending: Vec<u8>,
     anchor: Option<(u32, i32)>,
     reveal: bool,
     width: u16,
@@ -167,7 +212,6 @@ impl Monitor {
             scroll: 0,
             pointer: None,
             range: 60,
-            interface: None,
             sort: 0,
             descending: true,
             query: String::new(),
@@ -175,21 +219,84 @@ impl Monitor {
             selected: None,
             process_order: Vec::new(),
             process_revision: None,
-            pending: Vec::new(),
             anchor: None,
             reveal: false,
             width: 80,
         })
     }
+    pub fn footer(&self, width: u16, controller: bool, remote: bool) -> View {
+        let mut view = View::default();
+        let arrow = width.saturating_sub(4);
+        view.button(
+            arrow,
+            0,
+            3,
+            if self.open { "" } else { "" },
+            if self.open {
+                Action::Close
+            } else {
+                Action::Tab(self.tab)
+            },
+            false,
+        );
+        if self.open {
+            let start = width.saturating_sub(25);
+            for (offset, seconds, label) in [
+                (0, 60, "60s"),
+                (6, 300, "5m"),
+                (11, 900, "15m"),
+                (17, 3600, "1h"),
+            ] {
+                if width >= 25 {
+                    view.button(
+                        start + offset,
+                        0,
+                        if offset == 0 || offset == 11 { 5 } else { 4 },
+                        label,
+                        Action::Range(seconds),
+                        self.range == seconds,
+                    );
+                }
+            }
+        } else {
+            let mut x = arrow;
+            for (index, label) in self.stats.summary().iter().enumerate().rev() {
+                let cells = text_width(label) as u16 + 2;
+                if cells > x {
+                    break;
+                }
+                x -= cells;
+                view.button(x, 0, cells, label, Action::Tab([1, 2, 3, 5][index]), false);
+            }
+            let prefix = match (controller, remote) {
+                (true, false) => "",
+                (true, true) => "Local",
+                (false, false) => "Read-only",
+                (false, true) => "Read-only · Local",
+            };
+            let cells = text_width(prefix) as u16 + 1;
+            if !prefix.is_empty() && cells <= x {
+                view.text(x - cells, 0, cells, prefix, MUTED);
+            }
+        }
+        for text in &mut view.texts {
+            text.focused = self.open
+                && view
+                    .hits
+                    .iter()
+                    .any(|hit| hit.x == text.x && hit.action == self.focus);
+        }
+        view
+    }
+
     pub fn seconds(&self) -> u32 {
         self.range
     }
     pub fn insert_query(&mut self, text: &str) {
-        let text: String = text.chars().filter(|c| !c.is_control()).collect();
+        let text = crate::input::without_controls(text);
         self.query.insert_str(self.cursor, &text);
         self.process_revision = None;
         self.cursor += text.len();
-        self.pending.clear();
         self.scroll = 0;
         self.anchor = None;
     }
@@ -200,7 +307,7 @@ impl Monitor {
         if self.open && self.focus == Action::Close {
             self.focus = Action::Tab(self.tab);
         }
-        self.stats.set_processes_enabled(self.open && self.tab == 2);
+        self.stats.set_processes_enabled(self.open && self.tab == 6);
         self.sync_process_detail();
     }
     pub fn resize(&mut self, rows: u16, total: u16) {
@@ -223,29 +330,13 @@ impl Monitor {
                 self.pointer = None;
             }
             Action::Tab(tab) => {
+                self.open = true;
                 self.tab = tab;
                 self.scroll = 0;
                 self.anchor = None;
             }
             Action::Range(range) => {
                 self.range = range;
-            }
-            Action::Interface => {
-                let networks = self.stats.networks();
-                let current = self.interface.as_deref().or_else(|| {
-                    networks
-                        .iter()
-                        .find(|n| n.name != "lo")
-                        .or(networks.first())
-                        .map(|n| n.name.as_str())
-                });
-                let index = networks
-                    .iter()
-                    .position(|n| Some(n.name.as_str()) == current)
-                    .unwrap_or(0);
-                self.interface = networks
-                    .get((index + 1) % networks.len().max(1))
-                    .map(|n| n.name.clone());
             }
             Action::Sort(sort) => {
                 self.descending = self.sort != sort || !self.descending;
@@ -266,12 +357,12 @@ impl Monitor {
                 };
             }
         }
-        self.stats.set_processes_enabled(self.open && self.tab == 2);
+        self.stats.set_processes_enabled(self.open && self.tab == 6);
         self.sync_process_detail();
     }
     fn sync_process_detail(&mut self) {
         self.stats
-            .set_process_detail(if self.open && self.tab == 2 {
+            .set_process_detail(if self.open && self.tab == 6 {
                 self.selected.filter(|identity| {
                     self.process_order.iter().any(|&index| {
                         self.stats
@@ -348,14 +439,11 @@ impl Monitor {
             .map(|&index| &self.stats.processes()[index])
     }
     fn controls(&mut self) -> Vec<Action> {
-        let mut controls: Vec<_> = (0..4).map(Action::Tab).collect();
-        if self.tab < 2 && self.width >= 50 {
-            controls.extend([60, 300, 900].map(Action::Range));
+        let mut controls: Vec<_> = (0..7).map(Action::Tab).collect();
+        if self.width >= 24 {
+            controls.extend([60, 300, 900, 3600].map(Action::Range));
         }
-        if self.tab == 1 {
-            controls.push(Action::Interface);
-        }
-        if self.tab == 2 {
+        if self.tab == 6 {
             controls.push(Action::Search);
             let body_width = self
                 .width
@@ -424,40 +512,39 @@ impl Monitor {
             self.sync_process_detail();
         }
     }
-    pub fn key(&mut self, symbol: u32, text: &str, control: bool) -> bool {
+    pub fn key(&mut self, symbol: u32, text: &str, control: bool) {
         if !self.open {
-            return false;
+            return;
         }
-        if symbol == 0xff1b {
-            self.pending.clear();
+        if symbol == keysym::ESCAPE {
             if self.searching {
                 self.searching = false;
             } else {
                 self.action(Action::Close);
             }
-            return true;
+            return;
         }
-        if matches!(symbol, 0xff09 | 0xfe20) {
-            self.cycle(symbol == 0xfe20);
-            return true;
+        if matches!(symbol, keysym::TAB | keysym::LEFT_TAB) {
+            self.cycle(symbol == keysym::LEFT_TAB);
+            return;
         }
         if self.searching {
             match symbol {
-                0xff51 => {
+                keysym::LEFT => {
                     self.cursor = self.query[..self.cursor]
                         .char_indices()
                         .next_back()
                         .map_or(0, |(i, _)| i)
                 }
-                0xff53 => {
+                keysym::RIGHT => {
                     self.cursor = self.query[self.cursor..]
                         .char_indices()
                         .nth(1)
                         .map_or(self.query.len(), |(i, _)| self.cursor + i)
                 }
-                0xff50 => self.cursor = 0,
-                0xff57 => self.cursor = self.query.len(),
-                0xff08 => {
+                keysym::HOME => self.cursor = 0,
+                keysym::END => self.cursor = self.query.len(),
+                keysym::BACKSPACE => {
                     if let Some((i, _)) = self.query[..self.cursor].char_indices().next_back() {
                         self.process_revision = None;
                         self.query.drain(i..self.cursor);
@@ -466,7 +553,7 @@ impl Monitor {
                     self.scroll = 0;
                     self.anchor = None;
                 }
-                0xffff => {
+                keysym::DELETE => {
                     if let Some(ch) = self.query[self.cursor..].chars().next() {
                         self.process_revision = None;
                         self.query.drain(self.cursor..self.cursor + ch.len_utf8());
@@ -474,7 +561,7 @@ impl Monitor {
                     self.scroll = 0;
                     self.anchor = None;
                 }
-                0xff0d => {
+                keysym::RETURN => {
                     self.searching = false;
                     self.rebuild_processes();
                     let pid = self.processes().next().map(|p| p.pid);
@@ -483,33 +570,33 @@ impl Monitor {
                         self.reveal = true;
                     }
                 }
-                _ if control => match text {
-                    "u" => {
+                _ if control => match crate::input::symbol_char(symbol) {
+                    Some('u' | 'U') => {
                         self.query.clear();
                         self.process_revision = None;
                         self.cursor = 0;
                         self.anchor = None;
                         self.scroll = 0;
                     }
-                    "a" => self.cursor = 0,
-                    "e" => self.cursor = self.query.len(),
+                    Some('a' | 'A') => self.cursor = 0,
+                    Some('e' | 'E') => self.cursor = self.query.len(),
                     _ => (),
                 },
                 _ => self.insert_query(text),
             }
-            return true;
+            return;
         }
         let ch = char::from_u32(symbol);
         match symbol {
-            0xff0d | 0x20 => {
+            keysym::RETURN | 0x20 => {
                 let action = self.focus;
                 self.action(action);
             }
-            0xff52 | 0xff54 | 0x6a | 0x6b => {
-                let down = matches!(symbol, 0xff54 | 0x6a);
+            keysym::UP | keysym::DOWN | 0x6a | 0x6b => {
+                let down = matches!(symbol, keysym::DOWN | 0x6a);
                 match self.focus {
                     Action::Tab(tab) => {
-                        let tab = if down { (tab + 1) % 4 } else { (tab + 3) % 4 };
+                        let tab = if down { (tab + 1) % 7 } else { (tab + 6) % 7 };
                         self.action(Action::Tab(tab));
                     }
                     Action::Process(_) => self.move_process(if down { 1 } else { -1 }),
@@ -522,8 +609,8 @@ impl Monitor {
                     }
                 }
             }
-            0xff51 | 0xff53 | 0x68 | 0x6c => {
-                let forward = matches!(symbol, 0xff53 | 0x6c);
+            keysym::LEFT | keysym::RIGHT | 0x68 | 0x6c => {
+                let forward = matches!(symbol, keysym::RIGHT | 0x6c);
                 if matches!(self.focus, Action::Tab(_)) && forward {
                     self.focus = self
                         .controls()
@@ -537,8 +624,8 @@ impl Monitor {
                     self.cycle(false);
                 }
             }
-            0xff55 | 0xff56 => {
-                let down = symbol == 0xff56;
+            keysym::PAGE_UP | keysym::PAGE_DOWN => {
+                let down = symbol == keysym::PAGE_DOWN;
                 if matches!(self.focus, Action::Process(_)) {
                     self.move_process(if down { 6 } else { -6 });
                 } else {
@@ -549,72 +636,9 @@ impl Monitor {
                     };
                 }
             }
-            _ if ch == Some('/') && self.tab == 2 => self.action(Action::Search),
+            _ if ch == Some('/') && self.tab == 6 => self.action(Action::Search),
             _ => (),
         }
-        true
-    }
-    pub fn query_bytes(&mut self, bytes: &[u8]) {
-        for &byte in bytes.iter().filter(|&&byte| byte >= 32 && byte != 127) {
-            self.pending.push(byte);
-            match std::str::from_utf8(&self.pending) {
-                Ok(text) => {
-                    let text = text.to_owned();
-                    self.insert_query(&text);
-                }
-                Err(error) if error.error_len().is_some() => self.pending.clear(),
-                Err(_) => (),
-            }
-        }
-    }
-    pub fn bytes(&mut self, bytes: &[u8]) -> bool {
-        if !self.open {
-            return false;
-        }
-        let symbol = match bytes {
-            b"\x1b" => Some(0xff1b),
-            b"\x1b[5~" => Some(0xff55),
-            b"\x1b[6~" => Some(0xff56),
-            b"\x1b[Z" => Some(0xfe20),
-            _ => crate::input::editing_key(bytes),
-        };
-        if let Some(symbol) = symbol {
-            self.key(symbol, "", false);
-            return true;
-        }
-        if bytes.starts_with(b"\x1b") {
-            return true;
-        }
-        for &byte in bytes {
-            match byte {
-                9 => {
-                    self.key(0xff09, "", false);
-                }
-                8 | 127 => {
-                    self.key(0xff08, "", false);
-                }
-                13 | 10 => {
-                    self.key(0xff0d, "", false);
-                }
-                1 | 5 | 21 => {
-                    self.key(
-                        0,
-                        match byte {
-                            1 => "a",
-                            5 => "e",
-                            _ => "u",
-                        },
-                        true,
-                    );
-                }
-                32..=255 if self.searching => self.query_bytes(&[byte]),
-                32..=126 => {
-                    self.key(u32::from(byte), "", false);
-                }
-                _ => (),
-            }
-        }
-        true
     }
     fn step(&self, columns: u16) -> u32 {
         let sample = crate::system_stats::SAMPLE_INTERVAL.as_secs().max(1) as u32;
@@ -638,46 +662,53 @@ impl Monitor {
             return;
         }
         let maximum = series.iter().map(|s| s.maximum).fold(0., f32::max);
-        let title = if series.len() == 2 {
-            "NETWORK"
-        } else {
-            series[0].name
+        let title = match (series.len(), series[0].name) {
+            (2, "RX") => series[0].summary.split('·').next().unwrap().trim(),
+            (2, "READ") => "DISK I/O",
+            (2, "IN") => "SWAP I/O",
+            _ => series[0].name,
         };
-        view.text(x, y, width, title, INK);
-        let value = series
-            .iter()
-            .map(|s| {
-                s.value.map_or_else(
-                    || "—".into(),
-                    |v| {
-                        if s.unit == "MiB/s" && v < 1. {
-                            format!("{:.0}KiB/s", v * 1024.)
-                        } else {
-                            format!("{v:.1}{}", s.unit)
-                        }
-                    },
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let value_width = (text_width(&value) as u16).min(width.saturating_sub(8));
-        view.text(x + width - value_width, y, value_width, value, GREEN);
-        view.text(
-            x,
-            y + 1,
-            5,
-            if maximum < 1. {
-                format!("{maximum:.3}")
-            } else {
-                format!("{maximum:.0}")
-            },
-            MUTED,
-        );
-        view.text(x, y + i32::from(height), 5, "0", MUTED);
+        if series.len() == 1 {
+            let value = trend_value(series[0].value, series[0].unit);
+            let value_width = (text_width(&value) as u16).min(width.saturating_sub(5));
+            view.text(x, y, width.saturating_sub(value_width + 1), title, INK);
+            view.text(
+                x + width - value_width,
+                y,
+                value_width,
+                value,
+                series_color(series[0].name),
+            );
+            view.text(x, y + 1, width, &series[0].summary, MUTED);
+        } else {
+            view.text(x, y, width, title, INK);
+            let columns = width / series.len() as u16;
+            for (i, trend) in series.iter().enumerate() {
+                view.text(
+                    x + i as u16 * columns,
+                    y + 1,
+                    columns,
+                    format!("{} {}", trend.name, trend_value(trend.value, trend.unit)),
+                    series_color(trend.name),
+                );
+            }
+        }
+        let scale = if series[0].unit == "%" {
+            format!("{maximum:.0}%")
+        } else if maximum < 1. {
+            format!("{:.0}K", maximum * 1024.)
+        } else {
+            format!("{maximum:.0}M")
+        };
+        view.text(x, y + 2, 5, scale, MUTED);
+        view.text(x, y + 1 + i32::from(height), 5, "0", MUTED);
         let plot_x = x + 5;
         let plot_width = width - 5;
-        let axis_y = y + i32::from(height) + 1;
+        let axis_y = y + i32::from(height) + 2;
+        // Choose tick spacing from the actual plot width so labels never collide.
+        let step = self.step(plot_width);
         let mut age = if plot_width < 8 { 0 } else { self.range };
+        let mut end = 0;
         loop {
             let label = if age == 0 {
                 "now".into()
@@ -690,26 +721,36 @@ impl Monitor {
             };
             let column = ((1. - age as f32 / self.range as f32)
                 * f32::from(plot_width.saturating_sub(1))) as u16;
-            let w = (text_width(&label) as u16).min(plot_width);
-            view.text(plot_x + column.min(plot_width - w), axis_y, w, label, MUTED);
+            let cells = (text_width(&label) as u16).min(plot_width);
+            let column = column.min(plot_width - cells);
+            if age == 0 || column >= end && column + cells + 4 < plot_width {
+                view.text(plot_x + column, axis_y, cells, label, MUTED);
+                end = column + cells + 2;
+            }
             if age == 0 {
                 break;
             }
             age = if age == self.range {
-                ((age - 1) / self.step(plot_width)) * self.step(plot_width)
+                ((age - 1) / step) * step
             } else {
-                age.saturating_sub(self.step(plot_width))
+                age.saturating_sub(step)
             };
         }
-        let summary = if series.len() == 2 {
-            "RX / TX · MiB/s · green / purple".to_string()
-        } else {
-            series[0].summary.clone()
-        };
-        view.text(x, axis_y + 1, width, summary, MUTED);
+        if series
+            .iter()
+            .all(|trend| trend.points.iter().all(|(_, value)| value.is_none()))
+        {
+            view.text(
+                plot_x,
+                y + 2 + i32::from(height / 2),
+                plot_width,
+                "Waiting for samples",
+                MUTED,
+            );
+        }
         view.plots.push(Plot {
             x: plot_x,
-            y: y + 1,
+            y: y + 2,
             width: plot_width,
             height,
             maximum,
@@ -741,122 +782,256 @@ impl Monitor {
             return view;
         }
         self.width = width;
-        if self.tab == 2 {
+        if self.tab == 6 {
             self.rebuild_processes();
         }
         let side = if width >= 80 { 13 } else { 9 };
         let x = side + 1;
         let w = width.saturating_sub(x + 1);
         view.body_x = x;
-        view.text(1, 0, 10, "SYSTEM", INK);
-        if self.tab < 2 && width >= 50 {
-            let start = width.saturating_sub(20).max(12);
-            for (i, (range, label)) in [(60, "60s"), (300, "5m"), (900, "15m")]
-                .into_iter()
-                .enumerate()
-            {
-                view.button(
-                    start + i as u16 * 6,
-                    0,
-                    5,
-                    label,
-                    Action::Range(range),
-                    self.range == range,
-                );
-            }
-        }
         let labels = if width >= 80 {
-            ["Overview", "Network", "Processes", "Disk/Swap"]
+            [
+                "Overview",
+                "CPU",
+                "Memory",
+                "Disk",
+                "Network",
+                "Swap",
+                "Processes",
+            ]
         } else {
-            ["System", "Net", "Tasks", "Disk"]
+            ["System", "CPU", "Mem", "Disk", "Net", "Swap", "Tasks"]
         };
-        for (i, label) in labels.into_iter().enumerate() {
-            if 2 + (i as u16 * 2) < height {
+        let spacing = if height >= 13 { 2 } else { 1 };
+        let first = usize::from(self.tab).saturating_sub(usize::from(height.saturating_sub(1)));
+        for (i, label) in labels.into_iter().enumerate().skip(first) {
+            let y = (i - first) as u16 * spacing;
+            if y < height {
                 view.button(
                     1,
-                    2 + i as i32 * 2,
+                    i32::from(y),
                     side - 1,
                     label,
                     Action::Tab(i as u8),
                     self.tab == i as u8,
                 );
+                if self.tab == i as u8 {
+                    view.text(0, i32::from(y), 1, "▎", GREEN);
+                }
             }
         }
         let mut body = View::default();
         match self.tab {
             0 => {
-                let trends = self.stats.system_trends(self.range);
+                let mut trends = self.stats.system_trends(self.range, 0..5).into_iter();
+                let cpu = trends.next().unwrap();
+                let memory = trends.next().unwrap();
+                let read = trends.next().unwrap();
+                let write = trends.next().unwrap();
+                let swap = trends.next().unwrap();
                 let columns = if w >= 54 { 2 } else { 1 };
                 let cw = (w - (columns - 1) * 2) / columns;
-                for (i, trend) in trends.into_iter().enumerate() {
+                for (i, series) in [vec![cpu], vec![memory], vec![read, write], vec![swap]]
+                    .into_iter()
+                    .enumerate()
+                {
                     self.graph(
                         &mut body,
                         x + (i as u16 % columns) * (cw + 2),
-                        (i as u16 / columns * 8) as i32,
+                        (i as u16 / columns * 7) as i32,
                         cw,
-                        4,
-                        vec![trend],
+                        3,
+                        series,
                     );
                 }
-                let y = if columns == 2 { 8 } else { 16 };
-                let mut rows = self.stats.overview();
-                if w >= 70 {
-                    let storage = rows.split_off(6.min(rows.len()));
-                    let cw = (w - 3) / 2;
-                    body.details(x, y, cw, rows);
-                    body.details(x + cw + 3, y, w - cw - 3, storage);
-                } else {
-                    body.details(x, y, w, rows);
-                }
+                body.details(x, i32::from(4 / columns * 7), w, self.stats.overview());
             }
             1 => {
-                let name = self
-                    .interface
-                    .as_deref()
-                    .or_else(|| {
-                        self.stats
-                            .networks()
-                            .iter()
-                            .find(|n| n.name != "lo")
-                            .or(self.stats.networks().first())
-                            .map(|n| n.name.as_str())
-                    })
-                    .unwrap_or("—");
-                body.button(
+                let graph_width = if w >= 72 { w * 3 / 5 } else { w };
+                self.graph(
+                    &mut body,
                     x,
                     0,
-                    w,
-                    &format!("Interface: {name}  ›"),
-                    Action::Interface,
-                    false,
+                    graph_width,
+                    4,
+                    self.stats.system_trends(self.range, 0..1),
                 );
-                let series = self.stats.network_trends(self.range, name);
-                let graph_height = height.saturating_sub(10).clamp(3, 9);
-                self.graph(&mut body, x, 2, w, graph_height, series);
+                let y = if graph_width < w {
+                    body.details(
+                        x + graph_width + 3,
+                        0,
+                        w - graph_width - 3,
+                        self.stats.cpu_details(),
+                    )
+                    .max(7)
+                } else {
+                    7
+                };
+                let columns = (w / 24).clamp(1, 4);
+                let cw = w / columns;
+                let mut bottom = y;
+                for (i, (name, value)) in self.stats.cpu_cores().iter().enumerate() {
+                    let column = x + (i as u16 % columns) * cw;
+                    let row = y + 1 + i as i32 / i32::from(columns);
+                    bottom = row + 2;
+                    let bar_width = cw.saturating_sub(13).min(20);
+                    let filled =
+                        value.map_or(0, |v| (v * f32::from(bar_width) / 100.).round() as u16);
+                    body.text(
+                        column,
+                        row,
+                        11.min(cw),
+                        format!(
+                            "{name:<6} {:>4}",
+                            value.map_or_else(|| "—".into(), |v| format!("{v:.0}%"))
+                        ),
+                        INK,
+                    );
+                    if bar_width > 0 {
+                        body.text(
+                            column + 12,
+                            row,
+                            bar_width,
+                            "─".repeat(usize::from(bar_width)),
+                            0x46524a,
+                        );
+                        if filled > 0 {
+                            body.text(
+                                column + 12,
+                                row,
+                                filled,
+                                "━".repeat(usize::from(filled)),
+                                GREEN,
+                            );
+                        }
+                    }
+                }
+                if graph_width == w {
+                    body.details(x, bottom, w, self.stats.cpu_details());
+                }
+            }
+            2 => {
+                let graph_width = if w >= 72 { w * 3 / 5 } else { w };
+                self.graph(
+                    &mut body,
+                    x,
+                    0,
+                    graph_width,
+                    5,
+                    self.stats.system_trends(self.range, 1..2),
+                );
+                let (dx, dy, dw) = if graph_width < w {
+                    (x + graph_width + 3, 0, w - graph_width - 3)
+                } else {
+                    (x, 9, w)
+                };
+                let y = body.details(dx, dy, dw, self.stats.memory_details());
+                body.lines(dx, y + 1, dw, "Available includes reclaimable cache", MUTED);
+            }
+            3 => {
+                let graph_width = if w >= 72 { w * 3 / 5 } else { w };
+                self.graph(
+                    &mut body,
+                    x,
+                    0,
+                    graph_width,
+                    4,
+                    self.stats.system_trends(self.range, 2..4),
+                );
+                let (dx, dw) = if graph_width < w {
+                    (x + graph_width + 3, w - graph_width - 3)
+                } else {
+                    (x, w)
+                };
+                let mut y = if graph_width < w { 0 } else { 8 };
+                if self.stats.disks().is_empty() {
+                    body.text(dx, y, dw, "No physical disks", MUTED);
+                    y += 2;
+                }
+                for disk in self.stats.disks() {
+                    body.text(dx, y, dw, &disk.name, INK);
+                    y = body.details(
+                        dx,
+                        y + 1,
+                        dw,
+                        [
+                            (
+                                "Read".into(),
+                                trend_value(disk.rates[0].map(|v| (v / 1048576.) as f32), "MiB/s"),
+                            ),
+                            (
+                                "Write".into(),
+                                trend_value(disk.rates[1].map(|v| (v / 1048576.) as f32), "MiB/s"),
+                            ),
+                            (
+                                "Busy".into(),
+                                disk.utilization
+                                    .map_or_else(|| "—".into(), |v| format!("{v:.0}%")),
+                            ),
+                        ],
+                    ) + 1;
+                }
                 body.details(
                     x,
-                    i32::from(graph_height) + 6,
+                    if graph_width < w { y.max(8) } else { y },
                     w,
-                    self.stats.network_details(Some(name)),
+                    self.stats.disk_details(),
                 );
             }
-            2 => self.process_view(&mut body, x, w),
-            _ => body.details(x, 0, w, self.stats.storage()),
+            4 => {
+                if self.stats.networks().is_empty() {
+                    body.text(x, 0, w, "No physical network interfaces", MUTED);
+                }
+                let graph_height = height.saturating_sub(6).clamp(3, 4);
+                let graph_width = if w >= 72 { w * 3 / 5 } else { w };
+                let mut y = 0;
+                for network in self.stats.networks() {
+                    self.graph(
+                        &mut body,
+                        x,
+                        y,
+                        graph_width,
+                        graph_height,
+                        self.stats.network_trends(self.range, network),
+                    );
+                    let details = network.details();
+                    let end = if graph_width < w {
+                        body.details(x + graph_width + 3, y, w - graph_width - 3, details)
+                    } else {
+                        body.details(x, y + i32::from(graph_height) + 4, w, details)
+                    };
+                    y = end.max(y + i32::from(graph_height) + 3) + 2;
+                }
+            }
+            5 => {
+                if self.stats.swap_disabled() {
+                    body.text(x, 0, w, "Swap is disabled", MUTED);
+                } else {
+                    let columns = if w >= 64 { 2 } else { 1 };
+                    let cw = (w - (columns - 1) * 3) / columns;
+                    let mut trends = self.stats.system_trends(self.range, 4..7);
+                    let rates = trends.split_off(1);
+                    self.graph(&mut body, x, 0, cw, 4, trends);
+                    self.graph(
+                        &mut body,
+                        if columns == 2 { x + cw + 3 } else { x },
+                        if columns == 2 { 0 } else { 8 },
+                        cw,
+                        4,
+                        rates,
+                    );
+                }
+            }
+            6 => self.process_view(&mut body, x, w),
+            _ => unreachable!(),
         }
         let content_height = body
             .texts
             .iter()
             .map(|t| t.y + 1)
             .chain(body.hits.iter().map(|hit| hit.y + 1))
-            .max()
-            .unwrap_or(0)
-            .max(
-                body.plots
-                    .iter()
-                    .map(|p| p.y + i32::from(p.height))
-                    .max()
-                    .unwrap_or(0),
-            );
+            .chain(body.plots.iter().map(|p| p.y + i32::from(p.height)))
+            .fold(0, i32::max);
         if let Action::Process(pid) = self.focus
             && !body.hits.iter().any(|hit| hit.action == self.focus)
         {
@@ -868,9 +1043,10 @@ impl Monitor {
             self.reveal = true;
         }
         self.follow_process(&body.hits);
+        let pinned = if self.tab == 6 && height > 5 { 4 } else { 0 };
         if self.reveal {
             if let Some(hit) = body.hits.iter().find(|hit| hit.action == self.focus) {
-                let visible = i32::from(height).saturating_sub(2).max(1);
+                let visible = i32::from(height).max(1);
                 let bottom = hit.y
                     + if self
                         .selected
@@ -880,8 +1056,8 @@ impl Monitor {
                     } else {
                         1
                     };
-                if hit.y < self.scroll as i32 {
-                    self.scroll = hit.y.max(0) as usize;
+                if hit.y >= pinned && hit.y < self.scroll as i32 + pinned {
+                    self.scroll = (hit.y - pinned).max(0) as usize;
                 }
                 if bottom > self.scroll as i32 + visible {
                     self.scroll = bottom.saturating_sub(visible).max(0) as usize;
@@ -891,11 +1067,14 @@ impl Monitor {
         }
         self.scroll = self
             .scroll
-            .min(content_height.saturating_sub(i32::from(height) - 2).max(0) as usize);
-        let offset = 2 - self.scroll as i32;
+            .min(content_height.saturating_sub(i32::from(height)).max(0) as usize);
+        let offset = -(self.scroll as i32);
         for mut text in body.texts {
-            text.y += offset;
-            if text.y >= 2 && text.y < i32::from(height) {
+            let fixed = text.y < pinned;
+            if !fixed {
+                text.y += offset;
+            }
+            if text.y >= if fixed { 0 } else { pinned } && text.y < i32::from(height) {
                 view.texts.push(text);
             }
         }
@@ -904,10 +1083,19 @@ impl Monitor {
             view.plots.push(plot);
         }
         for mut hit in body.hits {
-            hit.y += offset;
-            if hit.y >= 2 && hit.y < i32::from(height) {
+            let fixed = hit.y < pinned;
+            if !fixed {
+                hit.y += offset;
+            }
+            if hit.y >= if fixed { 0 } else { pinned } && hit.y < i32::from(height) {
                 view.hits.push(hit);
             }
+        }
+        if self.scroll > 0 {
+            view.text(width - 1, pinned, 1, "↑", MUTED);
+        }
+        if content_height > self.scroll as i32 + i32::from(height) {
+            view.text(width - 1, i32::from(height - 1), 1, "↓", MUTED);
         }
         view.texts.retain(|text| text.x < width);
         for text in &mut view.texts {
@@ -918,11 +1106,7 @@ impl Monitor {
             hit.width = hit.width.min(width - hit.x);
         }
         // Keep every process hit for focus anchoring; allocate text only for visible rows.
-        if view
-            .hits
-            .iter()
-            .any(|hit| matches!(hit.action, Action::Process(_)))
-        {
+        if self.tab == 6 {
             let (columns, count) = process_columns(w, self.sort);
             let columns = &columns[..count];
             for hit in &view.hits {
@@ -975,17 +1159,17 @@ impl Monitor {
         view
     }
     fn process_view(&self, body: &mut View, x: u16, width: u16) {
-        let before = &self.query[..self.cursor];
-        let mut start = 0;
-        let mut columns = text_width(before);
-        for (i, ch) in before.char_indices() {
-            if columns <= usize::from(width.saturating_sub(12)) {
-                break;
-            }
-            columns = columns.saturating_sub(usize::from(scalar_width(ch).min(2)));
-            start = i + ch.len_utf8();
-        }
         let filter = if self.searching {
+            let before = &self.query[..self.cursor];
+            let mut start = 0;
+            let mut columns = text_width(before);
+            for (i, ch) in before.char_indices() {
+                if columns <= usize::from(width.saturating_sub(12)) {
+                    break;
+                }
+                columns = columns.saturating_sub(usize::from(scalar_width(ch).min(2)));
+                start = i + ch.len_utf8();
+            }
             format!(
                 "⌕ {}▏{}",
                 &self.query[start..self.cursor],
@@ -1152,24 +1336,28 @@ mod tests {
     #[test]
     fn search_focus_unicode_and_tabs_do_not_consume_terminal_input() {
         let mut monitor = Monitor::new().unwrap();
-        assert!(!monitor.bytes(b"terminal"));
-        monitor.toggle();
-        monitor.action(Action::Tab(2));
-        monitor.action(Action::Search);
-        for byte in "中rustc".as_bytes() {
-            assert!(monitor.bytes(&[*byte]));
-        }
-        assert_eq!(monitor.query, "中rustc");
-        monitor.bytes(&[127]);
-        assert_eq!(monitor.query, "中rust");
-        monitor.bytes(&[21]);
+        monitor.key(u32::from('t'), "t", false);
         assert!(monitor.query.is_empty());
-        monitor.bytes(b"\x1b");
+        monitor.toggle();
+        monitor.action(Action::Tab(6));
+        monitor.action(Action::Search);
+        monitor.key(0, "中rustc", false);
+        assert_eq!(monitor.query, "中rustc");
+        monitor.key(keysym::BACKSPACE, "", false);
+        assert_eq!(monitor.query, "中rust");
+        monitor.key(u32::from('A'), "", true);
+        assert_eq!(monitor.cursor, 0);
+        monitor.key(u32::from('e'), "", true);
+        assert_eq!(monitor.cursor, monitor.query.len());
+        monitor.key(u32::from('u'), "", true);
+        assert!(monitor.query.is_empty());
+        monitor.key(keysym::ESCAPE, "", false);
         assert!(!monitor.searching);
         assert!(monitor.open);
-        monitor.bytes(b"\x1b");
+        monitor.key(keysym::ESCAPE, "", false);
         assert!(!monitor.open);
-        assert!(!monitor.bytes(b"terminal"));
+        monitor.key(u32::from('t'), "t", false);
+        assert!(monitor.query.is_empty());
         monitor.toggle();
         monitor.action(Action::Tab(3));
         let view = monitor.view(80, 18);
@@ -1180,7 +1368,7 @@ mod tests {
                 .any(|hit| matches!(hit.action, Action::Range(_)))
         );
         monitor.action(Action::Tab(0));
-        let view = monitor.view(80, 18);
+        let view = monitor.footer(80, true, false);
         assert!(
             view.hits
                 .iter()
@@ -1195,7 +1383,7 @@ mod tests {
         let hit = view
             .hits
             .iter()
-            .find(|hit| hit.action == Action::Tab(1))
+            .find(|hit| hit.action == Action::Tab(4))
             .unwrap();
         let label = view
             .texts
@@ -1203,7 +1391,7 @@ mod tests {
             .find(|text| text.x == hit.x && text.y == hit.y)
             .unwrap();
         assert_eq!(label.text, " Network ");
-        assert_eq!(hit.width, 9);
+        assert_eq!(hit.width, 12);
         assert!(!label.selected);
         monitor.pointer = Some((hit.x, hit.y));
         let view = monitor.view(120, 18);
@@ -1238,23 +1426,25 @@ mod tests {
             b"\x1b[1;5D",
             b"\x1bOP",
         ] {
-            monitor.bytes(sequence);
+            if let Some((symbol, modifiers)) = crate::input::sequence_key(sequence) {
+                monitor.key(symbol, "", modifiers & crate::input::CONTROL != 0);
+            };
             assert!(monitor.open);
         }
-        monitor.action(Action::Tab(2));
-        monitor.bytes(b"/");
+        monitor.action(Action::Tab(6));
+        monitor.key(u32::from('/'), "", false);
         assert!(monitor.searching);
-        monitor.query_bytes("中文".as_bytes());
-        monitor.bytes(b"\x1b[D");
-        monitor.query_bytes(b"X");
+        monitor.insert_query("中文");
+        monitor.key(keysym::LEFT, "", false);
+        monitor.insert_query("X");
         assert_eq!(monitor.query, "中X文");
-        monitor.bytes(b"\x1b[1;5D");
+        monitor.key(keysym::LEFT, "", true);
         assert!(monitor.searching);
         assert!(monitor.open);
         assert_eq!(monitor.query, "中X文");
-        monitor.bytes(b"\x1b[3~");
-        assert_eq!(monitor.query, "中X");
-        monitor.bytes(b"\x1b");
+        monitor.key(keysym::DELETE, "", false);
+        assert_eq!(monitor.query, "中文");
+        monitor.key(keysym::ESCAPE, "", false);
         assert!(!monitor.searching);
         assert!(monitor.open);
     }
@@ -1263,22 +1453,23 @@ mod tests {
         let mut monitor = Monitor::new().unwrap();
         monitor.toggle();
         monitor.view(80, 18);
-        monitor.bytes(b"\t");
+        monitor.key(keysym::TAB, "", false);
         assert_eq!(monitor.focus, Action::Tab(1));
-        monitor.bytes(b"\r");
+        monitor.key(keysym::RETURN, "", false);
         assert_eq!(monitor.tab, 1);
-        monitor.bytes(b"\x1b[Z");
+        monitor.key(keysym::LEFT_TAB, "", false);
         assert_eq!(monitor.focus, Action::Tab(0));
-        monitor.bytes(b"\x1b[B");
+        monitor.key(keysym::DOWN, "", false);
         assert_eq!(monitor.tab, 1);
-        monitor.bytes(b"\x1b[B");
+        monitor.key(keysym::DOWN, "", false);
         assert_eq!(monitor.tab, 2);
-        monitor.bytes(b"/");
+        monitor.action(Action::Tab(6));
+        monitor.key(u32::from('/'), "", false);
         assert!(monitor.searching);
-        monitor.bytes(b"\t");
+        monitor.key(keysym::TAB, "", false);
         assert!(!monitor.searching);
         assert_eq!(monitor.focus, Action::Sort(0));
-        monitor.key(0xff0d, "", false);
+        monitor.key(keysym::RETURN, "", false);
         assert!(!monitor.descending);
         let view = monitor.view(60, 12);
         assert!(view.texts.iter().any(|text| text.focused));
@@ -1314,7 +1505,7 @@ mod tests {
             monitor.resize(100, lines);
             assert!(monitor.rows(lines) <= lines - 6);
         }
-        for tab in 0..4 {
+        for tab in 0..7 {
             monitor.action(Action::Tab(tab));
             for width in [12, 30, 80, 120] {
                 let view = monitor.view(width, 10);

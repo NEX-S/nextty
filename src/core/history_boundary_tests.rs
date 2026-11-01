@@ -34,21 +34,8 @@ fn core() -> Core {
     .unwrap();
     core
 }
-fn settle(core: &mut Core) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        core.poll_history(true).unwrap();
-        let history = core.history.as_ref().unwrap();
-        if history.spool.is_empty()
-            && history.stored_end == history.hot_start
-            && !core.history_loading()
-        {
-            return;
-        }
-        assert!(std::time::Instant::now() < deadline);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
+use super::settle_history as settle;
+
 fn copy(mut result: HistoryCopy) -> String {
     let mut value = String::new();
     result.file.read_to_string(&mut value).unwrap();
@@ -147,7 +134,7 @@ fn semantic_selection_at_the_bottom_of_a_loaded_cold_page_stops_at_the_cache_bou
 }
 
 #[test]
-#[cfg(feature = "tui")]
+
 fn alternate_clear_and_resize_keep_main_command_boundaries_and_output() {
     let mut core = core();
     let mut parser = Parser::new();
@@ -185,7 +172,7 @@ fn alternate_clear_and_resize_keep_main_command_boundaries_and_output() {
     assert_eq!(core.display_offset(), core.history_size());
 }
 #[test]
-#[cfg(feature = "tui")]
+
 fn osc_directory_validates_host_percent_encoding_and_preserves_raw_paths() {
     let mut core = core();
     let mut parser = Parser::new();

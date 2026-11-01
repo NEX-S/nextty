@@ -1,5 +1,6 @@
 //! The SSH process carries framed workspace messages on stdin/stdout, without a PTY.
 use crate::clipboard_reader::ClipboardReader;
+use crate::poll::poll;
 use crate::wire::{Peer, Response};
 use crate::workspace::{Action, check_peer, ensure_server, socket_path};
 use std::collections::VecDeque;
@@ -235,17 +236,6 @@ fn fd(fd: i32, events: i16) -> libc::pollfd {
         revents: 0,
     }
 }
-fn poll(fds: &mut [libc::pollfd], timeout: i32) -> io::Result<()> {
-    loop {
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } >= 0 {
-            return Ok(());
-        }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-    }
-}
 
 #[cfg(test)]
 mod tests {
@@ -280,16 +270,12 @@ mod tests {
             matches!(server.next_action().unwrap(), Some(Action::AgentAttach { name, token }) if name == "remote" && token == [0, 255, 1])
         );
         server
-            .send_response(Response::Agent {
-                kind: 4,
-                payload: vec![].into(),
-            })
+            .send_response(Response::Agent(crate::workspace::AgentEvent::Attached))
             .unwrap();
         server
-            .send_response(Response::Agent {
-                kind: 2,
-                payload: vec![0, 255, 2].into(),
-            })
+            .send_response(Response::Agent(crate::workspace::AgentEvent::Request(
+                vec![0, 255, 2],
+            )))
             .unwrap();
         server
             .send_response(Response::Error("normal error after owner ACK".into()))
@@ -299,11 +285,13 @@ mod tests {
         let mut kinds = Vec::new();
         let mut error_seen = false;
         receive_until(&mut remote, |response| match response {
-            Response::Agent { kind, payload } => {
-                if kind == 2 {
-                    assert_eq!(payload.as_ref(), [0, 255, 2]);
-                }
-                kinds.push(kind);
+            Response::Agent(crate::workspace::AgentEvent::Attached) => {
+                kinds.push(4);
+                false
+            }
+            Response::Agent(crate::workspace::AgentEvent::Request(payload)) => {
+                assert_eq!(payload, [0, 255, 2]);
+                kinds.push(2);
                 false
             }
             Response::Error(error) => {
@@ -479,7 +467,7 @@ mod tests {
         std::fs::remove_file(empty_path).unwrap();
         server
             .send_response(Response::Clipboard {
-                request: 33,
+                request: 31,
                 file: empty,
                 incomplete: false,
             })
@@ -507,7 +495,7 @@ mod tests {
                 false
             }
             Response::Clipboard {
-                request: 33,
+                request: 31,
                 file,
                 incomplete: false,
             } => {
@@ -567,6 +555,7 @@ mod tests {
                 panes: Vec::new(),
             },
             Vec::new(),
+            0,
         ))
         .unwrap();
     }

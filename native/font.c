@@ -36,6 +36,8 @@ struct NtFonts {
     cairo_font_options_t *options;
     Style styles[8];
     hb_buffer_t *buffer;
+    void *scratch; /* Per-line itemization arrays, reused across shaping calls. */
+    size_t scratch_size;
     struct { uint32_t key; Font *font; } choices[2048]; /* Borrowed from styles. */
 };
 
@@ -105,6 +107,7 @@ void nt_fonts_free(NtFonts *f) {
     if (f->options) cairo_font_options_destroy(f->options);
     if (f->config) FcConfigDestroy(f->config);
     free(f->family);
+    free(f->scratch);
     free(f);
 }
 
@@ -355,8 +358,13 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         (printable_ascii ? 0 : sizeof(FriBidiCharType) + sizeof(FriBidiBracketType));
     if (characters > SIZE_MAX / item_size) return fail(f, "Line itemization is too large");
     /* Keep the character, code and bidi arrays in one scratch allocation. */
-    Character *chars = malloc(characters * item_size);
-    if (!chars) return fail(f, "Cannot allocate line itemization");
+    if (characters * item_size > f->scratch_size) {
+        void *grown = realloc(f->scratch, characters * item_size);
+        if (!grown) return fail(f, "Cannot allocate line itemization");
+        f->scratch = grown;
+        f->scratch_size = characters * item_size;
+    }
+    Character *chars = f->scratch;
     FriBidiChar *codes = (FriBidiChar *)(chars + characters);
     FriBidiLevel *levels = (FriBidiLevel *)(codes + characters);
     NtFontGlyph *out = NULL;
@@ -498,6 +506,5 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     success = 1;
 done:
     if (!success) nt_font_glyphs_free(out, used);
-    free(chars);
     return success;
 }

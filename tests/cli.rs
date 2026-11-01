@@ -1,5 +1,3 @@
-#![cfg(feature = "tui")]
-
 use std::{
     fs,
     os::{

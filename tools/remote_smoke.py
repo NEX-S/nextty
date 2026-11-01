@@ -3,9 +3,11 @@
 
 Uses existing ssh/sshd/ssh-keygen, throwaway keys and isolated HOME/cache/runtime
 paths. No user SSH configuration, daemon, session or shell configuration is used.
-Only the TUI is driven here; this does not measure latency or validate GUI/IBus.
+The TUI input-to-displayed-echo path is measured with optional added SSH delay.
+GUI rendering and IBus are not exercised.
 """
 import argparse
+from collections import deque
 import errno
 import fcntl
 import getpass
@@ -20,6 +22,7 @@ import shlex
 import shutil
 import signal
 import socket
+import statistics
 import struct
 import subprocess
 import sys
@@ -78,6 +81,47 @@ def fixture(root):
     os.execve(binary, [binary, *command[1:]], env)
 
 
+def delay_proxy(host, port, rtt_ms):
+    with socket.create_connection((host, int(port))) as remote:
+        remote.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+        remote.setblocking(False)
+        for fd in (0, 1):
+            os.set_blocking(fd, False)
+        remote_fd = remote.fileno()
+        readers = {0: remote_fd, remote_fd: 1}
+        queues = {remote_fd: deque(), 1: deque()}
+        delay = float(rtt_ms) / 2000
+        while readers or any(queues.values()):
+            now = time.monotonic()
+            writers = [fd for fd, queue in queues.items() if queue and queue[0][0] <= now]
+            deadlines = [queue[0][0] for queue in queues.values() if queue]
+            timeout = max(0, min(deadlines) - now) if deadlines else None
+            ready, writable, _ = select.select(list(readers), writers, [], timeout)
+            for fd in ready:
+                data = os.read(fd, 65536)
+                destination = readers[fd]
+                queues[destination].append((time.monotonic() + delay, data))
+                if not data:
+                    del readers[fd]
+                    if fd == remote_fd:
+                        readers.pop(0, None)
+            for fd in writable:
+                due, data = queues[fd][0]
+                if not data:
+                    queues[fd].popleft()
+                    if fd == remote_fd:
+                        remote.shutdown(socket.SHUT_WR)
+                    continue
+                try:
+                    count = os.write(fd, data)
+                except BlockingIOError:
+                    continue
+                if count == len(data):
+                    queues[fd].popleft()
+                else:
+                    queues[fd][0] = (due, data[count:])
+
+
 class Terminal:
     def __init__(self, lab, args, name):
         self.master, slave = pty.openpty()
@@ -106,7 +150,6 @@ class Terminal:
                     break
                 self.output.extend(data)
                 self.log.write(data)
-        return bytes(self.output)
 
     def expect(self, text, timeout=8):
         expected = text.encode() if isinstance(text, str) else text
@@ -151,7 +194,8 @@ class Terminal:
 
 
 class Lab:
-    def __init__(self, binary, output):
+    def __init__(self, binary, output, rtt_ms):
+        self.rtt_ms = rtt_ms
         self.binary = binary.resolve(strict=True)
         self.output = output.resolve()
         self.output.mkdir(parents=True, exist_ok=True)
@@ -199,6 +243,11 @@ class Lab:
             f'  UserKnownHostsFile {root / "known_hosts"}', '  GlobalKnownHostsFile /dev/null',
             '  ConnectTimeout 2', '  ConnectionAttempts 1', '  LogLevel ERROR', '',
         ]))
+        if self.rtt_ms:
+            proxy = shlex.join([sys.executable, str(Path(__file__).resolve()),
+                                '--delay-proxy', '%h', '%p', str(self.rtt_ms)])
+            with (root / 'ssh_config').open('a') as config:
+                config.write('  ProxyCommand ' + proxy + '\n')
         system_ssh = shutil.which('ssh')
         sshd = shutil.which('sshd')
         if not system_ssh or not sshd:
@@ -241,6 +290,30 @@ class Lab:
         self.checks.append(dict(case=case, passed=True, **details))
         print('PASS ' + case, flush=True)
 
+    def measure_echo(self, terminal):
+        script = (
+            "import os,termios,tty; old=termios.tcgetattr(0); tty.setraw(0); "
+            "os.write(1,b'LATENCY'+b'READY'); "
+            "[(os.read(0,1),os.write(1,('probe-%03d\\r\\n'%i).encode())) for i in range(20)]; "
+            "termios.tcsetattr(0,termios.TCSANOW,old)"
+        )
+        terminal.command('python3 -u -c ' + shlex.quote(script))
+        terminal.expect('LATENCYREADY')
+        samples = []
+        for index in range(20):
+            terminal.output.clear()
+            started = time.monotonic()
+            terminal.send(b'x')
+            expected = ('probe-%03d' % index).encode()
+            while expected not in ANSI.sub(b'', terminal.output):
+                terminal.read(.001)
+                if time.monotonic() - started > 5:
+                    raise TimeoutError('remote input echo')
+            samples.append((time.monotonic() - started) * 1000)
+        self.record('remote input reaches the child and returns to the displayed screen',
+                    added_rtt_ms=self.rtt_ms, samples=len(samples),
+                    p50_ms=statistics.median(samples), p99_ms=sorted(samples)[-1])
+
     def exercise(self):
         target = self.destination
         empty = self.cli('list', target)
@@ -250,6 +323,7 @@ class Lab:
         first = Terminal(self, ['new', target, 'smoke', '--tui', '-e', '/bin/sh', '-i'], 'new')
         first.expect('smoke>')
         first.expect('Local')
+        self.measure_echo(first)
         first.send(b'\x1bf')
         first.expect('Files are unavailable in remote sessions')
         self.record('remote TUI labels statistics as local and disables remote file navigation')
@@ -390,15 +464,20 @@ def main():
     parser.add_argument('--binary', type=Path, default=Path('target/release/nextty'))
     parser.add_argument('--output-dir', type=Path, default=Path('target/remote-ssh-20261024/validation'))
     parser.add_argument('--fixture', type=Path, help=argparse.SUPPRESS)
+    parser.add_argument('--rtt-ms', type=float, default=0, help='added round-trip delay on the private SSH connection')
+    parser.add_argument('--delay-proxy', nargs=3, help=argparse.SUPPRESS)
     args = parser.parse_args()
+    if args.delay_proxy:
+        delay_proxy(*args.delay_proxy)
+        return
     if args.fixture:
         fixture(args.fixture)
         return
-    lab = Lab(args.binary, args.output_dir)
+    lab = Lab(args.binary, args.output_dir, args.rtt_ms)
     report = {'scope': __doc__, 'binary': str(lab.binary),
               'binary_sha256': hashlib.sha256(lab.binary.read_bytes()).hexdigest(), 'checks': lab.checks,
               'not_covered': ['GUI rendering and IBus', 'large command-block clipboard export',
-                              'prediction/local echo (not implemented in this stage)', 'WAN latency and performance']}
+                              'prediction/local echo (not implemented in this stage)', 'real WAN packet loss and bandwidth limits']}
     try:
         lab.start()
         lab.exercise()

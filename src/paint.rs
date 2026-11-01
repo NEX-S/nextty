@@ -213,11 +213,9 @@ impl Frame {
                     block_cursor,
                 );
                 if previous_style == Some(style)
-                    && runs
-                        .last()
-                        .is_some_and(|run| usize::from(run.end) == column)
+                    && let Some(run) = runs.last_mut()
+                    && usize::from(run.end) == column
                 {
-                    let run = runs.last_mut().unwrap();
                     run.text.end = text.len() as u32;
                     run.end = (column + width) as u16;
                     continue;
@@ -266,7 +264,7 @@ impl Frame {
                     strike: cell.flags.contains(Flags::STRIKEOUT),
                 });
             }
-            while let Some(run) = runs.last() {
+            while let Some(run) = runs.last_mut() {
                 if run.background.is_some() || run.underline.is_some() || run.strike {
                     break;
                 }
@@ -274,7 +272,7 @@ impl Frame {
                 let trimmed = text[start..].trim_end_matches(' ').len();
                 text.truncate(start + trimmed);
                 column_map.truncate(text.len());
-                runs.last_mut().unwrap().text.end = text.len() as u32;
+                run.text.end = text.len() as u32;
                 if trimmed != 0 {
                     break;
                 }
@@ -626,7 +624,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
+
     fn prompt_cells_do_not_gain_selection_background() {
         use crate::core::{Point, SelectionType, Side};
         let config = Config::default();
@@ -665,7 +663,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(feature = "tui")]
+
     fn right_prompt_shaping_and_decorations_keep_terminal_columns() {
         let mut core = Core::new(
             WindowSize {

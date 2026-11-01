@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection, semantic_group};
+use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection};
 use crate::eventfd::{consume_notification, notify};
 use crate::vt::{Color, NamedColor, Rgb};
 
@@ -27,7 +27,6 @@ pub struct HistoryBudget {
     notifications: Mutex<Vec<std::sync::Weak<OwnedFd>>>,
 }
 struct BudgetFiles {
-    open: Option<(Arc<Path>, File)>,
     files: VecDeque<(Arc<Path>, u64, u64)>,
     used: u64,
 }
@@ -45,7 +44,6 @@ impl HistoryBudget {
             directory,
             capacity,
             files: Mutex::new(BudgetFiles {
-                open: None,
                 files: VecDeque::new(),
                 used: 0,
             }),
@@ -53,73 +51,53 @@ impl HistoryBudget {
             notifications: Mutex::new(Vec::new()),
         }))
     }
-    fn append_file(
+    fn record_file(
         &self,
         path: &Arc<Path>,
         create: bool,
-        data: &[u8],
+        bytes: u64,
         order: u64,
-    ) -> io::Result<u64> {
-        // Serialization with eviction prevents another pane from unlinking a segment
-        // between opening it and publishing the appended rows.
+    ) -> io::Result<bool> {
         let mut files = self
             .files
             .lock()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let previous = if create || files.open.as_ref().is_none_or(|(open, _)| open != path) {
-            let file = if create {
-                OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .mode(0o600)
-                    .open(path)?
-            } else {
-                OpenOptions::new().append(true).open(path)?
-            };
-            files.open.replace((path.clone(), file))
-        } else {
-            None
-        };
-        let file = &mut files.open.as_mut().unwrap().1;
-        file.write_all(data)?;
-        let metadata = file.metadata()?;
-        if metadata.nlink() == 0 {
-            files.open = None;
-            return Err(io::ErrorKind::NotFound.into());
-        }
-        let bytes = (metadata.blocks() * 512).max(4096);
         let end = if files.files.back().is_some_and(|(_, _, age)| *age > order) {
             files.files.partition_point(|(_, _, age)| *age <= order)
         } else {
             files.files.len()
         };
-        if !create
-            && let Some(index) = files
-                .files
-                .range(..end)
-                .rposition(|(existing, _, _)| existing == path)
-        {
-            let previous = files.files[index].1;
-            files.files[index].1 = bytes;
-            files.used = files.used - previous + bytes;
-        } else {
+        if create {
             files.files.insert(end, (path.clone(), bytes, order));
             files.used += bytes;
+        } else {
+            let start = files.files.partition_point(|(_, _, age)| *age < order);
+            // Another pane can evict this segment while its write is in progress.
+            let Some(index) = files
+                .files
+                .range(start..end)
+                .position(|(existing, _, _)| existing == path)
+            else {
+                return Ok(false);
+            };
+            let previous = files.files[start + index].1;
+            files.files[start + index].1 = bytes;
+            files.used = files.used - previous + bytes;
         }
-        let mut evicted = false;
+        let mut evicted = Vec::new();
+        let mut retained = true;
         while files.used > self.capacity {
-            let (path, bytes, _) = files.files.pop_front().unwrap();
-            if files.open.as_ref().is_some_and(|(open, _)| open == &path) {
-                files.open = None;
-            }
-            remove_segment(&path)?;
+            let (evicted_path, bytes, _) = files.files.pop_front().unwrap();
+            retained &= &evicted_path != path;
             files.used -= bytes;
-            evicted = true;
+            evicted.push(evicted_path);
         }
-        // Replaced handles can close without serializing other archive writers.
         drop(files);
-        drop(previous);
-        if evicted {
+        if !evicted.is_empty() {
+            for path in evicted {
+                remove_segment(&path)?;
+            }
+            // Readers may trust a generation until every evicted path is unlinked.
             self.generation.fetch_add(1, Ordering::Release);
             let mut notifications = self
                 .notifications
@@ -130,7 +108,7 @@ impl HistoryBudget {
                 notify(fd.as_raw_fd())?;
             }
         }
-        Ok(metadata.len())
+        Ok(retained)
     }
     fn unregister(&self, segments: &[Segment]) -> io::Result<()> {
         if segments.is_empty() {
@@ -167,14 +145,8 @@ impl HistoryBudget {
             });
         }
         files.used -= removed;
+        drop(files);
         for segment in segments {
-            if files
-                .open
-                .as_ref()
-                .is_some_and(|(open, _)| open == &segment.path)
-            {
-                files.open = None;
-            }
             remove_segment(&segment.path)?;
         }
         Ok(())
@@ -350,12 +322,15 @@ impl Drop for SearchWorker {
 fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
     let mut matcher = crate::search::Matcher::new(&job.query);
     let mut cells = Vec::new();
+    let finder = memchr::memmem::Finder::new(job.query.as_bytes());
+    let mut wrapped = false;
     for (path, start, end) in &job.segments {
         if job.cancelled.load(Ordering::Relaxed) {
             break;
         }
         let Some(mut reader) = open_segment(path)? else {
             matcher.gap();
+            wrapped = false;
             continue;
         };
         let mut id = *start;
@@ -372,13 +347,26 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
             if empty != 0 {
                 if line_break {
                     matcher.line_break();
+                    wrapped = false;
                 }
                 reader.consume(empty * 9);
                 id += empty as u64;
                 continue;
             }
+            if !wrapped {
+                let skip = plain_row_text(reader.fill_buf()?)
+                    .filter(|(_, text)| finder.find(text).is_none())
+                    .map(|(length, _)| length);
+                if let Some(length) = skip {
+                    reader.consume(length);
+                    matcher.line_break();
+                    id += 1;
+                    continue;
+                }
+            }
             let row = read_row::<false>(&mut reader, cells)?;
             matcher.row(id, &row);
+            wrapped = row.wrapped;
             cells = row.cells;
             id += 1;
         }
@@ -395,7 +383,6 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
 pub(crate) enum Reply {
     Stored {
         first: u64,
-        end: u64,
     },
     Cleared,
     Page {
@@ -521,10 +508,7 @@ impl History {
                             archive
                                 .append(start, &rows)
                                 .and_then(|()| archive.first())
-                                .map(|first| Reply::Stored {
-                                    first,
-                                    end: archive.end,
-                                }),
+                                .map(|first| Reply::Stored { first }),
                         ),
                         Request::Page {
                             epoch,
@@ -581,10 +565,9 @@ impl History {
                             None
                         }
                         Request::Clear => Some(archive.clear().map(|()| Reply::Cleared)),
-                        Request::Status => Some(archive.first().map(|first| Reply::Stored {
-                            first,
-                            end: archive.end,
-                        })),
+                        Request::Status => {
+                            Some(archive.first().map(|first| Reply::Stored { first }))
+                        }
                         Request::Reflow(request) => Some(archive.reflow(request)),
                     };
                     if let Some(result) = result
@@ -613,6 +596,10 @@ impl History {
     }
     pub fn event_fd(&self) -> RawFd {
         self.notification.as_raw_fd()
+    }
+    pub(crate) fn shutdown(mut self) {
+        self.sender.take();
+        self.thread.take();
     }
     pub fn check_budget(&mut self) {
         let generation = self.budget.generation.load(Ordering::Acquire);
@@ -1001,28 +988,69 @@ struct Archive {
     end: u64,
     order_hint: Option<u64>,
     encoded: Vec<u8>,
+    current: Option<File>,
+    generation: u64,
 }
 impl Archive {
     fn new(budget: Arc<HistoryBudget>) -> Self {
         Self {
+            generation: budget.generation.load(Ordering::Acquire),
             budget,
             segments: VecDeque::new(),
             end: 0,
             order_hint: None,
             encoded: Vec::new(),
+            current: None,
         }
     }
     fn first(&mut self) -> io::Result<u64> {
-        while let Some(segment) = self.segments.front() {
-            if segment.path.try_exists()? {
-                break;
+        let generation = self.budget.generation.load(Ordering::Acquire);
+        if generation != self.generation {
+            while let Some(segment) = self.segments.front() {
+                if segment.path.try_exists()? {
+                    break;
+                }
+                self.segments.pop_front();
             }
-            self.segments.pop_front();
+            if self.segments.is_empty() {
+                self.current = None;
+            }
+            self.generation = generation;
         }
         Ok(self
             .segments
             .front()
             .map_or(self.end, |segment| segment.start))
+    }
+    fn append_file(
+        &mut self,
+        path: &Arc<Path>,
+        create: bool,
+        order: u64,
+    ) -> io::Result<Option<u64>> {
+        if create {
+            self.current = Some(
+                OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)?,
+            );
+        }
+        let file = self.current.as_mut().unwrap();
+        file.write_all(&self.encoded)?;
+        let metadata = file.metadata()?;
+        if metadata.nlink() == 0 {
+            self.current = None;
+            return Ok(None);
+        }
+        let retained =
+            self.budget
+                .record_file(path, create, (metadata.blocks() * 512).max(4096), order)?;
+        if !retained {
+            self.current = None;
+        }
+        Ok((create || retained).then_some(metadata.len()))
     }
     fn append(&mut self, start: u64, rows: &[Row]) -> io::Result<()> {
         if start != self.end {
@@ -1034,23 +1062,18 @@ impl Archive {
         for chunk in rows.chunks(BATCH) {
             self.encoded.clear();
             for row in chunk {
-                write_row(&mut self.encoded, row)?;
+                write_row(&mut self.encoded, row);
             }
-            let reuse = self
-                .segments
-                .back()
-                .is_some_and(|segment| segment.bytes + self.encoded.len() as u64 <= SEGMENT_BYTES);
+            let reuse = self.current.is_some()
+                && self.segments.back().is_some_and(|segment| {
+                    segment.bytes + self.encoded.len() as u64 <= SEGMENT_BYTES
+                        && self.order_hint.is_none_or(|order| order == segment.order)
+                });
             let bytes = if reuse {
-                match self.budget.append_file(
-                    &self.segments.back().unwrap().path,
-                    false,
-                    &self.encoded,
-                    self.segments.back().unwrap().order,
-                ) {
-                    Ok(bytes) => Some(bytes),
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => None,
-                    Err(error) => return Err(error),
-                }
+                let segment = self.segments.back().unwrap();
+                let path = segment.path.clone();
+                let order = segment.order;
+                self.append_file(&path, false, order)?
             } else {
                 None
             };
@@ -1062,7 +1085,7 @@ impl Archive {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
                 let path: Arc<Path> = self.budget.directory.join(format!("{id}.rows")).into();
                 let order = self.order_hint.unwrap_or(id);
-                let bytes = self.budget.append_file(&path, true, &self.encoded, order)?;
+                let bytes = self.append_file(&path, true, order)?.unwrap();
                 self.segments.push_back(Segment {
                     path,
                     start: self.end,
@@ -1294,99 +1317,30 @@ impl Archive {
                         },
                 );
             }
-        } else if matches!(kind, SelectionType::Lines) {
-            while start.0 > first && source_row(start.0 - 1)?.is_some_and(|row| row.wrapped) {
-                start.0 -= 1;
-            }
-            while source_row(end.0)?.is_some_and(|row| row.wrapped)
-                && end.0 + 1 < hot_start + hot.len() as u64
-            {
-                end.0 += 1;
-            }
-            start.1 = 0;
-            end.1 = source_row(end.0)?.map_or(0, |row| row.cells.len());
-        } else if matches!(kind, SelectionType::Semantic) {
-            if let Some(mut row) = source_row(start.0)? {
-                if start.1 > 0
-                    && row
-                        .cells
-                        .get(start.1)
-                        .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-                {
-                    start.1 -= 1;
+        } else {
+            let mut first_point = (start.0 as i64, start.1);
+            let mut last_point = (end.0 as i64, end.1.saturating_sub(1));
+            crate::core::expand_selection(kind, &mut first_point, &mut last_point, |id| {
+                if id < first as i64 {
+                    Ok(None)
+                } else {
+                    source_row(id as u64)
                 }
-                let class = semantic_group(row.cells[start.1.min(row.cells.len() - 1)].c);
-                loop {
-                    let mut previous = *start;
-                    if previous.1 > 0 {
-                        previous.1 -= 1;
-                    } else if previous.0 > first {
-                        let Some(previous_row) = source_row(previous.0 - 1)? else {
-                            break;
-                        };
-                        if !previous_row.wrapped {
-                            break;
-                        }
-                        previous.0 -= 1;
-                        previous.1 = previous_row.used().saturating_sub(1);
-                        row = previous_row;
-                    } else {
-                        break;
-                    }
-                    if previous.1 > 0
-                        && row.cells[previous.1]
-                            .flags
-                            .contains(Flags::WIDE_CHAR_SPACER)
+            })?;
+            *start = (first_point.0 as u64, first_point.1);
+            let row = source_row(last_point.0 as u64)?;
+            *end = (
+                last_point.0 as u64,
+                last_point.1
+                    + if row
+                        .as_ref()
+                        .is_some_and(|row| row.cells[last_point.1].flags.contains(Flags::WIDE_CHAR))
                     {
-                        previous.1 -= 1;
-                    }
-                    if semantic_group(row.cells[previous.1].c) != class {
-                        break;
-                    }
-                    *start = previous;
-                }
-            }
-            // The core supplies an inclusive semantic end converted to a half-open endpoint.
-            if end.1 > 0 {
-                end.1 -= 1;
-            }
-            if let Some(mut row) = source_row(end.0)? {
-                end.1 = end.1.min(row.cells.len() - 1);
-                if end.1 > 0 && row.cells[end.1].flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    end.1 -= 1;
-                }
-                let class = semantic_group(row.cells[end.1].c);
-                loop {
-                    let mut next = *end;
-                    next.1 += if row.cells[end.1].flags.contains(Flags::WIDE_CHAR) {
                         2
                     } else {
                         1
-                    };
-                    if row.wrapped && next.1 >= row.used() {
-                        let Some(next_row) = source_row(next.0 + 1)? else {
-                            break;
-                        };
-                        if semantic_group(next_row.cells[0].c) != class {
-                            break;
-                        }
-                        next.0 += 1;
-                        next.1 = 0;
-                        row = next_row;
-                    } else {
-                        if next.1 >= row.cells.len() || semantic_group(row.cells[next.1].c) != class
-                        {
-                            break;
-                        }
-                    }
-                    *end = next;
-                }
-                end.1 += if row.cells[end.1].flags.contains(Flags::WIDE_CHAR) {
-                    2
-                } else {
-                    1
-                };
-            }
+                    },
+            );
         }
         Ok(())
     }
@@ -1414,18 +1368,18 @@ impl Archive {
                 .is_some_and(|segment| segment.end <= retain_before)
             {
                 let segment = self.segments.pop_front().unwrap();
-                output.count = segment.end;
+                output.flow.count = segment.end;
                 output.archive.end = segment.end;
                 output.archive.segments.push_back(segment);
             }
             while let Some(&(row, column, index)) = anchors.get(anchor)
-                && row < output.count
+                && row < output.flow.count
             {
-                output.points[index] = Some((row, column));
+                output.flow.points[index] = Some((row, column));
                 anchor += 1;
             }
-            if (first..output.count).contains(&request.view_top) {
-                output.view_top = Some(request.view_top);
+            if (first..output.flow.count).contains(&request.view_top) {
+                output.flow.view_top = Some(request.view_top);
             }
         }
         let mut cells = Vec::new();
@@ -1436,7 +1390,7 @@ impl Archive {
             output.archive.order_hint = Some(segment.order);
             for id in segment.start..segment.end {
                 let row = read_row::<true>(&mut file, cells)?;
-                cells = output.row(id, row, &anchors, &mut anchor, &request)?;
+                cells = output.row(id, row, &anchors, &mut anchor)?;
             }
             drop(file);
             self.budget.unregister(std::slice::from_ref(&segment))?;
@@ -1444,25 +1398,32 @@ impl Archive {
         output.archive.order_hint = Some(NEXT.fetch_add(1, Ordering::Relaxed));
         let hot_len = request.hot.len();
         for (index, row) in std::mem::take(&mut request.hot).into_iter().enumerate() {
-            output.row(
-                request.hot_start + index as u64,
+            output.row(request.hot_start + index as u64, row, &anchors, &mut anchor)?;
+        }
+        if let Some(row) = output.flow.finish() {
+            ReflowOutput::retain_row(
                 row,
-                &anchors,
-                &mut anchor,
-                &request,
+                &mut output.tail,
+                &mut output.pending,
+                &mut output.archive,
+                output.keep,
             )?;
         }
-        if output.column != 0 || output.last_wrapped {
-            output.emit(false)?;
-        }
-        let cursor = output.points.first().copied().flatten().unwrap_or((0, 0)).0;
+        let cursor = output
+            .flow
+            .points
+            .first()
+            .copied()
+            .flatten()
+            .unwrap_or((0, 0))
+            .0;
         if request.old_columns != request.columns {
             while output.tail.len() > request.lines
                 && output.tail.back().is_some_and(|row| row.used() == 0)
-                && output.count - 1 > cursor
+                && output.flow.count - 1 > cursor
             {
                 output.tail.pop_back();
-                output.count -= 1;
+                output.flow.count -= 1;
             }
         } else {
             let removed = request.old_lines.saturating_sub(request.lines).min(
@@ -1474,38 +1435,40 @@ impl Archive {
             );
             for _ in 0..removed {
                 output.tail.pop_back();
-                output.count -= 1;
+                output.flow.count -= 1;
             }
         }
         let screen_start = output
+            .flow
             .count
             .saturating_sub(request.lines as u64)
             .min(cursor);
-        while output.count > screen_start + request.lines as u64 {
+        while output.flow.count > screen_start + request.lines as u64 {
             output.tail.pop_back();
-            output.count -= 1;
+            output.flow.count -= 1;
         }
         while output.tail.len() < request.lines {
             output
                 .tail
                 .push_back(Row::new(request.columns, Cell::default()));
-            output.count += 1;
+            output.flow.count += 1;
         }
         output.flush()?;
-        let hot_start = output.count - output.tail.len() as u64;
+        let hot_start = output.flow.count - output.tail.len() as u64;
         let first = output.archive.first()?;
-        let view_top = output.view_top.unwrap_or(first).max(first);
+        let view_top = output.flow.view_top.unwrap_or(first).max(first);
         output.archive.order_hint = None;
         *self = output.archive;
         Ok(Reply::Reflow {
             rows: output.tail,
             first,
             hot_start,
-            points: output.points,
+            points: output.flow.points,
             view_top,
         })
     }
     fn clear(&mut self) -> io::Result<()> {
+        self.current = None;
         let result = self.budget.unregister(self.segments.make_contiguous());
         self.segments.clear();
         result?;
@@ -1517,13 +1480,8 @@ struct ReflowOutput {
     archive: Archive,
     tail: VecDeque<Row>,
     pending: Vec<Row>,
-    row: Row,
-    column: usize,
-    count: u64,
-    points: Vec<Option<(u64, usize)>>,
-    view_top: Option<u64>,
+    flow: crate::core::RowReflow,
     keep: usize,
-    last_wrapped: bool,
 }
 impl ReflowOutput {
     fn new(budget: Arc<HistoryBudget>, request: &Reflow) -> Self {
@@ -1531,37 +1489,36 @@ impl ReflowOutput {
             archive: Archive::new(budget),
             tail: VecDeque::new(),
             pending: Vec::new(),
-            row: Row::new(request.columns, Cell::default()),
-            column: 0,
-            count: 0,
-            points: vec![None; request.points.len()],
-            view_top: None,
+            flow: crate::core::RowReflow::new(
+                request.old_columns,
+                request.columns,
+                request.points.len(),
+                request.view_top,
+            ),
             keep: request.keep_rows.max(request.lines),
-            last_wrapped: false,
         }
-    }
-    fn emit(&mut self, wrapped: bool) -> io::Result<()> {
-        let columns = self.row.cells.len();
-        let mut row = std::mem::replace(&mut self.row, Row::new(columns, Cell::default()));
-        row.wrapped = wrapped;
-        self.column = 0;
-        self.push_row(row)
-    }
-    fn push_row(&mut self, row: Row) -> io::Result<()> {
-        self.tail.push_back(row);
-        self.count += 1;
-        while self.tail.len() > self.keep {
-            self.pending.push(self.tail.pop_front().unwrap());
-            if self.pending.len() == BATCH {
-                self.flush()?;
-            }
-        }
-        Ok(())
     }
     fn flush(&mut self) -> io::Result<()> {
         if !self.pending.is_empty() {
             self.archive.append(self.archive.end, &self.pending)?;
             self.pending.clear();
+        }
+        Ok(())
+    }
+    fn retain_row(
+        row: Row,
+        tail: &mut VecDeque<Row>,
+        pending: &mut Vec<Row>,
+        archive: &mut Archive,
+        keep: usize,
+    ) -> io::Result<()> {
+        tail.push_back(row);
+        while tail.len() > keep {
+            pending.push(tail.pop_front().unwrap());
+            if pending.len() == BATCH {
+                archive.append(archive.end, pending)?;
+                pending.clear();
+            }
         }
         Ok(())
     }
@@ -1571,88 +1528,19 @@ impl ReflowOutput {
         row: Row,
         anchors: &[(u64, usize, usize)],
         anchor: &mut usize,
-        request: &Reflow,
     ) -> io::Result<Vec<Cell>> {
-        if id == request.view_top {
-            self.view_top = Some(self.count);
-        }
-        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line < id) {
-            *anchor += 1;
-        }
-        let begin = *anchor;
-        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line == id) {
-            *anchor += 1;
-        }
-        let anchors = &anchors[begin..*anchor];
-        if request.old_columns == request.columns {
-            for (_, column, index) in anchors {
-                self.points[*index] = Some((self.count, *column));
-            }
-            return self.push_row(row).map(|_| Vec::new());
-        }
-        let mut used = row.used();
-        if !row.wrapped {
-            for (_, column, index) in anchors {
-                used = used.max(if *index < 2 && *column == request.old_columns {
-                    *column
-                } else {
-                    column + 1
-                });
-            }
-        }
-        used = used.min(request.old_columns);
-        let mut extras = row
-            .extras
-            .map(Arc::unwrap_or_clone)
-            .unwrap_or_default()
-            .into_iter()
-            .peekable();
-        for source in 0..used {
-            let cell = row.cells[source];
-            if (cell.flags.contains(Flags::WIDE_CHAR)
-                && self.column + 1 == request.columns
-                && request.columns > 1)
-                || self.column == request.columns
-            {
-                self.emit(true)?;
-            }
-            for (_, column, index) in anchors {
-                if (*column).min(if row.wrapped { row.used } else { used }) == source {
-                    self.points[*index] = Some((self.count, self.column));
-                }
-            }
-            let extra = if extras.peek().is_some_and(|(column, _)| *column == source) {
-                Some(extras.next().unwrap().1)
-            } else {
-                None
-            };
-            if request.columns == 1 && cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            self.row.cells[self.column] = cell;
-            if request.columns == 1 {
-                self.row.cells[self.column].flags.remove(Flags::WIDE_CHAR);
-            }
-            if source < row.used {
-                self.row.used = self.column + 1;
-            }
-            if let Some(extra) = extra {
-                self.row.extras_mut().push((self.column, extra));
-            }
-            self.column += 1;
-        }
-        for (_, column, index) in anchors {
-            if (*column).min(if row.wrapped { row.used } else { used }) == used {
-                self.points[*index] = Some((self.count, self.column));
-            }
-        }
-        self.last_wrapped = row.wrapped;
-        if !row.wrapped {
-            self.emit(false)?;
-        }
-        Ok(row.cells)
+        self.flow.row(id, row, anchors, anchor, &mut |row| {
+            Self::retain_row(
+                row,
+                &mut self.tail,
+                &mut self.pending,
+                &mut self.archive,
+                self.keep,
+            )
+        })
     }
 }
+
 /// `None` means another pane's append evicted the segment.
 fn open_segment(path: &Path) -> io::Result<Option<BufReader<File>>> {
     match File::open(path) {
@@ -1687,17 +1575,9 @@ fn write_text(
         length += ch.encode_utf8(&mut bytes[length..]).len();
         Ok(())
     };
-    for (_, cell, extra) in row.cells_with_extras(start..end) {
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER)
-            || (skip_prompt && cell.flags.contains(Flags::PROMPT))
-        {
-            continue;
-        }
-        push(cell.c)?;
-        if let Some(extra) = extra {
-            for &ch in &extra.zerowidth {
-                push(ch)?;
-            }
+    for (column, ch) in row.characters(start..end) {
+        if !skip_prompt || !row.cells[column].flags.contains(Flags::PROMPT) {
+            push(ch)?;
         }
     }
     file.write_all(&bytes[..length])
@@ -1732,43 +1612,103 @@ fn read_color(bytes: [u8; 4]) -> io::Result<Color> {
         )),
     }
 }
-fn write_row(file: &mut impl Write, row: &Row) -> io::Result<()> {
-    let stored = if row.used() == row.cells.len() {
-        row.used()
-    } else {
-        let used = row.used();
-        row.cells[used..]
-            .iter()
-            .rposition(|cell| *cell != Cell::default())
-            .map_or(used, |column| used + column + 1)
+// Bit 15 is not a cell flag: the run holds wide characters whose spacer cells the
+// reader derives, so wide text needs neither spacer text nor one run per cell.
+const WIDE_PAIRS: u16 = 1 << 15;
+
+fn wide_spacer(cell: &Cell) -> Cell {
+    Cell {
+        c: ' ',
+        flags: (cell.flags - Flags::WIDE_CHAR) | Flags::WIDE_CHAR_SPACER,
+        ..*cell
+    }
+}
+
+fn write_row(bytes: &mut Vec<u8>, row: &Row) {
+    let stored = row.cells[row.used()..]
+        .iter()
+        .rposition(|cell| *cell != Cell::default())
+        .map_or(row.used(), |column| row.used() + column + 1);
+    bytes.extend_from_slice(&(row.cells.len() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(row.used() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(stored as u16).to_le_bytes());
+    bytes.push(u8::from(row.wrapped));
+    bytes.extend_from_slice(&(row.extras().len() as u16).to_le_bytes());
+    if stored == 0 && row.extras().is_empty() {
+        return;
+    }
+    // Length, text length and run count are filled in once the row is written.
+    let header = bytes.len();
+    bytes.extend_from_slice(&[0; 10]);
+    let cells = &row.cells[..stored];
+    let pair = |column: usize| {
+        cells[column].flags.contains(Flags::WIDE_CHAR)
+            && cells.get(column + 1) == Some(&wide_spacer(&cells[column]))
     };
-    file.write_all(&(row.cells.len() as u16).to_le_bytes())?;
-    file.write_all(&(row.used() as u16).to_le_bytes())?;
-    file.write_all(&(stored as u16).to_le_bytes())?;
-    file.write_all(&[u8::from(row.wrapped)])?;
-    file.write_all(&(row.extras().len() as u16).to_le_bytes())?;
-    for cells in row.cells[..stored].chunks(64) {
-        let mut bytes = [0; 14 * 64];
-        for (cell, bytes) in cells.iter().zip(bytes.chunks_exact_mut(14)) {
-            bytes[..4].copy_from_slice(&(cell.c as u32).to_le_bytes());
-            bytes[4..8].copy_from_slice(&color_bytes(cell.fg));
-            bytes[8..12].copy_from_slice(&color_bytes(cell.bg));
-            bytes[12..].copy_from_slice(&cell.flags.bits().to_le_bytes());
+    let mut column = 0;
+    while column < stored {
+        let mut utf8 = [0; 4];
+        bytes.extend_from_slice(cells[column].c.encode_utf8(&mut utf8).as_bytes());
+        column += 1 + usize::from(pair(column));
+    }
+    let text_bytes = bytes.len() - header - 10;
+    let style = |column: usize| {
+        let cell = &cells[column];
+        (cell.fg, cell.bg, cell.flags, pair(column))
+    };
+    let default = Cell::default();
+    let default = (default.fg, default.bg, default.flags, false);
+    let (mut runs, mut column) = (0u16, 0);
+    while column < stored {
+        let (start, key) = (column, style(column));
+        while column < stored && style(column) == key {
+            column += 1 + usize::from(key.3);
         }
-        file.write_all(&bytes[..cells.len() * 14])?;
+        if key != default {
+            bytes.extend_from_slice(&(start as u16).to_le_bytes());
+            bytes.extend_from_slice(&(column as u16).to_le_bytes());
+            bytes.extend_from_slice(&color_bytes(key.0));
+            bytes.extend_from_slice(&color_bytes(key.1));
+            let pairs = if key.3 { WIDE_PAIRS } else { 0 };
+            bytes.extend_from_slice(&(key.2.bits() | pairs).to_le_bytes());
+            runs += 1;
+        }
     }
     for (column, extra) in row.extras() {
-        file.write_all(&(*column as u16).to_le_bytes())?;
-        file.write_all(&(extra.zerowidth.len() as u32).to_le_bytes())?;
+        bytes.extend_from_slice(&(*column as u16).to_le_bytes());
+        bytes.extend_from_slice(&(extra.zerowidth.len() as u32).to_le_bytes());
         for c in &extra.zerowidth {
-            file.write_all(&(*c as u32).to_le_bytes())?;
+            bytes.extend_from_slice(&(*c as u32).to_le_bytes());
         }
-        file.write_all(&[u8::from(extra.underline_color.is_some())])?;
+        bytes.push(u8::from(extra.underline_color.is_some()));
         if let Some(color) = extra.underline_color {
-            file.write_all(&color_bytes(color))?;
+            bytes.extend_from_slice(&color_bytes(color));
         }
     }
-    Ok(())
+    let length = (bytes.len() - header - 4) as u32;
+    bytes[header..header + 4].copy_from_slice(&length.to_le_bytes());
+    bytes[header + 4..header + 8].copy_from_slice(&(text_bytes as u32).to_le_bytes());
+    bytes[header + 8..header + 10].copy_from_slice(&runs.to_le_bytes());
+}
+fn plain_row_text(bytes: &[u8]) -> Option<(usize, &[u8])> {
+    let header = bytes.get(..19)?;
+    let columns = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
+    let used = u16::from_le_bytes(header[2..4].try_into().unwrap()) as usize;
+    let stored = u16::from_le_bytes(header[4..6].try_into().unwrap()) as usize;
+    let length = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+    let text_bytes = u32::from_le_bytes(header[13..17].try_into().unwrap()) as usize;
+    if columns == 0
+        || used != stored
+        || stored > columns
+        || header[6..9] != [0; 3]
+        || header[17..19] != [0; 2]
+        || text_bytes != stored
+        || length != 6 + text_bytes
+    {
+        return None;
+    }
+    let text = bytes.get(19..13 + length)?;
+    text.is_ascii().then_some((13 + length, text))
 }
 fn empty_row_headers(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     // Empty rows have only a header; avoid materializing their cells.
@@ -1783,16 +1723,9 @@ fn skip_rows(file: &mut BufReader<File>, mut count: u64) -> io::Result<()> {
             .count();
         if empty == 0 {
             let header = read_array::<9>(file)?;
-            let stored = u16::from_le_bytes([header[4], header[5]]);
-            let extras = u16::from_le_bytes([header[7], header[8]]);
-            file.seek_relative(i64::from(stored) * 14)?;
-            for _ in 0..extras {
-                let extra = read_array::<6>(file)?;
-                let combining = u32::from_le_bytes(extra[2..].try_into().unwrap());
-                file.seek_relative(i64::from(combining) * 4)?;
-                if read_array::<1>(file)?[0] != 0 {
-                    file.seek_relative(4)?;
-                }
+            if header[4..6] != [0; 2] || header[7..9] != [0; 2] {
+                let length = u32::from_le_bytes(read_array(file)?);
+                file.seek_relative(i64::from(length))?;
             }
             count -= 1;
         } else {
@@ -1807,20 +1740,6 @@ fn read_array<const N: usize>(file: &mut impl Read) -> io::Result<[u8; N]> {
     file.read_exact(&mut bytes)?;
     Ok(bytes)
 }
-fn decode_cells<const COLORS: bool>(cells: &mut [Cell], bytes: &[u8]) -> io::Result<()> {
-    for (cell, bytes) in cells.iter_mut().zip(bytes.chunks_exact(14)) {
-        cell.c = char::from_u32(u32::from_le_bytes(bytes[..4].try_into().unwrap())).ok_or_else(
-            || io::Error::new(io::ErrorKind::InvalidData, "invalid history character"),
-        )?;
-        if COLORS {
-            cell.fg = read_color(bytes[4..8].try_into().unwrap())?;
-            cell.bg = read_color(bytes[8..12].try_into().unwrap())?;
-        }
-        cell.flags = Flags::from_bits(u16::from_le_bytes(bytes[12..].try_into().unwrap()))
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history flags"))?;
-    }
-    Ok(())
-}
 fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
     let header = read_array::<9>(file)?;
     let columns = u16::from_le_bytes([header[0], header[1]]) as usize;
@@ -1834,28 +1753,92 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
             "invalid history row",
         ));
     }
-    cells.truncate(stored);
+    cells.clear();
     cells.resize(columns, Cell::default());
-    for cells in cells[..stored].chunks_mut(64) {
-        let length = cells.len() * 14;
-        let buffered = file.fill_buf()?;
-        if buffered.len() >= length {
-            decode_cells::<COLORS>(cells, &buffered[..length])?;
-            file.consume(length);
-        } else {
-            let mut bytes = [0; 14 * 64];
-            file.read_exact(&mut bytes[..length])?;
-            decode_cells::<COLORS>(cells, &bytes[..length])?;
+    if stored == 0 && count == 0 {
+        return Ok(Row::from_parts(cells, wrapped, used, Vec::new()).unwrap());
+    }
+    let length = u32::from_le_bytes(read_array(file)?);
+    let mut file = file.take(u64::from(length));
+    let text_bytes = u32::from_le_bytes(read_array(&mut file)?) as usize;
+    let runs = u16::from_le_bytes(read_array(&mut file)?) as usize;
+    let mut short = [0; 1024];
+    let mut long = Vec::new();
+    let text = if text_bytes <= short.len() {
+        &mut short[..text_bytes]
+    } else {
+        long.resize(text_bytes, 0);
+        &mut long
+    };
+    file.read_exact(text)?;
+    let text = std::str::from_utf8(text)
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
+    let mut chars = text.chars();
+    let mut next = || chars.next().ok_or_else(|| invalid("short history text"));
+    let mut column = 0;
+    for _ in 0..runs {
+        let run = read_array::<14>(&mut file)?;
+        let start = u16::from_le_bytes(run[..2].try_into().unwrap()) as usize;
+        let end = u16::from_le_bytes(run[2..4].try_into().unwrap()) as usize;
+        let bits = u16::from_le_bytes(run[12..14].try_into().unwrap());
+        let pairs = bits & WIDE_PAIRS != 0;
+        let flags =
+            Flags::from_bits(bits & !WIDE_PAIRS).ok_or_else(|| invalid("invalid history flags"))?;
+        if start < column
+            || start > end
+            || end > stored
+            || pairs && !(end - start).is_multiple_of(2)
+        {
+            return Err(invalid("invalid history style range"));
         }
+        for cell in &mut cells[column..start] {
+            cell.c = next()?;
+        }
+        let (fg, bg) = if COLORS {
+            (
+                read_color(run[4..8].try_into().unwrap())?,
+                read_color(run[8..12].try_into().unwrap())?,
+            )
+        } else {
+            (Cell::default().fg, Cell::default().bg)
+        };
+        if pairs {
+            for pair in cells[start..end].chunks_exact_mut(2) {
+                pair[0] = Cell {
+                    c: next()?,
+                    fg,
+                    bg,
+                    flags,
+                };
+                pair[1] = wide_spacer(&pair[0]);
+            }
+        } else {
+            for cell in &mut cells[start..end] {
+                *cell = Cell {
+                    c: next()?,
+                    fg,
+                    bg,
+                    flags,
+                };
+            }
+        }
+        column = end;
+    }
+    for cell in &mut cells[column..stored] {
+        cell.c = next()?;
+    }
+    if chars.next().is_some() {
+        return Err(invalid("long history text"));
     }
     let mut extras = Vec::with_capacity(count);
     for _ in 0..count {
-        let column = u16::from_le_bytes(read_array(file)?) as usize;
-        let count = u32::from_le_bytes(read_array(file)?) as usize;
+        let column = u16::from_le_bytes(read_array(&mut file)?) as usize;
+        let count = u32::from_le_bytes(read_array(&mut file)?) as usize;
         let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
         for _ in 0..count {
             zerowidth.push(
-                char::from_u32(u32::from_le_bytes(read_array(file)?)).ok_or_else(|| {
+                char::from_u32(u32::from_le_bytes(read_array(&mut file)?)).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         "invalid history combining character",
@@ -1863,10 +1846,10 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
                 })?,
             );
         }
-        let underline_color = if read_array::<1>(file)?[0] == 0 {
+        let underline_color = if read_array::<1>(&mut file)?[0] == 0 {
             None
         } else {
-            Some(read_color(read_array(file)?)?)
+            Some(read_color(read_array(&mut file)?)?)
         };
         extras.push((
             column,
@@ -1876,6 +1859,12 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
             },
         ));
     }
+    if file.limit() != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid history row length",
+        ));
+    }
     Row::from_parts(cells, wrapped, used, extras)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history row"))
 }
@@ -1883,6 +1872,37 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wide_character_runs_restore_every_cell() {
+        let red = Color::Named(NamedColor::Red);
+        let wide = |c| Cell {
+            c,
+            fg: red,
+            flags: Flags::WIDE_CHAR,
+            ..Cell::default()
+        };
+        let mut cells = vec![Cell::default(); 12];
+        cells[0].c = 'a';
+        cells[1] = wide('中');
+        cells[2] = wide_spacer(&cells[1]);
+        cells[3] = wide('文');
+        cells[4] = wide_spacer(&cells[3]);
+        cells[5] = wide('字');
+        // Spacers that differ from the derived one, and wide cells without one, stay exact.
+        cells[6] = Cell {
+            bg: Color::Named(NamedColor::Blue),
+            ..wide_spacer(&cells[5])
+        };
+        cells[7].c = 'b';
+        cells[9] = wide('尾');
+        let row = Row::from_parts(cells, false, 10, Vec::new()).unwrap();
+        let mut bytes = Vec::new();
+        write_row(&mut bytes, &row);
+        let decoded = read_row::<true>(&mut bytes.as_slice(), Vec::new()).unwrap();
+        assert_eq!(decoded.cells, row.cells);
+        assert_eq!(decoded.used(), row.used());
+    }
     #[test]
     fn search_keeps_unicode_matches_across_the_cold_hot_boundary() {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
@@ -1969,10 +1989,11 @@ mod tests {
             .into_iter()
             .map(|(start, end)| {
                 let path: Arc<Path> = budget.directory.join(format!("{start}.rows")).into();
-                let mut file = File::create(&path).unwrap();
+                let mut bytes = Vec::new();
                 for id in start..end {
-                    write_row(&mut file, core.row(id)).unwrap();
+                    write_row(&mut bytes, core.row(id));
                 }
+                std::fs::write(&path, bytes).unwrap();
                 (path, start as u64, end as u64)
             })
             .collect::<Vec<_>>();
@@ -2049,6 +2070,14 @@ mod tests {
     #[test]
     fn decoding_sparse_rows_with_reused_storage_preserves_their_full_cells() {
         let mut styled = vec![Cell::default(); 9];
+        styled[2].fg = Color::Spec(Rgb { r: 1, g: 2, b: 3 });
+        styled[2].flags = Flags::BOLD | Flags::HIDDEN;
+        styled[3..6].fill(Cell {
+            c: 'a',
+            fg: Color::Indexed(5),
+            bg: Color::Indexed(6),
+            flags: Flags::ITALIC,
+        });
         styled[8].bg = Color::Indexed(17);
         let mut rows = [
             Row::from_parts(
@@ -2093,7 +2122,7 @@ mod tests {
         ]);
         let mut bytes = Vec::new();
         for row in &rows {
-            write_row(&mut bytes, row).unwrap();
+            write_row(&mut bytes, row);
         }
         for capacity in [7, 31, 257, 4096] {
             let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
@@ -2165,15 +2194,137 @@ mod eviction_tests {
     }
     fn row(id: u64) -> Row {
         let value = format!("{id:06} {}", "x".repeat(65));
+        // Dense styles keep eviction fixtures independent of plain-text compression.
         let cells = value
             .chars()
-            .map(|c| Cell {
+            .enumerate()
+            .map(|(column, c)| Cell {
                 c,
+                fg: Color::Indexed(column as u8),
                 ..Cell::default()
             })
             .collect::<Vec<_>>();
         let used = cells.len();
         Row::from_parts(cells, false, used, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn failed_history_write_keeps_pty_input_and_output_running() {
+        use crate::core::WindowSize;
+        use crate::terminal::{Event, Shell, Terminal};
+        use std::time::{Duration, Instant};
+
+        let budget = budget();
+        let terminal = Terminal::new_with_history(
+            Some(Shell::new(
+                "python3".into(),
+                vec![
+                    "-c".into(),
+                    "import os; input(); os.write(1, b'x\\r\\n' * 12000); input(); os.write(1, b'\\r\\nALIVE'); input()".into(),
+                ],
+            )),
+            None,
+            WindowSize {
+                num_cols: 8,
+                num_lines: 3,
+                cell_width: 0,
+                cell_height: 0,
+            },
+            0xffffff,
+            0,
+            HistoryConfig {
+                budget: budget.clone(),
+                hot_rows: 8,
+            },
+        )
+        .unwrap();
+        fs::remove_dir(&budget.directory).unwrap();
+        terminal.write(b"start\n".to_vec()).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            match terminal
+                .events
+                .recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .unwrap()
+            {
+                Event::HistoryError(error) => {
+                    assert!(error.to_string().contains("disk history disabled"));
+                    break;
+                }
+                Event::Exit(status) => panic!("history failure ended child: {status}"),
+                _ => (),
+            }
+        }
+        terminal.write(b"continue\n".to_vec()).unwrap();
+        loop {
+            let core = terminal.core.lock().unwrap();
+            if core.row(2).cells[..5]
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                == "ALIVE"
+            {
+                assert!(core.history_read_ready());
+                assert!(core.history_size() <= 10_000);
+                assert_eq!(core.history_event_fd(), None);
+                break;
+            }
+            drop(core);
+            assert!(
+                Instant::now() < deadline,
+                "PTY output stopped after history failure"
+            );
+            for event in terminal.events.try_iter() {
+                if let Event::Exit(status) = event {
+                    panic!("history failure ended child: {status}");
+                }
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn disk_reflow_preserves_custom_tabs_like_memory_resize() {
+        use crate::core::{Core, WindowSize};
+        use crate::vt::Parser;
+        use std::time::{Duration, Instant};
+
+        let mut size = WindowSize {
+            num_cols: 24,
+            num_lines: 3,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let mut memory = Core::new(size, 0xffffff, 0);
+        let mut disk = Core::new(size, 0xffffff, 0);
+        disk.enable_history(HistoryConfig {
+            budget: budget(),
+            hot_rows: 8,
+        })
+        .unwrap();
+        let mut memory_parser = Parser::new();
+        let mut disk_parser = Parser::new();
+        let custom = b"\x1b[3g\x1b[1;4H\x1bH\x1b[H";
+        memory_parser.advance(&mut memory, custom);
+        disk_parser.advance(&mut disk, custom);
+        for (columns, lines) in [(32, 3), (12, 3), (24, 3), (24, 4)] {
+            size.num_cols = columns;
+            size.num_lines = lines;
+            memory.resize(size);
+            disk.resize(size);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while disk.resize_pending() {
+                disk.poll_history(true).unwrap();
+                assert!(Instant::now() < deadline, "disk resize stalled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            for column in 1..columns {
+                let input = format!("\x1b[1;{column}H\t");
+                memory_parser.advance(&mut memory, input.as_bytes());
+                disk_parser.advance(&mut disk, input.as_bytes());
+                assert_eq!(disk.cursor().0, memory.cursor().0);
+            }
+        }
     }
 
     #[test]
@@ -2479,7 +2630,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     }
 
     #[test]
-    fn synchronized_ris_keeps_the_replay_guard_through_disk_backpressure() {
+    fn synchronized_ris_parses_in_order_with_bounded_disk_backpressure() {
         use crate::core::{Core, Event, Mode, WindowSize};
         use crate::vt::Parser;
         use std::time::{Duration, Instant};
@@ -2501,7 +2652,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         })
         .unwrap();
         let mut parser = Parser::new();
-        // Pause archive writes until the replay has filled its bounded queue.
+        // Pause archive writes until parsing fills its bounded queue.
         let mut paused = Some(budget.files.lock().unwrap());
         let input = format!(
             "\x1b[?2026h{}\x1b[3J\x1bc\x1b[?2026$p{}DONE\x1b[?2026l",
@@ -2514,8 +2665,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         let mut reset = false;
         let mut replies = Vec::new();
         loop {
-            if !committed && parser.has_queued() {
-                assert!(core.mode().contains(Mode::SYNC_UPDATE));
+            if core.mode().contains(Mode::SYNC_UPDATE) {
+                assert!(!committed);
             }
             for event in core.take_events() {
                 match event {
@@ -2526,9 +2677,6 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                         );
                         assert!(!core.mode().contains(Mode::SYNC_UPDATE));
                         reset = true;
-                    }
-                    Event::HistoryCleared => {
-                        assert!(committed || core.mode().contains(Mode::SYNC_UPDATE));
                     }
                     Event::Write(bytes) => replies.extend(bytes),
                     _ => (),
@@ -2544,12 +2692,13 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                 if paused.is_some() {
                     assert!(core.mode().contains(Mode::SYNC_UPDATE));
                     assert!(!reset);
+                    assert!(core.history_size() < 1024);
                     backpressured = true;
                     paused.take();
                 }
                 std::thread::yield_now();
             }
-            assert!(Instant::now() < deadline, "RIS replay stalled");
+            assert!(Instant::now() < deadline, "RIS parsing stalled");
         }
         assert!(backpressured);
         assert!(reset);
@@ -2565,7 +2714,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
             "DONE"
         );
 
-        // The preceding replay can leave a full history spool. Pump its replies
+        // The preceding batch can leave a full history spool. Pump its replies
         // before the next frame, as the PTY loop does even without new output.
         let drain_queued = |core: &mut Core, parser: &mut Parser| {
             while parser.has_queued() {
@@ -2588,18 +2737,23 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                 assert!(Instant::now() < deadline, "next synchronized frame stalled");
             }
         };
-        parser.advance_queued(&mut core, b"\x1b[?2026h\rNEXT");
+        parser.advance_queued(&mut core, "\x1b[?2026h\r中NEXT".as_bytes());
         drain_queued(&mut core, &mut parser);
-        assert_eq!(core.row(2).cells[0].c, 'D');
+        assert_eq!(core.row(2).cells[0].c, '中');
+        assert!(core.row(2).cells[1].flags.contains(Flags::WIDE_CHAR_SPACER));
+        assert!(core.mode().contains(Mode::SYNC_UPDATE));
+        assert!(parser.deadline().is_some());
         parser.advance_queued(&mut core, b"\x1b[?2026l");
         drain_queued(&mut core, &mut parser);
         assert_eq!(
-            core.row(2).cells[..4]
+            core.row(2).cells[2..6]
                 .iter()
                 .map(|cell| cell.c)
                 .collect::<String>(),
             "NEXT"
         );
+        assert!(!core.mode().contains(Mode::SYNC_UPDATE));
+        assert!(parser.deadline().is_none());
     }
 
     #[test]
@@ -2752,7 +2906,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         archive.append(0, &rows).unwrap();
         let mut prefix = Vec::new();
         for row in &rows[..2] {
-            write_row(&mut prefix, row).unwrap();
+            write_row(&mut prefix, row);
         }
         OpenOptions::new()
             .write(true)
@@ -2835,10 +2989,10 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                     c: 'x',
                     ..Cell::default()
                 };
-                100
+                1200
             ],
             false,
-            100,
+            1200,
             Vec::new(),
         )
         .unwrap();

@@ -8,6 +8,8 @@ frame cadence. The fixture's marker rate is configurable; the display decides
 presentation cadence.
 """
 import argparse
+import ctypes
+import errno
 import fcntl
 import hashlib
 import json
@@ -61,14 +63,28 @@ def percentile(values):
     return {f"p{p}": ordered[math.ceil(len(ordered) * p / 100) - 1] for p in (50, 95, 99)}
 
 
+_cpu_clock = ctypes.CDLL(None).clock_getcpuclockid
+_cpu_clock.argtypes = (ctypes.c_int, ctypes.POINTER(ctypes.c_int))
+_cpu_clock.restype = ctypes.c_int
+
+
 def cost(pid):
     result = {"monotonic": time.monotonic()}
     for line in Path(f"/proc/{pid}/smaps_rollup").read_text().splitlines():
         key, *rest = line.split()
         if key in ("Rss:", "Pss:", "Anonymous:"):
             result[key[:-1].lower() + "_kib"] = int(rest[0])
-    fields = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
-    result["cpu_seconds"] = (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    clock = ctypes.c_int()
+    error = _cpu_clock(pid, ctypes.byref(clock))
+    if error:
+        raise OSError(error, os.strerror(error))
+    try:
+        result["cpu_seconds"] = time.clock_gettime(clock.value)
+    except OSError as error:
+        if error.errno != errno.EINVAL:
+            raise
+        # Linux invalidates a process clock when that process exits.
+        raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH)) from error
     result["threads"] = len(list(Path(f"/proc/{pid}/task").iterdir()))
     result["drm"] = []
     for item in Path(f"/proc/{pid}/fdinfo").iterdir():
@@ -96,8 +112,6 @@ def main():
         parser.error("--producer-hz must be finite and positive")
     binary = args.binary.resolve()
     workspace_name = f"gpu-bench-{os.getpid()}"
-    help_text = subprocess.check_output([str(binary), "--help"], text=True)
-    workspace_enabled = "\nWorkspace input:\n" in help_text
     directory = args.output_dir.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     config = directory / "config.toml"
@@ -113,10 +127,9 @@ def main():
               "scope": __doc__, "config": config.read_text(), "cost_samples": [],
               "seconds_per_phase": args.seconds, "warmup_seconds_per_phase": args.warmup,
               "producer_hz": args.producer_hz,
-              "cost_scope": "application process only; bare GUI includes PTY IO, workspace GUI excludes daemon; both exclude child fixture and compositor",
-              "workspace_enabled": workspace_enabled,
+              "cost_scope": "GUI process only; excludes workspace daemon, child fixture and compositor",
               "driver_environment": {key: env[key] for key in ("VK_DRIVER_FILES", "VK_INSTANCE_LAYERS", "VK_LAYER_VALIDATE_SYNC") if key in env}}
-    command = [str(binary)] + (["new", workspace_name] if workspace_enabled else []) + ["--gui", "--config", str(config), "-e", sys.executable,
+    command = [str(binary), "new", workspace_name, "--gui", "--config", str(config), "-e", sys.executable,
                str(Path(__file__).resolve()), "--fixture", str(directory / "writes.json"),
                str(int(args.wait_key)), str(args.seconds), str(args.warmup), str(args.producer_hz)]
     with (directory / "app.log").open("w") as log:
@@ -136,12 +149,11 @@ def main():
                 raise RuntimeError(f"terminal exited {app.returncode}; see {directory / 'app.log'}")
         finally:
             try:
-                if workspace_enabled:
-                    listing = subprocess.run([str(binary), "list"], env=env,
-                                             check=True, capture_output=True, text=True, timeout=5)
-                    if any(line.split("\t", 1)[0] == workspace_name for line in listing.stdout.splitlines()):
-                        subprocess.run([str(binary), "terminate", workspace_name], env=env,
-                                       check=True, capture_output=True, timeout=5)
+                listing = subprocess.run([str(binary), "list"], env=env,
+                                         check=True, capture_output=True, text=True, timeout=5)
+                if any(line.split("\t", 1)[0] == workspace_name for line in listing.stdout.splitlines()):
+                    subprocess.run([str(binary), "terminate", workspace_name], env=env,
+                                   check=True, capture_output=True, timeout=5)
             finally:
                 if app.poll() is None:
                     os.killpg(app.pid, signal.SIGTERM)
@@ -156,12 +168,12 @@ def main():
             frames[int(fields[1])] = {"begin": float(fields[2]), "snapshot": float(fields[3]),
                                      "prepared": float(fields[4]), "swapped": float(fields[5]),
                                      "marker": int(fields[7]),
-                                     "geometry": [int(fields[9]), int(fields[10]), float(fields[11])] if len(fields) >= 12 else None,
-                                     "focused": bool(int(fields[12])) if len(fields) >= 13 else None}
+                                     "geometry": [int(fields[9]), int(fields[10]), float(fields[11])],
+                                     "focused": bool(int(fields[12]))}
         elif fields[0] == "frame_callback":
             callbacks[int(fields[1])] = {"received": float(fields[2]),
                                         "dispatched": float(fields[3]),
-                                        "server_raw_ms_u32": int(fields[4]) if len(fields) >= 5 else None}
+                                        "server_raw_ms_u32": int(fields[4])}
         elif fields[0] == "window_state":
             window_states.append({"received": float(fields[1]), "flags": int(fields[2])})
         elif fields[0] == "frame_rate":
@@ -183,18 +195,17 @@ def main():
                                       "server batch emission is millisecond truncated, so emission-to-receipt is overestimated by less than 1 ms")
     for callback in callbacks.values():
         raw = callback["server_raw_ms_u32"]
-        if raw is not None:
-            received_ms = callback["received"] * 1e3
-            callback["server_emitted"] = (received_ms - ((received_ms - raw) % 2**32)) / 1e3
+        received_ms = callback["received"] * 1e3
+        callback["server_emitted"] = (received_ms - ((received_ms - raw) % 2**32)) / 1e3
     report["phases"] = {}
     for phase in ("sparse", "scrolling"):
         submitted = [(n, f) for n, f in frames.items()
                      if f["marker"] in writes and writes[f["marker"]]["phase"] == phase
-                     and writes[f["marker"]].get("record", True)]
+                     and writes[f["marker"]]["record"]]
         swap_times = sorted(f["swapped"] for _, f in submitted)
         pairs = [(f, presented[n], writes[f["marker"]]) for n, f in frames.items()
                  if n in presented and f["marker"] in writes and writes[f["marker"]]["phase"] == phase
-                 and writes[f["marker"]].get("record", True)]
+                 and writes[f["marker"]]["record"]]
         first_presentations = {}
         for f, p, w in pairs:
             previous = first_presentations.get(f["marker"])
@@ -203,7 +214,7 @@ def main():
         times = sorted(p["time"] for _, p, _ in pairs)
         callback_pairs = [(f, callbacks[n]) for n, f in frames.items()
                           if n in callbacks and f["marker"] in writes
-                          and writes[f["marker"]]["phase"] == phase and writes[f["marker"]].get("record", True)]
+                          and writes[f["marker"]]["phase"] == phase and writes[f["marker"]]["record"]]
         if len(times) < 2:
             raise RuntimeError(f"insufficient presentation feedback for {phase}")
         report["phases"][phase] = {
@@ -222,10 +233,10 @@ def main():
             "snapshot_age_ms": percentile([(f["snapshot"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
             "focused_frames": sum(f["focused"] is True for f, _, _ in pairs),
             "unfocused_frames": sum(f["focused"] is False for f, _, _ in pairs),
-            "geometry_logical_px_scale": [list(v) for v in sorted({tuple(f["geometry"]) for f, _, _ in pairs if f["geometry"]})],
+            "geometry_logical_px_scale": [list(v) for v in sorted({tuple(f["geometry"]) for f, _, _ in pairs})],
             "callback_after_swap_ms": percentile([(c["received"] - f["swapped"]) * 1e3 for f, c in callback_pairs]),
-            "callback_server_emission_after_swap_ms": percentile([(c["server_emitted"] - f["swapped"]) * 1e3 for f, c in callback_pairs if "server_emitted" in c]),
-            "callback_server_emission_to_receipt_ms": percentile([(c["received"] - c["server_emitted"]) * 1e3 for _, c in callback_pairs if "server_emitted" in c]),
+            "callback_server_emission_after_swap_ms": percentile([(c["server_emitted"] - f["swapped"]) * 1e3 for f, c in callback_pairs]),
+            "callback_server_emission_to_receipt_ms": percentile([(c["received"] - c["server_emitted"]) * 1e3 for _, c in callback_pairs]),
             "callback_receipt_to_rust_dispatch_ms": percentile([(c["dispatched"] - c["received"]) * 1e3 for _, c in callback_pairs]),
             "presentation_flags": sorted({p["flags"] for _, p, _ in pairs}),
             "refresh_ns": sorted({p["refresh_ns"] for _, p, _ in pairs}),

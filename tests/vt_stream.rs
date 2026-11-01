@@ -295,7 +295,7 @@ fn omitted_and_zero_csi_parameters_use_the_documented_defaults() {
 }
 
 #[test]
-fn synchronized_output_is_invisible_until_the_entire_esu_arrives() {
+fn synchronized_output_defers_presentation_until_the_entire_esu_arrives() {
     let end = b"\x1b[?2026l";
     for split in 0..=end.len() {
         let mut terminal = Terminal::new();
@@ -304,12 +304,12 @@ fn synchronized_output_is_invisible_until_the_entire_esu_arrives() {
         assert!(terminal.parser.deadline().is_some());
         terminal.core.reset_damage();
         assert!(!terminal.write("\r\x1b[2K新".as_bytes()));
-        assert_line(&terminal, 0, "old");
-        assert!(terminal.core.dirty_rows().next().is_none());
+        assert_line(&terminal, 0, "新");
+        assert!(terminal.core.mode().contains(Mode::SYNC_UPDATE));
         let changed = terminal.write(&end[..split]);
         if split < end.len() {
             assert!(!changed);
-            assert_line(&terminal, 0, "old");
+            assert_line(&terminal, 0, "新");
             assert!(terminal.write(&end[split..]));
         } else {
             assert!(changed);
@@ -332,7 +332,7 @@ fn ris_ends_synchronized_output_and_the_next_frame_still_waits_for_esu() {
             assert!(!terminal.core.mode().contains(Mode::SYNC_UPDATE));
             assert_eq!(terminal.replies(), b"\x1b[?2026;2$y");
             terminal.write(b"\x1b[?2026h\r\x1b[2Knext");
-            assert_line(terminal, 0, "fresh");
+            assert_line(terminal, 0, "next");
             assert!(terminal.write(b"\x1b[?2026l"));
             assert_line(terminal, 0, "next");
         },
@@ -343,7 +343,7 @@ fn ris_ends_synchronized_output_and_the_next_frame_still_waits_for_esu() {
 fn forced_sync_flush_preserves_partial_csi_and_is_idempotent() {
     let mut terminal = Terminal::new();
     terminal.write(b"old\x1b[?2026h\r\x1b[2Knew\x1b[31");
-    assert_line(&terminal, 0, "old");
+    assert_line(&terminal, 0, "new");
     assert!(terminal.parser.deadline().is_some());
     assert!(terminal.parser.finish_sync(&mut terminal.core));
     assert_line(&terminal, 0, "new");

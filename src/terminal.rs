@@ -25,6 +25,7 @@ pub enum Event {
     ClipboardStore { primary: bool, text: String },
     Exit(ExitStatus),
     Error(io::Error),
+    HistoryError(io::Error),
 }
 
 #[derive(Clone, Debug)]
@@ -81,9 +82,54 @@ impl EventProxy {
 
 #[derive(Debug)]
 enum Message {
-    Input(Cow<'static, [u8]>),
-    Resize(libc::winsize),
     Shutdown,
+}
+
+// Shared so writers reach the PTY without waking the IO thread; one queue keeps
+// user input and protocol replies in order.
+struct Input {
+    // The IO thread closes the PTY by taking this.
+    master: Option<OwnedFd>,
+    pending: VecDeque<Cow<'static, [u8]>>,
+    offset: usize,
+    open: bool,
+    // Input since the IO thread last looked schedules a foreground process sample.
+    written: bool,
+}
+
+impl Input {
+    /// Writes queued data in order, or discards it once the slave has closed.
+    /// Returns how many bytes left the queue.
+    fn flush(&mut self) -> io::Result<usize> {
+        let mut consumed = 0;
+        if self.open
+            && let Some(master) = &self.master
+        {
+            let (open, written) = flush(master.as_raw_fd(), &mut self.pending, &mut self.offset)?;
+            self.open = open;
+            consumed = written;
+        }
+        if !self.open || self.master.is_none() {
+            consumed += self.pending.iter().map(|data| data.len()).sum::<usize>() - self.offset;
+            self.pending.clear();
+            self.offset = 0;
+        }
+        Ok(consumed)
+    }
+}
+
+fn release_input(input_bytes: &AtomicUsize, consumed: usize, consumer: &Wakeup) {
+    if consumed == 0 {
+        return;
+    }
+    let queued = input_bytes.fetch_sub(consumed, Ordering::AcqRel);
+    let low_watermark = INPUT_CAPACITY * 3 / 4;
+    if queued > low_watermark
+        && queued - consumed <= low_watermark
+        && let Err(error) = notify(consumer.fd.as_raw_fd())
+    {
+        eprintln!("notify terminal UI: {error}");
+    }
 }
 
 struct Wakeup {
@@ -98,6 +144,7 @@ pub struct Terminal {
     event_wakeup: Arc<Wakeup>,
     sender: Option<mpsc::Sender<Message>>,
     wakeup: Arc<Wakeup>,
+    input: Arc<Mutex<Input>>,
     reader: Option<JoinHandle<()>>,
     child_pid: u32,
     process_metadata: Arc<Mutex<Arc<ProcessMetadata>>>,
@@ -120,7 +167,6 @@ impl Terminal {
         )
     }
 
-    #[cfg(feature = "tui")]
     pub fn new_with_history(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
@@ -151,7 +197,7 @@ impl Terminal {
             fd: crate::eventfd::new()?,
             pending: AtomicBool::new(false),
         });
-        #[cfg(feature = "tui")]
+
         let integrate = shell.is_none();
         let mut command = match shell {
             Some(shell) => {
@@ -167,7 +213,7 @@ impl Terminal {
         if let Some(directory) = &working_directory {
             command.current_dir(directory);
         }
-        #[cfg(feature = "tui")]
+
         let integration = if integrate {
             crate::shell_integration::Integration::prepare(&mut command)?
         } else {
@@ -221,15 +267,24 @@ impl Terminal {
             unavailable: vec!["Foreground process has not been sampled yet".into()],
             ..ProcessMetadata::default()
         })));
+        let master_fd = master.as_raw_fd();
+        let input = Arc::new(Mutex::new(Input {
+            master: Some(master),
+            pending: VecDeque::new(),
+            offset: 0,
+            open: true,
+            written: false,
+        }));
         let io = PtyLoop {
-            master,
+            master: master_fd,
+            input: input.clone(),
             process_metadata: process_metadata.clone(),
             input_bytes: input_bytes.clone(),
             process: ChildGuard { child, pidfd },
             wakeup: wakeup.clone(),
             receiver,
             core: core.clone(),
-            #[cfg(feature = "tui")]
+
             _integration: integration,
             proxy: EventProxy {
                 sender: event_sender,
@@ -247,6 +302,7 @@ impl Terminal {
             event_wakeup,
             sender: Some(sender),
             wakeup,
+            input,
             reader,
             child_pid,
             process_metadata,
@@ -254,39 +310,11 @@ impl Terminal {
         })
     }
 
-    #[cfg(feature = "tui")]
-    pub fn copy_block(
-        &self,
-        id: u64,
-    ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryCopy>>> {
-        self.core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .copy_block(id)
-    }
-
-    #[cfg(feature = "tui")]
-    pub fn read_history(
-        &self,
-        block: Option<u64>,
-        cursor: Option<crate::history::HistoryCursor>,
-        query: Option<&str>,
-    ) -> io::Result<(
-        mpsc::Receiver<io::Result<crate::history::HistoryPage>>,
-        Arc<AtomicBool>,
-    )> {
-        self.core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .read_history(block, cursor, query)
-    }
-
     pub fn process_metadata(&self) -> Arc<ProcessMetadata> {
         self.process_metadata.lock().unwrap().clone()
     }
 
     pub fn current_directory(&self) -> io::Result<PathBuf> {
-        #[cfg(feature = "tui")]
         if let Some(directory) = self
             .core
             .lock()
@@ -298,28 +326,13 @@ impl Terminal {
         std::fs::read_link(format!("/proc/{}/cwd", self.child_pid))
     }
 
-    #[cfg(feature = "tui")]
-    pub fn copy_selection(
-        &self,
-    ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryCopy>>> {
-        self.core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .copy_selection()
-    }
-
     pub fn write(&self, data: impl Into<Cow<'static, [u8]>>) -> io::Result<()> {
         let data = data.into();
         if data.is_empty() {
             return Ok(());
         }
         self.input_bytes.fetch_add(data.len(), Ordering::AcqRel);
-        let length = data.len();
-        if let Err(error) = self.send(Message::Input(data)) {
-            self.input_bytes.fetch_sub(length, Ordering::AcqRel);
-            return Err(error);
-        }
-        Ok(())
+        self.queue(data)
     }
 
     pub fn input_pending_bytes(&self) -> usize {
@@ -344,9 +357,28 @@ impl Terminal {
                     .filter(|bytes| *bytes <= INPUT_CAPACITY)
             })
             .map_err(|_| io::Error::new(io::ErrorKind::WouldBlock, "PTY input queue is full"))?;
-        if let Err(error) = self.send(Message::Input(data)) {
-            self.input_bytes.fetch_sub(length, Ordering::AcqRel);
-            return Err(error);
+        self.queue(data)
+    }
+
+    /// Writes now when no earlier input is queued; the IO thread writes what
+    /// the PTY does not accept yet.
+    fn queue(&self, data: Cow<'static, [u8]>) -> io::Result<()> {
+        let mut input = self
+            .input
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        input.written = true;
+        let idle = input.pending.is_empty();
+        input.pending.push_back(data);
+        if !idle {
+            return Ok(());
+        }
+        let consumed = input.flush()?;
+        let queued = !input.pending.is_empty();
+        drop(input);
+        release_input(&self.input_bytes, consumed, &self.event_wakeup);
+        if queued && !self.wakeup.pending.swap(true, Ordering::AcqRel) {
+            notify(self.wakeup.fd.as_raw_fd())?;
         }
         Ok(())
     }
@@ -357,8 +389,19 @@ impl Terminal {
             .core
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
-        self.send(Message::Resize(pty_size))?;
+        // Under the input lock, so input written after a resize sees the new size.
+        if let Some(master) = &self
+            .input
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .master
+        {
+            set_size(master.as_raw_fd(), pty_size)?;
+        }
         core.resize(size);
+        if !self.event_wakeup.pending.swap(true, Ordering::AcqRel) {
+            notify(self.event_wakeup.fd.as_raw_fd())?;
+        }
         Ok(())
     }
 
@@ -388,7 +431,7 @@ impl Terminal {
         Ok(self.event_wakeup.pending.load(Ordering::Acquire))
     }
 
-    #[cfg(all(test, feature = "tui"))]
+    #[cfg(test)]
     pub(crate) fn io_cpu_clock(&self) -> libc::clockid_t {
         use std::os::unix::thread::JoinHandleExt;
         let mut clock = 0;
@@ -404,7 +447,6 @@ impl Terminal {
         clock
     }
 
-    #[cfg(feature = "tui")]
     pub(crate) fn shutdown(mut self) -> JoinHandle<()> {
         let _ = self.send(Message::Shutdown);
         self.reader.take().unwrap()
@@ -423,9 +465,9 @@ impl Drop for Terminal {
     }
 }
 
-// Field order also closes the PTY before child cleanup if thread startup or execution unwinds.
 struct PtyLoop {
-    master: OwnedFd,
+    master: RawFd,
+    input: Arc<Mutex<Input>>,
     process_metadata: Arc<Mutex<Arc<ProcessMetadata>>>,
     input_bytes: Arc<AtomicUsize>,
     process: ChildGuard,
@@ -433,7 +475,7 @@ struct PtyLoop {
     receiver: mpsc::Receiver<Message>,
     core: Arc<Mutex<Core>>,
     proxy: EventProxy,
-    #[cfg(feature = "tui")]
+
     _integration: Option<crate::shell_integration::Integration>,
 }
 
@@ -442,10 +484,23 @@ fn process_refresh_time(last: Option<Instant>) -> Instant {
     last.map_or(soon, |last| soon.max(last + Duration::from_secs(1)))
 }
 
+// Closes the PTY before child cleanup, also when thread startup or execution unwinds.
+impl Drop for PtyLoop {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl PtyLoop {
+    fn close(&self) {
+        if let Ok(mut input) = self.input.lock() {
+            input.master = None;
+        }
+    }
+
     fn run(mut self) {
         let result = self.io_loop();
-        drop(self.master);
+        self.close();
         if let Err(error) = result {
             self.proxy.send(Event::Error(error));
         }
@@ -466,7 +521,7 @@ impl PtyLoop {
             child_pid: current.child_pid,
             ..ProcessMetadata::default()
         };
-        let pgid = unsafe { libc::tcgetpgrp(self.master.as_raw_fd()) };
+        let pgid = unsafe { libc::tcgetpgrp(self.master) };
         if pgid < 0 {
             metadata.unavailable.push(format!(
                 "foreground process group: {}",
@@ -475,29 +530,37 @@ impl PtyLoop {
         } else {
             metadata.foreground_pgid = Some(pgid as u32);
             let directory = PathBuf::from(format!("/proc/{pgid}"));
-            match std::fs::read(directory.join("cmdline")) {
-                Ok(bytes) => {
-                    metadata.foreground_pid = Some(pgid as u32);
-                    metadata.foreground_argv = Some(if bytes.is_empty() {
-                        Vec::new()
-                    } else {
-                        bytes
-                            .strip_suffix(&[0])
-                            .unwrap_or(&bytes)
-                            .split(|byte| *byte == 0)
-                            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                            .collect()
-                    });
-                }
-                Err(error) => metadata
-                    .unavailable
-                    .push(format!("foreground argv: {error}")),
-            }
             match std::fs::read_link(directory.join("exe")) {
                 Ok(path) => metadata.foreground_executable = Some(path),
                 Err(error) => metadata
                     .unavailable
                     .push(format!("foreground executable: {error}")),
+            }
+            if metadata.foreground_pgid == current.foreground_pgid
+                && metadata.foreground_executable == current.foreground_executable
+                && current.foreground_argv.is_some()
+            {
+                metadata.foreground_pid = current.foreground_pid;
+                metadata.foreground_argv = current.foreground_argv.clone();
+            } else {
+                match std::fs::read(directory.join("cmdline")) {
+                    Ok(bytes) => {
+                        metadata.foreground_pid = Some(pgid as u32);
+                        metadata.foreground_argv = Some(if bytes.is_empty() {
+                            Vec::new()
+                        } else {
+                            bytes
+                                .strip_suffix(&[0])
+                                .unwrap_or(&bytes)
+                                .split(|byte| *byte == 0)
+                                .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                                .collect()
+                        });
+                    }
+                    Err(error) => metadata
+                        .unavailable
+                        .push(format!("foreground argv: {error}")),
+                }
             }
             match std::fs::read_link(directory.join("cwd")) {
                 Ok(path) => metadata.foreground_cwd = Some(path),
@@ -530,77 +593,72 @@ impl PtyLoop {
     fn io_loop(&mut self) -> io::Result<()> {
         let mut parser = crate::vt::Parser::new();
         let mut buffer = [0; 8 * 1024];
-        let mut pending = VecDeque::new();
-        let mut offset = 0;
-        let mut write_open = true;
+        let mut read_count = 0;
+        let mut read_open = true;
         let mut write_ready = true;
         let mut child_exited = false;
         let mut process_deadline = Some(Instant::now());
         let mut process_sampled = None;
-        #[cfg(feature = "tui")]
+
         let mut history_notified = true;
         loop {
-            let mut resize = None;
-            while let Ok(message) = self.receiver.try_recv() {
-                match message {
-                    Message::Input(data) => {
-                        pending.push_back(data);
-                        process_deadline
-                            .get_or_insert_with(|| process_refresh_time(process_sampled));
-                    }
-                    Message::Resize(size) => resize = Some(size),
-                    Message::Shutdown => return Ok(()),
+            if let Ok(Message::Shutdown) = self.receiver.try_recv() {
+                return Ok(());
+            }
+            let consumed = {
+                let mut input = self
+                    .input
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?;
+                if std::mem::take(&mut input.written) {
+                    process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
                 }
-            }
-            if let Some(size) = resize {
-                set_size(self.master.as_raw_fd(), size)?;
-                self.proxy.wakeup();
-            }
-            let consumed = if write_open && write_ready {
-                let (open, consumed) = flush(self.master.as_raw_fd(), &mut pending, &mut offset)?;
-                write_open = open;
-                write_ready = pending.is_empty();
+                let consumed = if write_ready || !input.open {
+                    input.flush()?
+                } else {
+                    0
+                };
+                write_ready = input.pending.is_empty();
                 consumed
-            } else if write_open {
-                0
-            } else {
-                let discarded = pending.iter().map(|data| data.len()).sum::<usize>() - offset;
-                pending.clear();
-                offset = 0;
-                discarded
             };
-            if consumed != 0 {
-                let queued = self.input_bytes.fetch_sub(consumed, Ordering::AcqRel);
-                let low_watermark = INPUT_CAPACITY * 3 / 4;
-                if queued > low_watermark && queued - consumed <= low_watermark {
-                    self.proxy.notify();
-                }
-            }
-            #[cfg(feature = "tui")]
-            let (history_fd, history_ready) = {
+            release_input(&self.input_bytes, consumed, &self.proxy.wakeup);
+
+            let (history_fd, history_ready, changed, events) = {
                 let mut core = self
                     .core
                     .lock()
                     .map_err(|error| io::Error::other(error.to_string()))?;
-                if core.poll_history(history_notified)? {
-                    self.proxy.wakeup();
-                }
+                let mut changed = core.poll_history(history_notified)?;
                 history_notified = false;
-                let ready = core.history_read_ready();
-                if ready && parser.has_queued() {
-                    let committed = parser.advance_queued(&mut core, &[]);
-                    let events = core.take_events();
-                    drop(core);
-                    self.dispatch(events, &mut pending);
-                    if committed {
-                        self.proxy.wakeup();
-                    }
-                    continue;
+                if read_count != 0 || (core.history_read_ready() && parser.has_queued()) {
+                    changed |= parser.advance_queued(&mut core, &buffer[..read_count]);
+                    read_count = 0;
                 }
-                (core.history_event_fd().unwrap_or(-1), ready)
+                if parser
+                    .deadline()
+                    .is_some_and(|deadline| deadline <= Instant::now())
+                    || (!read_open && !parser.has_queued())
+                {
+                    changed |= parser.finish_sync(&mut core);
+                }
+                (
+                    core.history_event_fd().unwrap_or(-1),
+                    core.history_read_ready(),
+                    changed,
+                    core.take_events(),
+                )
             };
-            #[cfg(not(feature = "tui"))]
-            let history_ready = true;
+            self.dispatch(events)?;
+            if changed {
+                self.proxy.wakeup();
+            }
+            if !read_open && !parser.has_queued() {
+                return Ok(());
+            }
+            if history_ready && parser.has_queued() {
+                continue;
+            }
+
             if process_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
                 self.sample_process();
                 process_sampled = Some(Instant::now());
@@ -613,25 +671,16 @@ impl PtyLoop {
                     .map(|_| Instant::now() + Duration::from_secs(1));
             }
             let sync_deadline = parser.deadline();
-            if sync_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                self.stop_sync(&mut parser, &mut pending)?;
-                continue;
-            }
             let deadline = sync_deadline.into_iter().chain(process_deadline).min();
-            let pty_events = if history_ready { libc::POLLIN } else { 0 }
-                | if write_open && !pending.is_empty() {
-                    libc::POLLOUT
-                } else {
-                    0
-                };
+            let pty_events = if read_open && history_ready {
+                libc::POLLIN
+            } else {
+                0
+            } | if self.writing()? { libc::POLLOUT } else { 0 };
             let mut fds = [
                 libc::pollfd {
                     // HUP is reported even with events=0; omit a backpressured PTY.
-                    fd: if pty_events == 0 {
-                        -1
-                    } else {
-                        self.master.as_raw_fd()
-                    },
+                    fd: if pty_events == 0 { -1 } else { self.master },
                     events: pty_events,
                     revents: 0,
                 },
@@ -649,7 +698,6 @@ impl PtyLoop {
                     events: libc::POLLIN,
                     revents: 0,
                 },
-                #[cfg(feature = "tui")]
                 libc::pollfd {
                     fd: history_fd,
                     events: libc::POLLIN,
@@ -668,21 +716,13 @@ impl PtyLoop {
                         .min(i32::MAX as u128) as i32
                 })
             };
-            if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout) } == -1 {
-                let error = io::Error::last_os_error();
-                if error.kind() == io::ErrorKind::Interrupted {
-                    continue;
-                }
-                return Err(error);
-            }
+            crate::poll::poll(&mut fds, timeout)?;
             if fds.iter().any(|fd| fd.revents & libc::POLLNVAL != 0) {
                 return Err(io::Error::from_raw_os_error(libc::EBADF));
             }
             write_ready |= fds[0].revents & libc::POLLOUT != 0;
-            #[cfg(feature = "tui")]
-            {
-                history_notified = fds[3].revents & libc::POLLIN != 0;
-            }
+
+            history_notified = fds[3].revents & libc::POLLIN != 0;
             if fds[1].revents & libc::POLLIN != 0 {
                 // Resetting first could consume a new wakeup and leave it suppressed.
                 consume_notification(self.wakeup.fd.as_raw_fd())?;
@@ -692,152 +732,78 @@ impl PtyLoop {
             if fds[2].revents & libc::POLLIN != 0 {
                 child_exited = true;
             }
-            #[cfg(feature = "tui")]
+
             if history_notified {
                 continue;
             }
-            if history_ready
+            if read_open
+                && history_ready
                 && (fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0
                     || child_exited)
             {
-                let count = unsafe {
-                    libc::read(
-                        self.master.as_raw_fd(),
-                        buffer.as_mut_ptr().cast(),
-                        buffer.len(),
-                    )
-                };
+                let count =
+                    unsafe { libc::read(self.master, buffer.as_mut_ptr().cast(), buffer.len()) };
                 if count == 0 {
-                    break;
+                    read_open = false;
+                    self.close_input()?;
+                    continue;
                 }
                 if count < 0 {
                     let error = io::Error::last_os_error();
                     match error.kind() {
                         io::ErrorKind::Interrupted => continue,
-                        io::ErrorKind::WouldBlock if child_exited => break,
-                        io::ErrorKind::WouldBlock => continue,
-                        _ if error.raw_os_error() == Some(libc::EIO) => break,
+                        io::ErrorKind::WouldBlock if !child_exited => continue,
+                        io::ErrorKind::WouldBlock => (),
+                        _ if error.raw_os_error() == Some(libc::EIO) => (),
                         _ => return Err(error),
                     }
+                    read_open = false;
+                    self.close_input()?;
+                    continue;
                 }
                 process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
-                let (committed, events) = {
-                    let mut core = self
-                        .core
-                        .lock()
-                        .map_err(|error| io::Error::other(error.to_string()))?;
-                    #[cfg(feature = "tui")]
-                    let committed = parser.advance_queued(&mut core, &buffer[..count as usize]);
-                    #[cfg(not(feature = "tui"))]
-                    let committed = parser.advance(&mut core, &buffer[..count as usize]);
-                    (committed, core.take_events())
-                };
-                self.dispatch(events, &mut pending);
-                // Bytes held entirely in the sync buffer have not changed the core.
-                if committed {
-                    self.proxy.wakeup();
-                }
+                read_count = count as usize;
             }
         }
-        self.stop_sync(&mut parser, &mut pending)?;
-        #[cfg(feature = "tui")]
-        while parser.has_queued() {
-            while let Ok(message) = self.receiver.try_recv() {
-                match message {
-                    Message::Shutdown => return Ok(()),
-                    Message::Input(data) => {
-                        self.input_bytes.fetch_sub(data.len(), Ordering::AcqRel);
-                    }
-                    Message::Resize(_) => (),
-                }
-            }
-            let (ready, history_fd, committed, events) = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                core.poll_history(true)?;
-                let ready = core.history_read_ready();
-                let committed = ready && parser.advance_queued(&mut core, &[]);
-                (
-                    ready,
-                    core.history_event_fd().unwrap_or(-1),
-                    committed,
-                    core.take_events(),
-                )
-            };
-            self.dispatch(events, &mut pending);
-            if committed {
-                self.proxy.wakeup();
-            }
-            if !ready {
-                let mut fds = [
-                    libc::pollfd {
-                        fd: history_fd,
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                    libc::pollfd {
-                        fd: self.wakeup.fd.as_raw_fd(),
-                        events: libc::POLLIN,
-                        revents: 0,
-                    },
-                ];
-                if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) } < 0 {
-                    let error = io::Error::last_os_error();
-                    if error.kind() != io::ErrorKind::Interrupted {
-                        return Err(error);
-                    }
-                }
-                if fds[1].revents & libc::POLLIN != 0 {
-                    consume_notification(self.wakeup.fd.as_raw_fd())?;
-                    self.wakeup.pending.store(false, Ordering::Release);
-                }
-            }
-        }
+    }
+
+    fn writing(&self) -> io::Result<bool> {
+        let input = self
+            .input
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?;
+        Ok(input.open && !input.pending.is_empty())
+    }
+
+    fn close_input(&self) -> io::Result<()> {
+        self.input
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))?
+            .open = false;
         Ok(())
     }
 
-    fn stop_sync(
-        &self,
-        parser: &mut crate::vt::Parser,
-        pending: &mut VecDeque<Cow<'static, [u8]>>,
-    ) -> io::Result<()> {
-        if parser.deadline().is_some() {
-            let events = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
-                #[cfg(feature = "tui")]
-                parser.finish_sync_queued(&mut core);
-                #[cfg(not(feature = "tui"))]
-                parser.finish_sync(&mut core);
-                core.take_events()
-            };
-            self.dispatch(events, pending);
-            self.proxy.wakeup();
-        }
-        Ok(())
-    }
-
-    fn dispatch(&self, events: Vec<CoreEvent>, pending: &mut VecDeque<Cow<'static, [u8]>>) {
+    fn dispatch(&self, events: Vec<CoreEvent>) -> io::Result<()> {
         for event in events {
             match event {
                 CoreEvent::Write(data) if !data.is_empty() => {
                     self.input_bytes.fetch_add(data.len(), Ordering::AcqRel);
-                    pending.push_back(data.into());
+                    self.input
+                        .lock()
+                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .pending
+                        .push_back(data.into());
                 }
                 CoreEvent::Write(_) => (),
                 CoreEvent::Title(title) => self.proxy.send(Event::Title(title)),
                 CoreEvent::ClipboardStore { primary, text } => {
                     self.proxy.send(Event::ClipboardStore { primary, text })
                 }
-                CoreEvent::HistoryCleared => self.proxy.wakeup(),
-                #[cfg(feature = "tui")]
-                CoreEvent::HistoryError(error) => self.proxy.send(Event::Error(error)),
+
+                CoreEvent::HistoryError(error) => self.proxy.send(Event::HistoryError(error)),
             }
         }
+        Ok(())
     }
 }
 
@@ -865,36 +831,21 @@ fn terminate_child(child: &mut Child, pidfd: RawFd) -> io::Result<ExitStatus> {
             return Err(error);
         }
     }
-    let deadline = Instant::now() + Duration::from_millis(100);
-    loop {
-        let mut pfd = libc::pollfd {
-            fd: pidfd,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        let timeout = deadline
-            .saturating_duration_since(Instant::now())
-            .as_millis()
-            .saturating_add(1)
-            .min(i32::MAX as u128) as i32;
-        let result = unsafe { libc::poll(&mut pfd, 1, timeout) };
-        if result == -1 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error);
-        }
-        if result > 0 {
-            return child.wait();
-        }
-        if let Err(error) = child.kill()
-            && error.raw_os_error() != Some(libc::ESRCH)
-        {
-            return Err(error);
-        }
+    let mut pfd = libc::pollfd {
+        fd: pidfd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    crate::poll::poll(std::slice::from_mut(&mut pfd), 100)?;
+    if pfd.revents != 0 {
         return child.wait();
     }
+    if let Err(error) = child.kill()
+        && error.raw_os_error() != Some(libc::ESRCH)
+    {
+        return Err(error);
+    }
+    child.wait()
 }
 
 fn flush(
@@ -1224,6 +1175,21 @@ mod tests {
             idle.sampled_at_ms,
             terminal.process_metadata().sampled_at_ms
         );
+        terminal
+            .write(b"cd /; exec /bin/sleep 30\n".as_slice())
+            .unwrap();
+        let replaced = wait(&|metadata| {
+            metadata
+                .foreground_executable
+                .as_ref()
+                .is_some_and(|path| path.file_name().is_some_and(|name| name == "sleep"))
+        });
+        assert_eq!(replaced.foreground_pgid, Some(replaced.child_pid));
+        assert_eq!(
+            replaced.foreground_argv.as_ref().unwrap(),
+            &["/bin/sleep", "30"]
+        );
+        assert_eq!(replaced.foreground_cwd, Some(PathBuf::from("/")));
     }
 
     #[test]
@@ -1569,7 +1535,7 @@ os.write(1,b'\r\nINPUT:x')
     }
 }
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod history_pty_tests {
     use super::*;
 
@@ -1666,7 +1632,7 @@ mod history_pty_tests {
                 loop {
                     wait();
                     core = terminal.core.lock().unwrap();
-                    if !core.history_loading() {
+                    if !core.resize_pending() {
                         break;
                     }
                     drop(core);

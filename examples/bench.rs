@@ -57,13 +57,10 @@ fn wait_for(terminal: &terminal::Terminal, expected: char) -> Result<()> {
             events: libc::POLLIN,
             revents: 0,
         };
-        if unsafe { libc::poll(&mut fd, 1, remaining.as_millis().max(1) as i32) } < 0 {
-            let error = std::io::Error::last_os_error();
-            if error.kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            return Err(error.into());
-        }
+        nextty::poll::poll(
+            std::slice::from_mut(&mut fd),
+            remaining.as_millis().max(1) as i32,
+        )?;
         terminal.drain_notification()?;
         terminal.acknowledge_wakeup();
         for event in terminal.events.try_iter() {

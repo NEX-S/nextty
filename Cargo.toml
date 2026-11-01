@@ -7,15 +7,12 @@ repository = "https://github.com/NEX-S/nextty"
 description = "A small GPU-accelerated Linux terminal"
 
 [features]
-default = ["gui", "tui", "monitor", "files", "agent"]
+default = ["gui", "agent"]
 gui = []
-tui = []
-monitor = ["tui"]
-agent = ["tui", "dep:serde_json", "dep:curl", "dep:pulldown-cmark", "dep:memchr"]
-files = ["tui", "dep:memchr"]
+agent = ["dep:serde_json", "dep:curl", "dep:pulldown-cmark"]
 
 [dependencies]
-memchr = { version = "2", optional = true }
+memchr = "2"
 curl = { version = "0.4", default-features = false, optional = true }
 libc = "0.2"
 pulldown-cmark = { version = "0.13", default-features = false, optional = true }

@@ -37,7 +37,6 @@ pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
-#[cfg(feature = "tui")]
 pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
     let start = output.len();
     output.resize(start + bytes.len().div_ceil(3) * 4, b'=');
@@ -97,7 +96,7 @@ mod tests {
             ("5Lit5paH", "中文"),
         ] {
             assert_eq!(decode_utf8(encoded.as_bytes()).as_deref(), Some(plain));
-            #[cfg(feature = "tui")]
+
             {
                 let mut output = Vec::new();
                 super::encode(plain.as_bytes(), &mut output);

@@ -7,10 +7,10 @@ use crate::screen::Update;
 use crate::terminal::{ProcessMetadata, Shell};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 use crate::workspace::{
-    Action, Axis, BlockMarker, CommandBlock, CreateOptions, Direction, HistoryCursor, HistoryPage,
-    PaneView, Snapshot, TabView, WorkspaceInfo,
+    Action, AgentEvent, AgentMessage, AgentModelPatch, Axis, BlockMarker, CommandBlock,
+    CreateOptions, Direction, HistoryCursor, HistoryPage, PaneView, Snapshot, TabView,
+    WorkspaceInfo,
 };
-use std::borrow::Cow;
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::{self, Seek, Write};
@@ -22,9 +22,9 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 16;
+pub(crate) const VERSION: u8 = 17;
 
-pub(crate) enum Response<'a> {
+pub(crate) enum Response {
     ScreenDirty,
     AgentInput {
         request: u64,
@@ -38,11 +38,8 @@ pub(crate) enum Response<'a> {
         request: u64,
         result: Result<HistoryPage, String>,
     },
-    Agent {
-        kind: u8,
-        payload: Cow<'a, [u8]>,
-    },
-    State(Snapshot, Vec<(u64, Update)>),
+    Agent(AgentEvent),
+    State(Snapshot, Vec<(u64, Update)>, u64),
     List(Vec<WorkspaceInfo>),
     Clipboard {
         request: u64,
@@ -346,9 +343,11 @@ impl Peer {
         snapshot: &Snapshot,
         updates: &[(u64, &Update)],
         previous: &HashMap<u64, Arc<ProcessMetadata>>,
+        request: u64,
     ) -> io::Result<()> {
         let mut encoder = Encoder::with_capacity(256);
         encoder.u8(1);
+        encoder.u64(request);
         encode_snapshot(&mut encoder, snapshot, previous);
         encoder.u32(updates.len() as u32);
         for (id, update) in updates {
@@ -357,11 +356,8 @@ impl Peer {
         }
         self.queue(encoder.0, None)
     }
-    pub fn send_response(&mut self, response: Response<'_>) -> io::Result<()> {
-        let mut encoder = match &response {
-            Response::Agent { payload, .. } => Encoder::with_capacity(11 + payload.len()),
-            _ => Encoder::new(),
-        };
+    pub fn send_response(&mut self, response: Response) -> io::Result<()> {
+        let mut encoder = Encoder::new();
         let file = match response {
             Response::History { request, result } => {
                 encoder.u8(16);
@@ -413,14 +409,14 @@ impl Peer {
                 encoder.u8(13);
                 None
             }
-            Response::Agent { kind, payload } => {
+            Response::Agent(event) => {
                 encoder.u8(12);
-                encoder.u8(kind);
-                encoder.bytes(&payload);
+                encode_agent_event(&mut encoder, &event);
                 None
             }
-            Response::State(snapshot, updates) => {
+            Response::State(snapshot, updates, request) => {
                 encoder.u8(1);
+                encoder.u64(request);
                 encode_snapshot(&mut encoder, &snapshot, &HashMap::new());
                 encoder.u32(updates.len() as u32);
                 for (id, update) in updates {
@@ -729,7 +725,7 @@ impl Peer {
             .ok_or_else(|| invalid("clipboard response has no file descriptor"))?;
         Ok((request, File::from(file), incomplete))
     }
-    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response<'static>>> {
+    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let result = self.receive_responses(previous);
         if result.is_err() {
             self.copy = None;
@@ -737,10 +733,7 @@ impl Peer {
         }
         result
     }
-    fn receive_responses(
-        &mut self,
-        previous: Option<&Snapshot>,
-    ) -> io::Result<Vec<Response<'static>>> {
+    fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let mut result = Vec::new();
         if let Some(receiver) = &self.receiver
             && let Some(ready) = receiver.take()?
@@ -799,16 +792,14 @@ impl Peer {
                     Some(Response::AgentInput { request, result })
                 }
                 13 => Some(Response::ScreenDirty),
-                12 => Some(Response::Agent {
-                    kind: d.u8()?,
-                    payload: d.bytes(MAX_FRAME)?.to_vec().into(),
-                }),
+                12 => Some(Response::Agent(decode_agent_event(&mut d)?)),
                 1 => {
+                    let request = d.u64()?;
                     let previous = result
                         .iter()
                         .rev()
                         .find_map(|response| match response {
-                            Response::State(snapshot, _) => Some(snapshot),
+                            Response::State(snapshot, _, _) => Some(snapshot),
                             _ => None,
                         })
                         .or(previous);
@@ -818,7 +809,7 @@ impl Peer {
                     for _ in 0..count {
                         updates.push((d.u64()?, decode_update(&mut d)?));
                     }
-                    Some(Response::State(snapshot, updates))
+                    Some(Response::State(snapshot, updates, request))
                 }
                 2 => {
                     let count = d.count(4096)?;
@@ -1252,9 +1243,92 @@ fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
         history_capacity: d.u64()?,
     })
 }
+fn encode_agent_model(e: &mut Encoder, patch: &AgentModelPatch) {
+    e.u64(patch.session);
+    e.bool(patch.busy);
+    e.u64(patch.revision);
+    e.u64(patch.turn);
+    e.u32(patch.start);
+    e.u32(patch.prefix_bytes);
+    e.u32(patch.messages.len() as u32);
+    for message in &patch.messages {
+        e.u64(message.turn);
+        e.string(&message.role);
+        e.string(&message.text);
+        e.bool(message.id.is_some());
+        if let Some(id) = &message.id {
+            e.string(id);
+        }
+    }
+    e.bytes(&patch.recovery);
+}
+fn decode_agent_model(d: &mut Decoder<'_>) -> io::Result<AgentModelPatch> {
+    let mut patch = AgentModelPatch {
+        session: d.u64()?,
+        busy: d.bool()?,
+        revision: d.u64()?,
+        turn: d.u64()?,
+        start: d.u32()?,
+        prefix_bytes: d.u32()?,
+        ..AgentModelPatch::default()
+    };
+    let count = d.count(4096)?;
+    for _ in 0..count {
+        patch.messages.push(AgentMessage {
+            turn: d.u64()?,
+            role: d.string(65536)?,
+            text: d.string(MAX_FRAME)?,
+            id: if d.bool()? {
+                Some(d.string(65536)?)
+            } else {
+                None
+            },
+        });
+    }
+    patch.recovery = d.bytes(MAX_FRAME)?.to_vec();
+    Ok(patch)
+}
+fn encode_agent_event(e: &mut Encoder, event: &AgentEvent) {
+    match event {
+        AgentEvent::Draft(payload) => {
+            e.u8(0);
+            e.bytes(payload);
+        }
+        AgentEvent::Model(patch) => {
+            e.u8(1);
+            encode_agent_model(e, patch);
+        }
+        AgentEvent::Request(payload) => {
+            e.u8(2);
+            e.bytes(payload);
+        }
+        AgentEvent::Start(token) => {
+            e.u8(3);
+            e.bytes(token);
+        }
+        AgentEvent::Attached => e.u8(4),
+        AgentEvent::Ready => e.u8(5),
+    }
+}
+fn decode_agent_event(d: &mut Decoder<'_>) -> io::Result<AgentEvent> {
+    Ok(match d.u8()? {
+        0 => AgentEvent::Draft(d.bytes(MAX_FRAME)?.to_vec()),
+        1 => AgentEvent::Model(decode_agent_model(d)?),
+        2 => AgentEvent::Request(d.bytes(MAX_FRAME)?.to_vec()),
+        3 => AgentEvent::Start(d.bytes(64)?.to_vec()),
+        4 => AgentEvent::Attached,
+        5 => AgentEvent::Ready,
+        _ => return Err(invalid("invalid Agent event")),
+    })
+}
+
 fn encode_action(e: &mut Encoder, action: &Action) {
     match action {
-        Action::ScreenRequest => e.u8(32),
+        Action::ScreenRequest { request, wait } => {
+            e.u8(32);
+            e.u64(*request);
+            e.bool(*wait);
+        }
         Action::AgentOpen => e.u8(27),
         Action::AgentView(payload) => {
             e.u8(28);
@@ -1269,10 +1343,13 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.string(name);
             e.bytes(token);
         }
-        Action::AgentUpdate { kind, payload } => {
+        Action::AgentUpdate(patch) => {
             e.u8(31);
-            e.u8(*kind);
-            e.bytes(payload);
+            encode_agent_model(e, patch);
+        }
+        Action::AgentRemove(session) => {
+            e.u8(36);
+            e.u64(*session);
         }
         Action::Create { name, options } => {
             e.u8(1);
@@ -1509,7 +1586,10 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
                 None
             },
         },
-        32 => Action::ScreenRequest,
+        32 => Action::ScreenRequest {
+            request: d.u64()?,
+            wait: d.bool()?,
+        },
         27 => Action::AgentOpen,
         28 => Action::AgentView(d.bytes(MAX_FRAME)?.to_vec()),
         29 => Action::AgentRequest(d.bytes(MAX_FRAME)?.to_vec()),
@@ -1517,10 +1597,8 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
             name: d.string(128)?,
             token: d.bytes(64)?.to_vec(),
         },
-        31 => Action::AgentUpdate {
-            kind: d.u8()?,
-            payload: d.bytes(MAX_FRAME)?.to_vec(),
-        },
+        31 => Action::AgentUpdate(decode_agent_model(d)?),
+        36 => Action::AgentRemove(d.u64()?),
         1 => Action::Create {
             name: d.string(128)?,
             options: decode_options(d)?,
@@ -2084,14 +2162,10 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
         for _ in 0..count {
             let column = d.u16()? as usize;
             let bytes = d.bytes(65536)?;
-            let zerowidth = if bytes.is_empty() {
-                Default::default()
-            } else {
-                std::str::from_utf8(bytes)
-                    .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                    .chars()
-                    .collect()
-            };
+            let zerowidth = std::str::from_utf8(bytes)
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
+                .chars()
+                .collect();
             let underline_color = if d.bool()? {
                 Some(decode_color(d)?)
             } else {
@@ -2126,27 +2200,6 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
 mod tests {
     use super::*;
     #[test]
-    fn borrowed_agent_payload_is_owned_by_the_queued_frame() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let mut payload = "cached snapshot 中🙂".as_bytes().to_vec();
-        sender
-            .send_response(Response::Agent {
-                kind: 1,
-                payload: payload.as_slice().into(),
-            })
-            .unwrap();
-        payload.fill(b'?');
-        sender.flush().unwrap();
-        let responses = receiver.responses(None).unwrap();
-        assert!(
-            matches!(&responses[..], [Response::Agent { kind: 1, payload }]
-            if payload.as_ref() == "cached snapshot 中🙂".as_bytes())
-        );
-    }
-
-    #[test]
     fn process_deltas_inherit_the_latest_snapshot_in_and_across_reads() {
         let (left, right) = UnixStream::pair().unwrap();
         let mut sender = Peer::new(left).unwrap();
@@ -2174,10 +2227,10 @@ mod tests {
             }],
         };
         let mut known = HashMap::new();
-        sender.send_state(&snapshot, &[], &known).unwrap();
+        sender.send_state(&snapshot, &[], &known, 0).unwrap();
         let full_size = sender.queued;
         known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        sender.send_state(&snapshot, &[], &known).unwrap();
+        sender.send_state(&snapshot, &[], &known, 0).unwrap();
         assert!(sender.queued - full_size < full_size);
         sender
             .send_response(Response::Error("marker".into()))
@@ -2187,17 +2240,17 @@ mod tests {
             foreground_argv: Some(vec!["new".into()]),
             ..ProcessMetadata::default()
         });
-        sender.send_state(&snapshot, &[], &known).unwrap();
+        sender.send_state(&snapshot, &[], &known, 0).unwrap();
         known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        sender.send_state(&snapshot, &[], &known).unwrap();
+        sender.send_state(&snapshot, &[], &known, 0).unwrap();
         sender.flush().unwrap();
         let responses = receiver.responses(None).unwrap();
         let [
-            Response::State(first, _),
-            Response::State(second, _),
+            Response::State(first, _, _),
+            Response::State(second, _, _),
             Response::Error(_),
-            Response::State(changed, _),
-            Response::State(last, _),
+            Response::State(changed, _, _),
+            Response::State(last, _, _),
         ] = responses.as_slice()
         else {
             panic!("state sequence changed")
@@ -2218,10 +2271,10 @@ mod tests {
             &changed.panes[0].process,
             &last.panes[0].process
         ));
-        sender.send_state(&snapshot, &[], &known).unwrap();
+        sender.send_state(&snapshot, &[], &known, 0).unwrap();
         sender.flush().unwrap();
         let next = receiver.responses(Some(last)).unwrap();
-        let Response::State(next, _) = &next[0] else {
+        let Response::State(next, _, _) = &next[0] else {
             panic!("state not delivered")
         };
         assert!(Arc::ptr_eq(&last.panes[0].process, &next.panes[0].process));
@@ -2277,12 +2330,12 @@ mod tests {
         let mut sender = Peer::new(left).unwrap();
         let mut receiver = Peer::remote(right).unwrap();
         sender
-            .send_response(Response::State(snapshot, Vec::new()))
+            .send_response(Response::State(snapshot, Vec::new(), 0))
             .unwrap();
         sender.flush().unwrap();
         receiver.read().unwrap();
         let responses = receiver.responses(None).unwrap();
-        let Response::State(snapshot, _) = &responses[0] else {
+        let Response::State(snapshot, _, _) = &responses[0] else {
             panic!("state not delivered")
         };
         assert_eq!(*snapshot.panes[0].process, expected);
@@ -2765,7 +2818,7 @@ mod tests {
         ];
         assert!(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 5000) } > 0);
     }
-    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response<'static>>> {
+    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response>> {
         loop {
             let responses = receiver.responses(None)?;
             if !responses.is_empty() {

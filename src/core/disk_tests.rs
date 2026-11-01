@@ -36,18 +36,8 @@ fn core(columns: u16, lines: u16, budget: std::sync::Arc<HistoryBudget>) -> Core
     .unwrap();
     core
 }
-fn settle(core: &mut Core) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        core.poll_history(true).unwrap();
-        let h = core.history.as_ref().unwrap();
-        if h.spool.is_empty() && h.stored_end == h.hot_start && !core.history_loading() {
-            break;
-        }
-        assert!(std::time::Instant::now() < deadline, "disk worker stalled");
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
+use super::settle_history as settle;
+
 fn feed(core: &mut Core, parser: &mut Parser, bytes: &[u8]) {
     for chunk in bytes.chunks(128) {
         parser.advance_queued(core, chunk);
@@ -104,7 +94,7 @@ fn text(mut copy: HistoryCopy) -> String {
     text
 }
 #[test]
-#[cfg(feature = "tui")]
+
 fn prompt_scopes_are_excluded_from_hot_cold_and_reflowed_selection() {
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(format!(
         "target/runtime-blocks/prompt-{}-{}",
@@ -155,7 +145,7 @@ fn prompt_scopes_are_excluded_from_hot_cold_and_reflowed_selection() {
     }
 }
 #[test]
-#[cfg(feature = "tui")]
+
 fn prompt_scope_tracks_secondary_right_prompt_padding_and_overwrites() {
     let mut core = Core::new(
         WindowSize {
@@ -409,7 +399,7 @@ fn disk_reflow_matches_the_existing_grid_including_a_long_soft_wrapped_cjk_line(
     }
 }
 #[test]
-#[cfg(feature = "tui")]
+
 fn running_block_copy_is_empty_after_the_cursor_moves_above_its_output() {
     let mut core = core(20, 4, budget(8 * 1024 * 1024));
     let mut parser = Parser::new();
@@ -427,9 +417,9 @@ fn running_block_copy_is_empty_after_the_cursor_moves_above_its_output() {
     assert_eq!(text(copy), "");
 }
 #[test]
-#[cfg(feature = "tui")]
+
 fn command_copy_survives_spilling_resize_and_reports_capacity_eviction() {
-    let mut core = core(16, 4, budget(12_000));
+    let mut core = core(16, 4, budget(4096));
     let mut parser = Parser::new();
     feed(
         &mut core,
@@ -458,7 +448,7 @@ fn command_copy_survives_spilling_resize_and_reports_capacity_eviction() {
     assert!(after.ends_with("line-0299\n"));
 }
 #[test]
-fn synchronized_replay_obeys_disk_backpressure_without_exposing_partial_commits() {
+fn synchronized_parsing_obeys_disk_backpressure_without_presenting_partial_frames() {
     let mut core = core(8, 3, budget(8 * 1024 * 1024));
     let mut parser = Parser::new();
     let source = format!("\x1b[?2026h{}\x1b[?2026l", "x\r\n".repeat(20_000));

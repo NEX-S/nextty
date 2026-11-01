@@ -6,13 +6,9 @@ use std::{
     ptr::NonNull,
 };
 
-#[cfg(feature = "tui")]
 use std::{fs::File, os::fd::IntoRawFd};
 
-pub const SHIFT: u32 = 1;
-pub const CONTROL: u32 = 2;
-pub const ALT: u32 = 4;
-pub const SUPER: u32 = 8;
+pub use crate::input::{ALT, CONTROL, SHIFT, SUPER};
 pub const KEY: i32 = 1;
 pub const TEXT: i32 = 2;
 pub const PREEDIT: i32 = 3;
@@ -77,11 +73,11 @@ unsafe extern "C" {
     ) -> c_int;
     fn nt_window_size(window: *mut c_void, width: *mut c_int, height: *mut c_int, scale: *mut f64);
     fn nt_window_title(window: *mut c_void, title: *const c_char);
-    #[cfg(feature = "tui")]
+
     fn nt_window_minimize(window: *mut c_void);
-    #[cfg(feature = "tui")]
+
     fn nt_window_maximize(window: *mut c_void, maximized: c_int);
-    #[cfg(any(feature = "agent", feature = "monitor"))]
+
     fn nt_window_resize_cursor(window: *mut c_void, enabled: c_int);
     fn nt_window_cursor_rect(window: *mut c_void, x: c_int, y: c_int, width: c_int, height: c_int);
     fn nt_window_set_selection(
@@ -91,7 +87,7 @@ unsafe extern "C" {
         len: usize,
     );
     fn nt_window_paste(window: *mut c_void, primary: c_int);
-    #[cfg(feature = "tui")]
+
     fn nt_window_set_selection_file(window: *mut c_void, primary: c_int, fd: c_int);
     fn nt_window_frame_ready(window: *mut c_void) -> c_int;
     fn nt_renderer_new(window: *mut c_void, family: *const c_char, font_size: f32) -> *mut c_void;
@@ -108,7 +104,7 @@ unsafe extern "C" {
     ) -> *mut c_void;
     fn nt_line_free(line: *mut c_void);
     fn nt_renderer_begin(renderer: *mut c_void, background: u32) -> c_int;
-    #[cfg(feature = "tui")]
+
     fn nt_renderer_clear(renderer: *mut c_void, background: u32) -> c_int;
     fn nt_renderer_clip(renderer: *mut c_void, x: f32, y: f32, width: f32, height: f32) -> c_int;
     fn nt_renderer_rect(
@@ -120,7 +116,7 @@ unsafe extern "C" {
         color: u32,
         wave: c_int,
     );
-    #[cfg(feature = "monitor")]
+
     fn nt_renderer_stroke(
         renderer: *mut c_void,
         x1: f32,
@@ -130,17 +126,7 @@ unsafe extern "C" {
         width: f32,
         color: u32,
     );
-    #[cfg(feature = "files")]
-    fn nt_renderer_round_rect(
-        renderer: *mut c_void,
-        x: f32,
-        y: f32,
-        width: f32,
-        height: f32,
-        radius: f32,
-        color: u32,
-    );
-    #[cfg(feature = "tui")]
+
     fn nt_renderer_tab(
         renderer: *mut c_void,
         x: f32,
@@ -150,7 +136,7 @@ unsafe extern "C" {
         inset: f32,
         color: u32,
     );
-    fn nt_renderer_line(renderer: *mut c_void, line: *mut c_void, x: f32, y: f32, factor: f32);
+    fn nt_renderer_line(renderer: *mut c_void, line: *mut c_void, x: f32, y: f32);
     fn nt_renderer_present(renderer: *mut c_void) -> c_int;
     fn nt_renderer_ready(renderer: *mut c_void) -> c_int;
     fn nt_renderer_finish(renderer: *mut c_void) -> c_int;
@@ -183,9 +169,6 @@ impl Window {
         timeout: i32,
         events: &mut Vec<Event>,
     ) -> Result<()> {
-        for source in sources.iter_mut() {
-            source.revents = 0;
-        }
         struct Collected<'a> {
             events: &'a mut Vec<Event>,
             error: Option<Error>,
@@ -252,21 +235,17 @@ impl Window {
         unsafe { nt_window_title(self.0.as_ptr(), text.as_ptr()) };
         Ok(())
     }
-    #[cfg(feature = "tui")]
+
     pub fn minimize(&self) {
         unsafe { nt_window_minimize(self.0.as_ptr()) };
     }
-    #[cfg(feature = "tui")]
+
     pub fn maximize(&self, maximized: bool) {
         unsafe { nt_window_maximize(self.0.as_ptr(), maximized.into()) };
     }
-    #[cfg(feature = "agent")]
-    pub fn resize_cursor(&self, enabled: bool) {
-        unsafe { nt_window_resize_cursor(self.0.as_ptr(), enabled.into()) };
-    }
-    #[cfg(all(feature = "tui", feature = "monitor"))]
-    pub fn vertical_resize_cursor(&self, enabled: bool) {
-        unsafe { nt_window_resize_cursor(self.0.as_ptr(), if enabled { 2 } else { 0 }) };
+    pub fn resize_cursor(&self, horizontal: bool, vertical: bool) {
+        let shape = if vertical { 2 } else { i32::from(horizontal) };
+        unsafe { nt_window_resize_cursor(self.0.as_ptr(), shape) };
     }
 
     pub fn cursor_rect(&self, x: i32, y: i32, width: i32, height: i32) {
@@ -285,7 +264,7 @@ impl Window {
     pub fn paste(&self, primary: bool) {
         unsafe { nt_window_paste(self.0.as_ptr(), primary.into()) }
     }
-    #[cfg(feature = "tui")]
+
     pub fn selection_file(&self, primary: bool, file: File) {
         unsafe { nt_window_set_selection_file(self.0.as_ptr(), primary.into(), file.into_raw_fd()) }
     }
@@ -324,7 +303,7 @@ impl Renderer {
     pub fn begin(&self, background: u32) -> Result<()> {
         self.check(unsafe { nt_renderer_begin(self.0.as_ptr(), background) })
     }
-    #[cfg(feature = "tui")]
+
     pub fn clear(&self, background: u32) -> Result<()> {
         self.check(unsafe { nt_renderer_clear(self.0.as_ptr(), background) })
     }
@@ -334,25 +313,11 @@ impl Renderer {
     pub fn rect(&self, x: f32, y: f32, width: f32, height: f32, color: u32, wave: bool) {
         unsafe { nt_renderer_rect(self.0.as_ptr(), x, y, width, height, color, wave.into()) };
     }
-    #[cfg(feature = "monitor")]
+
     pub fn stroke(&self, from: (f32, f32), to: (f32, f32), width: f32, color: u32) {
         unsafe { nt_renderer_stroke(self.0.as_ptr(), from.0, from.1, to.0, to.1, width, color) };
     }
-    #[cfg(feature = "files")]
-    pub fn rounded_rect(&self, position: (f32, f32), size: (f32, f32), radius: f32, color: u32) {
-        unsafe {
-            nt_renderer_round_rect(
-                self.0.as_ptr(),
-                position.0,
-                position.1,
-                size.0,
-                size.1,
-                radius,
-                color,
-            )
-        };
-    }
-    #[cfg(feature = "tui")]
+
     pub fn tab(&self, position: (f32, f32), size: (f32, f32), inset: f32, color: u32) {
         unsafe {
             nt_renderer_tab(
@@ -367,11 +332,7 @@ impl Renderer {
         };
     }
     pub fn line(&self, line: &Line, x: f32, y: f32) {
-        unsafe { nt_renderer_line(self.0.as_ptr(), line.0.as_ptr(), x, y, 1.) };
-    }
-    #[cfg(feature = "tui")]
-    pub fn line_scaled(&self, line: &Line, x: f32, y: f32, factor: f32) {
-        unsafe { nt_renderer_line(self.0.as_ptr(), line.0.as_ptr(), x, y, factor) };
+        unsafe { nt_renderer_line(self.0.as_ptr(), line.0.as_ptr(), x, y) };
     }
     pub fn fd(&self) -> i32 {
         unsafe { nt_renderer_fd(self.0.as_ptr()) }

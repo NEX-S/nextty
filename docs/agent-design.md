@@ -48,7 +48,9 @@ A query focuses on matching rows and neighboring context while retaining the vis
 
 ## Harness and implementation
 
-Tools within one conversation execute in order. Consecutive queued full conversation snapshots may be replaced by the latest snapshot before presentation; preserve intervening view and lifecycle events. Network activity, terminal/history waits and presentation work must not block frontend input. Record known tool results before fallible UI notifications. Keep input authorization separate from the activity observation used for waits.
+Screen frames use one pull path for local and remote frontends and the Agent owner. A frontend keeps its next frame request pending; the owner requests frames only for pending work. Tool execution obtains a fresh snapshot before interpreting or acting on terminal state. Request identities keep an older in-flight frame from satisfying that fresh read.
+
+Tools within one conversation execute in order. Conversation updates carry ordered message patches; preserve their order and intervening lifecycle events. Consecutive queued draft snapshots may be replaced by the latest draft before presentation. Network activity, terminal/history waits and presentation work must not block frontend input. Record known tool results before fallible UI notifications. Keep input authorization separate from the activity observation used for waits.
 
 Waits are bounded observations. `read.wait` is an integer number of seconds, from 0 through 1800; omission or 0 reads immediately. Return a reason and current state so the agent can continue or respond to an interactive prompt; do not wake the model for every output line. Stopping the agent cancels its own requests and waits, not programs already running in the terminal. Preserve results already received when cancellation arrives, then stop before another action or model request.
 

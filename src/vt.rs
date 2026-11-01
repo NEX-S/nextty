@@ -1,5 +1,5 @@
 //! Streaming VT input for the terminal's screen core.
-#[cfg(feature = "tui")]
+
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
@@ -304,7 +304,6 @@ impl Csi {
     }
 }
 
-const SYNC_LIMIT: usize = 2 * 1024 * 1024;
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 const OSC_RETAIN_LIMIT: usize = 16 * 1024;
 
@@ -318,13 +317,9 @@ pub struct Parser {
     utf8_len: usize,
     last_char: Option<char>,
     osc: Vec<u8>,
-    sync: Vec<u8>,
     deadline: Option<Instant>,
-    replaying: bool,
-    #[cfg(feature = "tui")]
-    queued: std::collections::VecDeque<(Vec<u8>, usize, bool)>,
-    #[cfg(feature = "tui")]
-    streaming: bool,
+
+    queued: std::collections::VecDeque<(Vec<u8>, usize)>,
 }
 
 #[inline]
@@ -361,146 +356,69 @@ impl Parser {
         self.deadline
     }
 
-    /// Returns whether this call committed input, rather than only buffering a synchronized frame.
+    /// Parses immediately; synchronized updates defer presentation until the mode ends.
     pub fn advance(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
-        self.advance_count(core, bytes).1
-    }
-
-    fn advance_count(&mut self, core: &mut Core, bytes: &[u8]) -> (usize, bool) {
         let mut position = 0;
-        let mut committed = false;
         while position < bytes.len() {
-            if self.deadline.is_some() {
-                // Scan only framing while the actual core and its UTF-8/REP state remain untouched.
-                if self.state == State::Ground && bytes[position] >= 0x20 && bytes[position] != 0x7f
-                {
-                    let length = text_prefix(&bytes[position..]);
-                    let length = length.min(SYNC_LIMIT - self.sync.len());
-                    self.sync
-                        .extend_from_slice(&bytes[position..position + length]);
-                    position += length;
-                } else {
-                    let byte = bytes[position];
-                    self.sync.push(byte);
-                    position += 1;
-                    if self.step(core, byte, true) {
-                        committed |= self.finish_sync(core);
-                        #[cfg(feature = "tui")]
-                        if self.streaming {
-                            break;
-                        }
-                        continue;
-                    }
-                }
-                if self.sync.len() == SYNC_LIMIT {
-                    committed |= self.finish_sync(core);
-                    #[cfg(feature = "tui")]
-                    if self.streaming {
-                        break;
-                    }
-                }
-            } else if self.state == State::Ground
-                && bytes[position] >= 0x20
-                && bytes[position] != 0x7f
-            {
+            if self.state == State::Ground && bytes[position] >= 0x20 && bytes[position] != 0x7f {
                 let length = text_prefix(&bytes[position..]);
                 self.text(core, &bytes[position..position + length]);
                 position += length;
-                committed = true;
             } else {
-                self.step(core, bytes[position], false);
+                self.step(core, bytes[position]);
                 position += 1;
-                committed = true;
             }
         }
-        (position, committed)
+        !bytes.is_empty() && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
     }
 
-    #[cfg(feature = "tui")]
     pub(crate) fn has_queued(&self) -> bool {
         !self.queued.is_empty()
     }
-    #[cfg(feature = "tui")]
+
     pub(crate) fn advance_queued(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
         let mut input = if self.queued.is_empty() {
-            (!bytes.is_empty()).then_some((Cow::Borrowed(bytes), 0, false))
+            (!bytes.is_empty()).then_some((Cow::Borrowed(bytes), 0))
         } else {
             if !bytes.is_empty() {
-                self.queued.push_back((bytes.to_vec(), 0, false));
+                self.queued.push_back((bytes.to_vec(), 0));
             }
             None
         };
         let mut committed = false;
-        // A PTY read is at most 16 KiB. Keep its ready history quanta under one
-        // Core lock, so a TUI's temporary drawing cursor does not become a frame.
+        // Keep one batch under the Core lock while respecting history backpressure.
         let mut remaining = 16 * 1024;
         loop {
             let next = input.take().or_else(|| {
                 self.queued
                     .pop_front()
-                    .map(|(data, position, replay)| (Cow::Owned(data), position, replay))
+                    .map(|(data, position)| (Cow::Owned(data), position))
             });
-            let Some((data, mut position, replay)) = next else {
+            let Some((data, mut position)) = next else {
                 break;
             };
             while position < data.len() && remaining != 0 && core.history_read_ready() {
-                self.streaming = true;
                 let end = (position + remaining.min(512)).min(data.len());
-                let (consumed, changed) = self.advance_count(core, &data[position..end]);
-                self.streaming = false;
-                position += consumed;
-                remaining -= consumed;
-                committed |= changed;
-                if !replay && self.replaying {
-                    break;
-                }
+                committed |= self.advance(core, &data[position..end]);
+                remaining -= end - position;
+                position = end;
             }
             if position < data.len() {
-                let data = data.into_owned();
-                if !replay && self.replaying {
-                    // finish_sync queued the frame first; resume the source after its replay.
-                    self.queued.insert(1, (data, position, replay));
-                } else {
-                    self.queued.push_front((data, position, replay));
-                }
-            } else if replay {
-                self.replaying = false;
-                core.unset_private_mode(2026);
-                return true;
+                self.queued.push_front((data.into_owned(), position));
             }
             if remaining == 0 || !core.history_read_ready() {
                 break;
             }
         }
-        committed && !self.replaying && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
-    }
-    #[cfg(feature = "tui")]
-    pub(crate) fn finish_sync_queued(&mut self, core: &mut Core) {
-        self.streaming = true;
-        self.finish_sync(core);
-        self.streaming = false;
+        committed && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
     }
 
-    /// Commits a complete or timed-out synchronized frame under the caller's core lock.
     pub fn finish_sync(&mut self, core: &mut Core) -> bool {
         if self.deadline.take().is_none() {
             return false;
         }
-        let bytes = std::mem::take(&mut self.sync);
-        self.state = State::Ground;
-        self.csi = Csi::default();
-        self.osc.clear();
-        self.utf8_len = 0;
-        self.replaying = true;
-        #[cfg(feature = "tui")]
-        if self.streaming {
-            self.queued.push_front((bytes, 0, true));
-            return false;
-        }
-        self.advance(core, &bytes);
-        self.replaying = false;
-        core.unset_private_mode(2026);
-        !bytes.is_empty()
+        core.set_private(2026, false);
+        true
     }
 
     fn print(&mut self, core: &mut Core, text: &str) {
@@ -563,8 +481,8 @@ impl Parser {
 
     fn control(&mut self, core: &mut Core, byte: u8) {
         match byte {
-            0x08 => core.backspace(),
-            0x09 => core.put_tab(1),
+            0x08 => core.move_backward(1),
+            0x09 => core.move_forward_tabs(1),
             0x0a..=0x0c => core.newline(),
             0x0d => core.carriage_return(),
             0x0e => core.set_active_charset(1),
@@ -588,7 +506,7 @@ impl Parser {
         self.osc = Vec::new();
     }
 
-    fn step(&mut self, core: &mut Core, byte: u8, scan: bool) -> bool {
+    fn step(&mut self, core: &mut Core, byte: u8) {
         if matches!(
             self.state,
             State::Osc | State::OscEscape | State::IgnoreString | State::IgnoreStringEscape
@@ -597,7 +515,7 @@ impl Parser {
                 0x18 | 0x1a => {
                     self.clear_osc();
                     self.state = State::Ground;
-                    if !scan && byte == 0x1a {
+                    if byte == 0x1a {
                         self.print(core, "\u{fffd}");
                     }
                 }
@@ -608,67 +526,50 @@ impl Parser {
                     };
                 }
                 b'\\' if matches!(self.state, State::OscEscape | State::IgnoreStringEscape) => {
-                    if self.state == State::OscEscape && !scan {
+                    if self.state == State::OscEscape {
                         self.dispatch_osc(core, "\x1b\\");
                     }
                     self.clear_osc();
                     self.state = State::Ground;
                 }
                 0x07 if matches!(self.state, State::Osc | State::OscEscape) => {
-                    if !scan {
-                        self.dispatch_osc(core, "\x07");
-                    }
+                    self.dispatch_osc(core, "\x07");
+
                     self.clear_osc();
                     self.state = State::Ground;
                 }
                 _ if matches!(self.state, State::OscEscape | State::IgnoreStringEscape) => {
                     self.clear_osc();
                     self.state = State::Escape;
-                    return self.step(core, byte, scan);
+                    return self.step(core, byte);
                 }
-                _ if self.state == State::Osc && !scan && byte >= 0x20 && byte != 0x7f => {
+                _ if self.state == State::Osc && byte >= 0x20 && byte != 0x7f => {
                     self.osc.push(byte)
                 }
                 _ => (),
             }
-            return false;
+            return;
         }
-        if byte == 0x1b {
-            if !scan && self.utf8_len != 0 {
+        if byte < 0x20 || byte == 0x7f {
+            if self.utf8_len != 0 {
                 self.print(core, "\u{fffd}");
                 self.utf8_len = 0;
             }
-            self.state = State::Escape;
-            return false;
-        }
-        if matches!(byte, 0x18 | 0x1a) {
-            self.state = State::Ground;
-            if !scan {
-                if self.utf8_len != 0 {
-                    self.print(core, "\u{fffd}");
-                    self.utf8_len = 0;
+            match byte {
+                0x1b => self.state = State::Escape,
+                0x18 | 0x1a => {
+                    self.state = State::Ground;
+                    if byte == 0x1a {
+                        self.print(core, "\u{fffd}");
+                    }
                 }
-                if byte == 0x1a {
-                    self.print(core, "\u{fffd}");
-                }
+                _ => self.control(core, byte),
             }
-            return false;
-        }
-        if byte < 0x20 || byte == 0x7f {
-            if !scan {
-                if self.utf8_len != 0 {
-                    self.print(core, "\u{fffd}");
-                    self.utf8_len = 0;
-                }
-                self.control(core, byte);
-            }
-            return false;
+            return;
         }
         match self.state {
             State::Ground => {
-                if !scan {
-                    self.text(core, &[byte]);
-                }
+                self.text(core, &[byte]);
             }
             State::Escape => match byte {
                 b'[' => {
@@ -686,20 +587,14 @@ impl Parser {
                 }
                 _ => {
                     self.state = State::Ground;
-                    if !scan {
-                        self.escape(core, 0, byte);
-                    } else if byte == b'c' {
-                        // RIS resets synchronized output too; replay it at the batch boundary.
-                        return true;
-                    }
+                    self.escape(core, 0, byte);
                 }
             },
             State::EscapeIntermediate => {
                 if byte >= 0x30 {
                     self.state = State::Ground;
-                    if !scan {
-                        self.escape(core, self.escape_intermediate, byte);
-                    }
+
+                    self.escape(core, self.escape_intermediate, byte);
                 } else {
                     self.escape_intermediate = 0xff;
                 }
@@ -707,28 +602,12 @@ impl Parser {
             State::Csi if (0x40..=0x7e).contains(&byte) => {
                 self.state = State::Ground;
                 if !self.csi.ignored {
-                    if scan {
-                        if self.csi.prefix == b'?'
-                            && self.csi.intermediate == 0
-                            && self.csi.colons == 0
-                            && self.csi.values[..self.csi.count].contains(&2026)
-                        {
-                            if byte == b'l' {
-                                return true;
-                            }
-                            if byte == b'h' {
-                                self.deadline = Some(Instant::now() + SYNC_TIMEOUT);
-                            }
-                        }
-                    } else {
-                        self.dispatch_csi(core, byte);
-                    }
+                    self.dispatch_csi(core, byte);
                 }
             }
             State::Csi => self.csi.byte(byte),
             _ => (),
         }
-        false
     }
 
     fn escape(&mut self, core: &mut Core, intermediate: u8, final_byte: u8) {
@@ -748,6 +627,7 @@ impl Parser {
             (0, b'c') => {
                 core.reset_state();
                 self.last_char = None;
+                self.deadline = None;
             }
             (b'#', b'8') => core.decaln(),
             (b'('..=b'+', b'0' | b'B') => core.configure_charset(
@@ -823,14 +703,10 @@ impl Parser {
             }
             (b'?', 0, b'h' | b'l') => {
                 for mode in &p.values[..p.count] {
-                    if final_byte == b'h' {
-                        core.set_private_mode(*mode);
-                    } else {
-                        core.unset_private_mode(*mode);
-                    }
+                    core.set_private(*mode, final_byte == b'h');
                 }
-                if final_byte == b'h' && p.values[..p.count].contains(&2026) && !self.replaying {
-                    self.deadline = Some(Instant::now() + SYNC_TIMEOUT);
+                if p.values[..p.count].contains(&2026) {
+                    self.deadline = (final_byte == b'h').then(|| Instant::now() + SYNC_TIMEOUT);
                 }
             }
             (0, 0, b'm') => self.sgr(core),
@@ -983,13 +859,13 @@ impl Parser {
                     .map_or(self.osc.len(), |i| i + 1);
                 core.set_title(Some(String::from_utf8_lossy(&self.osc[offset..])));
             }
-            #[cfg(feature = "tui")]
+
             7 => {
                 if let Some(directory) = parts.next() {
                     core.set_directory_uri(directory);
                 }
             }
-            #[cfg(feature = "tui")]
+
             133 => {
                 if let Some(marker) = parts.next() {
                     core.shell_marker(marker, parts.next());
@@ -1201,19 +1077,18 @@ mod tests {
     }
 
     #[test]
-    fn full_synchronized_buffer_commits_without_losing_input_after_its_boundary() {
+    fn synchronized_queries_reply_before_presentation() {
         let (mut core, mut parser) = terminal();
         parser.advance(&mut core, b"\x1b[?2026h");
-        let mut bytes = vec![b'\r'; SYNC_LIMIT - 2];
-        bytes.extend_from_slice("中Z".as_bytes());
-        assert!(parser.advance(&mut core, &bytes));
+        assert!(!parser.advance(&mut core, "中Z\x1b[6n\x1b[c".as_bytes()));
         assert_eq!(core.row(0).cells[0].c, '中');
         assert_eq!(core.row(0).cells[2].c, 'Z');
+        assert_eq!(replies(&mut core), b"\x1b[1;4R\x1b[?6c");
+        assert!(core.mode().contains(Mode::SYNC_UPDATE));
+        assert!(parser.advance(&mut core, b"\x1b[?2026l"));
         assert!(parser.deadline().is_none());
-        assert!(!core.mode().contains(Mode::SYNC_UPDATE));
     }
 
-    #[cfg(feature = "tui")]
     #[test]
     fn queued_pty_read_does_not_publish_a_tui_cursor_between_show_and_restore() {
         let (mut core, mut parser) = terminal();
@@ -1229,9 +1104,8 @@ mod tests {
         assert!(!parser.has_queued());
     }
 
-    #[cfg(feature = "tui")]
     #[test]
-    fn queued_frames_replay_before_their_source_remainders_at_every_split() {
+    fn queued_and_direct_parsing_match_at_every_split() {
         let input = "A\x1b[?2026h\r\x1b[2K中\u{301}\x1b[2b\x1b[?2026lB\x1b[?2026h\r\nsecond\x1b[6n\x1bcfresh\x1b[?2026h\r\nthird\x1b[6n\x1b[?2026lC".as_bytes();
         let (mut expected, mut direct) = terminal();
         direct.advance(&mut expected, input);
@@ -1259,12 +1133,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tui")]
     #[test]
-    fn queued_full_frame_resumes_partial_utf8_then_the_next_frame_in_order() {
+    fn queued_large_frame_preserves_utf8_and_frame_order() {
         let (mut core, mut parser) = terminal();
         let mut input = b"\x1b[?2026h".to_vec();
-        input.extend(std::iter::repeat_n(b'\r', SYNC_LIMIT - 2));
+        input.extend(std::iter::repeat_n(b'\r', 32 * 1024 - 2));
         input.extend_from_slice("中Z\x1b[?2026h\r\nnext\x1b[?2026l!".as_bytes());
         parser.advance_queued(&mut core, &input);
         while parser.has_queued() {

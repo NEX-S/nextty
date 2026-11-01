@@ -243,21 +243,8 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
             row.used()
         }
         .min(row.used());
-        for (_, cell, extra) in row.cells_with_extras(from..to) {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            if cell.flags.contains(Flags::HIDDEN) {
-                result.text.push(' ');
-                if cell.flags.contains(Flags::WIDE_CHAR) {
-                    result.text.push(' ');
-                }
-            } else {
-                result.text.push(cell.c);
-                if let Some(extra) = extra {
-                    result.text.extend(&extra.zerowidth);
-                }
-            }
+        for (_, ch) in row.characters(from..to) {
+            result.text.push(ch);
             if result.text.len() > SNAPSHOT_LIMIT {
                 while result.text.len() > SNAPSHOT_LIMIT {
                     result.text.pop();

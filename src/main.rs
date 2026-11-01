@@ -1,10 +1,9 @@
-#[cfg(feature = "tui")]
 mod ssh;
 
-#[cfg(any(feature = "gui", feature = "tui"))]
 use nextty::config::Config;
 use nextty::error::{Error, Result};
 use nextty::terminal::Shell;
+use nextty::workspace::{self, Action, Client, CreateOptions};
 use std::path::PathBuf;
 
 fn main() {
@@ -24,7 +23,7 @@ fn run() -> Result<()> {
         match arg.as_str() {
             #[cfg(feature = "agent")]
             "--agent-owner" => {
-                nextty::agent_owner::run()?;
+                nextty::agent::owner::run()?;
                 return Ok(());
             }
             "--help" | "-h" => {
@@ -50,40 +49,27 @@ fn run() -> Result<()> {
             "--gui" => gui = true,
             "--tui" => gui = false,
             "--bridge" => {
-                #[cfg(feature = "tui")]
-                {
-                    let version = args
-                        .next()
-                        .ok_or_else(|| Error::msg("--bridge requires a protocol version"))?
-                        .parse::<u8>()
-                        .map_err(|_| Error::msg("invalid bridge protocol version"))?;
-                    if args.next().is_some() {
-                        return Err(Error::msg("unexpected bridge argument"));
-                    }
-                    nextty::workspace::run_bridge(version)?;
-                    return Ok(());
+                let version = args
+                    .next()
+                    .ok_or_else(|| Error::msg("--bridge requires a protocol version"))?
+                    .parse::<u8>()
+                    .map_err(|_| Error::msg("invalid bridge protocol version"))?;
+                if args.next().is_some() {
+                    return Err(Error::msg("unexpected bridge argument"));
                 }
-                #[cfg(not(feature = "tui"))]
-                return Err(Error::msg("this build has no workspace support"));
+                nextty::workspace::run_bridge(version)?;
+                return Ok(());
             }
             "--server" => {
-                #[cfg(feature = "tui")]
-                {
-                    let path = PathBuf::from(
-                        args.next()
-                            .ok_or_else(|| Error::msg("--server requires a socket path"))?,
-                    );
-                    if args.next().is_some() {
-                        return Err(Error::msg("unexpected server argument"));
-                    }
-                    nextty::workspace::run_server(
-                        &path,
-                        nextty::workspace::ServerOptions::default(),
-                    )?;
-                    return Ok(());
+                let path = PathBuf::from(
+                    args.next()
+                        .ok_or_else(|| Error::msg("--server requires a socket path"))?,
+                );
+                if args.next().is_some() {
+                    return Err(Error::msg("unexpected server argument"));
                 }
-                #[cfg(not(feature = "tui"))]
-                return Err(Error::msg("this build has no workspace support"));
+                nextty::workspace::run_server(&path, nextty::workspace::ServerOptions::default())?;
+                return Ok(());
             }
             "-e" => {
                 program = Some(Shell::new(
@@ -100,57 +86,18 @@ fn run() -> Result<()> {
             _ => return Err(Error::msg(format!("unknown argument {arg:?}; use --help"))),
         }
     }
-    #[cfg(feature = "tui")]
-    {
-        let (remote, name) = match (command.as_deref(), positions.as_slice()) {
-            (_, []) => (None, None),
-            (Some("list"), [host]) => (Some(ssh::RemoteTarget::parse(host)?), None),
-            (Some("list"), _) => return Err(Error::msg("list takes at most one remote target")),
-            (_, [host, name]) => (Some(ssh::RemoteTarget::parse(host)?), Some(name.clone())),
-            (_, [host]) if ssh::RemoteTarget::recognizes(host) => {
-                (Some(ssh::RemoteTarget::parse(host)?), None)
-            }
-            (_, [name]) => (None, Some(name.clone())),
-            _ => unreachable!(),
-        };
-        workspace(command, name, remote, gui, directory, program, config_path)
-    }
-    #[cfg(not(feature = "tui"))]
-    {
-        if command.is_some() || !positions.is_empty() {
-            return Err(Error::msg(
-                "workspace commands require the tui Cargo feature",
-            ));
-        }
-        if !gui {
-            return Err(Error::msg(
-                "this build has no TUI; use --gui for the desktop terminal",
-            ));
-        }
-        #[cfg(feature = "gui")]
-        {
-            let config = Config::load(config_path)?;
-            nextty::Desktop::new(config, program, directory)?.run()
-        }
-        #[cfg(not(feature = "gui"))]
-        {
-            let _ = (program, directory, config_path);
-            Err(Error::msg("enable gui or tui to run a frontend"))
-        }
-    }
-}
 
-#[cfg(feature = "tui")]
-fn workspace(
-    command: Option<String>,
-    name: Option<String>,
-    remote: Option<ssh::RemoteTarget>,
-    gui: bool,
-    directory: Option<PathBuf>,
-    program: Option<Shell>,
-    config_path: Option<PathBuf>,
-) -> Result<()> {
-    use nextty::workspace::{self, Action, Client, CreateOptions};
+    let (remote, name) = match (command.as_deref(), positions.as_slice()) {
+        (_, []) => (None, None),
+        (Some("list"), [host]) => (Some(ssh::RemoteTarget::parse(host)?), None),
+        (Some("list"), _) => return Err(Error::msg("list takes at most one remote target")),
+        (_, [host, name]) => (Some(ssh::RemoteTarget::parse(host)?), Some(name.clone())),
+        (_, [host]) if ssh::RemoteTarget::recognizes(host) => {
+            (Some(ssh::RemoteTarget::parse(host)?), None)
+        }
+        (_, [name]) => (None, Some(name.clone())),
+        _ => unreachable!(),
+    };
     let command = command.as_deref().unwrap_or("new");
     if command != "new" && (directory.is_some() || program.is_some()) {
         return Err(Error::msg(
@@ -240,10 +187,6 @@ fn workspace(
     }
     let mut client =
         connect().map_err(|error| Error::context("connect workspace server", error))?;
-    #[cfg(feature = "gui")]
-    if gui && !client.is_remote() {
-        client.enable_screen_requests()?;
-    }
     client.send(action)?;
     #[cfg(feature = "gui")]
     if gui {
@@ -253,7 +196,6 @@ fn workspace(
     Ok(())
 }
 
-#[cfg(feature = "tui")]
 fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<()> {
     use nextty::workspace::ClientEvent;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
@@ -291,19 +233,10 @@ fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<(
                 },
             revents: 0,
         };
-        if unsafe {
-            libc::poll(
-                &mut fd,
-                1,
-                remaining.as_millis().min(i32::MAX as u128) as i32,
-            )
-        } < 0
-        {
-            let error = std::io::Error::last_os_error();
-            if error.kind() != std::io::ErrorKind::Interrupted {
-                return Err(error.into());
-            }
-        }
+        nextty::poll::poll(
+            std::slice::from_mut(&mut fd),
+            remaining.as_millis().min(i32::MAX as u128) as i32,
+        )?;
         if fd.revents & libc::POLLOUT != 0 {
             client.flush()?;
         }
@@ -311,7 +244,7 @@ fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<(
 }
 fn help() {
     println!("nextty — terminal\n\nUsage: nextty [OPTIONS] [-e COMMAND [ARG...]]");
-    #[cfg(feature = "tui")]
+
     println!(
         "       nextty new [HOST] [NAME] [OPTIONS]\n       nextty attach [HOST] NAME [OPTIONS]\n       nextty list [HOST]\n       nextty terminate [HOST] NAME\n\nDefaults: use the current terminal; --tui selects it explicitly.\nHOST: [user@]host[:port] or ssh://[user@]host[:port]\nUse [IPv6]:port; SSH aliases work as HOST with NAME or ssh://alias."
     );
@@ -324,7 +257,7 @@ fn help() {
     println!(
         "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nCtrl+double-click Select a URL, path or quoted object\nShift+PageUp/Down Scroll history\nShift+Home/End    Top/bottom of history\nShift+mouse      Select when an application captures the mouse\nMiddle click     Paste primary selection"
     );
-    #[cfg(feature = "tui")]
+
     println!(
         "\nWorkspace input:\nAlt+v/s          Split left/right or top/bottom; drag the divider to resize\nAlt+h/j/k/l      Focus a pane\nAlt+,/.          Previous/next tab\nAlt+Enter        New tab\nAlt+q            Detach; workspace keeps running\nAlt+o            Cycle input focus\nAlt+?            Context help\nAlt+/            Find pane output; Enter/ShiftEnter next/previous, Esc restores view\nAlt+p/n          Previous/next prompt\nAlt+c            Copy command output; an existing selection takes precedence\n\nNew unnamed sessions use the lowest available number: 0, 1, 2, ...\nAttach takes control; the previous frontend becomes read-only.\nRemote sessions use system ssh and require nextty on PATH at both ends.\nRemote cwd defaults to remote HOME; relative paths are resolved there."
     );
@@ -332,20 +265,17 @@ fn help() {
     println!(
         "\nAlt+a            Toggle Agent chat\nDouble-click     Attach object context to chat\nAgent editor: Enter sends, Ctrl+J inserts a newline, Ctrl+A selects all.\nEsc selects an earlier user message; repeat for older, Enter confirms rewind.\nCtrl+C copies a selection or clears the draft; in Agent output it copies a selection or stops the reply."
     );
-    #[cfg(feature = "monitor")]
+
     println!(
         "Alt+m or resource counters open the resizable monitor; Tab/arrows navigate, Enter activates. SSH counters describe the local machine."
     );
-    #[cfg(feature = "files")]
+
     println!(
-        "Alt+f            Files: hjkl navigate, / search, Enter inserts a quoted path (local sessions)"
+        "Alt+f            Files: left tree, l expands/previews, Enter copies path (local sessions)"
     );
     println!(
-        "\nCompiled features: gui={}, tui={}, monitor={}, files={}, agent={}",
+        "\nCompiled features: gui={}, agent={}",
         cfg!(feature = "gui"),
-        cfg!(feature = "tui"),
-        cfg!(feature = "monitor"),
-        cfg!(feature = "files"),
         cfg!(feature = "agent")
     );
 }

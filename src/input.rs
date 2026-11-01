@@ -1,17 +1,216 @@
 use crate::core::Mode;
-#[cfg(feature = "gui")]
-use crate::native::{ALT, CONTROL, SHIFT, SUPER};
+use std::borrow::Cow;
+pub const SHIFT: u32 = 1;
+pub const CONTROL: u32 = 2;
+pub const ALT: u32 = 4;
+pub const SUPER: u32 = 8;
 
-#[cfg(feature = "tui")]
+pub(crate) mod keysym {
+    pub const LEFT_TAB: u32 = 0xfe20;
+    pub const BACKSPACE: u32 = 0xff08;
+    pub const TAB: u32 = 0xff09;
+    pub const RETURN: u32 = 0xff0d;
+    pub const ESCAPE: u32 = 0xff1b;
+    pub const HOME: u32 = 0xff50;
+    pub const LEFT: u32 = 0xff51;
+    pub const UP: u32 = 0xff52;
+    pub const RIGHT: u32 = 0xff53;
+    pub const DOWN: u32 = 0xff54;
+    pub const PAGE_UP: u32 = 0xff55;
+    pub const PAGE_DOWN: u32 = 0xff56;
+    pub const END: u32 = 0xff57;
+    pub const INSERT: u32 = 0xff63;
+    pub const KP_ENTER: u32 = 0xff8d;
+    pub const DELETE: u32 = 0xffff;
+    #[cfg(feature = "gui")]
+    pub use gui::*;
+
+    #[cfg(feature = "gui")]
+    mod gui {
+        pub const KP_TAB: u32 = 0xff89;
+        pub const KP_F1: u32 = 0xff91;
+        pub const KP_F2: u32 = 0xff92;
+        pub const KP_F3: u32 = 0xff93;
+        pub const KP_F4: u32 = 0xff94;
+        pub const KP_HOME: u32 = 0xff95;
+        pub const KP_LEFT: u32 = 0xff96;
+        pub const KP_UP: u32 = 0xff97;
+        pub const KP_RIGHT: u32 = 0xff98;
+        pub const KP_DOWN: u32 = 0xff99;
+        pub const KP_PAGE_UP: u32 = 0xff9a;
+        pub const KP_PAGE_DOWN: u32 = 0xff9b;
+        pub const KP_END: u32 = 0xff9c;
+        pub const KP_INSERT: u32 = 0xff9e;
+        pub const KP_DELETE: u32 = 0xff9f;
+        pub const F1: u32 = 0xffbe;
+        pub const F2: u32 = 0xffbf;
+        pub const F3: u32 = 0xffc0;
+        pub const F4: u32 = 0xffc1;
+        pub const F5: u32 = 0xffc2;
+        pub const F6: u32 = 0xffc3;
+        pub const F7: u32 = 0xffc4;
+        pub const F8: u32 = 0xffc5;
+        pub const F9: u32 = 0xffc6;
+        pub const F10: u32 = 0xffc7;
+        pub const F11: u32 = 0xffc8;
+        pub const F12: u32 = 0xffc9;
+    }
+}
+
+pub(crate) struct Key<'a> {
+    pub symbol: u32,
+    pub modifiers: u32,
+    pub text: &'a str,
+}
+
+impl Key<'_> {
+    pub fn control(&self) -> bool {
+        self.modifiers & CONTROL != 0
+    }
+    pub fn shift(&self) -> bool {
+        self.modifiers & SHIFT != 0
+    }
+    pub fn letter(&self) -> Option<char> {
+        symbol_char(self.symbol).map(|c| c.to_ascii_lowercase())
+    }
+    pub fn paste(&self) -> bool {
+        self.control() && self.letter() == Some('v')
+            || self.shift() && self.symbol == keysym::INSERT
+    }
+    /// Unhandled printable keys fall back to their composed text.
+    pub fn text_result(&self) -> KeyResult {
+        if self.text.is_empty() && symbol_char(self.symbol).is_some() && !self.control() {
+            KeyResult::Text
+        } else {
+            KeyResult::Handled
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PasteTarget {
+    Search,
+    Monitor,
+    #[cfg(feature = "agent")]
+    Agent(u64),
+    Pane {
+        pane: crate::workspace::PaneId,
+        bracketed: bool,
+    },
+    Files,
+}
+
+pub(crate) enum KeyResult {
+    Unhandled,
+    Text,
+    Handled,
+    Copy(String, bool),
+    Paste,
+}
+
+#[derive(Default)]
+pub(crate) struct TextDecoder {
+    pending: Vec<u8>,
+}
+
+impl TextDecoder {
+    pub fn clear(&mut self) {
+        self.pending.clear();
+    }
+
+    pub fn decode<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, str> {
+        if self.pending.is_empty()
+            && let Ok(text) = std::str::from_utf8(bytes)
+        {
+            return Cow::Borrowed(text);
+        }
+        self.pending.extend_from_slice(bytes);
+        let mut valid = 0;
+        while valid < self.pending.len() {
+            match std::str::from_utf8(&self.pending[valid..]) {
+                Ok(_) => valid = self.pending.len(),
+                Err(error) => {
+                    valid += error.valid_up_to();
+                    let Some(length) = error.error_len() else {
+                        break;
+                    };
+                    valid += length;
+                }
+            }
+        }
+        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
+        self.pending.drain(..valid);
+        Cow::Owned(text)
+    }
+}
+
+pub(crate) fn without_controls(text: &str) -> Cow<'_, str> {
+    if text.chars().any(char::is_control) {
+        Cow::Owned(text.chars().filter(|ch| !ch.is_control()).collect())
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+pub(crate) fn character_key(ch: char) -> (u32, u32) {
+    match ch {
+        '\0' => (32, CONTROL),
+        '\t' => (keysym::TAB, 0),
+        '\r' => (keysym::RETURN, 0),
+        '\u{8}' | '\u{7f}' => (keysym::BACKSPACE, 0),
+        '\u{1b}' => (keysym::ESCAPE, 0),
+        '\u{1}'..='\u{1a}' => (u32::from(ch) + u32::from('a') - 1, CONTROL),
+        _ => (u32::from(ch), 0),
+    }
+}
+
+pub(crate) fn sequence_key(bytes: &[u8]) -> Option<(u32, u32)> {
+    let (symbol, modifiers) = match bytes {
+        b"\x1b" => (keysym::ESCAPE, 0),
+        b"\x1b[Z" => (keysym::LEFT_TAB, SHIFT),
+        b"\x1b[5~" => (keysym::PAGE_UP, 0),
+        b"\x1b[6~" => (keysym::PAGE_DOWN, 0),
+        b"\x1b[2~" => (keysym::INSERT, 0),
+        b"\x1b[13;2u" | b"\x1b[27;2;13~" => (keysym::RETURN, SHIFT),
+        _ => {
+            if let Some(symbol) = editing_key(bytes) {
+                return Some((symbol, 0));
+            }
+            if let Some(body) = bytes.strip_prefix(b"\x1b[1;") {
+                let (&final_byte, modifier) = body.split_last()?;
+                if modifier.len() != 1 {
+                    return None;
+                }
+                let modifiers = u32::from(modifier[0].checked_sub(b'1')?);
+                let modifiers = ((modifiers & 1) * SHIFT)
+                    | (((modifiers >> 1) & 1) * ALT)
+                    | (((modifiers >> 2) & 1) * CONTROL);
+                let symbol = match final_byte {
+                    b'A' => keysym::UP,
+                    b'B' => keysym::DOWN,
+                    b'C' => keysym::RIGHT,
+                    b'D' => keysym::LEFT,
+                    b'H' => keysym::HOME,
+                    b'F' => keysym::END,
+                    _ => return None,
+                };
+                return Some((symbol, modifiers));
+            }
+            return None;
+        }
+    };
+    Some((symbol, modifiers))
+}
+
 pub(crate) fn editing_key(bytes: &[u8]) -> Option<u32> {
     Some(match bytes {
-        b"\x1b[A" | b"\x1bOA" => 0xff52,
-        b"\x1b[B" | b"\x1bOB" => 0xff54,
-        b"\x1b[C" | b"\x1bOC" => 0xff53,
-        b"\x1b[D" | b"\x1bOD" => 0xff51,
-        b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => 0xff50,
-        b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => 0xff57,
-        b"\x1b[3~" => 0xffff,
+        b"\x1b[A" | b"\x1bOA" => keysym::UP,
+        b"\x1b[B" | b"\x1bOB" => keysym::DOWN,
+        b"\x1b[C" | b"\x1bOC" => keysym::RIGHT,
+        b"\x1b[D" | b"\x1bOD" => keysym::LEFT,
+        b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => keysym::HOME,
+        b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => keysym::END,
+        b"\x1b[3~" => keysym::DELETE,
         _ => return None,
     })
 }
@@ -33,16 +232,16 @@ pub fn key_bytes(
         + 4 * u8::from(modifiers & CONTROL != 0);
 
     let special = match symbol {
-        0xff52 | 0xff97 => Some((b'A', true)),
-        0xff54 | 0xff99 => Some((b'B', true)),
-        0xff53 | 0xff98 => Some((b'C', true)),
-        0xff51 | 0xff96 => Some((b'D', true)),
-        0xff50 | 0xff95 => Some((b'H', true)),
-        0xff57 | 0xff9c => Some((b'F', true)),
-        0xffbe | 0xff91 => Some((b'P', false)),
-        0xffbf | 0xff92 => Some((b'Q', false)),
-        0xffc0 | 0xff93 => Some((b'R', false)),
-        0xffc1 | 0xff94 => Some((b'S', false)),
+        keysym::UP | keysym::KP_UP => Some((b'A', true)),
+        keysym::DOWN | keysym::KP_DOWN => Some((b'B', true)),
+        keysym::RIGHT | keysym::KP_RIGHT => Some((b'C', true)),
+        keysym::LEFT | keysym::KP_LEFT => Some((b'D', true)),
+        keysym::HOME | keysym::KP_HOME => Some((b'H', true)),
+        keysym::END | keysym::KP_END => Some((b'F', true)),
+        keysym::F1 | keysym::KP_F1 => Some((b'P', false)),
+        keysym::F2 | keysym::KP_F2 => Some((b'Q', false)),
+        keysym::F3 | keysym::KP_F3 => Some((b'R', false)),
+        keysym::F4 | keysym::KP_F4 => Some((b'S', false)),
         _ => None,
     };
     if let Some((final_byte, cursor)) = special {
@@ -56,18 +255,18 @@ pub fn key_bytes(
     }
 
     let number = match symbol {
-        0xff63 | 0xff9e => Some(2),
-        0xffff | 0xff9f => Some(3),
-        0xff55 | 0xff9a => Some(5),
-        0xff56 | 0xff9b => Some(6),
-        0xffc2 => Some(15),
-        0xffc3 => Some(17),
-        0xffc4 => Some(18),
-        0xffc5 => Some(19),
-        0xffc6 => Some(20),
-        0xffc7 => Some(21),
-        0xffc8 => Some(23),
-        0xffc9 => Some(24),
+        keysym::INSERT | keysym::KP_INSERT => Some(2),
+        keysym::DELETE | keysym::KP_DELETE => Some(3),
+        keysym::PAGE_UP | keysym::KP_PAGE_UP => Some(5),
+        keysym::PAGE_DOWN | keysym::KP_PAGE_DOWN => Some(6),
+        keysym::F5 => Some(15),
+        keysym::F6 => Some(17),
+        keysym::F7 => Some(18),
+        keysym::F8 => Some(19),
+        keysym::F9 => Some(20),
+        keysym::F10 => Some(21),
+        keysym::F11 => Some(23),
+        keysym::F12 => Some(24),
         _ => None,
     };
     if let Some(number) = number {
@@ -87,18 +286,18 @@ pub fn key_bytes(
     let mut utf8 = [0; 4];
     let control;
     let data: &[u8] = match symbol {
-        0xff0d | 0xff8d => b"\r",
-        0xff08 => {
+        keysym::RETURN | keysym::KP_ENTER => b"\r",
+        keysym::BACKSPACE => {
             if modifiers & CONTROL != 0 {
                 b"\x08"
             } else {
                 b"\x7f"
             }
         }
-        0xff1b => b"\x1b",
-        0xfe20 => b"\x1b[Z",
-        0xff09 | 0xff89 if modifiers & SHIFT != 0 => b"\x1b[Z",
-        0xff09 | 0xff89 => b"\t",
+        keysym::ESCAPE => b"\x1b",
+        keysym::LEFT_TAB => b"\x1b[Z",
+        keysym::TAB | keysym::KP_TAB if modifiers & SHIFT != 0 => b"\x1b[Z",
+        keysym::TAB | keysym::KP_TAB => b"\t",
         _ if modifiers & CONTROL != 0 => {
             let ch = symbol_char(symbol)?.to_ascii_lowercase();
             control = match ch {
@@ -132,7 +331,6 @@ pub fn key_bytes(
     Some(bytes)
 }
 
-#[cfg(feature = "gui")]
 pub fn symbol_char(symbol: u32) -> Option<char> {
     match symbol {
         0x20..=0x7e | 0xa0..=0xff => char::from_u32(symbol),
@@ -275,23 +473,23 @@ mod tests {
             };
         }
         let symbol = match name {
-            "up" => 0xff52,
-            "down" => 0xff54,
-            "right" => 0xff53,
-            "left" => 0xff51,
-            "home" => 0xff50,
-            "end" => 0xff57,
-            "insert" => 0xff63,
-            "delete" => 0xffff,
-            "pageup" => 0xff55,
-            "pagedown" => 0xff56,
-            "enter" => 0xff0d,
-            "backspace" => 0xff08,
-            "escape" => 0xff1b,
-            "tab" => 0xff09,
+            "up" => keysym::UP,
+            "down" => keysym::DOWN,
+            "right" => keysym::RIGHT,
+            "left" => keysym::LEFT,
+            "home" => keysym::HOME,
+            "end" => keysym::END,
+            "insert" => keysym::INSERT,
+            "delete" => keysym::DELETE,
+            "pageup" => keysym::PAGE_UP,
+            "pagedown" => keysym::PAGE_DOWN,
+            "enter" => keysym::RETURN,
+            "backspace" => keysym::BACKSPACE,
+            "escape" => keysym::ESCAPE,
+            "tab" => keysym::TAB,
             "space" => 0x20,
             name if name.starts_with('f') && name.len() > 1 => {
-                0xffbd + name[1..].parse::<u32>().unwrap()
+                keysym::F1 - 1 + name[1..].parse::<u32>().unwrap()
             }
             name => name.chars().next().unwrap() as u32,
         };
@@ -317,7 +515,7 @@ mod tests {
         assert_eq!(encode("up", Mode::NONE), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode("home", Mode::APP_CURSOR), Some(b"\x1bOH".to_vec()));
         assert_eq!(
-            key_bytes(0xff97, 0, "", || Mode::APP_CURSOR),
+            key_bytes(keysym::KP_UP, 0, "", || Mode::APP_CURSOR),
             Some(b"\x1bOA".to_vec())
         );
         assert_eq!(
@@ -355,12 +553,14 @@ mod tests {
         }
         assert_eq!(encode("shift-tab", Mode::NONE), Some(b"\x1b[Z".to_vec()));
         assert_eq!(
-            key_bytes(0xfe20, SHIFT, "", || panic!("unexpected mode read")),
+            key_bytes(keysym::LEFT_TAB, SHIFT, "", || panic!(
+                "unexpected mode read"
+            )),
             Some(b"\x1b[Z".to_vec())
         );
         assert_eq!(encode("alt-backspace", Mode::NONE), Some(vec![27, 127]));
         assert_eq!(
-            key_bytes(0xff8d, 0, "", || panic!("unexpected mode read")),
+            key_bytes(keysym::KP_ENTER, 0, "", || panic!("unexpected mode read")),
             Some(b"\r".to_vec())
         );
         assert_eq!(encode("ctrl-alt-c", Mode::NONE), Some(vec![27, 3]));

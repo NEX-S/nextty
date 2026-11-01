@@ -1,4 +1,3 @@
-#[cfg(feature = "tui")]
 use crate::history::{
     History, HistoryConfig, HistoryCopy, HistoryCursor, HistoryPage, HistoryRead, Reflow, Reply,
 };
@@ -8,7 +7,7 @@ use crate::vt::{
 use crate::{base64::decode_utf8, width::scalar_width};
 use std::borrow::Cow;
 use std::collections::VecDeque;
-#[cfg(feature = "tui")]
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -27,7 +26,7 @@ pub struct CommandBlock {
     pub status: Option<i32>,
     pub has_output: bool,
 }
-#[cfg(feature = "tui")]
+
 #[derive(Clone, Debug)]
 struct Block {
     id: u64,
@@ -38,19 +37,17 @@ struct Block {
     status: Option<i32>,
     incomplete: bool,
 }
-#[cfg(feature = "tui")]
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockPoint {
     row: u64,
     column: usize,
 }
-#[cfg(feature = "tui")]
+
 struct DiskHistory {
     io: History,
     first: u64,
     hot_start: u64,
-    spool_start: u64,
-    stored_end: u64,
     spool: VecDeque<Row>,
     epoch: u64,
     layout_epoch: u64,
@@ -63,7 +60,7 @@ struct DiskHistory {
     clear_pending: bool,
     clear_requested: bool,
 }
-#[cfg(feature = "tui")]
+
 struct PendingResize {
     size: WindowSize,
     selection: Option<Selection>,
@@ -395,6 +392,29 @@ impl Row {
         })
     }
 
+    pub(crate) fn characters(
+        &self,
+        range: std::ops::Range<usize>,
+    ) -> impl Iterator<Item = (usize, char)> {
+        self.cells_with_extras(range)
+            .filter(|(_, cell, _)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
+            .flat_map(|(column, cell, extra)| {
+                let hidden = cell.flags.contains(Flags::HIDDEN);
+                std::iter::once((column, if hidden { ' ' } else { cell.c }))
+                    .chain(
+                        (hidden && cell.flags.contains(Flags::WIDE_CHAR)).then_some((column, ' ')),
+                    )
+                    .chain(
+                        extra
+                            .filter(|_| !hidden)
+                            .into_iter()
+                            .flat_map(move |extra| {
+                                extra.zerowidth.iter().map(move |&ch| (column, ch))
+                            }),
+                    )
+            })
+    }
+
     pub(crate) fn new(columns: usize, blank: Cell) -> Self {
         Self {
             cells: vec![blank; columns],
@@ -412,7 +432,7 @@ impl Row {
             .map(|index| &extras[index].1)
     }
 
-    fn extra_mut(&mut self, column: usize) -> &mut Extra {
+    pub(crate) fn extra_mut(&mut self, column: usize) -> &mut Extra {
         let extras = self.extras_mut();
         let index = match extras.last() {
             Some((last, _)) if *last == column => extras.len() - 1,
@@ -586,6 +606,104 @@ pub(crate) fn semantic_group(c: char) -> u8 {
     } else {
         2
     }
+}
+
+pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
+    kind: SelectionType,
+    start: &mut (i64, usize),
+    end: &mut (i64, usize),
+    mut row: impl FnMut(i64) -> Result<Option<R>, E>,
+) -> Result<(), E> {
+    if kind == SelectionType::Lines {
+        while row(start.0 - 1)?.is_some_and(|row| row.borrow().wrapped) {
+            start.0 -= 1;
+        }
+        while row(end.0)?.is_some_and(|row| row.borrow().wrapped) && row(end.0 + 1)?.is_some() {
+            end.0 += 1;
+        }
+        start.1 = 0;
+        if let Some(row) = row(end.0)? {
+            end.1 = row.borrow().cells.len() - 1;
+        }
+    } else if kind == SelectionType::Semantic {
+        if let Some(mut current) = row(start.0)? {
+            start.1 = start.1.min(current.borrow().cells.len() - 1);
+            if start.1 > 0
+                && current.borrow().cells[start.1]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                start.1 -= 1;
+            }
+            let class = semantic_group(current.borrow().cells[start.1].c);
+            loop {
+                let mut previous = *start;
+                if previous.1 > 0 {
+                    previous.1 -= 1;
+                } else if let Some(previous_row) = row(previous.0 - 1)? {
+                    if !previous_row.borrow().wrapped {
+                        break;
+                    }
+                    previous.0 -= 1;
+                    previous.1 = previous_row.borrow().used().saturating_sub(1);
+                    current = previous_row;
+                } else {
+                    break;
+                }
+                let current = current.borrow();
+                if previous.1 > 0
+                    && current.cells[previous.1]
+                        .flags
+                        .contains(Flags::WIDE_CHAR_SPACER)
+                {
+                    previous.1 -= 1;
+                }
+                if semantic_group(current.cells[previous.1].c) != class {
+                    break;
+                }
+                *start = previous;
+            }
+        }
+        if let Some(mut current) = row(end.0)? {
+            end.1 = end.1.min(current.borrow().cells.len() - 1);
+            if end.1 > 0
+                && current.borrow().cells[end.1]
+                    .flags
+                    .contains(Flags::WIDE_CHAR_SPACER)
+            {
+                end.1 -= 1;
+            }
+            let class = semantic_group(current.borrow().cells[end.1].c);
+            loop {
+                let mut next = *end;
+                next.1 += if current.borrow().cells[end.1]
+                    .flags
+                    .contains(Flags::WIDE_CHAR)
+                {
+                    2
+                } else {
+                    1
+                };
+                if current.borrow().wrapped && next.1 >= current.borrow().used() {
+                    let Some(next_row) = row(next.0 + 1)? else {
+                        break;
+                    };
+                    if semantic_group(next_row.borrow().cells[0].c) != class {
+                        break;
+                    }
+                    next.0 += 1;
+                    next.1 = 0;
+                    current = next_row;
+                } else if next.1 >= current.borrow().cells.len()
+                    || semantic_group(current.borrow().cells[next.1].c) != class
+                {
+                    break;
+                }
+                *end = next;
+            }
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
@@ -776,12 +894,8 @@ struct Selection {
 pub enum Event {
     Write(Vec<u8>),
     Title(Option<String>),
-    HistoryCleared,
-    ClipboardStore {
-        primary: bool,
-        text: String,
-    },
-    #[cfg(feature = "tui")]
+    ClipboardStore { primary: bool, text: String },
+
     HistoryError(std::io::Error),
 }
 
@@ -864,7 +978,6 @@ impl Screen {
     }
 }
 
-#[cfg(feature = "tui")]
 #[derive(Clone, Copy)]
 pub(crate) struct SearchAnchor {
     base: u64,
@@ -888,24 +1001,26 @@ pub struct Core {
     foreground: u32,
     background: u32,
     colors: [Option<Rgb>; 269],
+    // Cleared with row damage; scrolled frames damage every row without a new palette.
+    palette_dirty: bool,
     events: Vec<Event>,
     title: Option<String>,
     titles: Vec<Option<String>>,
-    #[cfg(feature = "tui")]
+
     history: Option<DiskHistory>,
-    #[cfg(feature = "tui")]
+
     blocks: VecDeque<Block>,
-    #[cfg(feature = "tui")]
+
     next_block: u64,
-    #[cfg(feature = "tui")]
+
     prompt_scope: Flags,
-    #[cfg(feature = "tui")]
+
     block_origin: u64,
-    #[cfg(feature = "tui")]
+
     directory: Option<PathBuf>,
-    #[cfg(feature = "tui")]
+
     input_generation: u64,
-    #[cfg(feature = "tui")]
+
     prompt_dirty: bool,
 }
 
@@ -928,24 +1043,25 @@ impl Core {
             foreground,
             background,
             colors: [None; 269],
+            palette_dirty: true,
             events: Vec::new(),
             title: None,
             titles: Vec::new(),
-            #[cfg(feature = "tui")]
+
             history: None,
-            #[cfg(feature = "tui")]
+
             blocks: VecDeque::new(),
-            #[cfg(feature = "tui")]
+
             next_block: 1,
-            #[cfg(feature = "tui")]
+
             prompt_scope: Flags::empty(),
-            #[cfg(feature = "tui")]
+
             block_origin: 0,
-            #[cfg(feature = "tui")]
+
             directory: None,
-            #[cfg(feature = "tui")]
+
             input_generation: 0,
-            #[cfg(feature = "tui")]
+
             prompt_dirty: false,
         }
     }
@@ -960,7 +1076,6 @@ impl Core {
         self.active.rows.len() - self.screen_lines()
     }
     pub fn history_size(&self) -> usize {
-        #[cfg(feature = "tui")]
         if !self.mode.contains(Mode::ALT_SCREEN)
             && let Some(history) = &self.history
         {
@@ -981,13 +1096,13 @@ impl Core {
         if let Some(row) = self.absolute_row(line) {
             return row;
         }
-        #[cfg(feature = "tui")]
+
         if let Some(history) = &self.history {
             return &history.blank;
         }
         unreachable!("visible row outside the screen")
     }
-    #[cfg(feature = "tui")]
+
     pub(crate) fn screen_row(&self, line: usize) -> &Row {
         &self.active.rows[self.hot_history_size() + line]
     }
@@ -1012,6 +1127,10 @@ impl Core {
     }
     pub fn reset_damage(&mut self) {
         self.dirty.fill(false);
+        self.palette_dirty = false;
+    }
+    pub(crate) fn palette_dirty(&self) -> bool {
+        self.palette_dirty
     }
     fn damage_all(&mut self) {
         self.dirty.fill(true);
@@ -1037,7 +1156,7 @@ impl Core {
         if let Ok(index) = usize::try_from(index) {
             return self.active.rows.get(index);
         }
-        #[cfg(feature = "tui")]
+
         if !self.mode.contains(Mode::ALT_SCREEN)
             && let Some(history) = &self.history
         {
@@ -1050,12 +1169,11 @@ impl Core {
     }
     fn text_template(&self) -> Cell {
         let mut cell = self.active.cursor.template;
-        #[cfg(feature = "tui")]
+
         if !self.mode.contains(Mode::ALT_SCREEN) {
             cell.flags.insert(self.prompt_scope);
         }
-        #[cfg(not(feature = "tui"))]
-        cell.flags.remove(Flags::PROMPT | Flags::RIGHT_PROMPT);
+
         cell
     }
     fn blank(&self) -> Cell {
@@ -1092,10 +1210,8 @@ impl Core {
         let history = top == 0 && !self.mode.contains(Mode::ALT_SCREEN);
         for _ in 0..count {
             if history {
-                #[cfg(feature = "tui")]
                 let disk = self.history.is_some();
-                #[cfg(not(feature = "tui"))]
-                let disk = false;
+
                 let mut recycled = if !disk && self.hot_history_size() == HISTORY_LIMIT {
                     self.active.rows.pop_front().unwrap()
                 } else {
@@ -1115,7 +1231,7 @@ impl Core {
             }
         }
         self.shift_selection(top, bottom, -(count as i32), history);
-        #[cfg(feature = "tui")]
+
         if !self.mode.contains(Mode::ALT_SCREEN) {
             if history {
                 self.block_origin += count as u64;
@@ -1125,7 +1241,6 @@ impl Core {
             }
         }
         if history {
-            #[cfg(feature = "tui")]
             self.spill_history();
             self.damage_all();
         } else {
@@ -1142,7 +1257,7 @@ impl Core {
             self.active.rows.insert(base + top, recycled);
         }
         self.shift_selection(top, bottom, count as i32, false);
-        #[cfg(feature = "tui")]
+
         if !self.mode.contains(Mode::ALT_SCREEN) {
             self.shift_blocks(top, bottom, count as i32);
         }
@@ -1160,7 +1275,7 @@ impl Core {
         };
         if offset != self.display_offset() {
             self.active.offset = offset;
-            #[cfg(feature = "tui")]
+
             self.request_history_page();
             self.damage_all();
             true
@@ -1229,7 +1344,7 @@ impl Core {
     }
     pub fn clear_selection(&mut self) -> bool {
         // Pending reflow must not restore a selection cleared by newer input.
-        #[cfg(feature = "tui")]
+
         if let Some(pending) = self
             .history
             .as_mut()
@@ -1305,93 +1420,21 @@ impl Core {
                     return None;
                 }
             }
-            SelectionType::Lines => {
-                while self
-                    .absolute_row(start.line - 1)
-                    .is_some_and(|row| row.wrapped)
-                {
-                    start.line -= 1;
-                }
-                while self.absolute_row(end.line).is_some_and(|row| row.wrapped)
-                    && end.line + 1 < self.screen_lines() as i32
-                {
-                    end.line += 1;
-                }
-                start.column = 0;
-                end.column = columns - 1;
-            }
-            SelectionType::Semantic => {
-                if let Some(row) = self.absolute_row(start.line) {
-                    if row.cells[start.column]
-                        .flags
-                        .contains(Flags::WIDE_CHAR_SPACER)
-                        && start.column > 0
-                    {
-                        start.column -= 1;
-                    }
-                    let class = semantic_group(row.cells[start.column].c);
-                    loop {
-                        let mut previous = start;
-                        if previous.column > 0 {
-                            previous.column -= 1;
-                        } else if let Some(row) = self
-                            .absolute_row(previous.line - 1)
-                            .filter(|row| row.wrapped)
-                        {
-                            previous.line -= 1;
-                            previous.column = row.used.saturating_sub(1);
-                        } else {
-                            break;
-                        }
-                        let row = self.absolute_row(previous.line).unwrap();
-                        if row.cells[previous.column]
-                            .flags
-                            .contains(Flags::WIDE_CHAR_SPACER)
-                            && previous.column > 0
-                        {
-                            previous.column -= 1;
-                        }
-                        if semantic_group(row.cells[previous.column].c) != class {
-                            break;
-                        }
-                        start = previous;
-                    }
-                }
-                if let Some(row) = self.absolute_row(end.line) {
-                    if row.cells[end.column]
-                        .flags
-                        .contains(Flags::WIDE_CHAR_SPACER)
-                        && end.column > 0
-                    {
-                        end.column -= 1;
-                    }
-                    let class = semantic_group(row.cells[end.column].c);
-                    loop {
-                        let row = self.absolute_row(end.line).unwrap();
-                        let mut next = end;
-                        next.column += if row.cells[end.column].flags.contains(Flags::WIDE_CHAR) {
-                            2
-                        } else {
-                            1
-                        };
-                        if row.wrapped
-                            && next.column >= row.used
-                            && end.line + 1 < self.screen_lines() as i32
-                        {
-                            next.line += 1;
-                            next.column = 0;
-                        } else if next.column >= columns {
-                            break;
-                        }
-                        let Some(row) = self.absolute_row(next.line) else {
-                            break;
-                        };
-                        if semantic_group(row.cells[next.column].c) != class {
-                            break;
-                        }
-                        end = next;
-                    }
-                }
+            SelectionType::Lines | SelectionType::Semantic => {
+                let mut first = (i64::from(start.line), start.column);
+                let mut last = (i64::from(end.line), end.column);
+                expand_selection(selection.kind, &mut first, &mut last, |line| {
+                    Ok::<_, std::convert::Infallible>(self.absolute_row(line as i32))
+                })
+                .unwrap();
+                start = Point {
+                    line: first.0 as i32,
+                    column: first.1,
+                };
+                end = Point {
+                    line: last.0 as i32,
+                    column: last.1,
+                };
             }
         }
         start.line = start.line.max(-(self.history_size() as i32));
@@ -1430,18 +1473,11 @@ impl Core {
                 self.columns()
             }
             .min(row.used);
-            for (_, cell, extra) in row.cells_with_extras(start..end) {
-                if cell
-                    .flags
-                    .intersects(Flags::WIDE_CHAR_SPACER | Flags::PROMPT)
-                {
-                    continue;
-                }
-                text.push(cell.c);
-                if let Some(extra) = extra {
-                    text.extend(&extra.zerowidth);
-                }
-            }
+            text.extend(
+                row.characters(start..end)
+                    .filter(|(column, _)| !row.cells[*column].flags.contains(Flags::PROMPT))
+                    .map(|(_, ch)| ch),
+            );
             if line != range.end.line && !row.wrapped {
                 text.push('\n');
             }
@@ -1471,7 +1507,6 @@ impl Core {
     }
 
     pub fn resize(&mut self, size: WindowSize) {
-        #[cfg(feature = "tui")]
         if let Some(history) = &mut self.history {
             history.desired_size = Some(size);
             self.start_history_resize();
@@ -1532,6 +1567,8 @@ impl Core {
         self.scroll_top = 0;
         self.scroll_bottom = lines;
         self.dirty = vec![true; lines];
+        // A resized frontend screen is rebuilt and needs the palette again.
+        self.palette_dirty = true;
     }
 
     #[inline]
@@ -1547,7 +1584,9 @@ impl Core {
                 .push(Event::Write(std::fmt::format(reply).into_bytes()));
         }
     }
-    fn set_private(&mut self, mode: u16, enabled: bool) {
+    // Mode changes are rare next to text; inlined into the parser loop they enlarge it.
+    #[inline(never)]
+    pub(crate) fn set_private(&mut self, mode: u16, enabled: bool) {
         match mode {
             6 => {
                 self.active.cursor.origin = enabled;
@@ -1596,6 +1635,130 @@ impl Core {
     }
 }
 
+pub(crate) struct RowReflow {
+    row: Row,
+    column: usize,
+    pub(crate) count: u64,
+    pub(crate) points: Vec<Option<(u64, usize)>>,
+    pub(crate) view_top: Option<u64>,
+    old_columns: usize,
+    source_view_top: u64,
+    last_wrapped: bool,
+}
+impl RowReflow {
+    pub(crate) fn new(old_columns: usize, columns: usize, points: usize, view_top: u64) -> Self {
+        Self {
+            row: Row::new(columns, Cell::default()),
+            column: 0,
+            count: 0,
+            points: vec![None; points],
+            view_top: None,
+            old_columns,
+            source_view_top: view_top,
+            last_wrapped: false,
+        }
+    }
+    fn emit(&mut self, wrapped: bool) -> Row {
+        let columns = self.row.cells.len();
+        let mut row = std::mem::replace(&mut self.row, Row::new(columns, Cell::default()));
+        row.wrapped = wrapped;
+        self.column = 0;
+        self.count += 1;
+        row
+    }
+    pub(crate) fn finish(&mut self) -> Option<Row> {
+        (self.column != 0 || self.last_wrapped).then(|| self.emit(false))
+    }
+    pub(crate) fn row<E>(
+        &mut self,
+        id: u64,
+        row: Row,
+        anchors: &[(u64, usize, usize)],
+        anchor: &mut usize,
+        emit: &mut impl FnMut(Row) -> Result<(), E>,
+    ) -> Result<Vec<Cell>, E> {
+        let columns = self.row.cells.len();
+        if id == self.source_view_top {
+            self.view_top = Some(self.count);
+        }
+        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line < id) {
+            *anchor += 1;
+        }
+        let begin = *anchor;
+        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line == id) {
+            *anchor += 1;
+        }
+        let anchors = &anchors[begin..*anchor];
+        if self.old_columns == columns {
+            for (_, column, index) in anchors {
+                self.points[*index] = Some((self.count, *column));
+            }
+            self.count += 1;
+            emit(row)?;
+            return Ok(Vec::new());
+        }
+        let mut used = row.used();
+        if !row.wrapped {
+            for (_, column, index) in anchors {
+                used = used.max(if *index < 2 && *column == self.old_columns {
+                    *column
+                } else {
+                    column + 1
+                });
+            }
+        }
+        used = used.min(self.old_columns);
+        let mut extras = row
+            .extras
+            .map(Arc::unwrap_or_clone)
+            .unwrap_or_default()
+            .into_iter()
+            .peekable();
+        for source in 0..used {
+            let cell = row.cells[source];
+            if (cell.flags.contains(Flags::WIDE_CHAR) && self.column + 1 == columns && columns > 1)
+                || self.column == columns
+            {
+                emit(self.emit(true))?;
+            }
+            for (_, column, index) in anchors {
+                if (*column).min(if row.wrapped { row.used } else { used }) == source {
+                    self.points[*index] = Some((self.count, self.column));
+                }
+            }
+            let extra = if extras.peek().is_some_and(|(column, _)| *column == source) {
+                Some(extras.next().unwrap().1)
+            } else {
+                None
+            };
+            if columns == 1 && cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                continue;
+            }
+            self.row.cells[self.column] = cell;
+            if columns == 1 {
+                self.row.cells[self.column].flags.remove(Flags::WIDE_CHAR);
+            }
+            if source < row.used {
+                self.row.used = self.column + 1;
+            }
+            if let Some(extra) = extra {
+                self.row.extras_mut().push((self.column, extra));
+            }
+            self.column += 1;
+        }
+        for (_, column, index) in anchors {
+            if (*column).min(if row.wrapped { row.used } else { used }) == used {
+                self.points[*index] = Some((self.count, self.column));
+            }
+        }
+        self.last_wrapped = row.wrapped;
+        if !row.wrapped {
+            emit(self.emit(false))?;
+        }
+        Ok(row.cells)
+    }
+}
+
 fn resize_screen(
     screen: &mut Screen,
     old_columns: usize,
@@ -1605,144 +1768,58 @@ fn resize_screen(
     points: &[Point],
 ) -> Vec<Point> {
     let old_history = screen.rows.len() - old_lines;
-    let absolute: Vec<_> = points
+    let mut anchors: Vec<_> = points
         .iter()
-        .map(|point| {
+        .enumerate()
+        .map(|(index, point)| {
             (
-                (old_history as i64 + i64::from(point.line)).max(0) as usize,
+                (old_history as i64 + i64::from(point.line)).max(0) as u64,
                 point.column,
+                index,
             )
         })
         .collect();
+    anchors.sort_unstable();
     let old_view_top = screen.rows.len() - old_lines - screen.offset;
-    let mut mapped = vec![Point::default(); points.len()];
-    let mut output = VecDeque::new();
-    let mut source_row = 0;
-    let mut mapped_view_top = 0;
+    let mut flow = RowReflow::new(old_columns, columns, points.len(), old_view_top as u64);
+    let rows = std::mem::take(&mut screen.rows);
+    let mut output;
     if old_columns == columns {
-        output = std::mem::take(&mut screen.rows);
+        output = rows;
         let removed = old_lines
             .saturating_sub(lines)
             .min(old_lines - 1 - screen.cursor.point.line as usize);
         output.truncate(output.len() - removed);
-        mapped_view_top = old_view_top;
-        for (point, (line, column)) in mapped.iter_mut().zip(&absolute) {
-            *point = Point {
-                line: *line as i32,
-                column: *column,
-            };
+        flow.view_top = Some(old_view_top as u64);
+        for &(row, column, index) in &anchors {
+            flow.points[index] = Some((row, column));
         }
     } else {
-        let mut cells = Vec::new();
-        let mut extras = Vec::new();
-        let mut point_offsets = Vec::new();
-        while !screen.rows.is_empty() {
-            let group_start = source_row;
-            cells.clear();
-            point_offsets.clear();
-            let mut text_used = 0;
-            loop {
-                let row = screen.rows.pop_front().unwrap();
-                let base = cells.len();
-                text_used = text_used.max(base + row.used);
-                let mut used = row.used;
-                for (index, (y, x)) in absolute.iter().enumerate() {
-                    if *y == source_row {
-                        // A wide wrap gap is outside the logical text, even if a saved
-                        // cursor or selection endpoint lands there after a resize.
-                        let column = if row.wrapped { (*x).min(row.used) } else { *x };
-                        if !row.wrapped {
-                            used = used.max(if index < 2 && column == old_columns {
-                                column
-                            } else {
-                                column + 1
-                            });
-                        }
-                        point_offsets.push((index, base + column));
-                    }
-                }
-                used = used.min(old_columns);
-                cells.extend_from_slice(&row.cells[..used]);
-                extras.extend(
-                    row.extras
-                        .map(Arc::unwrap_or_clone)
-                        .unwrap_or_default()
-                        .into_iter()
-                        .filter(|(x, _)| *x < used)
-                        .map(|(x, extra)| (base + x, extra)),
-                );
-                source_row += 1;
-                if !row.wrapped || screen.rows.is_empty() {
-                    break;
-                }
-            }
-            let output_start = output.len();
-            let mut row = Row::new(columns, Cell::default());
-            let mut column = 0;
-            let mut input = 0;
-            let mut extras = extras.drain(..).peekable();
-            loop {
-                if input == cells.len() {
-                    break;
-                }
-                if cells[input].flags.contains(Flags::WIDE_CHAR)
-                    && column + 1 == columns
-                    && columns > 1
-                {
-                    row.wrapped = true;
-                    row.used = column;
-                    output.push_back(row);
-                    row = Row::new(columns, Cell::default());
-                    column = 0;
-                }
-                if column == columns {
-                    row.wrapped = true;
-                    output.push_back(row);
-                    row = Row::new(columns, Cell::default());
-                    column = 0;
-                }
-                for (index, offset) in &point_offsets {
-                    if *offset == input {
-                        mapped[*index] = Point {
-                            line: output.len() as i32,
-                            column,
-                        };
-                    }
-                }
-                let cell = cells[input];
-                if columns == 1 && cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                    input += 1;
-                    continue;
-                }
-                row.cells[column] = cell;
-                if input < text_used {
-                    row.used = column + 1;
-                }
-                if columns == 1 {
-                    row.cells[column].flags.remove(Flags::WIDE_CHAR);
-                }
-                if extras.peek().is_some_and(|(x, _)| *x == input) {
-                    let (_, extra) = extras.next().unwrap();
-                    row.extras_mut().push((column, extra));
-                }
-                column += 1;
-                input += 1;
-            }
-            for (index, offset) in &point_offsets {
-                if *offset == input {
-                    mapped[*index] = Point {
-                        line: output.len() as i32,
-                        column,
-                    };
-                }
-            }
+        output = VecDeque::new();
+        let mut anchor = 0;
+        for (id, row) in rows.into_iter().enumerate() {
+            flow.row(id as u64, row, &anchors, &mut anchor, &mut |row| {
+                output.push_back(row);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+        }
+        if let Some(row) = flow.finish() {
             output.push_back(row);
-            if old_view_top >= group_start && old_view_top < source_row {
-                mapped_view_top =
-                    output_start + (old_view_top - group_start) * old_columns / columns;
-            }
         }
     }
+    let mut mapped: Vec<_> = flow
+        .points
+        .into_iter()
+        .map(|point| {
+            let (line, column) = point.unwrap();
+            Point {
+                line: line as i32,
+                column,
+            }
+        })
+        .collect();
+    let mapped_view_top = flow.view_top.unwrap() as usize;
     while old_columns != columns
         && output.len() > lines
         && output.back().is_some_and(|row| row.used == 0)
@@ -2037,9 +2114,6 @@ impl Core {
         self.move_up(count);
         self.carriage_return();
     }
-    pub(crate) fn backspace(&mut self) {
-        self.move_backward(1);
-    }
     pub(crate) fn carriage_return(&mut self) {
         self.goto_col(0);
     }
@@ -2066,9 +2140,6 @@ impl Core {
         } else {
             self.move_up(1);
         }
-    }
-    pub(crate) fn put_tab(&mut self, count: u16) {
-        self.move_forward_tabs(count);
     }
     pub(crate) fn move_forward_tabs(&mut self, count: u16) {
         let mut column = self.active.cursor.point.column;
@@ -2199,22 +2270,15 @@ impl Core {
         let offset = self.display_offset();
         match mode {
             ClearMode::Saved => {
-                let history = self.history_size();
                 self.active.rows.drain(..self.hot_history_size());
-                #[cfg(feature = "tui")]
+
                 if !self.mode.contains(Mode::ALT_SCREEN) {
                     self.clear_disk_history();
-                }
-                #[cfg(feature = "tui")]
-                if !self.mode.contains(Mode::ALT_SCREEN) {
                     self.blocks.clear();
                     self.block_origin = 0;
                 }
                 self.active.rows.shrink_to_fit();
                 self.active.offset = 0;
-                if history != 0 && !self.mode.contains(Mode::ALT_SCREEN) {
-                    self.events.push(Event::HistoryCleared);
-                }
                 if self
                     .selection
                     .is_some_and(|selection| selection.start.line < 0 || selection.end.line < 0)
@@ -2353,12 +2417,6 @@ impl Core {
             self.mode.remove(flag);
         }
     }
-    pub(crate) fn set_private_mode(&mut self, mode: u16) {
-        self.set_private(mode, true);
-    }
-    pub(crate) fn unset_private_mode(&mut self, mode: u16) {
-        self.set_private(mode, false);
-    }
     pub(crate) fn set_keypad_application_mode(&mut self) {
         self.mode.insert(Mode::APP_KEYPAD);
     }
@@ -2370,14 +2428,12 @@ impl Core {
         let foreground = self.foreground;
         let background = self.background;
         let mut events = std::mem::take(&mut self.events);
-        #[cfg(feature = "tui")]
+
         let history = self.history.take();
         *self = Self::new(size, foreground, background);
-        #[cfg(feature = "tui")]
-        {
-            self.history = history;
-            self.clear_disk_history();
-        }
+
+        self.history = history;
+        self.clear_disk_history();
         events.push(Event::Title(None));
         self.events = events;
     }
@@ -2442,6 +2498,7 @@ impl Core {
             && *slot != Some(color)
         {
             *slot = Some(color);
+            self.palette_dirty = true;
             self.damage_all();
         }
     }
@@ -2449,6 +2506,7 @@ impl Core {
         if let Some(slot) = self.colors.get_mut(index)
             && slot.take().is_some()
         {
+            self.palette_dirty = true;
             self.damage_all();
         }
     }
@@ -2537,15 +2595,12 @@ impl Core {
     }
 }
 
-#[cfg(feature = "tui")]
 impl Core {
     pub fn enable_history(&mut self, config: HistoryConfig) -> std::io::Result<()> {
         self.history = Some(DiskHistory {
             io: History::new(config)?,
             first: 0,
             hot_start: 0,
-            spool_start: 0,
-            stored_end: 0,
             spool: VecDeque::new(),
             epoch: 0,
             layout_epoch: 0,
@@ -2563,14 +2618,6 @@ impl Core {
     }
     pub fn history_event_fd(&self) -> Option<std::os::fd::RawFd> {
         self.history.as_ref().map(|history| history.io.event_fd())
-    }
-    pub fn history_loading(&self) -> bool {
-        self.history.as_ref().is_some_and(|h| {
-            h.requested.is_some()
-                || h.resizing.is_some()
-                || h.desired_size.is_some()
-                || h.clear_pending
-        })
     }
     pub(crate) fn resize_pending(&self) -> bool {
         self.history
@@ -2613,15 +2660,13 @@ impl Core {
         }
         while history.spool.len() >= 32 || (final_batch && !history.spool.is_empty()) {
             let count = history.spool.len().min(32);
+            let start = history.hot_start - history.spool.len() as u64;
             let rows = history.spool.drain(..count).collect();
-            match history.io.append(history.spool_start, rows) {
-                Ok(()) => history.spool_start += count as u64,
-                Err(rows) => {
-                    for row in rows.into_iter().rev() {
-                        history.spool.push_front(row);
-                    }
-                    break;
+            if let Err(rows) = history.io.append(start, rows) {
+                for row in rows.into_iter().rev() {
+                    history.spool.push_front(row);
                 }
+                break;
             }
         }
     }
@@ -2673,18 +2718,18 @@ impl Core {
         let mut page_loaded = false;
         let mut notified = false;
         let mut reflow = None;
+        let mut failure = None;
         if let Some(history) = &mut self.history {
             notified = read_notification && history.io.drain()?;
             history.io.check_budget();
             for reply in history.io.poll() {
                 match reply {
-                    Reply::Stored { first, end } => {
+                    Reply::Stored { first } => {
                         if history.clear_pending {
                             continue;
                         }
+                        changed |= history.first != first;
                         history.first = first;
-                        history.stored_end = end;
-                        changed = true;
                     }
                     Reply::Cleared => {
                         history.clear_pending = false;
@@ -2716,9 +2761,42 @@ impl Core {
                         points,
                         view_top,
                     } => reflow = Some((rows, first, hot_start, points, view_top)),
-                    Reply::Error(error) => return Err(error),
+                    Reply::Error(error) => {
+                        failure = Some(error);
+                        break;
+                    }
                 }
             }
+        }
+        if let Some(error) = failure {
+            let history = self.history.take().unwrap();
+            let size = history
+                .desired_size
+                .or(history.resizing.map(|pending| pending.size));
+            let lines = self.screen_lines();
+            let main = if self.mode.contains(Mode::ALT_SCREEN) {
+                &mut self.inactive
+            } else {
+                &mut self.active
+            };
+            for row in history.spool.into_iter().rev() {
+                main.rows.push_front(row);
+            }
+            main.rows
+                .drain(..main.rows.len().saturating_sub(HISTORY_LIMIT + lines));
+            main.offset = main.offset.min(main.rows.len() - lines);
+            self.selection = None;
+            history.io.shutdown();
+            self.trim_blocks();
+            if let Some(size) = size {
+                self.resize(size);
+            }
+            self.damage_all();
+            self.events.push(Event::HistoryError(std::io::Error::new(
+                error.kind(),
+                format!("disk history disabled; retained history is incomplete: {error}"),
+            )));
+            return Ok(true);
         }
         if let Some((rows, first, hot_start, points, view_top)) = reflow {
             self.finish_history_resize(rows, first, hot_start, points, view_top);
@@ -2912,12 +2990,15 @@ impl Core {
         self.size = pending.size;
         self.scroll_top = 0;
         self.scroll_bottom = lines;
-        self.tabs = (0..columns).map(|x| x != 0 && x % 8 == 0).collect();
+        let old_columns = self.tabs.len();
+        self.tabs.resize_with(columns, || false);
+        for column in old_columns..columns {
+            self.tabs[column] = column != 0 && column % 8 == 0;
+        }
         self.dirty = vec![true; lines];
+        self.palette_dirty = true;
         history.first = first;
         history.hot_start = hot_start;
-        history.spool_start = hot_start;
-        history.stored_end = hot_start;
         history.page.clear();
         history.requested = None;
         history.blank = Row::new(columns, Cell::default());
@@ -2931,8 +3012,6 @@ impl Core {
             history.clear_requested = false;
             history.first = 0;
             history.hot_start = 0;
-            history.spool_start = 0;
-            history.stored_end = 0;
             history.spool.clear();
             history.page.clear();
             history.requested = None;
@@ -2945,7 +3024,6 @@ impl Core {
     }
 }
 
-#[cfg(feature = "tui")]
 impl Core {
     pub fn input_generation(&self) -> u64 {
         self.input_generation
@@ -3185,12 +3263,12 @@ impl Core {
             has_output: block.output.is_some(),
         }
     }
-    pub fn latest_command(&self) -> Option<CommandBlock> {
+    pub(crate) fn latest_command_status(&self) -> Option<Option<i32>> {
         self.blocks
             .iter()
             .rev()
             .find(|block| block.output.is_some())
-            .map(|block| self.command_metadata(block))
+            .map(|block| block.status)
     }
     pub fn recent_command_blocks(&self) -> Vec<CommandBlock> {
         self.blocks
@@ -3319,8 +3397,7 @@ impl Core {
     {
         let alternate = self.mode.contains(Mode::ALT_SCREEN);
         if !alternate {
-            self.flush_history(true);
-            self.require_history_ready_for_copy()?;
+            self.prepare_history_copy()?;
         }
         let history = self.history.as_ref().ok_or_else(|| {
             std::io::Error::new(
@@ -3386,12 +3463,7 @@ impl Core {
         self.damage_all();
         Ok(())
     }
-    pub fn copy_block(
-        &mut self,
-        id: u64,
-    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<HistoryCopy>>> {
-        self.flush_history(true);
-        self.require_history_ready_for_copy()?;
+    fn block_output(&self, id: u64) -> std::io::Result<(&Block, BlockPoint, BlockPoint)> {
         let block = self
             .blocks
             .iter()
@@ -3417,6 +3489,19 @@ impl Core {
             row: self.block_origin + main.cursor.point.line as u64,
             column: main.cursor.point.column + usize::from(main.cursor.wrap_pending),
         });
+        Ok((block, start, end))
+    }
+    pub fn copy_block(
+        &mut self,
+        id: u64,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<HistoryCopy>>> {
+        self.prepare_history_copy()?;
+        let (block, start, end) = self.block_output(id)?;
+        let main = if self.mode.contains(Mode::ALT_SCREEN) {
+            &self.inactive
+        } else {
+            &self.active
+        };
         let history = self.history.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -3445,8 +3530,7 @@ impl Core {
         std::sync::mpsc::Receiver<std::io::Result<HistoryPage>>,
         Arc<std::sync::atomic::AtomicBool>,
     )> {
-        self.flush_history(true);
-        self.require_history_ready_for_copy()?;
+        self.prepare_history_copy()?;
         let history = self.history.as_ref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::Unsupported,
@@ -3465,26 +3549,7 @@ impl Core {
             &self.active
         };
         let (start, end, incomplete, command) = if let Some(id) = block {
-            let block = self
-                .blocks
-                .iter()
-                .find(|block| block.id == id)
-                .ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        "command block no longer retained",
-                    )
-                })?;
-            let start = block.output.ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "command has no output marker",
-                )
-            })?;
-            let end = block.end.unwrap_or(BlockPoint {
-                row: self.block_origin + main.cursor.point.line as u64,
-                column: main.cursor.point.column + usize::from(main.cursor.wrap_pending),
-            });
+            let (block, start, end) = self.block_output(id)?;
             (
                 (start.row, start.column),
                 (end.max(start).row, end.max(start).column),
@@ -3533,7 +3598,6 @@ impl Core {
     }
 }
 
-#[cfg(feature = "tui")]
 impl Core {
     fn copy_rows(rows: &VecDeque<Row>, hot_start: u64, start: u64, end: u64) -> (u64, Vec<Row>) {
         let count = rows.len() as u64;
@@ -3546,7 +3610,8 @@ impl Core {
         )
     }
 
-    fn require_history_ready_for_copy(&self) -> std::io::Result<()> {
+    fn prepare_history_copy(&mut self) -> std::io::Result<()> {
+        self.flush_history(true);
         if self.mode.contains(Mode::SYNC_UPDATE)
             || self.history.as_ref().is_some_and(|history| {
                 !history.spool.is_empty()
@@ -3562,8 +3627,7 @@ impl Core {
     pub fn copy_selection(
         &mut self,
     ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<HistoryCopy>>> {
-        self.flush_history(true);
-        self.require_history_ready_for_copy()?;
+        self.prepare_history_copy()?;
         let range = self
             .selection_range()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no selection"))?;
@@ -3624,10 +3688,44 @@ impl Core {
 }
 
 #[cfg(test)]
+fn settle_history(core: &mut Core) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        core.poll_history(true).unwrap();
+        let main = if core.mode.contains(Mode::ALT_SCREEN) {
+            &core.inactive
+        } else {
+            &core.active
+        };
+        let cursor = HistoryCursor {
+            epoch: core.history.as_ref().unwrap().layout_epoch,
+            row: core.block_origin + main.cursor.point.line as u64,
+            offset: 0,
+        };
+        match core.read_history(None, Some(cursor), None) {
+            Ok((receiver, _)) => {
+                receiver
+                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                    .unwrap()
+                    .unwrap();
+                core.poll_history(true).unwrap();
+                return;
+            }
+            Err(error) => assert_eq!(error.kind(), std::io::ErrorKind::WouldBlock),
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "history worker barrier stalled"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+#[cfg(test)]
 mod tests;
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod disk_tests;
 
-#[cfg(all(test, feature = "tui"))]
+#[cfg(test)]
 mod history_boundary_tests;

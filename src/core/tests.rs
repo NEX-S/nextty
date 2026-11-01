@@ -675,34 +675,19 @@ fn local_scrolling_damages_only_the_visible_region_and_preserves_fixed_rows() {
 }
 
 #[test]
-fn history_cleared_event_only_reports_a_real_main_history_clear() {
+fn clear_saved_only_removes_main_history() {
     let (mut core, mut parser) = terminal(5, 2);
-    feed(
-        &mut core,
-        &mut parser,
-        "one\r\ntwo\r\nthree\x1b[?1049h\x1b[3J\x1b[?1049l",
-    );
-    assert!(
-        !core
-            .take_events()
-            .iter()
-            .any(|event| matches!(event, Event::HistoryCleared))
-    );
+    feed(&mut core, &mut parser, "one\r\ntwo\r\nthree");
+    let retained = core.history_size();
+    assert!(retained > 0);
+    feed(&mut core, &mut parser, "\x1b[?1049h\x1b[3J\x1b[?1049l");
+    assert_eq!(core.history_size(), retained);
     feed(&mut core, &mut parser, "\x1b[3J");
-    assert_eq!(
-        core.take_events()
-            .iter()
-            .filter(|event| matches!(event, Event::HistoryCleared))
-            .count(),
-        1
-    );
+    assert_eq!(core.history_size(), 0);
+    assert_eq!(line(&core, 0), "two  ");
+    assert_eq!(line(&core, 1), "three");
     feed(&mut core, &mut parser, "\x1b[3J");
-    assert!(
-        !core
-            .take_events()
-            .iter()
-            .any(|event| matches!(event, Event::HistoryCleared))
-    );
+    assert_eq!(core.history_size(), 0);
 }
 
 #[test]

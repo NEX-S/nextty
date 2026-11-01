@@ -1,4 +1,5 @@
 use crate::core::{Flags, Row};
+use crate::input::keysym;
 use crate::workspace::{Action, Client, PaneId};
 use std::collections::VecDeque;
 use std::fmt::Write;
@@ -96,36 +97,18 @@ impl Matcher {
         self.truncated = true;
     }
     pub fn row(&mut self, id: u64, row: &Row) {
-        for (column, cell, extra) in row.cells_with_extras(0..row.used()) {
-            if cell.flags.intersects(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
+        for (column, character) in row.characters(0..row.used()) {
             let start = (id, column as u16);
             let end = (
                 id,
                 (column
-                    + if cell.flags.contains(Flags::WIDE_CHAR) {
+                    + if row.cells[column].flags.contains(Flags::WIDE_CHAR) {
                         2
                     } else {
                         1
                     }) as u16,
             );
-            self.character(
-                if cell.flags.contains(Flags::HIDDEN) {
-                    ' '
-                } else {
-                    cell.c
-                },
-                start,
-                end,
-            );
-            if !cell.flags.contains(Flags::HIDDEN)
-                && let Some(extra) = extra
-            {
-                for &character in &extra.zerowidth {
-                    self.character(character, start, end);
-                }
-            }
+            self.character(character, start, end);
         }
         if !row.wrapped {
             self.line_break();
@@ -153,7 +136,6 @@ pub(crate) struct Search {
     pub truncated: bool,
     controller: bool,
     request: u64,
-    utf8: Vec<u8>,
 }
 impl Search {
     pub fn begin(&mut self, client: &mut Client, pane: PaneId) -> io::Result<()> {
@@ -196,12 +178,8 @@ impl Search {
             query: self.query.clone(),
         })
     }
-    #[cfg(any(feature = "gui", test))]
     pub fn edit(&mut self, client: &mut Client, text: &str) -> io::Result<()> {
-        let text: String = text
-            .chars()
-            .filter(|character| !character.is_control())
-            .collect();
+        let text = crate::input::without_controls(text);
         if text.is_empty() {
             return Ok(());
         }
@@ -213,7 +191,6 @@ impl Search {
         self.open = false;
         self.pending = false;
         self.count = 0;
-        self.utf8.clear();
         client.send(Action::SearchCancel {
             pane: self.pane,
             request: self.request,
@@ -266,25 +243,25 @@ impl Search {
         symbol: u32,
         shift: bool,
         control: bool,
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         if !self.open {
-            return Ok(false);
+            return Ok(());
         }
         match symbol {
-            0xff1b => self.close(client)?,
-            0xff0d | 0xff8d => self.next(client, shift)?,
-            0xff52 => self.next(client, true)?,
-            0xff54 => self.next(client, false)?,
-            0xff51 => self.cursor = self.previous(),
-            0xff53 => self.cursor = self.following(),
-            0xff50 => self.cursor = 0,
-            0xff57 => self.cursor = self.query.len(),
-            0xff08 => {
+            keysym::ESCAPE => self.close(client)?,
+            keysym::RETURN | keysym::KP_ENTER => self.next(client, shift)?,
+            keysym::UP => self.next(client, true)?,
+            keysym::DOWN => self.next(client, false)?,
+            keysym::LEFT => self.cursor = self.previous(),
+            keysym::RIGHT => self.cursor = self.following(),
+            keysym::HOME => self.cursor = 0,
+            keysym::END => self.cursor = self.query.len(),
+            keysym::BACKSPACE => {
                 if self.delete(self.previous()..self.cursor) {
                     self.submit(client)?;
                 }
             }
-            0xffff => {
+            keysym::DELETE => {
                 if self.delete(self.cursor..self.following()) {
                     self.submit(client)?;
                 }
@@ -297,7 +274,7 @@ impl Search {
             }
             _ => (),
         }
-        Ok(true)
+        Ok(())
     }
     fn previous(&self) -> usize {
         self.query[..self.cursor]
@@ -313,80 +290,10 @@ impl Search {
                 .map_or(0, char::len_utf8)
     }
     fn delete(&mut self, range: std::ops::Range<usize>) -> bool {
-        self.utf8.clear();
         self.cursor = range.start;
         let changed = !range.is_empty();
         self.query.replace_range(range, "");
         changed
-    }
-    pub fn bytes(&mut self, client: &mut Client, bytes: &[u8], pasted: bool) -> io::Result<bool> {
-        if !self.open && !pasted {
-            return Ok(false);
-        }
-        if !pasted && bytes.first() == Some(&27) {
-            let (symbol, shift) = match bytes {
-                b"\x1b" => (0xff1b, false),
-                b"\x1b[13;2u" | b"\x1b[27;2;13~" => (0xff0d, true),
-                _ => match crate::input::editing_key(bytes) {
-                    Some(symbol) => (symbol, false),
-                    None => return Ok(true),
-                },
-            };
-            return self.key(client, symbol, shift, false);
-        }
-        if pasted
-            && self.utf8.is_empty()
-            && !bytes.is_empty()
-            && let Ok(text) = std::str::from_utf8(bytes)
-            && bytes.iter().all(|&byte| byte >= 32 && byte != 127)
-        {
-            self.query.insert_str(self.cursor, text);
-            self.cursor += text.len();
-            self.submit(client)?;
-            return Ok(true);
-        }
-        let mut changed = false;
-        for &byte in bytes {
-            if !pasted {
-                match byte {
-                    8 | 127 => {
-                        changed |= self.delete(self.previous()..self.cursor);
-                        continue;
-                    }
-                    1 | 21 => {
-                        changed |= self.delete(0..self.query.len());
-                        continue;
-                    }
-                    13 | 10 => {
-                        if changed {
-                            self.submit(client)?;
-                            changed = false;
-                        }
-                        self.next(client, false)?;
-                        continue;
-                    }
-                    _ => (),
-                }
-            }
-            if byte < 32 || byte == 127 {
-                continue;
-            }
-            self.utf8.push(byte);
-            match std::str::from_utf8(&self.utf8) {
-                Ok(text) => {
-                    self.query.insert_str(self.cursor, text);
-                    self.cursor += text.len();
-                    self.utf8.clear();
-                    changed = true;
-                }
-                Err(error) if error.error_len().is_some() => self.utf8.clear(),
-                Err(_) => (),
-            }
-        }
-        if changed {
-            self.submit(client)?;
-        }
-        Ok(true)
     }
     pub fn label(&self, preedit: &str) -> String {
         let mut label = format!(

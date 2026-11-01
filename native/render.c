@@ -103,7 +103,7 @@ typedef struct {
         uint32_t background;
         float clip[4];
         Quad quad;
-        struct { NtLine *line; float x, y, factor; } line;
+        struct { NtLine *line; float x, y; } line;
     };
 } Op;
 
@@ -242,7 +242,7 @@ static int64_t submission_time(void) {
 }
 
 static int reserve_quads(NtRenderer *r, size_t count);
-static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor);
+static int draw_line(NtRenderer *r, NtLine *line, float x, float y);
 
 #define VK_CHECK(call) do { \
     VkResult vk_result = (call); \
@@ -888,7 +888,7 @@ static int replay(NtRenderer *r) {
             r->quads[r->quad_count++] = op->quad;
             break;
         case OP_LINE:
-            if (!draw_line(r, op->line.line, op->line.x, op->line.y, op->line.factor)) return 0;
+            if (!draw_line(r, op->line.line, op->line.x, op->line.y)) return 0;
             break;
         }
     }
@@ -1302,14 +1302,6 @@ void nt_renderer_stroke(NtRenderer *r, float x1, float y1, float x2, float y2,
     add_op(r, op);
 }
 
-void nt_renderer_round_rect(NtRenderer *r, float x, float y, float width, float height,
-                            float radius, uint32_t color) {
-    if (r->error[0] || width <= 0 || height <= 0) return;
-    Op op = {.kind = OP_QUAD, .quad = make_quad(x, y, width, height, color, 4)};
-    op.quad.uv[0] = fminf(radius, fminf(width, height) * 0.5f);
-    add_op(r, op);
-}
-
 void nt_renderer_tab(NtRenderer *r, float x, float y, float width, float height,
                      float inset, uint32_t color) {
     if (r->error[0] || width <= 0 || height <= 0) return;
@@ -1318,13 +1310,13 @@ void nt_renderer_tab(NtRenderer *r, float x, float y, float width, float height,
     add_op(r, op);
 }
 
-void nt_renderer_line(NtRenderer *r, const NtLine *line, float x, float y, float factor) {
+void nt_renderer_line(NtRenderer *r, const NtLine *line, float x, float y) {
     if (r->error[0] || (!line->text && !line->count)) return;
-    if (add_op(r, (Op){.kind = OP_LINE, .line = {(NtLine *)line, x, y, factor}}))
+    if (add_op(r, (Op){.kind = OP_LINE, .line = {(NtLine *)line, x, y}}))
         ++((NtLine *)line)->references;
 }
 
-static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor) {
+static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
     if (!shape_line(r, line) || !reserve_quads(r, r->quad_count + line->count)) return 0;
     double inverse_scale = 1. / r->scale;
     float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
@@ -1359,12 +1351,6 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y, float factor
             q.uv[1] = (entry->y + 0.5f) * inverse_atlas;
             q.uv[2] = (entry->width - 1) * inverse_atlas;
             q.uv[3] = (entry->height - 1) * inverse_atlas;
-        }
-        if (factor != 1.f) {
-            q.rect[0] = x + (q.rect[0] - x) * factor;
-            q.rect[1] = y + (q.rect[1] - y) * factor;
-            q.rect[2] *= factor;
-            q.rect[3] *= factor;
         }
         r->quads[r->quad_count++] = q;
     }

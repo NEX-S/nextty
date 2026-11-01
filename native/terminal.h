@@ -87,11 +87,9 @@ void nt_renderer_rect(NtRenderer *, float x, float y, float width, float height,
                       uint32_t color, int wave);
 void nt_renderer_stroke(NtRenderer *, float x1, float y1, float x2, float y2,
                         float width, uint32_t color);
-void nt_renderer_round_rect(NtRenderer *, float x, float y, float width, float height,
-                            float radius, uint32_t color);
 void nt_renderer_tab(NtRenderer *, float x, float y, float width, float height,
                      float inset, uint32_t color);
-void nt_renderer_line(NtRenderer *, const NtLine *, float x, float y, float factor);
+void nt_renderer_line(NtRenderer *, const NtLine *, float x, float y);
 /* Present transfers the frame packet to one GPU worker. While pending, only
  * ready/finish/fd/metrics/free and nt_line_free may be called. Ready returns -1 on error, 0 while
  * pending, and 1 when the next frame may be built. */

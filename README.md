@@ -17,8 +17,6 @@ nextty is built around a small terminal core, explicit ownership of background w
 - **Agent panel:** separate conversations, streamed Markdown, terminal-context attachments, current-shell execution, paged history, and conversation rewind. Conversations keep running after the frontend detaches.
 - **Local tools:** an asynchronous file browser with fuzzy search and text preview, plus CPU, memory, network, process, and storage monitoring.
 
-The workspace layer is optional. A `gui`-only build opens one PTY directly, without nextty's tabs, panels, or session daemon. It works well as a desktop host for tmux.
-
 ## Design philosophy
 
 **Keep the terminal path short.** PTY input does not pass through a widget tree or a general-purpose async runtime. Each PTY has an I/O thread that handles writes, reads, parsing, and process notifications. A busy output stream gets a limited amount of work before input is serviced again.
@@ -60,31 +58,19 @@ Shaders are compiled to SPIR-V by `glslangValidator` during the build. Wayland p
 
 ### Build only what you use
 
-Default features are `gui,tui,monitor,files,agent`.
+Default features are `gui,agent`. Workspace support, the ANSI frontend, monitor, and file browser are always included.
 
 - `gui`: Wayland window, input handling, font backend, and Vulkan renderer.
-- `tui`: workspace daemon, tabs, splits, command blocks, disk history, and ANSI frontend. With `gui`, the desktop shows the same workspace UI.
-- `monitor`: asynchronous resource sampling and monitor panel; enables `tui`.
-- `files`: file browser and preview; enables `tui`.
-- `agent`: Agent panel, model/tool loop, JSON, HTTP, and Markdown; enables `tui`.
+- `agent`: Agent panel, model/tool loop, JSON, HTTP, and Markdown.
 
-A single-PTY desktop terminal:
+All desktop windows use the workspace daemon. A workspace frontend and server without graphical or Agent dependencies:
 
 ```sh
-cargo build --release --locked --no-default-features \
-  --features gui --target-dir target/minimal
-./target/minimal/release/nextty --gui
-```
-
-A workspace frontend and server without graphical dependencies:
-
-```sh
-cargo build --release --locked --no-default-features \
-  --features tui --target-dir target/headless
+cargo build --release --locked --no-default-features --target-dir target/headless
 ./target/headless/release/nextty
 ```
 
-Add `monitor,files,agent` to the latter build for the optional panels. The `tui` build is also enough for a remote workspace server.
+Add `--features agent` for the Agent panel. This build is also enough for a remote workspace server.
 
 ## Usage
 
@@ -102,9 +88,9 @@ nextty --working-directory /path/to/project
 nextty --gui -e /bin/bash --noprofile --norc
 ```
 
-`nextty` defaults to the ANSI frontend. `--gui` opens a desktop window; `--tui` selects the current terminal explicitly. GUI-only builds also require `--gui`. Put nextty options before `-e`: everything after it belongs to the child command. Explicit `-e` commands run as supplied; automatic shell integration is installed only for default interactive Bash/Zsh sessions.
+`nextty` defaults to the ANSI frontend. `--gui` opens a desktop window; `--tui` selects the current terminal explicitly. Put nextty options before `-e`: everything after it belongs to the child command. Explicit `-e` commands run as supplied; automatic shell integration is installed only for default interactive Bash/Zsh sessions.
 
-Tab dots gently pulse gray while programs are running. Unread successful completion is orange, and failure is red; visiting the tab clears its result indicator. Closing a tab with running programs or unknown state asks for confirmation, with Cancel selected by default. The footer shows workspace/input focus on the left and local resource usage, including Swap, on the right.
+Set `tab_style = "angled"` (default) or `tab_style = "flat"` in the configuration. Both styles use orange dots for running programs, green for successful completion, red for failure, and gray for idle or unknown state; close buttons are gray. Closing a tab with running programs or unknown state asks for confirmation, with Cancel selected by default. The footer shows the focused pane's directory and local Git branch on the left. The right side shows local CPU/MEM/DSK/SWP usage with `` / `` / `` / `` icons. Each resource item opens its own CPU, Memory, Disk, or Swap monitor page, with independent hover feedback. The monitor sidebar contains Overview, CPU, Memory, Disk, Network, Swap, and Processes; the expand arrow restores the last page. Overview shows compact resource trends, while the individual pages expose per-core CPU usage, memory availability and cache, physical-disk I/O, swap activity, hardware network interfaces, and the process list. Filesystem capacity follows the focused pane’s directory and is separate from physical-disk I/O. Wide layouts place resource graphs beside their details; narrow layouts stack them. Inline colored legends identify graph series, and process filtering and column headers stay visible while the list scrolls. The `` button expands the monitor; when expanded, it contains `60s`, `5m`, `15m`, `1h` and `` to collapse. Both arrow buttons leave one non-clickable character of space at the right edge. Network monitoring lists all interfaces backed by hardware devices, excluding virtual interfaces such as loopback, tunnels and bridges. Remote directories are displayed as supplied by the remote terminal; local Git branches are never inferred for them.
 
 `Alt+q` detaches without terminating the workspace. Closing a desktop window offers **Keep running** or **End session**. Session state lives in the daemon; it survives a frontend exit or disconnection, but not a reboot or daemon crash.
 
@@ -133,14 +119,14 @@ Remote sessions support tabs, splits, history, selection, and clipboard transfer
 - `Alt+q`: detach. `Alt+?`: context help.
 - `Alt+/`: search the current pane's retained output. Enter / Shift+Enter: next/previous match. Esc: restore the previous selection and reading position.
 - `Alt+p` / `Alt+n`: previous/next prompt. `Alt+c`: copy command output.
-- `Alt+a`, `Alt+m`, `Alt+f`: Agent, monitor, and files. Each requires its corresponding feature.
+- `Alt+a`, `Alt+m`, `Alt+f`: Agent, monitor, and files. The Agent requires the `agent` feature.
 - `Alt+o`: cycle focus between the terminal and visible Agent/monitor regions.
 
 In the desktop frontend, `Ctrl+Shift+C/V` copies/pastes, middle-click pastes the primary selection, and `Shift+PageUp/Down` scrolls history. Hold Shift to select or scroll locally when an application captures the mouse. `Ctrl+double-click` selects a URL, path, or quoted object. Double-clicking a recognized address, register, path, symbol, or instruction captures its visible context for the Agent panel.
 
 The ANSI frontend uses the host terminal for paste and OSC 52 for clipboard export. Both frontends support mouse selection and right-click copy; an existing selection takes precedence over command-output copying.
 
-In the file browser, use `hjkl` or arrows to navigate, `/` to search, and Tab to switch between list and preview. Enter opens a directory or inserts a quoted file path into the shell without executing it. Esc backs out of preview, search, then the browser.
+`Alt+f` opens a tree selector in the left sidebar and leaves the terminal visible beside it. Use `j`/`k` or arrows to select, `l` to expand a directory or open a centered file preview, and `h` to collapse or move to the parent. Enter copies the selected absolute path to the clipboard without sending input to the shell. `/` searches beneath the root directory. Esc closes the preview first, then search, then the sidebar. Directory scans and on-demand file previews run asynchronously.
 
 ## Agent
 
@@ -155,7 +141,7 @@ model = "your-model"
 
 nextty appends `/v1/messages` to `base_url`; an empty URL uses `https://api.anthropic.com`. Agent turns enable automatic prompt caching with `cache_control`; custom endpoints must support this Messages API field. Set `ANTHROPIC_AUTH_TOKEN` for Bearer authentication or `ANTHROPIC_API_KEY` for API-key authentication in the environment before starting nextty.
 
-Open the panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C copies a selection; without a selection, it stops a running reply from the input or output area. The stop button does the same. In the ANSI frontend, End in the Agent output returns to the latest reply; the editor grows with the draft. Esc in the editor selects an earlier user message; Enter confirms rewind. Rewind removes later conversation history and restores the draft and attachments. It does not undo shell commands or file changes.
+Open the panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C copies a selection; without a selection, it stops a running reply from the input or output area. The stop button does the same. In the ANSI frontend, End in the Agent output returns to the latest reply; the editor starts with three rows and grows with the draft. Esc in the editor selects an earlier user message; Enter confirms rewind. Rewind removes later conversation history and restores the draft and attachments. It does not undo shell commands or file changes.
 
 Each conversation has its own draft, attachments, transcript, and worker. A local background owner keeps these conversations alive when a frontend detaches. Closing a conversation cancels it; terminating the workspace ends the owner. Conversation state does not survive a machine restart.
 
@@ -201,8 +187,6 @@ flowchart TB
     PTY <--> Shell["Shells and terminal applications"]
 ```
 
-The `gui`-only build omits the workspace daemon and shared panel UI. Its desktop process owns one `Terminal` directly and uses the same parser, core, and GPU paint path.
-
 The desktop's UI thread builds drawing packets. A render worker owns font selection, shaping, glyph caches, atlases, and Vulkan submission:
 
 ```mermaid
@@ -225,10 +209,10 @@ The ANSI frontend emits terminal escape sequences from those visible rows instea
 - [core.rs](src/core.rs), [vt.rs](src/vt.rs), [terminal.rs](src/terminal.rs): grid, VT sequences, selection, PTY I/O, and process lifetime.
 - [workspace.rs](src/workspace.rs), [wire.rs](src/wire.rs), [bridge.rs](src/bridge.rs): session ownership, layout, transport, and SSH bridge.
 - [screen.rs](src/screen.rs), [ui.rs](src/ui.rs): visible snapshots and shared frontend state.
-- [workspace_view.rs](src/workspace_view.rs), [tui.rs](src/tui.rs), [desktop.rs](src/desktop.rs): desktop workspace, ANSI, and direct desktop frontends.
+- [workspace_view.rs](src/workspace_view.rs), [tui.rs](src/tui.rs): desktop workspace and ANSI frontends.
 - [paint.rs](src/paint.rs), [native/](native/): drawing packets, Wayland, font shaping, and Vulkan.
 - [history.rs](src/history.rs): bounded disk history and asynchronous history operations.
-- [agent_owner.rs](src/agent_owner.rs), [harness.rs](src/harness.rs), [agent_http.rs](src/agent_http.rs): conversation ownership, model/tool loop, HTTP, and terminal tools.
+- [agent/owner.rs](src/agent/owner.rs), [agent/harness.rs](src/agent/harness.rs), [agent/http.rs](src/agent/http.rs): conversation ownership, model/tool loop, HTTP, and terminal tools.
 - [files.rs](src/files.rs), [monitor.rs](src/monitor.rs), [system_stats.rs](src/system_stats.rs): file navigation and local resource monitoring.
 
 ## Performance details
@@ -237,11 +221,11 @@ These are implementation choices, not a claim of a particular frame rate or inpu
 
 ### Input and output scheduling
 
-A PTY read is at most **16 KiB**. Workspace parsing consumes at most 16 KiB under one Core lock and checks history backpressure in chunks of at most **512 bytes**. The I/O loop services pending input between batches. History backpressure pauses output consumption while leaving input writes available.
+A PTY read is at most **8 KiB**. Workspace parsing consumes at most 16 KiB under one Core lock and checks history backpressure in chunks of at most **512 bytes**. The I/O loop services pending input between batches. History backpressure pauses output consumption while leaving input writes available.
 
 Ordinary ANSI input has no merge delay. A lone Escape waits up to **25 ms** so it can be distinguished from an escape sequence. Linux eventfd notifications wake consumers; redundant terminal redraw notifications are coalesced.
 
-Synchronized output is buffered until its end sequence, a **150 ms** deadline, a **2 MiB** limit, or EOF. Replay respects history backpressure. This keeps an application's partial synchronized frame off screen without allowing it to hold output indefinitely.
+Synchronized output is parsed immediately, including terminal query replies. Display updates wait for its end sequence, a **150 ms** deadline, or EOF. History backpressure still bounds parsing; synchronized frames do not retain a second copy of PTY bytes.
 
 ### Rendering and frame pacing
 
@@ -257,19 +241,19 @@ Drawing is demand-driven and stops for suspended windows. Submission is capped a
 
 Ordinary cells occupy **16 bytes**. Combining marks and underline colors use sparse per-row storage; plain ASCII is written in runs. Reflow moves existing row data, and wire decoding reads from its receive buffer.
 
-A workspace pane keeps its visible grid and **512 hot history rows** by default. Older styled rows go to disk in roughly **64 KiB** segments. Panes share a **1 GiB** workspace budget, charged by allocated filesystem blocks; the oldest segments are evicted first. Paging, output copying, and large-history reflow run on the history worker. Command-block metadata is retained alongside the commands it describes.
+A workspace pane keeps its visible grid and **512 hot history rows** by default. Older rows go to disk as UTF-8 text, style ranges, and sparse extra data in roughly **64 KiB** segments. Panes share a **1 GiB** workspace budget, charged by allocated filesystem blocks; the oldest segments are evicted first. Paging, output copying, and large-history reflow run on the history worker. Command-block metadata is retained alongside the commands it describes. A failed history write reports the error and disables disk history for that pane; the shell continues with bounded in-memory scrollback.
 
 Large clipboard exports stream through anonymous files and file descriptors. The history and clipboard cache filesystems must support Linux `O_TMPFILE`. Remote clipboard receive work holds at most **128 KiB** across running and pending chunks. A slow file consumer applies receive backpressure without stopping outgoing input. Pane shutdown leaves process termination and history cleanup with the PTY's I/O thread, so the daemon can continue serving other workspaces.
 
 ### Optional work stays optional
 
-File navigation keeps the latest pending request and cancels stale work. Text previews are limited to 256 KiB and 4,096 lines. Pane search starts a worker only when used, searches a snapshot, and retains at most 10,000 matches.
+File navigation uses separate persistent scan and preview workers, keeps only their latest pending request, and cancels stale work. Text previews are limited to 256 KiB and 4,096 lines. Pane search starts a worker only when used, searches a snapshot, and retains at most 10,000 matches.
 
-Resource sampling runs off the input thread once per second. Process scans run only while the process page is open. Agent HTTP uses nonblocking libcurl multi I/O; cancellation wakes workers through eventfd. Empty conversation tabs do not start model workers.
+Resource sampling runs off the input thread once per second. A closed panel samples only its summary counters; process scans run only while the process page is open. Agent HTTP uses nonblocking libcurl multi I/O; cancellation wakes workers through eventfd. Empty conversation tabs do not start model workers.
 
 ## Configuration
 
-Read from `$XDG_CONFIG_HOME/nextty/config.toml`, or `~/.config/nextty/config.toml`. Use `--config PATH` to select another file. All fields are optional:
+Read from `$XDG_CONFIG_HOME/nextty/config.toml`, or `~/.config/nextty/config.toml`. Use `--config PATH` to select another file. Use one `key = value` assignment per line. Strings use single or double quotes, without escapes or multiline values. Blank lines and `#` comments are supported, including comments after values. Decimal numbers may contain underscores. All fields are optional:
 
 ```toml
 font_family = "CodeNewRoman Nerd Font Mono"
@@ -278,6 +262,7 @@ foreground = "#cccccc"
 background = "#202020"
 background_opacity = 1.0
 tab_bar_opacity = 0.7
+tab_style = "angled"
 history_limit_bytes = 1_073_741_824
 base_url = ""
 model = ""
@@ -293,7 +278,7 @@ Settings load at startup. A missing default file uses built-in settings; a missi
 cargo fmt --all -- --check
 cargo clippy --all-targets --all-features --locked -- -D warnings
 cargo test --all-targets --all-features --locked
-cargo test --all-targets --locked --no-default-features --features tui,files,monitor
+cargo test --all-targets --locked --no-default-features
 ```
 
 The repository also includes tools for separate parts of the terminal path:

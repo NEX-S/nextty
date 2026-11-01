@@ -33,6 +33,9 @@ pub(crate) struct Decoder {
 
 impl Decoder {
     pub fn feed(&mut self, bytes: &[u8], now: Instant) -> std::vec::Drain<'_, Input> {
+        if let Some(event) = self.expire(now) {
+            self.ready.push(event);
+        }
         let output = &mut self.ready;
         if self.pending.is_empty() && !bytes.is_empty() && !bytes.contains(&0x1b) {
             let bytes = bytes.to_vec();
@@ -96,6 +99,9 @@ impl Decoder {
                         .position(|byte| (0x40..=0x7e).contains(byte))
                         .map(|index| index + 2)
                     else {
+                        if pending.len() == 2 {
+                            self.escape_since.get_or_insert(now);
+                        }
                         if pending.len() >= 4096 {
                             output.push(Input::Bytes(pending.to_vec()));
                             consumed += pending.len();
@@ -119,6 +125,7 @@ impl Decoder {
                 }
                 b'O' => {
                     if pending.len() < 3 {
+                        self.escape_since.get_or_insert(now);
                         break;
                     }
                     output.push(Input::Bytes(pending[..3].to_vec()));
@@ -129,8 +136,12 @@ impl Decoder {
                     consumed += 2;
                 }
                 _ => {
-                    output.push(Input::Bytes(pending[..2].to_vec()));
-                    consumed += 2;
+                    let length = pending[1..]
+                        .iter()
+                        .position(|&byte| byte == 0x1b)
+                        .map_or(pending.len(), |index| index + 1);
+                    output.push(Input::Bytes(pending[..length].to_vec()));
+                    consumed += length;
                 }
             }
         }
@@ -143,9 +154,13 @@ impl Decoder {
             .escape_since
             .is_some_and(|start| now.duration_since(start) >= ESCAPE_WAIT)
         {
+            let event = match self.pending.as_slice() {
+                [0x1b, byte] => Input::Alt(*byte),
+                _ => Input::Escape,
+            };
             self.pending.clear();
             self.escape_since = None;
-            Some(Input::Escape)
+            Some(event)
         } else {
             None
         }
@@ -222,6 +237,31 @@ mod tests {
         assert_eq!(
             decoder.feed(b"\x1bs", now).collect::<Vec<_>>(),
             vec![Input::Alt(b's')]
+        );
+    }
+
+    #[test]
+    fn bare_csi_and_ss3_expire_without_consuming_the_next_key() {
+        let now = Instant::now();
+        for prefix in *b"[O" {
+            let mut decoder = Decoder::default();
+            assert!(decoder.feed(&[0x1b, prefix], now).next().is_none());
+            assert_eq!(decoder.timeout(now), Some(ESCAPE_WAIT));
+            assert_eq!(
+                decoder.feed(b"x", now + ESCAPE_WAIT).collect::<Vec<_>>(),
+                vec![Input::Alt(prefix), Input::Bytes(b"x".to_vec())]
+            );
+            assert!(decoder.timeout(now + ESCAPE_WAIT).is_none());
+        }
+    }
+
+    #[test]
+    fn alt_unicode_does_not_split_a_following_ascii_key_from_its_utf8_prefix() {
+        let mut decoder = Decoder::default();
+        let bytes = "\x1béx".as_bytes();
+        assert_eq!(
+            decoder.feed(bytes, Instant::now()).collect::<Vec<_>>(),
+            vec![Input::Bytes(bytes.to_vec())]
         );
     }
 

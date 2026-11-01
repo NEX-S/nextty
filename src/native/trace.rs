@@ -8,8 +8,17 @@ use std::{
 
 pub(crate) struct Trace {
     pub(crate) output: BufWriter<TraceWriter>,
-    pub(crate) frame: u32,
-    pub(crate) pending: Option<(String, String)>,
+    frame: u32,
+    pending: Option<PendingFrame>,
+}
+
+struct PendingFrame {
+    begin: f64,
+    prepared: f64,
+    marker: (u32, u32),
+    geometry: (i32, i32, f64),
+    preedit: bool,
+    focused: bool,
 }
 const TRACE_BLOCK: usize = 8192;
 pub(crate) struct TraceWriter {
@@ -72,6 +81,74 @@ impl Write for TraceWriter {
     }
 }
 impl Trace {
+    pub(crate) fn event(&mut self, event: &super::Event) -> io::Result<()> {
+        match event.kind {
+            super::KEY | super::TEXT | super::PREEDIT => writeln!(
+                self.output,
+                "dispatch {:.9} {} {}",
+                monotonic(),
+                event.kind,
+                event.text.len()
+            )?,
+            super::FRAME if event.code != 0 => writeln!(
+                self.output,
+                "frame_callback {} {:.9} {:.9} {:.0}",
+                event.code,
+                event.x,
+                monotonic(),
+                event.y
+            )?,
+            super::PRESENTED => writeln!(
+                self.output,
+                "presented {} {:.9} {} {} {} {:.0} {:.9}",
+                event.code,
+                event.x,
+                event.start,
+                event.end,
+                event.modifiers,
+                event.y,
+                monotonic()
+            )?,
+            super::WINDOW_STATE => {
+                writeln!(self.output, "window_state {:.9} {}", event.x, event.code)?
+            }
+            super::FRAME_RATE => {
+                writeln!(self.output, "frame_rate {:.9} {:.0}", monotonic(), event.x)?
+            }
+            super::FOCUS => {
+                writeln!(
+                    self.output,
+                    "focus {:.9} {}",
+                    monotonic(),
+                    u8::from(event.code != 0)
+                )?;
+                self.output.flush()?;
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+
+    pub(crate) fn frame(
+        &mut self,
+        begin: f64,
+        prepared: f64,
+        marker: (u32, u32),
+        geometry: (i32, i32, f64),
+        preedit: bool,
+        focused: bool,
+    ) {
+        self.frame = self.frame.wrapping_add(1);
+        self.pending = Some(PendingFrame {
+            begin,
+            prepared,
+            marker,
+            geometry,
+            preedit,
+            focused,
+        });
+    }
+
     pub(crate) fn from_env() -> io::Result<Option<Self>> {
         std::env::var_os("NEXTTY_TRACE")
             .map(|path| {
@@ -85,8 +162,22 @@ impl Trace {
     }
 
     pub(crate) fn record_swap(&mut self, time: f64) -> io::Result<()> {
-        if let Some((prefix, suffix)) = self.pending.take() {
-            writeln!(self.output, "{prefix} {time:.9}{suffix}")?;
+        if let Some(frame) = self.pending.take() {
+            writeln!(
+                self.output,
+                "frame {} {:.9} {:.9} {:.9} {time:.9} {} {} {} {} {} {:.9} {}",
+                self.frame,
+                frame.begin,
+                frame.begin,
+                frame.prepared,
+                frame.marker.0,
+                frame.marker.1,
+                u8::from(frame.preedit),
+                frame.geometry.0,
+                frame.geometry.1,
+                frame.geometry.2,
+                u8::from(frame.focused),
+            )?;
         }
         Ok(())
     }

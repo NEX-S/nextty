@@ -2,7 +2,7 @@
 
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions, ReadDir};
 use std::io::{self, Read};
@@ -10,9 +10,8 @@ use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -51,12 +50,13 @@ impl FileEntry {
 pub struct FileNav {
     wakeup: Arc<OwnedFd>,
     directory: PathBuf,
+    expanded: BTreeSet<PathBuf>,
     query: Option<String>,
     scan: Scan,
     selection: usize,
     generation: Arc<AtomicU64>,
     scan_pending: bool,
-    worker: Option<Worker>,
+    worker: Worker<ScanRequest, (u64, Scan, bool)>,
     restore_selection: Option<PathBuf>,
     directory_selection: BTreeMap<PathBuf, PathBuf>,
     focus: FileFocus,
@@ -65,13 +65,7 @@ pub struct FileNav {
     preview_scroll: usize,
     preview_generation: Arc<AtomicU64>,
     preview_pending: bool,
-    preview_worker: Option<PreviewWorker>,
-}
-
-struct PreviewWorker {
-    generation: u64,
-    result: Receiver<Preview>,
-    handle: JoinHandle<()>,
+    preview_worker: Worker<(u64, PathBuf, Preview), (u64, Preview)>,
 }
 
 #[derive(Default)]
@@ -81,27 +75,114 @@ struct Preview {
     truncated: bool,
 }
 
-struct Worker {
+struct ScanRequest {
     generation: u64,
-    updates: Receiver<Scan>,
-    result: Receiver<Scan>,
-    handle: JoinHandle<()>,
+    directory: PathBuf,
+    query: Option<String>,
+    expanded: BTreeSet<PathBuf>,
+    previous: (Scan, Preview),
 }
 
-// Result senders are moved after this guard so panic unwinding disconnects before waking.
-struct WakeOnDrop(Arc<OwnedFd>);
+struct Work<Request, Output> {
+    pending: Option<Request>,
+    result: Option<Output>,
+    closed: bool,
+}
 
-impl WakeOnDrop {
-    fn notify(&self) {
-        if let Err(error) = crate::eventfd::notify(self.0.as_raw_fd()) {
-            eprintln!("notify file navigation: {error}");
+struct Worker<Request, Output> {
+    shared: Arc<(Mutex<Work<Request, Output>>, Condvar)>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
+    fn new(
+        name: &str,
+        wakeup: Arc<OwnedFd>,
+        run: impl Fn(Request, &dyn Fn(Output)) + Send + 'static,
+    ) -> io::Result<Self> {
+        let shared = Arc::new((
+            Mutex::new(Work {
+                pending: None,
+                result: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker = Arc::clone(&shared);
+        let handle = thread::Builder::new().name(name.into()).spawn(move || {
+            let (lock, changed) = &*worker;
+            let _exit = WakeOnDrop(|| {
+                lock.lock().unwrap().closed = true;
+                notify(&wakeup);
+            });
+            let publish = |result| {
+                let previous = lock.lock().unwrap().result.replace(result);
+                drop(previous);
+                notify(&wakeup);
+            };
+            loop {
+                let mut state = lock.lock().unwrap();
+                while state.pending.is_none() && !state.closed {
+                    state = changed.wait(state).unwrap();
+                }
+                if state.closed {
+                    return;
+                }
+                let request = state.pending.take().unwrap();
+                drop(state);
+                run(request, &publish);
+            }
+        })?;
+        Ok(Self {
+            shared,
+            handle: Some(handle),
+        })
+    }
+
+    fn submit(&self, request: Request) {
+        let (lock, changed) = &*self.shared;
+        let previous = lock.lock().unwrap().pending.replace(request);
+        if previous.is_none() {
+            changed.notify_one();
         }
+        drop(previous);
+    }
+
+    fn take(&mut self) -> Option<Output> {
+        let mut state = self.shared.0.lock().unwrap();
+        if !state.closed {
+            return state.result.take();
+        }
+        drop(state);
+        self.handle
+            .take()
+            .unwrap()
+            .join()
+            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        unreachable!("file worker exited while its navigator is alive");
     }
 }
 
-impl Drop for WakeOnDrop {
+impl<Request, Output> Drop for Worker<Request, Output> {
     fn drop(&mut self) {
-        self.notify();
+        let (lock, changed) = &*self.shared;
+        let mut state = lock.lock().unwrap();
+        state.closed = true;
+        changed.notify_one();
+    }
+}
+
+struct WakeOnDrop<Finish: Fn()>(Finish);
+
+impl<Finish: Fn()> Drop for WakeOnDrop<Finish> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+
+fn notify(wakeup: &OwnedFd) {
+    if let Err(error) = crate::eventfd::notify(wakeup.as_raw_fd()) {
+        eprintln!("notify file navigation: {error}");
     }
 }
 
@@ -120,24 +201,61 @@ impl FileNav {
         } else {
             std::env::current_dir()?.join(directory)
         };
+        let wakeup = Arc::new(crate::eventfd::new()?);
+        let generation = Arc::new(AtomicU64::new(0));
+        let preview_generation = Arc::new(AtomicU64::new(0));
+        let cancellation = Arc::clone(&generation);
+        let worker = Worker::new(
+            "nextty-files",
+            Arc::clone(&wakeup),
+            move |request: ScanRequest, publish| {
+                drop(request.previous);
+                let cancelled = || cancellation.load(Ordering::Relaxed) != request.generation;
+                let result = scan(
+                    &request.directory,
+                    request.query.as_deref(),
+                    &request.expanded,
+                    &cancelled,
+                    &|scan| {
+                        publish((request.generation, scan, false));
+                    },
+                );
+                publish((request.generation, result, true));
+            },
+        )?;
+        let cancellation = Arc::clone(&preview_generation);
+        let preview_worker = Worker::new(
+            "nextty-preview",
+            Arc::clone(&wakeup),
+            move |(generation, path, previous): (u64, PathBuf, Preview), publish| {
+                drop(previous);
+                let cancelled = || cancellation.load(Ordering::Relaxed) != generation;
+                let result = read_preview(&path, &cancelled).unwrap_or_else(|error| Preview {
+                    error: Some(error),
+                    ..Preview::default()
+                });
+                publish((generation, result));
+            },
+        )?;
         let mut nav = Self {
-            wakeup: Arc::new(crate::eventfd::new()?),
+            wakeup,
             directory,
+            expanded: BTreeSet::new(),
             query: None,
             scan: Scan::default(),
             selection: 0,
-            generation: Arc::new(AtomicU64::new(0)),
+            generation,
             scan_pending: false,
-            worker: None,
+            worker,
             restore_selection: None,
             directory_selection: BTreeMap::new(),
             focus: FileFocus::List,
             preview_path: None,
             preview: Preview::default(),
             preview_scroll: 0,
-            preview_generation: Arc::new(AtomicU64::new(0)),
+            preview_generation,
             preview_pending: false,
-            preview_worker: None,
+            preview_worker,
         };
         nav.request_scan();
         Ok(nav)
@@ -177,7 +295,7 @@ impl FileNav {
 
     /// Whether a directory load, recursive search or preview is still running.
     pub fn searching(&self) -> bool {
-        self.scan_pending || self.worker.is_some() || self.preview_loading()
+        self.scan_pending || self.preview_loading()
     }
 
     pub fn focus(&self) -> FileFocus {
@@ -187,6 +305,7 @@ impl FileNav {
     pub fn focus_preview(&mut self) -> bool {
         if self.selected().is_some_and(|entry| !entry.is_dir) {
             self.focus = FileFocus::Preview;
+            self.update_preview();
             true
         } else {
             false
@@ -195,6 +314,7 @@ impl FileNav {
 
     pub fn focus_list(&mut self) {
         self.focus = FileFocus::List;
+        self.update_preview();
     }
 
     pub fn preview_lines(&self) -> &[String] {
@@ -213,7 +333,7 @@ impl FileNav {
     }
 
     pub fn preview_loading(&self) -> bool {
-        self.preview_pending || self.preview_worker.is_some()
+        self.preview_pending
     }
 
     pub fn preview_truncated(&self) -> bool {
@@ -260,7 +380,22 @@ impl FileNav {
 
     pub(crate) fn insert_query(&mut self, text: &str) {
         self.focus_list();
-        self.set_query([self.query(), text].concat());
+        match &mut self.query {
+            Some(query) if !text.is_empty() => {
+                query.push_str(text);
+                self.restore_selection = None;
+                self.request_scan();
+            }
+            None => self.set_query(text.to_owned()),
+            _ => (),
+        }
+    }
+
+    pub(crate) fn backspace_query(&mut self) {
+        if self.query.as_mut().unwrap().pop().is_some() {
+            self.restore_selection = None;
+            self.request_scan();
+        }
     }
 
     pub fn stop_search(&mut self) {
@@ -283,18 +418,36 @@ impl FileNav {
             std::env::current_dir()?.join(directory)
         };
         self.query = None;
+        self.expanded.clear();
         self.restore_selection = self.directory_selection.get(&self.directory).cloned();
         self.request_scan();
         Ok(())
     }
 
     pub fn parent(&mut self) -> bool {
-        let Some(parent) = self.directory.parent() else {
+        if let Some(entry) = self.scan.entries.get(self.selection) {
+            let path = &entry.path;
+            if self.expanded.remove(path) {
+                self.restore_selection = Some(path.clone());
+                self.request_scan();
+                return true;
+            }
+            if let Some(parent) = path.parent().filter(|parent| *parent != self.directory)
+                && let Some(index) = self
+                    .scan
+                    .entries
+                    .iter()
+                    .position(|entry| entry.path == parent)
+            {
+                self.selection = index;
+                return true;
+            }
+        }
+        let Some(parent) = self.directory.parent().map(Path::to_path_buf) else {
             return false;
         };
-        let parent = parent.to_path_buf();
-        self.remember_selection();
         self.restore_selection = Some(std::mem::replace(&mut self.directory, parent));
+        self.expanded.clear();
         self.query = None;
         self.request_scan();
         true
@@ -304,90 +457,80 @@ impl FileNav {
         let Some(entry) = self.selected().filter(|entry| entry.is_dir) else {
             return false;
         };
-        let directory = entry.path.clone();
-        self.remember_selection();
-        self.directory = directory;
+        let path = &entry.path;
+        if self.expanded.contains(path) && !self.is_search() {
+            if self
+                .scan
+                .entries
+                .get(self.selection + 1)
+                .is_some_and(|entry| entry.path.parent() == Some(path.as_path()))
+            {
+                self.move_selection(1);
+            }
+            return true;
+        }
+        let path = path.clone();
+        for directory in path
+            .ancestors()
+            .take_while(|directory| *directory != self.directory)
+        {
+            self.expanded.insert(directory.to_path_buf());
+        }
         self.query = None;
-        self.restore_selection = self.directory_selection.get(&self.directory).cloned();
+        self.restore_selection = Some(path);
         self.request_scan();
         true
     }
 
-    /// Returns an absolute, shell-quoted path, without a trailing newline.
-    pub fn selected_shell_path(&self) -> Option<Vec<u8>> {
-        self.selected()
-            .filter(|entry| !entry.is_dir)
-            .map(|entry| shell_quote(entry.path.as_os_str()))
+    pub fn entry_label<'a>(&self, entry: &'a FileEntry) -> Cow<'a, str> {
+        if self.is_search() {
+            return entry.display_path(&self.directory);
+        }
+        let depth = entry
+            .path
+            .strip_prefix(&self.directory)
+            .unwrap()
+            .components()
+            .count()
+            .saturating_sub(1);
+        let marker = if entry.is_dir {
+            if self.expanded.contains(&entry.path) {
+                ""
+            } else {
+                ""
+            }
+        } else {
+            " "
+        };
+        Cow::Owned(format!(
+            "{:indent$}{marker} {}",
+            "",
+            entry.display_name(),
+            indent = depth * 2,
+        ))
     }
 
-    /// Receives available results and starts the latest pending request; never waits.
-    /// Drain available results after a notification or navigation change.
+    /// Receives the latest available results without waiting for filesystem work.
     pub fn poll(&mut self) -> bool {
         let mut changed = false;
-        let generation = self.generation.load(Ordering::Relaxed);
-        // Unseen partial results must not pin the selection to an outdated ranking.
-        let scan = match self.worker.as_ref().map(|worker| worker.result.try_recv()) {
-            Some(Ok(scan)) => Some(scan),
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                let worker = self.worker.take().unwrap();
-                worker
-                    .handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                unreachable!("file worker exited without publishing its result");
-            }
-            _ => None,
-        };
-        let mut previous = Scan::default();
-        if let Some(scan) = scan {
-            let worker = self.worker.take().unwrap();
-            if worker.generation == generation {
-                self.publish_scan(scan);
-                self.restore_selection = None;
-            } else {
-                previous = scan;
-            }
-            changed = true;
-        } else {
-            while let Some(worker) = &self.worker {
-                let Ok(update) = worker.updates.try_recv() else {
-                    break;
-                };
-                if worker.generation == generation {
-                    self.publish_scan(update);
-                    changed = true;
-                }
-            }
-        }
-        changed |= self.start_pending((previous, Preview::default()));
-        self.update_preview();
-        let preview = match self
-            .preview_worker
-            .as_ref()
-            .map(|worker| worker.result.try_recv())
+        if let Some((generation, scan, complete)) = self.worker.take()
+            && generation == self.generation.load(Ordering::Relaxed)
         {
-            Some(Ok(preview)) => Some(preview),
-            Some(Err(mpsc::TryRecvError::Disconnected)) => {
-                let worker = self.preview_worker.take().unwrap();
-                worker
-                    .handle
-                    .join()
-                    .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
-                unreachable!("preview worker exited without publishing its result");
-            }
-            _ => None,
-        };
-        let mut previous = Preview::default();
-        if let Some(preview) = preview {
-            let worker = self.preview_worker.take().unwrap();
-            if worker.generation == self.preview_generation.load(Ordering::Relaxed) {
-                self.preview = preview;
-            } else {
-                previous = preview;
+            self.publish_scan(scan);
+            if complete {
+                self.restore_selection = None;
+                self.scan_pending = false;
             }
             changed = true;
         }
-        changed |= self.start_preview(previous);
+        self.update_preview();
+        if let Some((generation, preview)) = self.preview_worker.take()
+            && generation == self.preview_generation.load(Ordering::Relaxed)
+        {
+            self.preview = preview;
+            self.preview_pending = false;
+            changed = true;
+        }
         changed
     }
 
@@ -413,55 +556,24 @@ impl FileNav {
     }
 
     fn update_preview(&mut self) {
-        let path = self.selected().map(|entry| &entry.path);
+        let path = (self.focus == FileFocus::Preview)
+            .then(|| self.selected().map(|entry| &entry.path))
+            .flatten();
         if self.preview_path.as_ref() == path {
             return;
         }
         self.preview_path = path.cloned();
         let previous = std::mem::take(&mut self.preview);
         self.preview_scroll = 0;
-        self.preview_generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.preview_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.preview_pending = self.preview_path.is_some();
-        self.start_preview(previous);
-    }
-
-    fn start_preview(&mut self, previous: Preview) -> bool {
-        if self.preview_worker.is_some() || !self.preview_pending {
-            return false;
+        if let Some(path) = self.preview_path.clone() {
+            self.preview_worker.submit((generation, path, previous));
         }
-        self.preview_pending = false;
-        let path = self.preview_path.clone().unwrap();
-        let generation = self.preview_generation.load(Ordering::Relaxed);
-        let cancellation = Arc::clone(&self.preview_generation);
-        let wakeup = Arc::clone(&self.wakeup);
-        let (sender, result) = mpsc::sync_channel(1);
-        match thread::Builder::new()
-            .name("nextty-preview".into())
-            .spawn(move || {
-                let _wake = WakeOnDrop(wakeup);
-                let output = sender;
-                drop(previous);
-                let cancelled = || cancellation.load(Ordering::Relaxed) != generation;
-                let result = read_preview(&path, &cancelled).unwrap_or_else(|error| Preview {
-                    error: Some(error),
-                    ..Preview::default()
-                });
-                let _ = output.send(result);
-            }) {
-            Ok(handle) => {
-                self.preview_worker = Some(PreviewWorker {
-                    generation,
-                    result,
-                    handle,
-                });
-            }
-            Err(error) => self.preview.error = Some(error),
-        }
-        true
     }
 
     fn request_scan(&mut self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
         let previous = (
             std::mem::take(&mut self.scan),
             std::mem::take(&mut self.preview),
@@ -470,48 +582,13 @@ impl FileNav {
         self.focus = FileFocus::List;
         self.update_preview();
         self.scan_pending = true;
-        self.start_pending(previous);
-    }
-
-    fn start_pending(&mut self, previous: (Scan, Preview)) -> bool {
-        if self.worker.is_some() || !self.scan_pending {
-            return false;
-        }
-        self.scan_pending = false;
-        let directory = self.directory.clone();
-        let query = self.query.clone();
-        let generation = self.generation.load(Ordering::Relaxed);
-        let cancellation = Arc::clone(&self.generation);
-        let (sender, updates) = mpsc::sync_channel(1);
-        let wakeup = Arc::clone(&self.wakeup);
-        let (result_sender, result) = mpsc::sync_channel(1);
-        match thread::Builder::new()
-            .name("nextty-files".into())
-            .spawn(move || {
-                let wake = WakeOnDrop(wakeup);
-                let output = result_sender;
-                // Release old directory lists and previews off the input thread.
-                drop(previous);
-                let cancelled = || cancellation.load(Ordering::Relaxed) != generation;
-                let _ = output.send(scan(
-                    &directory,
-                    query.as_deref(),
-                    &cancelled,
-                    sender,
-                    &wake,
-                ));
-            }) {
-            Ok(handle) => {
-                self.worker = Some(Worker {
-                    generation,
-                    updates,
-                    result,
-                    handle,
-                });
-            }
-            Err(error) => self.scan.error = Some(error),
-        }
-        true
+        self.worker.submit(ScanRequest {
+            generation,
+            directory: self.directory.clone(),
+            query: self.query.clone(),
+            expanded: self.expanded.clone(),
+            previous,
+        });
     }
 }
 
@@ -529,31 +606,6 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         return Ok(Preview::default());
     }
     let metadata = fs::metadata(path)?;
-    if metadata.is_dir() {
-        let mut preview = Preview::default();
-        let mut entries = Vec::new();
-        let mut bytes = 0;
-        for entry in fs::read_dir(path)? {
-            if cancelled() {
-                return Ok(Preview::default());
-            }
-            let entry = entry?;
-            let is_dir = entry.file_type()?.is_dir();
-            let mut name = preview_text(&entry.file_name().to_string_lossy());
-            if is_dir {
-                name.push('/');
-            }
-            if entries.len() == PREVIEW_LINE_LIMIT || bytes + name.len() > PREVIEW_BYTE_LIMIT {
-                preview.truncated = true;
-                break;
-            }
-            bytes += name.len();
-            entries.push((is_dir, name));
-        }
-        entries.sort_unstable_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
-        preview.lines = entries.into_iter().map(|(_, name)| name).collect();
-        return Ok(preview);
-    }
     if !metadata.is_file() {
         return Ok(Preview {
             lines: Box::new(["Special file; preview unavailable".into()]),
@@ -655,52 +707,12 @@ fn preview_text(text: &str) -> String {
     result
 }
 
-/// Quotes Unix filename bytes for insertion into a Bash or Zsh command line.
-/// Controls use ANSI-C escapes so the interactive editor cannot treat them as keys.
-pub fn shell_quote(path: &OsStr) -> Vec<u8> {
-    if path.as_bytes().iter().any(u8::is_ascii_control) {
-        let mut quoted = b"$'".to_vec();
-        for &byte in path.as_bytes() {
-            if byte.is_ascii_control() {
-                quoted.extend_from_slice(&[
-                    b'\\',
-                    b'0' + (byte >> 6),
-                    b'0' + ((byte >> 3) & 7),
-                    b'0' + (byte & 7),
-                ]);
-            } else {
-                if matches!(byte, b'\'' | b'\\') {
-                    quoted.push(b'\\');
-                }
-                quoted.push(byte);
-            }
-        }
-        quoted.push(b'\'');
-        return quoted;
-    }
-    let bytes = path.as_bytes();
-    // Count with search and stop at the total to scan quote-free paths only once.
-    let quotes = memchr::memchr_iter(b'\'', bytes);
-    let count = quotes.clone().fold(0, |count, _| count + 1);
-    let mut quoted = Vec::with_capacity(bytes.len() + 2 + count * 3);
-    quoted.push(b'\'');
-    let mut start = 0;
-    for index in quotes.take(count) {
-        quoted.extend_from_slice(&bytes[start..index]);
-        quoted.extend_from_slice(b"'\\''");
-        start = index + 1;
-    }
-    quoted.extend_from_slice(&bytes[start..]);
-    quoted.push(b'\'');
-    quoted
-}
-
 fn scan(
     directory: &Path,
     query: Option<&str>,
+    expanded: &BTreeSet<PathBuf>,
     cancelled: &impl Fn() -> bool,
-    updates: SyncSender<Scan>,
-    wake: &WakeOnDrop,
+    publish: &impl Fn(Scan),
 ) -> Scan {
     if cancelled() {
         return Scan::default();
@@ -715,8 +727,30 @@ fn scan(
         }
     };
     match query {
-        None => list_directory(root, cancelled),
-        Some(query) => search_directory(root, directory, query, cancelled, updates, wake),
+        None if expanded.is_empty() => list_directory(root, cancelled),
+        None => {
+            let mut result = list_directory(root, cancelled);
+            let entries = std::mem::take(&mut result.entries);
+            for entry in entries {
+                let children = if entry.is_dir && expanded.contains(&entry.path) {
+                    Some(scan(&entry.path, None, expanded, cancelled, publish))
+                } else {
+                    None
+                };
+                result.entries.push(entry);
+                if let Some(mut children) = children {
+                    result.entries.append(&mut children.entries);
+                    if result.error.is_none() {
+                        result.error = children.error;
+                    }
+                }
+                if cancelled() {
+                    return Scan::default();
+                }
+            }
+            result
+        }
+        Some(query) => search_directory(root, directory, query, cancelled, publish),
     }
 }
 
@@ -759,8 +793,7 @@ fn search_directory(
     directory: &Path,
     query: &str,
     cancelled: &impl Fn() -> bool,
-    updates: SyncSender<Scan>,
-    wake: &WakeOnDrop,
+    publish: &impl Fn(Scan),
 ) -> Scan {
     let pattern: Vec<char> = query.to_lowercase().chars().collect();
     let ascii_pattern = pattern.iter().all(|ch| ch.is_ascii());
@@ -840,11 +873,8 @@ fn search_directory(
                 truncated: scan.truncated,
                 ..Scan::default()
             };
-            // A slow front end retains at most one snapshot. The joined result is final.
-            if updates.try_send(update).is_ok() {
-                dirty = false;
-                wake.notify();
-            }
+            publish(update);
+            dirty = false;
             last_update = Instant::now();
         }
     }
@@ -910,8 +940,8 @@ mod tests {
     use std::ffi::OsString;
     use std::os::unix::ffi::OsStringExt;
     use std::os::unix::fs::symlink;
-    use std::process::Command;
     use std::sync::atomic::AtomicUsize;
+    use std::sync::mpsc;
 
     static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
 
@@ -978,7 +1008,8 @@ mod tests {
         nav.move_selection(1);
         assert!(nav.enter_selected());
         finish(&mut nav);
-        assert_eq!(nav.entries()[0].display_name(), "child");
+        assert_eq!(nav.entries()[2].display_name(), "child");
+        assert!(nav.entry_label(&nav.entries()[2]).starts_with("    "));
         assert!(nav.parent());
         finish(&mut nav);
         assert_eq!(nav.directory(), fixture.0);
@@ -1050,29 +1081,27 @@ mod tests {
     }
 
     #[test]
-    fn completed_search_takes_precedence_over_an_unseen_partial_selection() {
+    fn completed_search_keeps_final_ranking_without_polling_partial_results() {
         let fixture = Fixture::new();
         let best = fixture.file("needle");
-        let partial = fixture.file("long-path-to-needle");
+        fixture.file("long-path-to-needle");
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
         nav.set_query("needle".into());
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !nav.worker.as_ref().unwrap().handle.is_finished() {
+        while !nav
+            .worker
+            .shared
+            .0
+            .lock()
+            .unwrap()
+            .result
+            .as_ref()
+            .is_some_and(|(_, _, complete)| *complete)
+        {
             assert!(Instant::now() < deadline);
             thread::sleep(Duration::from_millis(1));
         }
-        let (sender, updates) = mpsc::sync_channel(1);
-        sender
-            .send(Scan {
-                entries: vec![FileEntry {
-                    path: partial,
-                    is_dir: false,
-                }],
-                ..Scan::default()
-            })
-            .unwrap();
-        nav.worker.as_mut().unwrap().updates = updates;
         nav.poll();
         assert_eq!(nav.entries().len(), 2);
         assert_eq!(nav.selected().unwrap().path, best);
@@ -1121,7 +1150,6 @@ mod tests {
         }
         let directory = fixture.0.clone();
         let (sender, receiver) = mpsc::sync_channel(1);
-        let wake = WakeOnDrop(Arc::new(crate::eventfd::new().unwrap()));
         let worker = thread::spawn(move || {
             search_directory(
                 fs::read_dir(&directory).unwrap(),
@@ -1132,8 +1160,9 @@ mod tests {
                     thread::sleep(Duration::from_millis(2));
                     false
                 },
-                sender,
-                &wake,
+                &|update| {
+                    let _ = sender.try_send(update);
+                },
             )
         });
         let partial = receiver.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1142,62 +1171,6 @@ mod tests {
         let complete = worker.join().unwrap();
         assert_eq!(complete.entries.len(), 80);
         assert!(complete.error.is_none());
-    }
-
-    #[test]
-    fn shell_paths_round_trip_original_bytes_without_execution_or_newline() {
-        let fixture = Fixture::new();
-        let name = OsString::from_vec(
-            "空 格'\\\n\r\x1b\x7f\t$(echo nope);"
-                .as_bytes()
-                .iter()
-                .copied()
-                .chain([0xff])
-                .collect(),
-        );
-        let path = fixture.file(Path::new(&name));
-        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
-        finish(&mut nav);
-        let quoted = nav.selected_shell_path().unwrap();
-        assert!(quoted.iter().all(|byte| !byte.is_ascii_control()));
-        let mut script = b"printf '%s' ".to_vec();
-        script.extend_from_slice(&quoted);
-        for shell in ["/bin/bash", "/bin/zsh"] {
-            let output = Command::new(shell)
-                .arg("-c")
-                .arg(OsString::from_vec(script.clone()))
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{shell}");
-            assert_eq!(output.stdout, path.as_os_str().as_bytes(), "{shell}");
-            assert!(output.stderr.is_empty(), "{shell}");
-        }
-    }
-
-    #[test]
-    fn ordinary_shell_paths_keep_posix_single_quotes() {
-        assert_eq!(
-            shell_quote(OsStr::new("空 格'\\file")),
-            "'空 格'\\''\\file'".as_bytes()
-        );
-    }
-
-    #[test]
-    fn every_ascii_control_is_encoded_without_raw_key_bytes() {
-        let bytes: Vec<_> = (1..=31).chain([127]).collect();
-        let quoted = shell_quote(OsStr::from_bytes(&bytes));
-        assert!(quoted.iter().all(|byte| !byte.is_ascii_control()));
-        let mut script = b"printf '%s' ".to_vec();
-        script.extend_from_slice(&quoted);
-        for shell in ["/bin/bash", "/bin/zsh"] {
-            let output = Command::new(shell)
-                .arg("-c")
-                .arg(OsString::from_vec(script.clone()))
-                .output()
-                .unwrap();
-            assert!(output.status.success(), "{shell}");
-            assert_eq!(output.stdout, bytes, "{shell}");
-        }
     }
 
     #[test]
@@ -1210,26 +1183,30 @@ mod tests {
     }
 
     #[test]
-    fn returning_to_parent_selects_the_directory_and_reentry_restores_its_file() {
+    fn tree_expansion_and_collapse_keep_the_root_and_parent_selected() {
         let fixture = Fixture::new();
-        fixture.file("a-dir/a-child");
+        let first = fixture.file("a-dir/a-child");
         let wanted = fixture.file("a-dir/z-child");
         fixture.file("b-dir/other");
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
-        assert_eq!(nav.preview_lines(), ["a-child", "z-child"]);
-        assert!(!nav.focus_preview());
+        assert!(nav.preview_lines().is_empty());
+        assert!(!nav.preview_loading());
         assert!(nav.enter_selected());
         finish(&mut nav);
-        nav.move_selection(1);
-        finish(&mut nav);
+        assert_eq!(nav.directory(), fixture.0);
+        assert_eq!(nav.entries().len(), 4);
+        nav.move_selection(2);
         assert_eq!(nav.selected().unwrap().path, wanted);
         assert!(nav.parent());
-        finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, fixture.0.join("a-dir"));
+        assert!(nav.parent());
+        finish(&mut nav);
+        assert_eq!(nav.entries().len(), 2);
         assert!(nav.enter_selected());
         finish(&mut nav);
-        assert_eq!(nav.selected().unwrap().path, wanted);
+        assert!(nav.enter_selected());
+        assert_eq!(nav.selected().unwrap().path, first);
     }
 
     #[test]
@@ -1246,7 +1223,11 @@ mod tests {
         nav.refresh();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
+        assert!(nav.preview_lines().is_empty());
+        assert!(nav.focus_preview());
+        finish(&mut nav);
         assert_eq!(nav.preview_lines(), ["selected contents"]);
+        nav.focus_list();
         nav.start_search();
         finish(&mut nav);
         nav.move_selection(2);
@@ -1271,11 +1252,12 @@ mod tests {
         assert_eq!(nav.focus(), FileFocus::List);
         assert!(nav.focus_preview());
         assert_eq!(nav.focus(), FileFocus::Preview);
+        finish(&mut nav);
         nav.scroll_preview(200, 2);
         assert_eq!(nav.preview_scroll(), 3);
         nav.focus_list();
         assert_eq!(nav.selected().unwrap().path, path);
-        assert_eq!(nav.preview_scroll(), 3);
+        assert_eq!(nav.preview_scroll(), 0);
         assert!(nav.focus_preview());
         nav.scroll_preview(-200, 2);
         assert_eq!(nav.preview_scroll(), 0);
@@ -1317,6 +1299,8 @@ mod tests {
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, fifo);
+        assert!(nav.focus_preview());
+        finish(&mut nav);
         assert_eq!(nav.preview_lines(), ["Special file; preview unavailable"]);
         assert!(nav.preview_error().is_none());
         nav.move_selection(1);
@@ -1345,6 +1329,9 @@ mod tests {
         nav.set_query("中needle".into());
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
+        assert!(nav.preview_lines().is_empty());
+        assert!(nav.focus_preview());
+        finish(&mut nav);
         assert_eq!(nav.preview_lines(), ["new contents"]);
         assert_eq!(nav.preview_scroll(), 0);
         assert!(nav.preview_error().is_none());
