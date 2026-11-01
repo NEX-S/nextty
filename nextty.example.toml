@@ -9,7 +9,7 @@ background_opacity = 1.0
 
 # GUI tabline background opacity, independent of terminal background opacity.
 # Tabs, text, status dots, and controls stay opaque. Does not affect TUI.
-tab_bar_opacity = 1.0
+tab_bar_opacity = 0.7
 
 # Tab shape for both frontends: "angled" or "flat".
 tab_style = "angled"

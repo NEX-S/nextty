@@ -32,7 +32,7 @@ impl Default for Config {
             foreground: 0xcccccc,
             background: 0x202020,
             background_opacity: 1.,
-            tab_bar_opacity: 1.,
+            tab_bar_opacity: 0.7,
             tab_style: TabStyle::Angled,
             history_limit_bytes: DEFAULT_HISTORY_LIMIT,
             base_url: String::new(),
@@ -204,7 +204,7 @@ model = "deepseek-flash""##,
         assert_eq!(config.foreground, 0xabcdef);
         assert_eq!(config.background, Config::default().background);
         assert_eq!(config.background_opacity, 0.75);
-        assert_eq!(config.tab_bar_opacity, 1.);
+        assert_eq!(config.tab_bar_opacity, 0.7);
         assert_eq!(config.base_url, "http://localhost:8080/anthropic");
         assert_eq!(config.model, "deepseek-flash");
     }
