@@ -121,11 +121,11 @@ impl TextCache {
     }
 }
 
-const CHROME: u32 = 0x1c2021ff;
-const BORDER: u32 = 0x343b3dff;
-const INK: u32 = 0xd4d9d8ff;
-const MUTED: u32 = 0x889391ff;
-const ACCENT: u32 = 0xb5d2a2ff;
+const CHROME: u32 = (crate::panel::CHROME << 8) | 255;
+const BORDER: u32 = (crate::panel::BORDER << 8) | 255;
+const INK: u32 = (crate::panel::INK << 8) | 255;
+const MUTED: u32 = (crate::panel::MUTED << 8) | 255;
+const ACCENT: u32 = (crate::panel::ACCENT << 8) | 255;
 const PADDING: f32 = 16.;
 const TERMINAL_PADDING: f32 = 4.;
 

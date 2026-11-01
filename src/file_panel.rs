@@ -92,22 +92,28 @@ pub(crate) fn list(files: &FileNav, rect: Rect, preedit: &str, config: &Config) 
         .enumerate()
     {
         let y = layout.body.y + row as u16;
+        let selected = layout.first + row == files.selection();
         grid.text(
             rect.x + 1,
             y,
             rect.cols.saturating_sub(2),
             &files.entry_label(entry),
-            foreground,
+            if selected {
+                config.foreground
+            } else {
+                foreground
+            },
             config.background,
         );
-        if layout.first + row == files.selection() {
+        if selected {
+            grid.text(rect.x, y, 1, "▎", crate::panel::ACCENT, config.background);
             grid.recolor(
                 Rect {
                     y,
                     rows: 1,
                     ..layout.body
                 },
-                mix_color(0xb5d2a2, config.background, 32),
+                mix_color(config.foreground, config.background, 24),
             );
         }
     }
@@ -130,9 +136,16 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
     let columns = rect.cols.saturating_sub(2);
     let title = files
         .selected()
-        .map(|entry| entry.path.to_string_lossy())
+        .map(|entry| entry.display_name())
         .unwrap_or_default();
-    grid.text(rect.x + 1, rect.y, columns, &title, 0xb5d2a2, background);
+    grid.text(
+        rect.x + 1,
+        rect.y,
+        columns,
+        &title,
+        config.foreground,
+        background,
+    );
     let error = files.preview_error().map(ToString::to_string);
     for row in 0..rect.rows.saturating_sub(2) {
         let text = match (row, files.preview_loading(), error.as_deref()) {

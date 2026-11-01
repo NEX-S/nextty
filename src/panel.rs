@@ -4,6 +4,15 @@ use crate::width::{fit_label, scalar_width};
 use crate::workspace::Rect;
 use std::io::{self, Write};
 
+pub(crate) const BACKGROUND: u32 = 0x202020;
+pub(crate) const CHROME: u32 = 0x191919;
+pub(crate) const BORDER: u32 = 0x303030;
+pub(crate) const INK: u32 = 0xcccccc;
+pub(crate) const MUTED: u32 = 0x969696;
+pub(crate) const SELECTED: u32 = 0x303830;
+pub(crate) const HOVER: u32 = 0x343434;
+pub(crate) const ACCENT: u32 = 0xb5d2a2;
+
 pub(crate) struct Grid {
     pub rect: Rect,
     pub rows: Vec<Row>,

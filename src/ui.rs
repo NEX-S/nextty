@@ -447,6 +447,65 @@ impl Ui {
             .unwrap();
     }
 
+    pub fn help_view(
+        &mut self,
+        rect: crate::workspace::Rect,
+        config: &crate::config::Config,
+    ) -> crate::panel::Grid {
+        let background = mix_color(config.foreground, config.background, 9);
+        let muted = mix_color(config.foreground, config.background, 176);
+        let mut grid = crate::panel::Grid::new(rect, config.foreground, background);
+        let columns = rect.cols.saturating_sub(4);
+        grid.text(
+            rect.x + 2,
+            rect.y,
+            columns,
+            "Keyboard shortcuts",
+            config.foreground,
+            background,
+        );
+        let count = usize::from(rect.rows.saturating_sub(4));
+        self.help_scroll = self
+            .help_scroll
+            .min(self.help_lines().count().saturating_sub(count));
+        for (row, line) in self
+            .help_lines()
+            .skip(self.help_scroll)
+            .take(count)
+            .enumerate()
+        {
+            let y = rect.y + 2 + row as u16;
+            if let Some((key, description)) = line.split_once("  ") {
+                let key_width = 16.min(columns);
+                grid.text(
+                    rect.x + 2,
+                    y,
+                    key_width,
+                    key.trim(),
+                    crate::panel::ACCENT,
+                    background,
+                );
+                grid.text(
+                    rect.x + 2 + key_width,
+                    y,
+                    columns.saturating_sub(key_width),
+                    description.trim(),
+                    muted,
+                    background,
+                );
+            }
+        }
+        grid.text(
+            rect.x + 2,
+            rect.y + rect.rows.saturating_sub(1),
+            columns,
+            "↑↓ scroll   Esc close",
+            muted,
+            background,
+        );
+        grid
+    }
+
     pub fn help_lines(&self) -> impl Clone + Iterator<Item = &'static str> + use<> {
         let other_focus = self.resources.open || self.files_open;
         #[cfg(feature = "agent")]

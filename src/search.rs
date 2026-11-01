@@ -2,7 +2,6 @@ use crate::core::{Flags, Row};
 use crate::input::keysym;
 use crate::workspace::{Action, Client, PaneId};
 use std::collections::VecDeque;
-use std::fmt::Write;
 use std::io;
 
 const MATCH_LIMIT: usize = 10_000;
@@ -295,26 +294,54 @@ impl Search {
         self.query.replace_range(range, "");
         changed
     }
-    pub fn label(&self, preedit: &str) -> String {
-        let mut label = format!(
-            "⌕ {}{}▏{}  ",
-            &self.query[..self.cursor],
-            preedit,
-            &self.query[self.cursor..]
-        );
-        if self.pending {
-            label.push_str("searching");
+    pub fn display(&self, preedit: &str, columns: usize) -> (String, usize) {
+        use crate::width::{fit_label, scalar_width, text_width};
+        let mut status = if self.pending {
+            "searching".into()
         } else {
-            let index = if self.count == 0 { 0 } else { self.index + 1 };
-            write!(label, "{index}/{}", self.count).unwrap();
-        }
+            format!(
+                "{}/{}",
+                if self.count == 0 { 0 } else { self.index + 1 },
+                self.count
+            )
+        };
         if self.truncated {
-            label.push_str("+ (partial)");
+            status.push('+');
         }
         if !self.controller {
-            label.push_str(" (read-only)");
+            status.push_str(if columns >= 40 { " read-only" } else { " RO" });
         }
-        label
+        let status = fit_label(&status, (columns.saturating_sub(5).min(columns / 2)) as u16);
+        let budget = columns.saturating_sub(text_width(&status) + 4);
+        let before = format!("{}{preedit}", &self.query[..self.cursor]);
+        let mut width = 0;
+        let start = before
+            .char_indices()
+            .rev()
+            .take_while(|(_, ch)| {
+                let next = width + usize::from(scalar_width(*ch));
+                if next > budget.saturating_sub(1) {
+                    false
+                } else {
+                    width = next;
+                    true
+                }
+            })
+            .last()
+            .map_or(before.len(), |(index, _)| index);
+        let before = &before[start..];
+        let after = fit_label(
+            &self.query[self.cursor..],
+            budget.saturating_sub(width + 1) as u16,
+        );
+        let query = format!("⌕ {before}▏{after}");
+        let caret = 2 + text_width(before);
+        let padding = columns.saturating_sub(text_width(&query) + text_width(&status));
+        let label = format!("{query}{}{status}", " ".repeat(padding));
+        (
+            fit_label(&label, columns as u16).into_owned(),
+            caret.min(columns.saturating_sub(1)),
+        )
     }
 }
 
@@ -330,8 +357,14 @@ mod tests {
             controller: true,
             ..Search::default()
         };
-        assert_eq!(search.label("预"), "⌕ A▏中预▏B  0/0");
-        assert_eq!(search.label(""), "⌕ A▏中▏B  0/0");
+        let (label, caret) = search.display("预", 40);
+        assert!(label.starts_with("⌕ A▏中预▏B"));
+        assert!(label.ends_with("0/0"));
+        assert_eq!(caret, 8);
+        let (label, caret) = search.display("", 12);
+        assert!(label.ends_with("0/0"));
+        assert!(crate::width::text_width(&label) <= 12);
+        assert!(caret < 12);
     }
     #[test]
     fn literal_matches_preserve_wide_combining_and_soft_wrapped_cell_ranges() {

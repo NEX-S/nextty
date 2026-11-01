@@ -767,14 +767,9 @@ impl AgentPainter<'_> {
                 .grid
                 .text(0, y, self.size.num_cols, "", self.config.foreground, bg);
         }
-        self.frame.grid.text(
-            2,
-            1,
-            columns,
-            &format!("[ {} ]", item.label),
-            self.config.foreground,
-            bg,
-        );
+        self.frame
+            .grid
+            .text(2, 1, columns, &item.label, self.config.foreground, bg);
         self.frame
             .grid
             .text(self.size.num_cols.saturating_sub(4), 1, 3, " × ", muted, bg);
@@ -792,8 +787,8 @@ impl AgentPainter<'_> {
             2,
             self.size.num_lines.saturating_sub(2),
             columns,
-            " ⧉   Esc back",
-            self.config.foreground,
+            " ⧉   Esc close",
+            muted,
             bg,
         );
         self.frame.hits.clear();

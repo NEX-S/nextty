@@ -25,7 +25,7 @@ impl WorkspaceView {
             "›",
             cell.0,
             0.,
-            if controller { 0x9c8fdcff } else { 0xfe9b30ff },
+            if controller { MUTED } else { 0xfe9b30ff },
         )?;
         let (tabs, label, before, after) = crate::workspace::tab_chrome(snapshot, columns, label);
         let mut end = 3;
@@ -69,7 +69,11 @@ impl WorkspaceView {
                 &fit(&tab.title, usize::from(columns - 8)),
                 x + cell.0 * 4.,
                 0.,
-                if active { 0x949494ff } else { 0x606060ff },
+                if active || hovered {
+                    (self.config.foreground << 8) | 255
+                } else {
+                    MUTED
+                },
             )?;
             let close_x = x + w - cell.0 * 3.;
             let close_hovered = self.pointer.0 >= close_x - cell.0
@@ -84,18 +88,15 @@ impl WorkspaceView {
                 "×",
                 close_x,
                 0.,
-                if close_hovered {
-                    0xe87575ff
-                } else if active {
-                    0x9c8fdcff
-                } else {
-                    0x404040ff
-                },
+                if close_hovered { INK } else { MUTED },
             )?;
             self.control_hits.push(GuiHit {
                 bounds: (close_x - cell.0, 0., cell.0 * 3., layout.top),
                 action: GuiAction::CloseTab(tab.id),
             });
+            if active && self.config.tab_style == crate::config::TabStyle::Flat {
+                self.renderer.rect(x, cell.1 - 2., w, 1., ACCENT, false);
+            }
             self.tab_hits.push((x, x + w, index));
             end = column + columns + 1;
         }
@@ -199,7 +200,7 @@ impl WorkspaceView {
         let hovered = GuiHit { bounds, action }.contains(self.pointer);
         if hovered {
             let underline = match action {
-                GuiAction::CloseTab(_) | GuiAction::Close => Some(0xe87575ff),
+                GuiAction::CloseTab(_) | GuiAction::Close => Some(MUTED),
                 GuiAction::NewTab
                 | GuiAction::Tab(_)
                 | GuiAction::Minimize
@@ -218,8 +219,14 @@ impl WorkspaceView {
                 );
                 return;
             }
-            self.renderer
-                .rect(bounds.0, bounds.1, bounds.2, bounds.3, 0x353e35ff, false);
+            self.renderer.rect(
+                bounds.0,
+                bounds.1,
+                bounds.2,
+                bounds.3,
+                (crate::panel::HOVER << 8) | 255,
+                false,
+            );
         }
     }
     pub(super) fn draw_scrollbars(&mut self) -> Result<()> {
@@ -326,10 +333,14 @@ impl WorkspaceView {
             let y = top + text.y as f32 * self.cell.1;
             let width = f32::from(text.width) * self.cell.0;
             self.renderer.clip(x, y, width, self.cell.1)?;
-            if text.selected || text.highlighted || text.focused && self.ui.focus == Focus::Monitor
-            {
+            let background = match text.emphasis(self.ui.focus == Focus::Monitor) {
+                crate::monitor::Emphasis::Selected => Some(crate::panel::SELECTED),
+                crate::monitor::Emphasis::Highlighted => Some(crate::panel::HOVER),
+                crate::monitor::Emphasis::None => None,
+            };
+            if let Some(background) = background {
                 self.renderer
-                    .rect(x, y, width, self.cell.1, 0x29322bff, false);
+                    .rect(x, y, width, self.cell.1, (background << 8) | 255, false);
             }
             self.text.draw(
                 &self.renderer,
@@ -364,7 +375,7 @@ impl WorkspaceView {
             layout.width,
             layout.height - layout.footer,
         )?;
-        self.renderer.clear(CHROME)?;
+        self.renderer.clear((crate::panel::BACKGROUND << 8) | 255)?;
         self.renderer
             .rect(0., layout.footer, layout.width, 1., BORDER, false);
         let summary_y = layout.height - self.cell.1 - 6.;
@@ -399,8 +410,14 @@ impl WorkspaceView {
                 self.control_hits.push(GuiHit { bounds, action });
             }
             if text.emphasis(self.ui.focus == Focus::Monitor) != crate::monitor::Emphasis::None {
-                self.renderer
-                    .rect(x, summary_y, bounds.2, self.cell.1, 0x29322bff, false);
+                self.renderer.rect(
+                    x,
+                    summary_y,
+                    bounds.2,
+                    self.cell.1,
+                    (crate::panel::SELECTED << 8) | 255,
+                    false,
+                );
             }
             self.text.draw(
                 &self.renderer,
@@ -453,56 +470,32 @@ impl WorkspaceView {
         }
     }
     pub(super) fn draw_help(&mut self, layout: GuiLayout) -> Result<()> {
-        let lines = self.ui.help_lines();
-        let padding = self.cell.0;
-        let w = (self.cell.0 * 72.).min((layout.width - padding * 2.).max(self.cell.0));
-        let columns = ((w - padding * 2.) / self.cell.0).max(1.) as u16;
-        let rows = ((layout.height - self.cell.1 * 4.) / self.cell.1).max(1.) as usize;
-        let total = lines.clone().count();
-        let count = total.min(rows);
-        self.ui.help_scroll = self.ui.help_scroll.min(total.saturating_sub(count));
-        let h = self.cell.1 * (count + 3) as f32;
-        let x = (layout.width - w) * 0.5;
-        let y = (layout.height - h) * 0.5;
+        let cols = ((layout.width / self.cell.0).floor() as u16)
+            .saturating_sub(4)
+            .min(78);
+        let rows = (self.ui.help_lines().count() as u16 + 4)
+            .min(((layout.height / self.cell.1).floor() as u16).saturating_sub(2));
+        let rect = crate::workspace::Rect {
+            x: ((layout.width / self.cell.0).floor() as u16 - cols) / 2,
+            y: ((layout.height / self.cell.1).floor() as u16 - rows) / 2,
+            cols,
+            rows,
+        };
         self.renderer.clip(0., 0., layout.width, layout.height)?;
         self.renderer
             .rect(0., 0., layout.width, layout.height, 0x00000088, false);
-        self.renderer.rect(x, y, w, h, CHROME, false);
-        self.renderer.clip(x, y, w, h)?;
-        self.text.draw(
-            &self.renderer,
-            "KEYS",
-            x + padding,
-            y + self.cell.1 * 0.5,
-            ACCENT,
-        )?;
-        for (row, line) in lines.skip(self.ui.help_scroll).take(count).enumerate() {
-            self.text.draw(
-                &self.renderer,
-                &fit_label(line, columns),
-                x + padding,
-                y + self.cell.1 * (row as f32 + 1.5),
-                INK,
-            )?;
-        }
-        let label = " ↑↓ scroll · Esc close ";
-        let close_w = text_width(label) as f32 * self.cell.0;
-        self.control_feedback(
-            (x + w - close_w - padding, y, close_w, self.cell.1 * 1.5),
-            GuiAction::DismissHelp,
-        );
-        self.text.draw(
-            &self.renderer,
-            label,
-            x + w - close_w - padding,
-            y + self.cell.1 * 0.5,
-            MUTED,
-        )?;
+        let grid = self.ui.help_view(rect, &self.config);
+        self.draw_panel(&grid)?;
         self.control_hits.push(GuiHit {
-            bounds: (x + w - close_w - padding, y, close_w, self.cell.1 * 1.5),
+            bounds: (
+                f32::from(rect.x) * self.cell.0,
+                f32::from(rect.y + rows.saturating_sub(1)) * self.cell.1,
+                f32::from(cols) * self.cell.0,
+                self.cell.1,
+            ),
             action: GuiAction::DismissHelp,
         });
-        self.renderer.clip(0., 0., 0., 0.)
+        Ok(())
     }
     pub(super) fn draw_search(&mut self, layout: GuiLayout) -> Result<()> {
         let Some(pane) = self.client.snapshot().and_then(|snapshot| {
@@ -520,7 +513,7 @@ impl WorkspaceView {
         let columns = pane.rect.cols.saturating_sub(2);
         self.renderer.clip(x, y, width, self.cell.1)?;
         self.renderer.rect(x, y, width, self.cell.1, CHROME, false);
-        let label = self.ui.search.label(&self.preedit);
+        let (label, caret) = self.ui.search.display(&self.preedit, usize::from(columns));
         self.text.draw(
             &self.renderer,
             &fit_label(&label, columns),
@@ -529,9 +522,6 @@ impl WorkspaceView {
             INK,
         )?;
         self.renderer.rect(x, y, width, 1., BORDER, false);
-        let caret = text_width("⌕ ")
-            + text_width(&self.ui.search.query[..self.ui.search.cursor])
-            + text_width(&self.preedit);
         self.window.cursor_rect(
             (x + self.cell.0 * (1 + caret.min(usize::from(columns))) as f32) as i32,
             y as i32,
@@ -546,7 +536,8 @@ impl WorkspaceView {
         let (x, y, w, h) = rects[0];
         let padding = self.cell.0.min(w * 0.1);
         let columns = ((w - padding * 2.) / self.cell.0) as usize;
-        self.renderer.rect(x, y, w, h, 0x404040ff, false);
+        self.renderer
+            .rect(x, y, w, h, (crate::panel::BORDER << 8) | 255, false);
         self.renderer.rect(
             x + 1.,
             y + 1.,
@@ -586,7 +577,7 @@ impl WorkspaceView {
             ),
             x + padding,
             y + h * 0.22,
-            0x888888ff,
+            MUTED,
         )?;
         let name = if name
             .chars()
@@ -608,7 +599,7 @@ impl WorkspaceView {
             ),
             x + padding,
             y + h * 0.36,
-            0x888888ff,
+            MUTED,
         )?;
         for ((terminate, label), &(bx, by, bw, bh)) in [
             (
@@ -622,9 +613,9 @@ impl WorkspaceView {
             (
                 false,
                 if prompt.tab.is_some() {
-                    "Cancel (default)"
+                    "Cancel"
                 } else {
-                    "Keep running (default)"
+                    "Keep running"
                 },
             ),
         ]
@@ -648,7 +639,11 @@ impl WorkspaceView {
                     by,
                     bw,
                     bh,
-                    if terminate { 0x633534ff } else { 0x353e35ff },
+                    if terminate {
+                        0x633534ff
+                    } else {
+                        (crate::panel::HOVER << 8) | 255
+                    },
                     false,
                 );
             }
@@ -666,7 +661,7 @@ impl WorkspaceView {
             &fit("Enter: confirm · Tab/←/→: select · Esc: cancel", columns),
             x + padding,
             y + h * 0.83,
-            0x666666ff,
+            MUTED,
         )?;
         self.renderer.clip(0., 0., 0., 0.)
     }

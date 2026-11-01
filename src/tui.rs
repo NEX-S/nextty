@@ -775,7 +775,7 @@ impl Frontend {
                 top,
                 self.size.num_cols,
                 &"─".repeat(usize::from(self.size.num_cols)),
-                0x363d38,
+                crate::panel::BORDER,
                 BACKGROUND,
             )?;
             let origin = i32::from(top) + 1;
@@ -854,8 +854,8 @@ impl Frontend {
                         &text.text,
                         text.color,
                         match text.emphasis(self.ui.focus == Focus::Monitor) {
-                            Emphasis::Selected => 0x29322b,
-                            Emphasis::Highlighted => 0x343c34,
+                            Emphasis::Selected => crate::panel::SELECTED,
+                            Emphasis::Highlighted => crate::panel::HOVER,
                             Emphasis::None => BACKGROUND,
                         },
                     )?;
@@ -886,7 +886,7 @@ impl Frontend {
                 &text.text,
                 text.color,
                 if hovered || text.emphasis(self.ui.focus == Focus::Monitor) != Emphasis::None {
-                    0x343c34
+                    crate::panel::HOVER
                 } else {
                     BACKGROUND
                 },
@@ -999,19 +999,18 @@ impl Frontend {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         if self.ui.search.open {
-            return write!(
-                output,
-                "\x1b[1;{}H\x1b[?1l\x1b>\x1b[?25h",
-                (text_width(&self.ui.search.query[..self.ui.search.cursor]) + text_width("⌕ ") + 1)
-                    .min(usize::from(self.size.num_cols))
-            );
+            let (_, caret) = self
+                .ui
+                .search
+                .display("", usize::from(self.size.num_cols.saturating_sub(2)));
+            return write!(output, "\x1b[1;{}H\x1b[?1l\x1b>\x1b[?25h", caret + 2);
         }
 
         if self.ui.resources.open && (self.ui.focus == Focus::Monitor) {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
 
-        if self.ui.files_open {
+        if self.ui.files_open && self.ui.focus == Focus::Files {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         #[cfg(feature = "agent")]
@@ -1163,6 +1162,7 @@ impl Frontend {
     }
 
     fn input(&mut self, event: Input) -> io::Result<()> {
+        let close_rect = self.close_rect();
         if let Some(prompt) = self.ui.close_prompt.as_mut() {
             let tab = prompt.tab.unwrap();
             match &event {
@@ -1181,13 +1181,13 @@ impl Frontend {
                 Input::Mouse(mouse)
                     if mouse.code & 3 == 0
                         && !mouse.release
-                        && mouse.row == self.size.num_lines / 2 + 1 =>
+                        && mouse.row == close_rect.y + close_rect.rows.saturating_sub(1) =>
                 {
-                    let left = (self.size.num_cols - self.size.num_cols.min(64)) / 2;
-                    if mouse.column >= left && mouse.column < left.saturating_add(16) {
+                    let left = close_rect.x + 2;
+                    if mouse.column >= left && mouse.column < left.saturating_add(10) {
                         self.ui.close_prompt = None;
-                    } else if mouse.column >= left.saturating_add(16)
-                        && mouse.column < left.saturating_add(32)
+                    } else if mouse.column >= left.saturating_add(12)
+                        && mouse.column < left.saturating_add(24)
                     {
                         self.client.send(Action::CloseTab(tab))?;
                         self.ui.close_prompt = None;
@@ -1753,7 +1753,7 @@ impl Frontend {
     fn help_rect(&self) -> Rect {
         let cols = self.size.num_cols.saturating_sub(4).min(78);
         let rows =
-            (self.ui.help_lines().count() as u16 + 3).min(self.size.num_lines.saturating_sub(2));
+            (self.ui.help_lines().count() as u16 + 4).min(self.size.num_lines.saturating_sub(2));
         Rect {
             x: (self.size.num_cols - cols) / 2,
             y: (self.size.num_lines - rows) / 2,
@@ -1763,13 +1763,13 @@ impl Frontend {
     }
 
     fn close_rect(&self) -> Rect {
-        let cols = self.size.num_cols.min(64);
-        let y = (self.size.num_lines / 2).saturating_sub(1);
+        let cols = self.size.num_cols.saturating_sub(4).min(64);
+        let rows = 7.min(self.size.num_lines.saturating_sub(2));
         Rect {
             x: (self.size.num_cols - cols) / 2,
-            y,
+            y: (self.size.num_lines - rows) / 2,
             cols,
-            rows: 3.min(self.size.num_lines - y),
+            rows,
         }
     }
 
@@ -1931,88 +1931,103 @@ impl Frontend {
             self.draw_files(output)?;
         }
         if self.ui.search.open {
+            let (label, _) = self
+                .ui
+                .search
+                .display("", usize::from(self.size.num_cols.saturating_sub(2)));
             draw_text(
                 output,
                 0,
                 0,
                 self.size.num_cols,
-                &self.ui.search.label(""),
-                0xb1c99c,
-                0x29322b,
+                "",
+                self.config.foreground,
+                crate::panel::CHROME,
+            )?;
+            draw_text(
+                output,
+                1,
+                0,
+                self.size.num_cols.saturating_sub(2),
+                &label,
+                self.config.foreground,
+                crate::panel::CHROME,
             )?;
         }
         if self.ui.help {
-            let Rect {
-                x,
-                y,
-                cols: width,
-                rows: height,
-            } = self.help_rect();
-            let lines = self.ui.help_lines();
-            for row in 0..height {
-                draw_text(output, x, y + row, width, "", 0xcbd0c9, 0x29322b)?;
-            }
-            draw_text(
-                output,
-                x + 1,
-                y,
-                width.saturating_sub(2),
-                "KEYS · ↑↓ scroll · Esc back",
-                0xb1c99c,
-                0x29322b,
-            )?;
-            self.ui.help_scroll = self.ui.help_scroll.min(
-                lines
-                    .clone()
-                    .count()
-                    .saturating_sub(height.saturating_sub(2) as usize),
-            );
-            for (index, line) in lines
-                .skip(self.ui.help_scroll)
-                .take(height.saturating_sub(2) as usize)
-                .enumerate()
-            {
-                draw_text(
-                    output,
-                    x + 1,
-                    y + index as u16 + 2,
-                    width.saturating_sub(2),
-                    line,
-                    0xcbd0c9,
-                    0x29322b,
-                )?;
-            }
+            self.ui
+                .help_view(self.help_rect(), &self.config)
+                .ansi(output, None, &[])?;
         }
         if let Some(prompt) = self.ui.close_prompt {
-            let Rect {
-                x,
-                y,
-                cols: width,
-                rows: height,
-            } = self.close_rect();
-            for (offset, text) in [
-                "Close tab? Programs are running or state is unknown.",
-                "Closing terminates every pane in this tab.",
-                if prompt.terminate {
-                    "    Cancel       [ Close tab ]"
-                } else {
-                    "  [ Cancel ]       Close tab"
-                },
-            ]
-            .into_iter()
-            .take(usize::from(height))
-            .enumerate()
-            {
-                draw_text(
-                    output,
-                    x,
-                    y + offset as u16,
-                    width,
-                    text,
-                    self.config.foreground,
-                    crate::ui::mix_color(self.config.foreground, self.config.background, 24),
-                )?;
+            let rect = self.close_rect();
+            let background =
+                crate::ui::mix_color(self.config.foreground, self.config.background, 9);
+            let muted = crate::ui::mix_color(self.config.foreground, self.config.background, 176);
+            let mut grid = crate::panel::Grid::new(rect, self.config.foreground, background);
+            let cols = rect.cols.saturating_sub(4);
+            grid.text(
+                rect.x + 2,
+                rect.y,
+                cols,
+                "Close tab?",
+                self.config.foreground,
+                background,
+            );
+            grid.text(
+                rect.x + 2,
+                rect.y + 2,
+                cols,
+                "Programs may still be running in this tab.",
+                muted,
+                background,
+            );
+            grid.text(
+                rect.x + 2,
+                rect.y + 3,
+                cols,
+                "Closing stops all panes in this tab.",
+                muted,
+                background,
+            );
+            if rect.rows >= 7 {
+                grid.text(
+                    rect.x + 2,
+                    rect.y + 5,
+                    cols,
+                    "Tab select   Enter confirm   Esc cancel",
+                    muted,
+                    background,
+                );
             }
+            let row = rect.y + rect.rows.saturating_sub(1);
+            grid.text(
+                rect.x + 2,
+                row,
+                cols,
+                "  Cancel      Close tab  ",
+                muted,
+                background,
+            );
+            let (x, width, label, color) = if prompt.terminate {
+                (
+                    rect.x + 14,
+                    12.min(cols.saturating_sub(12)),
+                    " Close tab ",
+                    0xe87575,
+                )
+            } else {
+                (rect.x + 2, 10.min(cols), " Cancel ", crate::panel::ACCENT)
+            };
+            grid.text(
+                x,
+                row,
+                width,
+                label,
+                color,
+                crate::ui::mix_color(self.config.foreground, self.config.background, 24),
+            );
+            grid.ansi(output, None, &[])?;
         }
         self.draw_active_cursor(output)?;
         let (snapshot, screens) = self.client.snapshot_and_screens_mut().unwrap();
@@ -2152,7 +2167,7 @@ fn draw_tabs(
     let style = config.tab_style;
     output.write_all(b"\x1b[H\x1b[0;48;2;25;25;25m\x1b[2K")?;
     let marker = if snapshot.controller {
-        "156;143;220"
+        "150;150;150"
     } else {
         "254;155;48"
     };
@@ -2163,13 +2178,7 @@ fn draw_tabs(
         let tab = &snapshot.tabs[index];
         let active = tab.id == snapshot.active_tab;
         let bg = if active { 32 } else { 28 };
-        let fg = if active && style == crate::config::TabStyle::Flat {
-            204
-        } else if active {
-            148
-        } else {
-            96
-        };
+        let fg = if active { 204 } else { 150 };
         let color = ui.tab_color(tab, config.foreground, config.background);
         let close = if active { "148;148;148" } else { "96;96;96" };
         let hovered =
@@ -2179,17 +2188,20 @@ fn draw_tabs(
         } else {
             (" ", " ")
         };
+        let flat_active = style == crate::config::TabStyle::Flat && active;
+        let selected_style = if flat_active {
+            "4;58;2;181;210;162;"
+        } else {
+            ""
+        };
         write!(
             output,
-            "\x1b[1;{}H\x1b[0;38;2;{bg};{bg};{bg};48;2;25;25;25m{left}\x1b[38;2;{};{};{};48;2;{bg};{bg};{bg}m • \x1b[38;2;{fg};{fg};{fg}m",
+            "\x1b[1;{}H\x1b[0;{selected_style}38;2;{bg};{bg};{bg};48;2;25;25;25m{left}\x1b[38;2;{};{};{};48;2;{bg};{bg};{bg}m • \x1b[38;2;{fg};{fg};{fg}m",
             x + 1,
             color >> 16 & 255,
             color >> 8 & 255,
             color & 255
         )?;
-        if style == crate::config::TabStyle::Flat && active {
-            output.write_all(b"\x1b[4;58;2;181;210;162m")?;
-        }
         if hovered {
             output.write_all(b"\x1b[38;2;212;217;216m")?;
         }
@@ -2198,14 +2210,21 @@ fn draw_tabs(
             row == 0 && (x + width - 4..x + width - 1).contains(&column)
         });
         let close = if close_hovered { "204;204;204" } else { close };
-        let underline = if close_hovered {
+        let underline = if flat_active {
+            "4;58;2;181;210;162"
+        } else if close_hovered {
             "4;58;2;148;148;148"
+        } else {
+            "24;59"
+        };
+        let edge_style = if flat_active {
+            "4;58;2;181;210;162"
         } else {
             "24;59"
         };
         write!(
             output,
-            "\x1b[38;2;{close};48;2;{bg};{bg};{bg}m \x1b[{underline}m×\x1b[24;59m \x1b[38;2;{bg};{bg};{bg};48;2;25;25;25m{right}\x1b[24;59m"
+            "\x1b[38;2;{close};48;2;{bg};{bg};{bg}m \x1b[{underline}m×\x1b[{edge_style}m \x1b[38;2;{bg};{bg};{bg};48;2;25;25;25m{right}\x1b[24;59m"
         )?;
         end = x + width + 1;
     }
@@ -2408,7 +2427,7 @@ fn draw_separators(
     damage: &[bool],
     left: u16,
 ) -> io::Result<()> {
-    output.write_all(b"\x1b[0;38;5;240m")?;
+    output.write_all(b"\x1b[0;38;2;48;48;48m")?;
     for pane in &snapshot.panes {
         if pane.rect.x > 0 && pane.rect.x <= size.num_cols {
             for row in pane.rect.y

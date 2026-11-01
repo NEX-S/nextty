@@ -3,10 +3,7 @@ use crate::system_stats::{Process, ResourceTrend, SystemStats};
 use crate::width::{fit_label, scalar_width, text_width};
 use std::{borrow::Cow, io};
 
-pub(crate) const BACKGROUND: u32 = 0x1c2220;
-pub(crate) const INK: u32 = 0xcbd0c9;
-pub(crate) const MUTED: u32 = 0x8b9690;
-pub(crate) const GREEN: u32 = 0xb1c99c;
+pub(crate) use crate::panel::{ACCENT as GREEN, BACKGROUND, INK, MUTED};
 pub(crate) const PURPLE: u32 = 0xb3a2ca;
 
 pub(crate) fn series_color(name: &str) -> u32 {

@@ -256,7 +256,7 @@ fn independent_clients_search_without_cancelling_each_other_or_selecting_read_on
     finish_search(&mut controller, &mut controller_ui.search);
     assert_eq!(viewer_ui.search.count, 3000);
     assert_eq!(controller_ui.search.count, viewer_ui.search.count);
-    assert!(viewer_ui.search.label("").contains("read-only"));
+    assert!(viewer_ui.search.display("", 80).0.contains("read-only"));
     let index = viewer_ui.search.index;
     viewer_ui.search.next(&mut viewer, false).unwrap();
     assert_eq!(viewer_ui.search.index, index);

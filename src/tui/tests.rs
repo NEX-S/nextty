@@ -2489,7 +2489,7 @@ mod agent {
                     .any(|icon| text.text.contains(*icon))
                 {
                     let color = if text.x == target.x {
-                        0x343c34
+                        crate::panel::HOVER
                     } else {
                         crate::monitor::BACKGROUND
                     };
