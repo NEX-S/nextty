@@ -70,9 +70,53 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
     std::borrow::Cow::Owned(label)
 }
 
+pub fn fit_middle(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
+    let clean = if text.chars().any(char::is_control) {
+        std::borrow::Cow::Owned(
+            text.chars()
+                .map(|ch| if ch.is_control() { ' ' } else { ch })
+                .collect::<String>(),
+        )
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    };
+    if text_width(&clean) <= usize::from(columns) {
+        return clean;
+    }
+    if columns == 0 {
+        return std::borrow::Cow::Borrowed("");
+    }
+    let left = (columns - 1) / 2;
+    let right = usize::from(columns - 1 - left);
+    let prefix = fit_label(&clean, left);
+    let mut used = 0;
+    let mut start = clean.len();
+    for (index, ch) in clean.char_indices().rev() {
+        let width = usize::from(scalar_width(ch).min(2));
+        if used + width > right {
+            break;
+        }
+        used += width;
+        start = index;
+    }
+    std::borrow::Cow::Owned(format!("{prefix}…{}", &clean[start..]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn middle_clipping_preserves_path_identity_and_unicode_column_budget() {
+        let path = "src/很长的目录/important.rs";
+        let clipped = fit_middle(path, 18);
+        assert!(clipped.starts_with("src/"));
+        assert!(clipped.ends_with(".rs"));
+        assert!(clipped.contains('…'));
+        assert!(text_width(&clipped) <= 18);
+        assert_eq!(fit_middle("src/main.rs", 20), "src/main.rs");
+        assert!(!fit_middle("src/line\nname.rs", 12).contains('\n'));
+    }
 
     #[test]
     fn labels_clip_by_columns_and_replace_controls() {

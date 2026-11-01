@@ -54,6 +54,7 @@ pub struct FileNav {
     query: Option<String>,
     scan: Scan,
     selection: usize,
+    scroll: usize,
     generation: Arc<AtomicU64>,
     scan_pending: bool,
     worker: Worker<ScanRequest, (u64, Scan, bool)>,
@@ -244,6 +245,7 @@ impl FileNav {
             query: None,
             scan: Scan::default(),
             selection: 0,
+            scroll: 0,
             generation,
             scan_pending: false,
             worker,
@@ -287,6 +289,19 @@ impl FileNav {
 
     pub fn selection(&self) -> usize {
         self.selection
+    }
+
+    pub fn follow_selection(&mut self, rows: usize) -> usize {
+        let margin = (rows / 2).min(2);
+        if self.selection < self.scroll + margin {
+            self.scroll = self.selection.saturating_sub(margin);
+        } else if self.selection >= (self.scroll + rows).saturating_sub(margin) {
+            self.scroll = (self.selection + margin + 1).saturating_sub(rows);
+        }
+        self.scroll = self
+            .scroll
+            .min(self.scan.entries.len().saturating_sub(rows));
+        self.scroll
     }
 
     pub fn selected(&self) -> Option<&FileEntry> {
@@ -988,6 +1003,25 @@ mod tests {
             nav.poll();
             assert!(Instant::now() < deadline, "file scan did not finish");
         }
+    }
+
+    #[test]
+    fn visible_selection_moves_without_dragging_the_whole_viewport() {
+        let fixture = Fixture::new();
+        for index in 0..40 {
+            fixture.file(format!("{index:02}.txt"));
+        }
+        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
+        finish(&mut nav);
+        assert_eq!(nav.follow_selection(8), 0);
+        nav.move_selection(10);
+        let first = nav.follow_selection(8);
+        assert!(first > 0);
+        nav.move_selection(-1);
+        assert_eq!(nav.follow_selection(8), first);
+        nav.move_selection(1);
+        assert_eq!(nav.follow_selection(8), first);
+        assert_eq!(nav.follow_selection(80), 0);
     }
 
     #[test]

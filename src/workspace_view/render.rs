@@ -435,9 +435,9 @@ impl WorkspaceView {
             .unwrap_or_default();
         self.text.draw(
             &self.renderer,
-            &fit(
+            &crate::width::fit_middle(
                 &label,
-                ((right - PADDING - self.cell.0 * 2.) / self.cell.0).max(0.) as usize,
+                ((right - PADDING - self.cell.0 * 2.) / self.cell.0).max(0.) as u16,
             ),
             PADDING,
             summary_y,
@@ -733,14 +733,15 @@ impl WorkspaceView {
     }
 
     pub(super) fn draw_files(&mut self, layout: GuiLayout) -> Result<()> {
-        let Some(files) = &self.ui.files else {
+        let rect = self.file_rect(layout);
+        let preview_rect = self.file_preview_layout(layout);
+        let Some(files) = &mut self.ui.files else {
             return Ok(());
         };
-        let grid =
-            crate::file_panel::list(files, self.file_rect(layout), &self.preedit, &self.config);
-        let preview = (files.focus() == FileFocus::Preview).then(|| {
-            crate::file_panel::preview(files, self.file_preview_layout(layout), &self.config)
-        });
+        let focused = self.ui.focus == Focus::Files && files.focus() == FileFocus::List;
+        let grid = crate::file_panel::list(files, rect, &self.preedit, focused, &self.config);
+        let preview = (files.focus() == FileFocus::Preview)
+            .then(|| crate::file_panel::preview(files, preview_rect, &self.config));
         self.draw_panel(&grid)?;
         if let Some(grid) = preview {
             self.draw_panel(&grid)?;

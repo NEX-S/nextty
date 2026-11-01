@@ -317,6 +317,8 @@ impl Ui {
         if let Some(snapshot) = client.snapshot() {
             let directory = if client.is_remote() {
                 Some(std::path::Path::new("/"))
+            } else if self.files_open && self.focus == Focus::Files {
+                self.files.as_ref().map(FileNav::directory)
             } else {
                 snapshot
                     .panes
@@ -384,12 +386,16 @@ impl Ui {
         if let Some((message, _)) = &self.status {
             return Cow::Borrowed(message);
         }
-        let Some(directory) = snapshot
-            .panes
-            .iter()
-            .find(|pane| pane.id == snapshot.focused)
-            .and_then(|pane| pane.cwd.as_deref())
-        else {
+        let directory = if self.files_open && self.focus == Focus::Files {
+            self.files.as_ref().map(FileNav::directory)
+        } else {
+            snapshot
+                .panes
+                .iter()
+                .find(|pane| pane.id == snapshot.focused)
+                .and_then(|pane| pane.cwd.as_deref())
+        };
+        let Some(directory) = directory else {
             return Cow::Borrowed("");
         };
         let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -493,6 +499,8 @@ impl Ui {
                     muted,
                     background,
                 );
+            } else if !line.is_empty() {
+                grid.text(rect.x + 2, y, columns, line, config.foreground, background);
             }
         }
         grid.text(
@@ -507,31 +515,35 @@ impl Ui {
     }
 
     pub fn help_lines(&self) -> impl Clone + Iterator<Item = &'static str> + use<> {
-        let other_focus = self.resources.open || self.files_open;
-        #[cfg(feature = "agent")]
-        let other_focus = other_focus || self.agent.open;
         [
             (
-                true,
+                self.focus == Focus::Files,
                 &[
-                    "Alt+v / Alt+s  Split left-right / top-bottom",
-                    "Alt+h/j/k/l    Focus pane",
-                    "Alt+, / Alt+.  Previous / next tab",
-                    "Alt+Enter      New tab",
-                    "Alt+p / Alt+n  Previous / next command",
-                    "Alt+c          Copy command output",
-                    "Alt+/          Find in this pane",
-                    "Alt+q          Detach; keep workspace running",
-                    "Alt+?          Help; Esc closes this view",
+                    "Files",
+                    "Enter          Copy selected absolute path",
+                    "/              Filter filenames",
+                    "l / Right      Expand directory / preview file",
+                    "h / Left       Collapse directory / go to parent",
+                    "Esc            Close preview, search, then tree",
+                    "",
                 ][..],
             ),
-            (other_focus, &["Alt+o          Cycle input focus"]),
-            #[cfg(feature = "agent")]
-            (true, &["Alt+a          Agent input"]),
+            (
+                self.focus == Focus::Monitor,
+                &[
+                    "Monitor",
+                    "Tab/Shift+Tab  Monitor controls",
+                    "Arrows / hjkl  Navigate; Enter activates",
+                    "/              Filter processes",
+                    "Esc            Leave filter, then close monitor",
+                    "",
+                ][..],
+            ),
             #[cfg(feature = "agent")]
             (
-                matches!(self.focus, Focus::Editor | Focus::Output | Focus::Controls),
+                self.focus.is_agent(),
                 &[
+                    "Agent",
                     "Tab/Shift+Tab  Agent input / output / controls",
                     "Enter / Space  Activate selected control",
                     "Ctrl+Space     Attach selection / visible screen",
@@ -539,27 +551,35 @@ impl Ui {
                     "Ctrl+C         Copy selection; otherwise stop while busy",
                     "Esc            Select previous user message; repeat for older",
                     "Enter          Confirm selected rewind; click input to cancel",
-                ],
+                    "",
+                ][..],
             ),
-            (true, &["Alt+m          System monitor"]),
             (
-                self.focus == Focus::Monitor,
+                self.focus == Focus::Terminal,
                 &[
-                    "Tab/Shift+Tab  Monitor controls",
-                    "Arrows / hjkl  Navigate; Enter activates",
-                    "/              Filter processes",
-                    "Esc            Leave filter, then close monitor",
-                ],
+                    "Terminal",
+                    "Alt+p / Alt+n  Previous / next command",
+                    "Alt+c          Copy command output",
+                    "Alt+/          Find in this pane",
+                    "",
+                ][..],
             ),
-            (true, &["Alt+f          Files"]),
             (
-                self.focus == Focus::Files,
+                true,
                 &[
-                    "Enter          Copy selected absolute path",
-                    "/              Filter filenames",
-                    "l / Right      Expand directory / preview file",
-                    "Esc            Close preview, search, then tree",
-                ],
+                    "Workspace",
+                    "Alt+v / Alt+s  Split left-right / top-bottom",
+                    "Alt+h/j/k/l    Focus pane",
+                    "Alt+, / Alt+.  Previous / next tab",
+                    "Alt+Enter      New tab",
+                    "Alt+o          Cycle input focus",
+                    "Alt+m          System monitor",
+                    "Alt+f          Files",
+                    #[cfg(feature = "agent")]
+                    "Alt+a          Agent input",
+                    "Alt+q          Detach; keep workspace running",
+                    "Alt+?          Help",
+                ][..],
             ),
         ]
         .into_iter()

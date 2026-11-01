@@ -899,7 +899,7 @@ impl Frontend {
                 1,
                 last,
                 right.saturating_sub(2),
-                &context,
+                &crate::width::fit_middle(&context, right.saturating_sub(2)),
                 MUTED,
                 BACKGROUND,
             )?;
@@ -2107,21 +2107,17 @@ impl Frontend {
         Ok(())
     }
 
-    fn draw_files(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        let Some(files) = &self.ui.files else {
+    fn draw_files(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+        let rect = self.file_rect();
+        let preview = self.file_preview_rect();
+        let Some(files) = &mut self.ui.files else {
             return Ok(());
         };
-        crate::file_panel::list(files, self.file_rect(), "", &self.config).ansi(
-            output,
-            None,
-            &[],
-        )?;
+        let focused =
+            self.ui.focus == Focus::Files && files.focus() == crate::files::FileFocus::List;
+        crate::file_panel::list(files, rect, "", focused, &self.config).ansi(output, None, &[])?;
         if files.focus() == crate::files::FileFocus::Preview {
-            crate::file_panel::preview(files, self.file_preview_rect(), &self.config).ansi(
-                output,
-                None,
-                &[],
-            )?;
+            crate::file_panel::preview(files, preview, &self.config).ansi(output, None, &[])?;
         }
         Ok(())
     }

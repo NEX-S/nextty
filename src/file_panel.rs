@@ -11,7 +11,7 @@ pub(crate) struct Layout {
 }
 
 impl Layout {
-    pub fn new(rect: Rect, files: &FileNav) -> Self {
+    pub fn new(rect: Rect, files: &mut FileNav) -> Self {
         let search = files.is_search().then_some(Rect {
             x: rect.x + 1,
             y: rect.y,
@@ -24,9 +24,7 @@ impl Layout {
             cols: rect.cols.saturating_sub(1),
             rows: rect.rows.saturating_sub(u16::from(search.is_some())),
         };
-        let first = files
-            .selection()
-            .saturating_sub(usize::from(body.rows.saturating_sub(1)));
+        let first = files.follow_selection(usize::from(body.rows));
         Self {
             body,
             search,
@@ -56,7 +54,13 @@ pub(crate) fn preview_rect(canvas: Rect) -> Rect {
     }
 }
 
-pub(crate) fn list(files: &FileNav, rect: Rect, preedit: &str, config: &Config) -> Grid {
+pub(crate) fn list(
+    files: &mut FileNav,
+    rect: Rect,
+    preedit: &str,
+    focused: bool,
+    config: &Config,
+) -> Grid {
     let layout = Layout::new(rect, files);
     let foreground = mix_color(config.foreground, config.background, 176);
     let mut grid = Grid::new(rect, foreground, config.background);
@@ -97,8 +101,8 @@ pub(crate) fn list(files: &FileNav, rect: Rect, preedit: &str, config: &Config) 
             rect.x + 1,
             y,
             rect.cols.saturating_sub(2),
-            &files.entry_label(entry),
-            if selected {
+            &crate::width::fit_middle(&files.entry_label(entry), rect.cols.saturating_sub(2)),
+            if selected && focused {
                 config.foreground
             } else {
                 foreground
@@ -106,21 +110,57 @@ pub(crate) fn list(files: &FileNav, rect: Rect, preedit: &str, config: &Config) 
             config.background,
         );
         if selected {
-            grid.text(rect.x, y, 1, "▎", crate::panel::ACCENT, config.background);
+            grid.text(
+                rect.x,
+                y,
+                1,
+                "▎",
+                if focused {
+                    crate::panel::ACCENT
+                } else {
+                    foreground
+                },
+                config.background,
+            );
             grid.recolor(
                 Rect {
                     y,
                     rows: 1,
                     ..layout.body
                 },
-                mix_color(config.foreground, config.background, 24),
+                mix_color(
+                    config.foreground,
+                    config.background,
+                    if focused { 24 } else { 12 },
+                ),
             );
         }
+    }
+    if files.entries().is_empty() && files.error().is_none() {
+        let message = if files.searching() {
+            "Loading…"
+        } else if files.is_search() {
+            "No matches"
+        } else {
+            "Empty directory"
+        };
+        grid.text(
+            layout.body.x + 1,
+            layout.body.y,
+            layout.body.cols.saturating_sub(1),
+            message,
+            foreground,
+            config.background,
+        );
     }
     if let Some(error) = files.error() {
         grid.text(
             rect.x + 1,
-            rect.y + rect.rows.saturating_sub(1),
+            if files.entries().is_empty() {
+                layout.body.y
+            } else {
+                rect.y + rect.rows.saturating_sub(1)
+            },
             rect.cols.saturating_sub(2),
             &error.to_string(),
             0xe87575,
@@ -132,6 +172,7 @@ pub(crate) fn list(files: &FileNav, rect: Rect, preedit: &str, config: &Config) 
 
 pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
     let background = mix_color(config.foreground, config.background, 9);
+    let muted = mix_color(config.foreground, config.background, 176);
     let mut grid = Grid::new(rect, config.foreground, background);
     let columns = rect.cols.saturating_sub(2);
     let title = files
@@ -142,20 +183,21 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
         rect.x + 1,
         rect.y,
         columns,
-        &title,
+        &crate::width::fit_middle(&title, columns),
         config.foreground,
         background,
     );
     let error = files.preview_error().map(ToString::to_string);
     for row in 0..rect.rows.saturating_sub(2) {
-        let text = match (row, files.preview_loading(), error.as_deref()) {
-            (0, true, _) => "Loading…",
-            (0, _, Some(error)) => error,
+        let (text, color) = match (row, files.preview_loading(), error.as_deref()) {
+            (0, true, _) => ("Loading…", muted),
+            (0, _, Some(error)) => (error, 0xe87575),
+            (0, false, None) if files.preview_lines().is_empty() => ("Empty file", muted),
             _ => match files
                 .preview_lines()
                 .get(files.preview_scroll() + usize::from(row))
             {
-                Some(text) => text,
+                Some(text) => (text.as_str(), config.foreground),
                 None => break,
             },
         };
@@ -164,7 +206,7 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
             rect.y + row + 1,
             columns,
             text,
-            config.foreground,
+            color,
             background,
         );
     }
@@ -177,7 +219,7 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
         } else {
             "Esc close · Enter copy path"
         },
-        mix_color(config.foreground, config.background, 144),
+        muted,
         background,
     );
     grid
@@ -217,12 +259,12 @@ mod tests {
             cols: 24,
             rows: 15,
         };
-        let before = Layout::new(rect, &files);
+        let before = Layout::new(rect, &mut files);
         assert_eq!(before.entry_at(&files, 1, before.body.y), Some(0));
         assert_eq!(before.entry_at(&files, 23, before.body.y), None);
         files.set_query("中".into());
         finish(&mut files);
-        let layout = Layout::new(rect, &files);
+        let layout = Layout::new(rect, &mut files);
         assert_eq!(layout.body.y, before.body.y + 1);
         assert_eq!(layout.entry_at(&files, 1, layout.body.y), Some(0));
         let config = Config {
@@ -230,7 +272,7 @@ mod tests {
             background: 0xf0e0d0,
             ..Config::default()
         };
-        let list = list(&files, rect, "文", &config);
+        let list = list(&mut files, rect, "文", true, &config);
         assert_eq!(
             list.rows[0].cells[0].bg,
             crate::panel::rgb(config.background)
