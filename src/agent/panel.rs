@@ -4,17 +4,18 @@ use crate::context::{self, Object, Snapshot as ContextSnapshot};
 use crate::core::Mode;
 use crate::core::{Flags, WindowSize};
 use crate::input::keysym;
-use crate::panel::{Grid, rgb};
-use crate::ui::{Focus, Ui, mix_color};
+use crate::panel::{Grid, mix_color, rgb};
+use crate::ui::{Focus, Ui};
 use crate::width::scalar_width;
 use crate::width::{fit_label, text_width};
+use crate::worker::Worker;
 use crate::workspace::Rect;
 use crate::workspace::{AgentEvent, AgentModelPatch, Client, PaneId};
 use std::collections::HashSet;
 use std::io;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Condvar, Mutex};
+use std::os::fd::RawFd;
+use std::sync::Arc;
 
 pub(crate) struct Panel {
     pub grid: Grid,
@@ -43,21 +44,16 @@ impl Panel {
 }
 
 pub(crate) fn editor(ui: &Ui, side: Rect) -> (Rect, EditorLines) {
+    let session = ui.agent.active();
+    let max_rows = usize::from((side.rows / 3).clamp(1, 8));
     let columns = usize::from(
         side.cols
             .saturating_sub(2)
-            .saturating_sub(u16::from(ui.agent.active().model.busy) * 3)
+            .saturating_sub(u16::from(session.model.busy) * 3)
             .max(1),
     );
-    let layout = ui
-        .agent
-        .active()
-        .editor_layout(columns, usize::from((side.rows / 3).clamp(1, 8)));
-    let rows = layout
-        .lines
-        .len()
-        .max(3)
-        .min(usize::from((side.rows / 3).clamp(1, 8))) as u16;
+    let layout = session.editor_layout(columns, max_rows);
+    let rows = layout.lines.len().max(3).min(max_rows) as u16;
     (
         Rect {
             x: side.x + 1,
@@ -142,7 +138,6 @@ impl AgentPainter<'_> {
     fn draw_agent(&mut self, editor: Rect, editor_layout: EditorLines) -> io::Result<()> {
         let side = self.side;
         if side.cols < 12 || side.rows < 6 {
-            self.frame.hits.clear();
             self.frame.grid.text(
                 side.x,
                 side.y,
@@ -168,20 +163,13 @@ impl AgentPainter<'_> {
             error,
             ..
         } = palette;
-        self.frame.hits.clear();
         let chat_top = side.y + 1;
         if self.ui.agent.active().context.preview.is_some() {
             self.draw_preview(bg, muted);
         } else {
+            let divider = mix_color(self.config.foreground, bg, 24);
             for row in side.y..side.y + side.rows {
-                self.frame.grid.text(
-                    side.x,
-                    row,
-                    side.cols,
-                    "│",
-                    mix_color(self.config.foreground, bg, 24),
-                    bg,
-                );
+                self.frame.grid.text(side.x, row, 1, "│", divider, bg);
             }
             self.frame.hits.push((side, AgentAction::Output));
             self.draw_agent_tabs(side, editor, bg);
@@ -197,20 +185,33 @@ impl AgentPainter<'_> {
             };
             let rewind = self.ui.agent.active().rewind_target.is_some();
             let hint_rows = if rewind { 3 } else { 0 };
-            let chat_end = editor.y.saturating_sub(attachment_rows + hint_rows);
+            let chat_end = editor.y.saturating_sub(1 + attachment_rows + hint_rows);
             self.draw_transcript(palette, editor, chat_top, chat_end)?;
             if rewind {
-                self.draw_rewind(palette, editor);
+                self.draw_rewind(
+                    palette,
+                    Rect {
+                        y: editor.y.saturating_sub(1),
+                        ..editor
+                    },
+                );
             }
             self.draw_attachments(palette, editor, chat_end, attachment_rows, attachment_first);
+            self.frame.grid.text(
+                side.x,
+                editor.y.saturating_sub(1),
+                side.cols,
+                &format!("├{}", "─".repeat(usize::from(side.cols.saturating_sub(1)))),
+                divider,
+                bg,
+            );
             self.draw_editor(palette, editor, editor_layout);
         }
         let hovered = self.pointer.and_then(|(x, y)| {
             self.frame
                 .hits
                 .iter()
-                .rev()
-                .find(|(rect, _)| rect.contains(x, y))
+                .rfind(|(rect, _)| rect.contains(x, y))
                 .map(|(_, action)| *action)
         });
         for index in 0..self.frame.hits.len() {
@@ -237,8 +238,11 @@ impl AgentPainter<'_> {
                 let start = usize::from(rect.x.saturating_sub(self.frame.grid.rect.x));
                 let end = (start + usize::from(rect.cols)).min(row.cells.len());
                 for cell in &mut row.cells[start..end] {
-                    cell.fg = rgb(self.config.foreground);
-                    cell.flags.insert(Flags::UNDERLINE);
+                    cell.fg = rgb(if matches!(action, AgentAction::CloseSession(_)) {
+                        0xef5350
+                    } else {
+                        self.config.foreground
+                    });
                 }
             } else {
                 self.frame.grid.recolor(rect, user_bg);
@@ -274,12 +278,12 @@ impl AgentPainter<'_> {
         let rows = usize::from(chat_end.saturating_sub(chat_top));
         let columns = usize::from(editor.cols);
         self.ui.agent.prepare_layout(columns)?;
-        if let Some(target) = self.ui.agent.active().rewind_index()
-            && let Some(line) = self.ui.agent.active().lines.iter().position(|line| {
+        let session = self.ui.agent.active_mut();
+        if let Some(target) = session.rewind_index()
+            && let Some(line) = session.lines.iter().position(|line| {
                 matches!(line, AgentLine::Text { message, .. } if *message as usize == target)
             })
         {
-            let session = self.ui.agent.active_mut();
             let first = session.lines.len().saturating_sub(rows + session.model.scroll);
             if line < first {
                 session.model.scroll = session.lines.len().saturating_sub(rows + line);
@@ -287,23 +291,14 @@ impl AgentPainter<'_> {
                 session.model.scroll = session.lines.len().saturating_sub(line + 1);
             }
         }
-        let scroll = self
-            .ui
-            .agent
-            .active()
+        session.model.scroll = session
             .model
             .scroll
-            .min(self.ui.agent.active().lines.len().saturating_sub(rows));
-        if scroll != self.ui.agent.active().model.scroll {
-            self.ui.agent.active_mut().model.scroll = scroll;
-        }
-        let first = self
-            .ui
-            .agent
-            .active()
+            .min(session.lines.len().saturating_sub(rows));
+        let first = session
             .lines
             .len()
-            .saturating_sub(rows + self.ui.agent.active().model.scroll);
+            .saturating_sub(rows + session.model.scroll);
         self.frame.chat = Rect {
             x: editor.x,
             y: chat_top,
@@ -623,7 +618,7 @@ impl AgentPainter<'_> {
     fn draw_editor(&mut self, palette: Palette, editor: Rect, layout: EditorLines) {
         let Palette {
             foreground,
-            user_bg,
+            bg,
             selection_bg,
             error,
             ..
@@ -677,7 +672,7 @@ impl AgentPainter<'_> {
                 editor.cols,
                 range.map_or("", |range| &display[range.clone()]),
                 foreground,
-                user_bg,
+                bg,
             );
             if self.preedit.is_empty()
                 && let Some(range) = range
@@ -712,7 +707,7 @@ impl AgentPainter<'_> {
                 3,
                 " ■ ",
                 error,
-                user_bg,
+                bg,
             );
             self.frame.hit(
                 editor.x + editor.cols.saturating_sub(3),
@@ -736,7 +731,7 @@ impl AgentPainter<'_> {
                     editor.cols,
                     &format!(" {label} "),
                     self.config.foreground,
-                    user_bg,
+                    bg,
                 );
                 self.frame.hit(
                     editor.x,
@@ -762,11 +757,6 @@ impl AgentPainter<'_> {
             ..
         } = preview;
         *scroll = (*scroll).min(lines.len().saturating_sub(rows));
-        for y in 1..self.size.num_lines.saturating_sub(1) {
-            self.frame
-                .grid
-                .text(0, y, self.size.num_cols, "", self.config.foreground, bg);
-        }
         self.frame
             .grid
             .text(2, 1, columns, &item.label, self.config.foreground, bg);
@@ -791,7 +781,6 @@ impl AgentPainter<'_> {
             muted,
             bg,
         );
-        self.frame.hits.clear();
         self.frame.hit(
             self.size.num_cols.saturating_sub(4),
             1,
@@ -804,8 +793,6 @@ impl AgentPainter<'_> {
             text_width(" ⧉ ") as u16,
             AgentAction::CopyPreview,
         );
-        self.frame.cursor = None;
-        self.frame.chat_rows.clear();
         self.frame.preview = Some(Rect {
             x: 2,
             y: 3,
@@ -821,12 +808,7 @@ impl AgentPainter<'_> {
         colors: (u32, u32),
         background: u32,
         hovered: bool,
-        active: bool,
     ) {
-        self.frame
-            .grid
-            .flags
-            .set(Flags::UNDERLINE, active || hovered);
         let foreground = if hovered { colors.1 } else { colors.0 };
         self.frame
             .grid
@@ -834,7 +816,6 @@ impl AgentPainter<'_> {
         self.frame
             .grid
             .text(rect.x + 1, rect.y, 1, label, foreground, background);
-        self.frame.grid.flags.remove(Flags::UNDERLINE);
     }
 
     fn draw_agent_tabs(&mut self, side: Rect, editor: Rect, bg: u32) {
@@ -859,99 +840,83 @@ impl AgentPainter<'_> {
             mix_color(self.config.foreground, bg, 24),
             line_bg,
         );
+        let active_fg = if (bg >> 16 & 255) + (bg >> 8 & 255) + (bg & 255) > 384 {
+            self.config.foreground
+        } else {
+            0xffffff
+        };
         let mut x = editor.x;
         for (index, column, columns) in self.ui.agent.tabs(usize::from(side.cols.saturating_sub(1)))
         {
             x = editor.x + column as u16;
             let width = columns as u16;
             let active = index == self.ui.agent.current;
-            let mut tab_bg = bg;
-            if !active {
-                tab_bg = 0;
-                for shift in [16, 8, 0] {
-                    tab_bg |= ((bg >> shift & 255) * 9 / 10) << shift;
-                }
-            }
-            let color = if active {
-                self.config.foreground
+            let hovered = self
+                .pointer
+                .is_some_and(|(column, row)| row == side.y && (x..x + width).contains(&column));
+            let model = &self.ui.agent.sessions[index].model;
+            let status = if model.busy {
+                0xfe9b30
+            } else if model.messages.last().is_some_and(|last| {
+                model
+                    .messages
+                    .iter()
+                    .rev()
+                    .take_while(|message| message.turn == last.turn)
+                    .any(|message| matches!(message.role.as_str(), "Error" | "Blocked"))
+            }) {
+                0xef5350
             } else {
-                muted
+                0xb5d2a2
             };
+            self.frame.grid.text(x, side.y, width, "", muted, line_bg);
+            self.frame.grid.text(x, side.y, 1, "•", status, line_bg);
+            self.frame.grid.flags.set(Flags::BOLD, active);
             self.frame.grid.text(
-                x,
+                x + 2,
                 side.y,
-                width,
-                &format!(
-                    " {}",
-                    fit_label(
-                        self.ui.agent.sessions[index].title(),
-                        width.saturating_sub(4)
-                    )
+                width.saturating_sub(7),
+                &fit_label(
+                    self.ui.agent.sessions[index].title(),
+                    width.saturating_sub(7),
                 ),
-                color,
-                tab_bg,
+                if active {
+                    active_fg
+                } else if hovered {
+                    self.config.foreground
+                } else {
+                    muted
+                },
+                line_bg,
             );
+            self.frame.grid.flags.remove(Flags::BOLD);
             self.frame
                 .hit(x, side.y, width, AgentAction::Session(index));
-            if active
-                || self
-                    .pointer
-                    .is_some_and(|(column, row)| row == side.y && column >= x && column < x + width)
-            {
-                let close = x + width.saturating_sub(3);
-                let hovered = self.pointer.is_some_and(|(column, row)| {
-                    row == side.y && column >= close && column < close + 3
-                });
-                self.tab_icon(
-                    Rect {
-                        x: close,
-                        y: side.y,
-                        cols: 3,
-                        rows: 1,
-                    },
-                    "×",
-                    (muted, self.config.foreground),
-                    tab_bg,
-                    hovered,
-                    active,
-                );
-                self.frame.hit(
-                    close,
-                    side.y,
-                    3.min(width),
-                    AgentAction::CloseSession(index),
-                );
-            }
-            if active {
-                self.frame.grid.underline(
-                    Rect {
-                        x,
-                        y: side.y,
-                        cols: width,
-                        rows: 1,
-                    },
-                    0xb5d2a2,
-                );
-            }
-            x += width;
-        }
-        let hovered = self
-            .pointer
-            .is_some_and(|(column, row)| row == side.y && column >= x && column < x + 3);
-        self.tab_icon(
-            Rect {
-                x,
+            let close = Rect {
+                x: x + width.saturating_sub(5),
                 y: side.y,
                 cols: 3,
                 rows: 1,
-            },
-            "+",
-            (self.config.foreground, self.config.foreground),
-            line_bg,
-            hovered,
-            false,
-        );
-        self.frame.hit(x, side.y, 3, AgentAction::NewSession);
+            };
+            let close_hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
+            self.tab_icon(close, "×", (muted, 0xef5350), line_bg, close_hovered);
+            self.frame
+                .hits
+                .push((close, AgentAction::CloseSession(index)));
+            self.frame.grid.text(
+                x + width - 2,
+                side.y,
+                1,
+                "╱",
+                mix_color(self.config.foreground, bg, 96),
+                line_bg,
+            );
+            x += width;
+        }
+        self.frame
+            .grid
+            .text(x, side.y, 2, "+", self.config.foreground, line_bg);
+        self.frame.hit(x, side.y, 2, AgentAction::NewSession);
         let close = Rect {
             x: side.x + side.cols.saturating_sub(3),
             y: side.y,
@@ -961,11 +926,10 @@ impl AgentPainter<'_> {
         let hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
         self.tab_icon(
             close,
-            "×",
+            "›",
             (muted, self.config.foreground),
             line_bg,
             hovered,
-            false,
         );
         self.frame.hits.push((close, AgentAction::ClosePanel));
     }
@@ -1082,8 +1046,7 @@ struct ChatSelection {
 #[derive(Clone)]
 struct RenderedMarkdown {
     turn: u64,
-    source_len: usize,
-    source_hash: u64,
+    source: Arc<str>,
     document: Arc<crate::agent::markdown::Markdown>,
 }
 
@@ -1092,124 +1055,60 @@ impl RenderedMarkdown {
         message.role == "Agent"
             && message.id.is_none()
             && message.turn == self.turn
-            && message
-                .text
-                .get(..self.source_len)
-                .is_some_and(|text| crate::agent::markdown::fingerprint(text) == self.source_hash)
+            && message.text.starts_with(self.source.as_ref())
     }
 }
 
 struct MarkdownJob {
     session: u64,
     request: u64,
-    messages: Vec<(usize, u64, String)>,
+    messages: Vec<(usize, u64, Arc<str>, Option<RenderedMarkdown>)>,
 }
 
-#[derive(Clone)]
 struct MarkdownResult {
     session: u64,
     request: u64,
     messages: Vec<(usize, RenderedMarkdown)>,
 }
 
-#[derive(Default)]
-struct MarkdownWork {
-    pending: Option<MarkdownJob>,
-    result: Option<MarkdownResult>,
-    closed: bool,
+fn markdown_worker() -> io::Result<Worker<MarkdownJob, MarkdownResult>> {
+    let notification = Arc::new(crate::eventfd::new()?);
+    Worker::new(
+        "nextty-markdown",
+        notification,
+        |job: MarkdownJob, publish| {
+            let messages = job
+                .messages
+                .into_iter()
+                .map(|(index, turn, source, cached)| {
+                    let old = cached
+                        .as_ref()
+                        .map(|rendered| (rendered.source.as_ref(), rendered.document.as_ref()));
+                    let document = Arc::new(crate::agent::markdown::Markdown::render(&source, old));
+                    (
+                        index,
+                        RenderedMarkdown {
+                            turn,
+                            source,
+                            document,
+                        },
+                    )
+                })
+                .collect();
+            publish(MarkdownResult {
+                session: job.session,
+                request: job.request,
+                messages,
+            });
+        },
+    )
 }
 
-struct MarkdownWorker {
-    shared: Arc<(Mutex<MarkdownWork>, Condvar)>,
-    notification: Arc<OwnedFd>,
-}
-
-impl MarkdownWorker {
-    fn new() -> io::Result<Self> {
-        let shared = Arc::new((Mutex::new(MarkdownWork::default()), Condvar::new()));
-        let notification = Arc::new(crate::eventfd::new()?);
-        let worker = Arc::clone(&shared);
-        let wake = Arc::clone(&notification);
-        std::thread::Builder::new()
-            .name("nextty-markdown".into())
-            .spawn(move || {
-                let mut previous: Option<MarkdownResult> = None;
-                loop {
-                    let (lock, changed) = &*worker;
-                    let mut state = lock.lock().unwrap();
-                    while state.pending.is_none() && !state.closed {
-                        state = changed.wait(state).unwrap();
-                    }
-                    if state.closed {
-                        return;
-                    }
-                    let job = state.pending.take().unwrap();
-                    drop(state);
-                    let messages = job
-                        .messages
-                        .into_iter()
-                        .map(|(index, turn, source)| {
-                            let old = previous
-                                .as_ref()
-                                .filter(|result| result.session == job.session)
-                                .and_then(|result| {
-                                    result.messages.iter().find(|(old_index, rendered)| {
-                                        *old_index == index && rendered.turn == turn
-                                    })
-                                })
-                                .map(|(_, rendered)| rendered.document.as_ref());
-                            let document =
-                                Arc::new(crate::agent::markdown::Markdown::render(&source, old));
-                            (
-                                index,
-                                RenderedMarkdown {
-                                    turn,
-                                    source_len: source.len(),
-                                    source_hash: crate::agent::markdown::fingerprint(&source),
-                                    document,
-                                },
-                            )
-                        })
-                        .collect();
-                    let result = MarkdownResult {
-                        session: job.session,
-                        request: job.request,
-                        messages,
-                    };
-                    previous = Some(result.clone());
-                    let discarded = lock.lock().unwrap().result.replace(result);
-                    drop(discarded);
-                    crate::eventfd::notify(wake.as_raw_fd()).unwrap();
-                }
-            })?;
-        Ok(Self {
-            shared,
-            notification,
-        })
-    }
-
-    fn submit(&self, job: MarkdownJob) {
-        let (lock, changed) = &*self.shared;
-        let previous = lock.lock().unwrap().pending.replace(job);
-        if previous.is_none() {
-            changed.notify_one();
-        }
-        drop(previous);
-    }
-
-    fn take(&self) -> Option<MarkdownResult> {
-        self.shared.0.lock().unwrap().result.take()
-    }
-}
-
-impl Drop for MarkdownWorker {
-    fn drop(&mut self) {
-        let (lock, changed) = &*self.shared;
-        let mut state = lock.lock().unwrap();
-        state.closed = true;
-        state.pending = None;
-        changed.notify_one();
-    }
+#[derive(PartialEq, Eq)]
+enum RemoteState {
+    Unopened,
+    Loading,
+    Ready,
 }
 
 pub(crate) struct AgentPanel {
@@ -1220,11 +1119,9 @@ pub(crate) struct AgentPanel {
     pub current: usize,
     pub keyboard: AgentAction,
     next_id: u64,
-    remote_opened: bool,
-    pub remote_ready: bool,
+    remote: RemoteState,
     pub view_dirty: bool,
-    last_view: Option<serde_json::Value>,
-    markdown_worker: Option<MarkdownWorker>,
+    markdown_worker: Option<Worker<MarkdownJob, MarkdownResult>>,
     next_render: u64,
     // The previous frame's grid, handed back by the frontend for reuse.
     pub spare_grid: Option<Grid>,
@@ -1240,10 +1137,8 @@ impl Default for AgentPanel {
             current: 0,
             keyboard: AgentAction::Editor,
             next_id: 1,
-            remote_opened: false,
-            remote_ready: false,
+            remote: RemoteState::Unopened,
             view_dirty: true,
-            last_view: None,
             markdown_worker: None,
             next_render: 0,
             spare_grid: None,
@@ -1283,8 +1178,7 @@ impl AgentPanel {
             && session.rewind_applied != Some(turn)
         {
             session.model.input = input;
-            session.model.cursor = session.model.input.len();
-            session.model.anchor = None;
+            session.model.set_cursor(session.model.input.len(), false);
             session.model.scroll = 0;
             session.context.basket = items.into_iter().map(ContextItem::from_view).collect();
             session.context.preview = None;
@@ -1322,7 +1216,7 @@ impl AgentPanel {
         if client.snapshot().is_none() {
             return Ok((false, false));
         }
-        if !self.remote_opened
+        if self.remote == RemoteState::Unopened
             && !self.open
             && self
                 .sessions
@@ -1331,9 +1225,9 @@ impl AgentPanel {
         {
             return Ok((false, false));
         }
-        if !self.remote_opened {
+        if self.remote == RemoteState::Unopened {
             client.send(crate::workspace::Action::AgentOpen)?;
-            self.remote_opened = true;
+            self.remote = RemoteState::Loading;
         }
         let mut changed = false;
         let mut messages = false;
@@ -1343,11 +1237,6 @@ impl AgentPanel {
                 AgentEvent::Draft(payload) => {
                     self.view_dirty = false;
                     self.restore_view_state(serde_json::from_slice(&payload)?)?;
-                    self.last_view = if self.view_dirty {
-                        None
-                    } else {
-                        Some(self.view_state())
-                    };
                     changed = true;
                 }
                 AgentEvent::Model(patch) => {
@@ -1357,7 +1246,7 @@ impl AgentPanel {
                     models_changed = true;
                 }
                 AgentEvent::Start(payload) => crate::agent::owner::spawn(client, &payload, config)?,
-                AgentEvent::Ready => self.remote_ready = true,
+                AgentEvent::Ready => self.remote = RemoteState::Ready,
                 _ => {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidData,
@@ -1369,30 +1258,22 @@ impl AgentPanel {
         if models_changed {
             self.request_markdown()?;
         }
-        if self.remote_ready && client.can_agent_input() {
+        if self.remote == RemoteState::Ready && client.can_agent_input() {
             if self.view_dirty {
-                if self
-                    .last_view
-                    .as_ref()
-                    .is_none_or(|view| !self.view_matches(view))
-                {
-                    let view = self.view_state();
-                    client.send(crate::workspace::Action::AgentView(serde_json::to_vec(
-                        &view,
-                    )?))?;
-                    self.last_view = Some(view);
-                }
+                client.send(crate::workspace::Action::AgentView(serde_json::to_vec(
+                    &self.view_state(),
+                )?))?;
                 self.view_dirty = false;
             }
             for session in &mut self.sessions {
-                for mut request in std::mem::take(&mut session.model.pending) {
+                for mut request in session.model.pending.drain(..) {
                     request["session"] = serde_json::json!(session.id);
                     client.send(crate::workspace::Action::AgentRequest(
                         serde_json::to_vec(&request).map_err(io::Error::other)?,
                     ))?;
                 }
             }
-        } else if self.remote_ready {
+        } else if self.remote == RemoteState::Ready {
             for session in &mut self.sessions {
                 if !session.model.pending.is_empty() {
                     for mut request in std::mem::take(&mut session.model.pending) {
@@ -1413,31 +1294,6 @@ impl AgentPanel {
             }
         }
         Ok((changed, messages))
-    }
-
-    fn view_matches(&self, view: &serde_json::Value) -> bool {
-        view["next_id"] == self.next_id
-            && view["sessions"].as_array().is_some_and(|values| {
-                values.len() == self.sessions.len()
-                    && values.iter().zip(&self.sessions).all(|(value, session)| {
-                        value["id"] == session.id
-                            && value["input"] == session.model.input
-                            && value["rewind_applied"].as_u64() == session.rewind_applied
-                            && value["failed_send_applied"].as_u64() == session.failed_send_applied
-                            && value["basket"].as_array().is_some_and(|items| {
-                                items.len() == session.context.basket.len()
-                                    && items.iter().zip(&session.context.basket).all(
-                                        |(value, item)| {
-                                            value[0] == item.label
-                                                && value[1] == item.source
-                                                && value[2] == item.kind
-                                                && value[3] == item.snapshot.text
-                                                && value[4] == item.snapshot.incomplete
-                                        },
-                                    )
-                            })
-                    })
-            })
     }
 
     pub fn view_state(&self) -> serde_json::Value {
@@ -1471,8 +1327,7 @@ impl AgentPanel {
             let input = serde_json::from_value(value["input"].take())?;
             let basket: Vec<ContextView> = serde_json::from_value(value["basket"].take())?;
             let basket = basket.into_iter().map(ContextItem::from_view).collect();
-            if self.remote_opened
-                && !self.remote_ready
+            if self.remote == RemoteState::Loading
                 && (!session.model.input.is_empty() || !session.context.basket.is_empty())
             {
                 session.restore_draft(input, basket);
@@ -1480,8 +1335,7 @@ impl AgentPanel {
             } else {
                 if session.model.input != input {
                     session.model.input = input;
-                    session.model.cursor = session.model.input.len();
-                    session.model.anchor = None;
+                    session.model.set_cursor(session.model.input.len(), false);
                     session.editor_scroll = None;
                 }
                 session.context.basket = basket;
@@ -1491,7 +1345,7 @@ impl AgentPanel {
                 serde_json::from_value(value["failed_send_applied"].take())?;
             self.sessions.push(session);
         }
-        if self.remote_opened && !self.remote_ready {
+        if self.remote == RemoteState::Loading {
             for session in previous {
                 if !session.model.input.is_empty()
                     || !session.context.basket.is_empty()
@@ -1555,13 +1409,20 @@ impl AgentPanel {
                     && message.id.is_none()
                     && session.rendered[index]
                         .as_ref()
-                        .is_none_or(|rendered| rendered.source_len != message.text.len())
+                        .is_none_or(|rendered| rendered.source.len() != message.text.len())
             })
-            .map(|(index, message)| (index, message.turn, message.text.clone()))
+            .map(|(index, message)| {
+                (
+                    index,
+                    message.turn,
+                    Arc::from(message.text.as_str()),
+                    session.rendered[index].clone(),
+                )
+            })
             .collect();
         if !messages.is_empty() {
             if self.markdown_worker.is_none() {
-                self.markdown_worker = Some(MarkdownWorker::new()?);
+                self.markdown_worker = Some(markdown_worker()?);
             }
             for session in &mut self.sessions {
                 session.render_request = None;
@@ -1579,24 +1440,20 @@ impl AgentPanel {
     }
 
     pub fn layout_fd(&self) -> RawFd {
-        self.markdown_worker
-            .as_ref()
-            .map_or(-1, |worker| worker.notification.as_raw_fd())
+        self.markdown_worker.as_ref().map_or(-1, Worker::fd)
     }
 
     pub fn poll_layout(&mut self) -> io::Result<bool> {
         let Some(worker) = &self.markdown_worker else {
             return Ok(false);
         };
-        Ok(
-            crate::eventfd::consume_notification(worker.notification.as_raw_fd())?
-                && self.open
-                && worker.shared.0.lock().unwrap().result.is_some(),
-        )
+        Ok(crate::eventfd::consume_notification(worker.fd())?
+            && self.open
+            && worker.ready(|_| true))
     }
 
     fn apply_markdown(&mut self) {
-        let Some(result) = self.markdown_worker.as_ref().and_then(MarkdownWorker::take) else {
+        let Some(result) = self.markdown_worker.as_mut().and_then(Worker::take) else {
             return;
         };
         let Some(session) = self.sessions.iter_mut().find(|session| {
@@ -1616,13 +1473,36 @@ impl AgentPanel {
             return;
         }
         let selection = session.selection_checkpoint();
+        // An unchanged rendered prefix only needs its last line wrapped again.
+        session.append_from = None;
+        if let [(index, rendered)] = result.messages.as_slice()
+            && *index + 1 == session.model.messages.len()
+            && session.columns != 0
+            && let Some(old) = &session.rendered[*index]
+            && rendered.document.text.starts_with(&old.document.text)
+        {
+            session.append_from =
+                session
+                    .lines
+                    .iter()
+                    .enumerate()
+                    .rev()
+                    .find_map(|(line, value)| match value {
+                        AgentLine::Text { message, range } if *message as usize == *index => {
+                            Some((line, range.start as usize))
+                        }
+                        _ => None,
+                    });
+        }
         for (index, rendered) in result.messages {
             session.rendered[index] = Some(rendered);
         }
         if session.selection.is_some() && !session.selection_matches(selection.as_ref()) {
             session.clear_selection();
         }
-        session.columns = 0;
+        if session.append_from.is_none() {
+            session.columns = 0;
+        }
     }
 
     #[cfg(test)]
@@ -1641,8 +1521,9 @@ impl AgentPanel {
     }
 
     pub fn new_session(&mut self) {
-        self.active_mut().end_selection();
-        self.active_mut().rewind_target = None;
+        let session = self.active_mut();
+        session.end_selection();
+        session.rewind_target = None;
         self.sessions.push(AgentSession {
             id: self.next_id,
             ..AgentSession::default()
@@ -1655,8 +1536,9 @@ impl AgentPanel {
 
     pub fn switch(&mut self, index: usize) {
         if index < self.sessions.len() {
-            self.active_mut().end_selection();
-            self.active_mut().rewind_target = None;
+            let session = self.active_mut();
+            session.end_selection();
+            session.rewind_target = None;
             self.current = index;
             self.keyboard = AgentAction::Editor;
         }
@@ -1666,8 +1548,9 @@ impl AgentPanel {
         if index >= self.sessions.len() {
             return;
         }
-        self.active_mut().end_selection();
-        self.active_mut().rewind_target = None;
+        let session = self.active_mut();
+        session.end_selection();
+        session.rewind_target = None;
         self.sessions.remove(index);
         self.view_dirty = true;
         if self.sessions.is_empty() {
@@ -1758,7 +1641,7 @@ impl AgentPanel {
         if available == 0 {
             return Vec::new();
         }
-        let count = self.sessions.len().min((available / 8).max(1));
+        let count = self.sessions.len().min((available / 10).max(1));
         let start = self
             .current
             .saturating_sub(count - 1)
@@ -1768,7 +1651,7 @@ impl AgentPanel {
             .map(|index| {
                 (
                     index,
-                    (crate::width::text_width(self.sessions[index].title()) + 4).max(8),
+                    (crate::width::text_width(self.sessions[index].title()) + 7).max(10),
                     0,
                 )
             })
@@ -1825,9 +1708,10 @@ fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usiz
             .strip_suffix("\r\n")
             .or_else(|| part.strip_suffix('\n'))
             .unwrap_or(part);
+        let content_end = offset + line.len();
         let mut start = offset;
         if line.len() <= columns || line.is_ascii() {
-            while offset + line.len() - start > columns {
+            while content_end - start > columns {
                 push(start..start + columns);
                 start += columns;
             }
@@ -1845,15 +1729,15 @@ fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usiz
                 width += next;
             }
         }
-        push(start..offset + line.len());
-        offset += part.len();
+        push(start..content_end);
+        offset = end;
     }
     if text.ends_with('\n') {
         push(text.len()..text.len());
     }
 }
 
-pub(crate) fn column_offset(text: &str, range: Range<usize>, column: f32) -> usize {
+fn column_offset(text: &str, range: Range<usize>, column: f32) -> usize {
     let mut used = 0.;
     for (index, c) in text[range.clone()].char_indices() {
         let width = f32::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2));
@@ -1880,6 +1764,7 @@ pub(crate) struct AgentSession {
     pub expanded_tools: HashSet<String>,
     pub lines: Vec<AgentLine>,
     pub columns: usize,
+    append_from: Option<(usize, usize)>,
     rendered: Vec<Option<RenderedMarkdown>>,
     render_request: Option<u64>,
     pub editor_scroll: Option<usize>,
@@ -1891,21 +1776,21 @@ pub(crate) struct AgentSession {
 
 impl AgentSession {
     fn restore_draft(&mut self, mut input: String, mut items: Vec<ContextItem>) {
-        let offset = if self.model.input.is_empty() {
+        if self.model.input.is_empty() {
             self.model.cursor = input.len();
-            0
-        } else if input.is_empty() {
-            0
-        } else {
+            self.model.input = input;
+        } else if !input.is_empty() {
             input.push('\n');
-            input.len()
-        };
-        input.push_str(&self.model.input);
-        self.model.input = input;
-        self.model.cursor += offset;
-        self.model.anchor = self.model.anchor.map(|anchor| anchor + offset);
-        items.append(&mut self.context.basket);
-        self.context.basket = items;
+            let offset = input.len();
+            input.push_str(&self.model.input);
+            self.model.input = input;
+            self.model.cursor += offset;
+            self.model.anchor = self.model.anchor.map(|anchor| anchor + offset);
+        }
+        if !items.is_empty() {
+            items.append(&mut self.context.basket);
+            self.context.basket = items;
+        }
     }
 
     pub fn rewind_index(&self) -> Option<usize> {
@@ -1942,8 +1827,7 @@ impl AgentSession {
     }
 
     fn sync_rendered(&mut self) {
-        self.rendered
-            .resize_with(self.model.messages.len(), || None);
+        self.rendered.resize(self.model.messages.len(), None);
         for (message, rendered) in self.model.messages.iter().zip(&mut self.rendered) {
             if rendered.as_ref().is_some_and(|old| !old.matches(message)) {
                 *rendered = None;
@@ -2178,6 +2062,31 @@ impl AgentSession {
         );
         self.model.set_cursor(cursor, extend);
     }
+    pub fn select_editor(
+        &mut self,
+        mut layout: EditorLines,
+        rows: usize,
+        (column, row): (f32, f32),
+        extend: bool,
+    ) {
+        if extend {
+            if row < 0. {
+                layout.first = layout.first.saturating_sub(1);
+            } else if row >= rows as f32 {
+                layout.first = (layout.first + 1).min(layout.lines.len().saturating_sub(rows));
+            }
+        }
+        let row = row.floor().clamp(0., rows.saturating_sub(1) as f32) as usize;
+        let end = self.model.input.len();
+        let range = layout
+            .lines
+            .get(layout.first + row)
+            .cloned()
+            .unwrap_or(end..end);
+        let cursor = column_offset(&self.model.input, range, column);
+        self.editor_scroll = Some(layout.first);
+        self.model.set_cursor(cursor, extend);
+    }
     pub fn add_context(&mut self, item: ContextItem) -> Result<(), &'static str> {
         if self.context.basket.iter().any(|old| {
             old.source == item.source && old.label == item.label && old.snapshot == item.snapshot
@@ -2227,15 +2136,28 @@ impl AgentSession {
         let mut request = serde_json::json!({
             "action": "send",
             "pane": pane,
-            "basket": self.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
         });
+        request["basket"] = serde_json::Value::Array(
+            self.context
+                .basket
+                .drain(..)
+                .map(|item| {
+                    serde_json::Value::Array(vec![
+                        item.label.into(),
+                        item.source.into(),
+                        item.kind.into(),
+                        item.snapshot.text.into(),
+                        item.snapshot.incomplete.into(),
+                    ])
+                })
+                .collect(),
+        );
         request["input"] = serde_json::Value::String(std::mem::take(&mut self.model.input));
         self.model.pending.push(request);
         self.model.clear_input();
         self.model.busy = true;
         self.model.scroll = 0;
         self.clear_selection();
-        self.context.basket.clear();
         self.context.preview = None;
         self.context.menu = false;
         self.columns = 0;
@@ -2287,7 +2209,8 @@ impl AgentSession {
         })
     }
     pub fn layout(&mut self, columns: usize) {
-        if self.columns == columns {
+        let append = self.append_from.take().filter(|_| self.columns == columns);
+        if self.columns == columns && append.is_none() {
             return;
         }
         let previous_lines = self.lines.len();
@@ -2303,14 +2226,20 @@ impl AgentSession {
             })
             .flatten();
         let mut lines = std::mem::take(&mut self.lines);
-        lines.clear();
+        if let Some((line, _)) = append {
+            lines.truncate(line);
+        } else {
+            lines.clear();
+        }
         self.expanded_tools.retain(|id| {
             self.model
                 .messages
                 .iter()
                 .any(|message| message.id.as_ref() == Some(id))
         });
-        for (index, message) in self.model.messages.iter().enumerate() {
+        let first = append.map_or(0, |_| self.model.messages.len() - 1);
+        let offset = append.map_or(0, |(_, offset)| offset);
+        for (index, message) in self.model.messages.iter().enumerate().skip(first) {
             let tool = message.id.is_some();
             if tool {
                 lines.push(AgentLine::Role(index as u32));
@@ -2331,12 +2260,12 @@ impl AgentSession {
                     0
                 };
                 wrap_context_into(
-                    self.message_text(index),
+                    &self.message_text(index)[offset..],
                     columns.saturating_sub(reserved),
                     |range| {
                         lines.push(AgentLine::Text {
                             message: index as u32,
-                            range: range.start as u32..range.end as u32,
+                            range: (offset + range.start) as u32..(offset + range.end) as u32,
                         });
                     },
                 );
@@ -2435,7 +2364,7 @@ impl Ui {
             AgentAction::NewSession => "New conversation · Enter",
             AgentAction::Session(_) => "Switch conversation · Enter",
             AgentAction::CloseSession(_) => "Close conversation · Enter",
-            AgentAction::ClosePanel => "Close Agent panel · Enter",
+            AgentAction::ClosePanel => "Collapse Agent panel · Enter",
             AgentAction::Rewind(_) => "Selected rewind target · Esc older · Enter confirms",
         };
         self.message(hint);
@@ -2486,7 +2415,7 @@ impl Ui {
         if action != AgentAction::ContextMenu {
             self.agent.active_mut().context.menu = false;
         }
-        if !self.agent.remote_ready
+        if self.agent.remote != RemoteState::Ready
             && matches!(
                 action,
                 AgentAction::NewSession | AgentAction::CloseSession(_)
@@ -2908,6 +2837,54 @@ mod tests {
     use super::*;
 
     #[test]
+    fn tab_dot_tracks_agent_outcome_without_treating_tool_errors_as_failure() {
+        let mut ui = Ui::new().unwrap();
+        ui.agent.open = true;
+        let config = Config::default();
+        let size = WindowSize {
+            num_cols: 80,
+            num_lines: 24,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let side = Rect {
+            x: 40,
+            y: 1,
+            cols: 40,
+            rows: 22,
+        };
+        for (role, busy, expected) in [
+            ("Agent", false, 0xb5d2a2),
+            ("Error", true, 0xfe9b30),
+            ("Error", false, 0xef5350),
+            ("Blocked", false, 0xef5350),
+            ("shell error", false, 0xb5d2a2),
+        ] {
+            let model = &mut ui.agent.active_mut().model;
+            model.busy = busy;
+            model.messages = vec![crate::workspace::AgentMessage {
+                turn: 1,
+                role: role.into(),
+                text: "result".into(),
+                id: None,
+            }];
+            let panel = draw(&mut ui, &config, side, size, None, "").unwrap();
+            let row = &panel.grid.rows[0];
+            assert_eq!(row.cells[1].c, '•');
+            assert_eq!(row.cells[1].fg, rgb(expected));
+            assert!(row.cells[3].flags.contains(Flags::BOLD));
+            assert_eq!(row.cells[3].fg, rgb(0xffffff));
+            assert!(
+                row.cells
+                    .iter()
+                    .all(|cell| !cell.flags.contains(Flags::UNDERLINE))
+            );
+            assert!(row.cells[1..].iter().all(|cell| cell.bg == rgb(0x191919)));
+            assert!(row.cells.iter().any(|cell| cell.c == '╱'));
+        }
+    }
+
+    #[test]
     fn shared_editor_preserves_composition_and_only_emits_changed_rows() {
         let mut ui = Ui::new().unwrap();
         ui.agent.open = true;
@@ -2967,7 +2944,7 @@ mod tests {
             let mut remote = AgentPanel::default();
             remote.active_mut().model.input = saved.into();
             let mut local = AgentPanel {
-                remote_opened: true,
+                remote: RemoteState::Loading,
                 ..AgentPanel::default()
             };
             local.active_mut().model.input = "typed".into();
@@ -2989,6 +2966,94 @@ mod tests {
         }
     }
 
+    #[test]
+    fn initial_idle_model_keeps_a_send_queued_while_loading_busy() {
+        use crate::wire::{Peer, Response};
+        use crate::workspace::{Action, Snapshot};
+
+        let path = std::env::temp_dir().join(format!(
+            "nextty-ui-loading-send-{}.sock",
+            std::process::id()
+        ));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut client = Client::connect(&path).unwrap();
+        let (stream, _) = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut peer = Peer::new(stream).unwrap();
+        peer.send_response(Response::State(
+            Snapshot {
+                name: "loading".into(),
+                controller: true,
+                focused: 1,
+                active_tab: 1,
+                tabs: Vec::new(),
+                panes: Vec::new(),
+            },
+            Vec::new(),
+            0,
+        ))
+        .unwrap();
+        peer.flush().unwrap();
+        client.poll().unwrap();
+
+        let saved = AgentPanel::default();
+        let mut local = AgentPanel {
+            open: true,
+            remote: RemoteState::Loading,
+            ..AgentPanel::default()
+        };
+        let item = ContextItem {
+            label: "attachment".into(),
+            source: "pane 1".into(),
+            kind: "Screen".into(),
+            snapshot: ContextSnapshot {
+                text: "registers".into(),
+                incomplete: false,
+            },
+        };
+        local.active_mut().context.basket.push(item.clone());
+        local.active_mut().model.insert("first draft").unwrap();
+        assert!(local.active_mut().send(&client).unwrap());
+        peer.send_response(Response::Agent(AgentEvent::Draft(
+            serde_json::to_vec(&saved.view_state()).unwrap(),
+        )))
+        .unwrap();
+        peer.send_response(Response::Agent(AgentEvent::Model(
+            saved.model_snapshot().remove(0),
+        )))
+        .unwrap();
+        peer.send_response(Response::Agent(AgentEvent::Ready))
+            .unwrap();
+        peer.flush().unwrap();
+        client.poll().unwrap();
+        local.poll_remote(&mut client, &Config::default()).unwrap();
+        assert!(local.active().model.pending.is_empty());
+        local.active_mut().model.insert("next draft").unwrap();
+        assert!(!local.active_mut().send(&client).unwrap());
+        assert!(local.active().model.busy);
+        assert_eq!(local.active().model.input, "next draft");
+        client.flush().unwrap();
+        let mut requests = Vec::new();
+        while let Some(action) = peer.next_action().unwrap() {
+            if let Action::AgentRequest(payload) = action {
+                requests.push(serde_json::from_slice::<serde_json::Value>(&payload).unwrap());
+            }
+        }
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0]["input"], "first draft");
+        assert_eq!(requests[0]["basket"], serde_json::json!([item.view()]));
+
+        peer.send_response(Response::Agent(AgentEvent::Model(
+            saved.model_snapshot().remove(0),
+        )))
+        .unwrap();
+        peer.flush().unwrap();
+        client.poll().unwrap();
+        local.poll_remote(&mut client, &Config::default()).unwrap();
+        assert!(!local.active().model.busy);
+        assert_eq!(local.active().model.input, "next draft");
+    }
+
     impl AgentPanel {
         fn model_snapshot(&self) -> Vec<AgentModelPatch> {
             self.sessions
@@ -2997,7 +3062,6 @@ mod tests {
                     session: session.id,
                     busy: session.model.busy,
                     revision: session.model.revision,
-                    turn: session.model.turn,
                     messages: session.model.messages.clone(),
                     recovery: b"{}".to_vec(),
                     ..AgentModelPatch::default()
@@ -3083,8 +3147,7 @@ mod tests {
         peer.flush().unwrap();
         client.poll().unwrap();
         let mut ui = Ui::new().unwrap();
-        ui.agent.remote_opened = true;
-        ui.agent.remote_ready = true;
+        ui.agent.remote = RemoteState::Ready;
         ui.agent
             .active_mut()
             .model
@@ -3300,6 +3363,58 @@ mod tests {
         assert_eq!(panel.active().message_text(0), "first");
         panel.wait_layout(40);
         assert_eq!(panel.active().message_text(0), "first\n\nnext");
+    }
+
+    #[test]
+    fn streamed_unicode_geometry_matches_full_layout() {
+        let mut panel = AgentPanel {
+            open: true,
+            ..AgentPanel::default()
+        };
+        for text in [
+            "Earlier reply\n\nkept for selection",
+            "中文🙂 e\u{301} ".repeat(8).as_str(),
+        ] {
+            panel
+                .active_mut()
+                .model
+                .messages
+                .push(crate::workspace::AgentMessage {
+                    turn: 1,
+                    role: "Agent".into(),
+                    text: text.into(),
+                    id: None,
+                });
+        }
+        panel.wait_layout(12);
+        let session = panel.active_mut();
+        session.begin_selection(session.point(0, 0).unwrap(), false);
+        session.extend_selection(session.point(0, 7).unwrap());
+        session.end_selection();
+        session.model.scroll = 3;
+        let rows = |session: &AgentSession| {
+            session
+                .lines
+                .iter()
+                .map(|line| match line {
+                    AgentLine::Role(message) => ('r', *message, 0..0),
+                    AgentLine::Text { message, range } => ('t', *message, range.clone()),
+                    AgentLine::Blank => ('b', 0, 0..0),
+                })
+                .collect::<Vec<_>>()
+        };
+        for delta in ["追加", "e\u{301}🙂", "\n\n**bold", "**\n\nlast"] {
+            panel.active_mut().model.messages[1].text.push_str(delta);
+            panel.wait_layout(12);
+            let session = panel.active_mut();
+            let streamed = rows(session);
+            let scroll = session.model.scroll;
+            session.columns = 0;
+            session.layout(12);
+            assert_eq!(streamed, rows(session));
+            assert_eq!(scroll, session.model.scroll);
+            assert_eq!(session.selected_text().as_deref(), Some("Earlier"));
+        }
     }
 
     #[test]
@@ -3637,11 +3752,11 @@ mod tests {
             });
         }
         let view = panel.view_state();
-        assert!(panel.view_matches(&view));
+        assert_eq!(panel.view_state(), view);
         panel.active_mut().model.cursor = 0;
         panel.active_mut().context.menu = false;
         panel.active_mut().context.preview = None;
-        assert!(panel.view_matches(&view));
+        assert_eq!(panel.view_state(), view);
         assert!(view["sessions"][0].get("cursor").is_none());
         assert!(view["sessions"][0].get("messages").is_none());
         let mut restored = AgentPanel::default();
@@ -3770,7 +3885,7 @@ mod tests {
                 id: None,
             });
         let wide = panel.tabs(100);
-        assert_eq!(wide[0].2, crate::width::text_width(title) + 4);
+        assert_eq!(wide[0].2, crate::width::text_width(title) + 7);
         assert!(wide[0].2 > 18);
         let narrow = panel.tabs(24);
         assert_eq!(narrow[0].2, 18);
@@ -3799,7 +3914,7 @@ mod tests {
             });
         let tabs = panel.tabs(80);
         assert_eq!(tabs.len(), 3);
-        assert_eq!(tabs[2].2, 8);
+        assert_eq!(tabs[2].2, 10);
         assert!(tabs[0].2 > 18 && tabs[1].2 > 18);
         assert_eq!(tabs.iter().map(|tab| tab.2).sum::<usize>(), 74);
         let tiny = panel.tabs(12);

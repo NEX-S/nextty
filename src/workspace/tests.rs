@@ -242,7 +242,7 @@ fn independent_clients_search_without_cancelling_each_other_or_selecting_read_on
     wait(&mut viewer, |client, _| {
         !client.snapshot().unwrap().controller
     });
-    assert!(viewer_ui.search.observe(&mut viewer).unwrap());
+    viewer_ui.search.observe(&mut viewer).unwrap();
     assert!(!viewer_ui.search.open);
     viewer_ui.search.begin(&mut viewer, pane).unwrap();
     let mut controller_ui = crate::ui::Ui::new().unwrap();
@@ -298,7 +298,7 @@ fn independent_clients_search_without_cancelling_each_other_or_selecting_read_on
             .iter()
             .any(|p| p.id == pane)
     });
-    assert!(viewer_ui.search.observe(&mut viewer).unwrap());
+    viewer_ui.search.observe(&mut viewer).unwrap();
     assert!(!viewer_ui.search.open);
 }
 
@@ -588,13 +588,7 @@ fn server_child() {
     let Some(directory) = std::env::var_os("NEXTTY_TEST_SERVER_DIR").map(PathBuf::from) else {
         return;
     };
-    run_server(
-        &directory.join("server.sock"),
-        ServerOptions {
-            history_directory: directory.join("history"),
-        },
-    )
-    .unwrap();
+    run_server(&directory.join("server.sock")).unwrap();
 }
 
 struct TestServer {
@@ -619,16 +613,17 @@ impl TestServer {
         let child = Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "workspace::tests::server_child", "--nocapture"])
             .env("NEXTTY_TEST_SERVER_DIR", &directory)
+            .env("XDG_CACHE_HOME", &directory)
             .env("HOME", &home)
             .env("ZDOTDIR", &home)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::from(log))
+            .stderr(log)
             .spawn()
             .unwrap();
         let result = Self { child, directory };
         let deadline = Instant::now() + Duration::from_secs(5);
-        while !result.socket().exists() || !result.directory.join("history").is_dir() {
+        while !result.socket().exists() || !result.directory.join("nextty/history").is_dir() {
             assert!(Instant::now() < deadline, "server did not finish starting");
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -1117,7 +1112,7 @@ fn input_clears_selection_only_after_it_is_accepted() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -1141,7 +1136,7 @@ fn input_clears_selection_only_after_it_is_accepted() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -1165,7 +1160,7 @@ fn input_clears_selection_only_after_it_is_accepted() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -1179,7 +1174,7 @@ fn input_clears_selection_only_after_it_is_accepted() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     );
     assert_eq!(rejected.unwrap_err().kind(), io::ErrorKind::InvalidInput);
@@ -1469,7 +1464,7 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         &mut clients,
         &mut workspaces,
         &mut HashSet::new(),
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -1668,7 +1663,7 @@ fn backpressured_broadcast_recovers_latest_grid_and_palette_with_a_full_update()
         &mut clients,
         &mut workspaces,
         &mut HashSet::new(),
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -1899,7 +1894,7 @@ fn daemon_preserves_pty_and_transfers_control_across_frontends() {
     });
     server.wait_for_exit();
     assert_eq!(
-        fs::read_dir(server.directory.join("history"))
+        fs::read_dir(server.directory.join("nextty/history"))
             .unwrap()
             .count(),
         0,
@@ -1927,7 +1922,7 @@ fn unchanged_pointer_and_view_actions_do_not_schedule_broadcasts() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut closing,
     )
     .unwrap();
@@ -1941,7 +1936,7 @@ fn unchanged_pointer_and_view_actions_do_not_schedule_broadcasts() {
         &mut clients,
         &mut workspaces,
         &mut dirty,
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut closing,
     )
     .unwrap();
@@ -2047,7 +2042,7 @@ fn unchanged_pointer_and_view_actions_do_not_schedule_broadcasts() {
             &mut clients,
             &mut workspaces,
             &mut dirty,
-            &server.directory.join("history"),
+            &server.directory.join("nextty/history"),
             &mut closing,
         )
         .unwrap();
@@ -2564,6 +2559,58 @@ fn tab_titles_follow_the_focused_pane_directory_instead_of_application_titles() 
 }
 
 #[test]
+fn closing_an_inactive_pane_preserves_the_middle_active_tab() {
+    for natural_exit in [true, false] {
+        let server = TestServer::start();
+        let mut client = Client::connect(&server.socket()).unwrap();
+        client
+            .send(Action::Create {
+                name: "persist".into(),
+                options: CreateOptions {
+                    program: Some(Shell::new("/bin/sh".into(), vec!["-i".into()])),
+                    ..CreateOptions::default()
+                },
+            })
+            .unwrap();
+        wait(&mut client, |client, _| client.snapshot().is_some());
+        let first = client.snapshot().unwrap().focused;
+        let mut tabs = Vec::new();
+        for count in [2, 3] {
+            client.send(Action::NewTab { pane: first }).unwrap();
+            wait(&mut client, |client, _| {
+                client.snapshot().unwrap().tabs.len() == count
+            });
+            tabs.push(client.snapshot().unwrap().active_tab);
+        }
+        client.send(Action::Tab(-1)).unwrap();
+        wait(&mut client, |client, _| {
+            client.snapshot().unwrap().active_tab == tabs[0]
+        });
+        let focused = client.snapshot().unwrap().focused;
+        client
+            .send(if natural_exit {
+                Action::Input {
+                    pane: first,
+                    data: b"exit\n".to_vec(),
+                }
+            } else {
+                Action::ClosePane(first)
+            })
+            .unwrap();
+        wait(&mut client, |client, _| {
+            client.snapshot().unwrap().tabs.len() == 2
+        });
+        let snapshot = client.snapshot().unwrap();
+        assert_eq!(
+            snapshot.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
+            tabs
+        );
+        assert_eq!(snapshot.active_tab, tabs[0]);
+        assert_eq!(snapshot.focused, focused);
+    }
+}
+
+#[test]
 fn closing_an_inactive_tab_terminates_its_panes_and_preserves_active_tab() {
     let mut server = TestServer::start();
     let mut client = Client::connect(&server.socket()).unwrap();
@@ -2623,7 +2670,7 @@ fn closing_an_inactive_tab_terminates_its_panes_and_preserves_active_tab() {
     });
     server.wait_for_exit();
     assert_eq!(
-        fs::read_dir(server.directory.join("history"))
+        fs::read_dir(server.directory.join("nextty/history"))
             .unwrap()
             .count(),
         0
@@ -2970,6 +3017,7 @@ fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_even
         tabs: Vec::new(),
         panes: vec![PaneView {
             id: 1,
+            tab: 1,
             rect: Rect {
                 cols: 2,
                 rows: 2,
@@ -3099,7 +3147,7 @@ fn screen_pull_waits_for_changes_and_recovers_after_another_consumer() {
         &mut clients,
         &mut workspaces,
         &mut HashSet::new(),
-        &server.directory.join("history"),
+        &server.directory.join("nextty/history"),
         &mut ClosingTerminals::default(),
     )
     .unwrap();
@@ -3214,13 +3262,25 @@ fn forced_screen_read_waits_for_its_own_reply() {
         _ => panic!("expected a fresh screen read"),
     };
     client.refresh_screen().unwrap();
-    assert!(peer.next_action().unwrap().is_none());
+    client.flush().unwrap();
+    let newest = match peer.next_action().unwrap().unwrap() {
+        Action::ScreenRequest {
+            request,
+            wait: false,
+        } => request,
+        _ => panic!("expected a newer forced screen read"),
+    };
     peer.send_response(Response::State(snapshot.clone(), Vec::new(), old))
         .unwrap();
     peer.flush().unwrap();
     client.poll().unwrap();
     assert!(client.screen_stale());
-    peer.send_response(Response::State(snapshot, Vec::new(), fresh))
+    peer.send_response(Response::State(snapshot.clone(), Vec::new(), fresh))
+        .unwrap();
+    peer.flush().unwrap();
+    client.poll().unwrap();
+    assert!(client.screen_stale());
+    peer.send_response(Response::State(snapshot, Vec::new(), newest))
         .unwrap();
     peer.flush().unwrap();
     client.poll().unwrap();
@@ -3463,6 +3523,180 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
 }
 
 #[test]
+fn recreated_workspaces_reject_old_history_requests() {
+    let server = TestServer::start();
+    let (sender, receiver) = UnixStream::pair().unwrap();
+    let mut clients = vec![Connection::new(1, sender).unwrap()];
+    let mut frontend = test_client(receiver);
+    let mut workspaces = HashMap::new();
+    let mut closing = ClosingTerminals::default();
+    let mut apply = |action, clients: &mut [Connection], workspaces: &mut HashMap<_, _>| {
+        apply_action(
+            0,
+            action,
+            clients,
+            workspaces,
+            &mut HashSet::new(),
+            &server.directory.join("nextty/history"),
+            &mut closing,
+        )
+        .unwrap();
+    };
+    let create = |name: &str| Action::Create {
+        name: name.into(),
+        options: CreateOptions {
+            program: Some(Shell::new("/bin/sleep".into(), vec!["30".into()])),
+            ..CreateOptions::default()
+        },
+    };
+    apply(create("source"), &mut clients, &mut workspaces);
+    let pane = workspaces["source"].focused();
+    let read = |request| Action::ReadHistory {
+        pane,
+        request,
+        block: None,
+        cursor: None,
+        query: None,
+    };
+    apply(read(1), &mut clients, &mut workspaces);
+    apply(read(5), &mut clients, &mut workspaces);
+    assert_eq!(clients[0].reads.len(), 2);
+    let cancelled = Arc::clone(&clients[0].reads[1].cancelled);
+    apply(
+        Action::CancelHistory { request: 5 },
+        &mut clients,
+        &mut workspaces,
+    );
+    assert!(cancelled.load(Ordering::Relaxed));
+    workspaces["source"].panes[&pane]
+        .terminal
+        .core
+        .lock()
+        .unwrap()
+        .set_private(2026, true);
+    apply(read(2), &mut clients, &mut workspaces);
+    apply(read(4), &mut clients, &mut workspaces);
+    apply(
+        Action::CopySelection { pane, request: 3 },
+        &mut clients,
+        &mut workspaces,
+    );
+    assert_eq!(clients[0].read_requests.len(), 2);
+    assert_eq!(clients[0].copy_requests.len(), 1);
+    apply(
+        Action::CancelHistory { request: 4 },
+        &mut clients,
+        &mut workspaces,
+    );
+    assert_eq!(clients[0].read_requests.len(), 1);
+    apply(create("keeper"), &mut clients, &mut workspaces);
+    apply(
+        Action::TerminateName("source".into()),
+        &mut clients,
+        &mut workspaces,
+    );
+    apply(create("source"), &mut clients, &mut workspaces);
+    let replacement = workspaces["source"].focused();
+    apply(
+        Action::Attach {
+            name: "keeper".into(),
+            size: CreateOptions::default().size,
+        },
+        &mut clients,
+        &mut workspaces,
+    );
+    complete_requests(&mut clients, &workspaces, &mut HashSet::new());
+    clients[0].peer.flush().unwrap();
+    let mut completed = HashSet::new();
+    for event in frontend.poll().unwrap() {
+        let (request, error) = match event {
+            ClientEvent::History { request, result } => (request, result.unwrap_err()),
+            ClientEvent::CopyError { request, error } => (request, error),
+            _ => panic!("unexpected history response"),
+        };
+        assert!(error.contains("source pane no longer exists"), "{error}");
+        completed.insert(request);
+    }
+    assert_eq!(completed, HashSet::from([1, 2, 3]));
+    assert!(clients[0].reads.is_empty());
+    assert!(clients[0].read_requests.is_empty());
+    assert!(clients[0].copy_requests.is_empty());
+    assert_ne!(pane, replacement);
+}
+
+#[test]
+fn switching_workspaces_preserves_pending_history_read_source() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    client
+        .send(Action::Create {
+            name: "read-source".into(),
+            options: CreateOptions::default(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| client.snapshot().is_some());
+    let pane = client.snapshot().unwrap().focused;
+    client
+        .send(Action::Input {
+            pane,
+            data: b"printf 'original-history-source\\n'\n".to_vec(),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        grid_contains(client, "original-history-source")
+    });
+    let mut target = Client::connect(&server.socket()).unwrap();
+    target
+        .send(Action::Create {
+            name: "read-target".into(),
+            options: CreateOptions::default(),
+        })
+        .unwrap();
+    wait(&mut target, |client, _| client.snapshot().is_some());
+    assert!(
+        target
+            .snapshot()
+            .unwrap()
+            .panes
+            .iter()
+            .all(|target| target.id != pane)
+    );
+    client
+        .peer
+        .send_action(&Action::ReadHistory {
+            pane,
+            request: 99,
+            block: None,
+            cursor: None,
+            query: Some("original-history-source".into()),
+        })
+        .unwrap();
+    client
+        .peer
+        .send_action(&Action::Attach {
+            name: "read-target".into(),
+            size: CreateOptions::default().size,
+        })
+        .unwrap();
+    client.flush().unwrap();
+    let mut finished = false;
+    wait(&mut client, |client, events| {
+        for event in events {
+            if let ClientEvent::History {
+                request: 99,
+                result,
+            } = event
+            {
+                let page = result.as_ref().unwrap();
+                assert!(page.text.contains("original-history-source"));
+                finished = true;
+            }
+        }
+        finished && client.snapshot().is_some_and(|s| s.name == "read-target")
+    });
+}
+
+#[test]
 fn closing_a_pane_completes_its_pending_history_read_without_more_terminal_events() {
     let server = TestServer::start();
     let mut client = Client::connect(&server.socket()).unwrap();
@@ -3526,7 +3760,7 @@ fn disk_history_failure_reports_without_closing_workspace_pane() {
     }).unwrap();
     wait(&mut client, |client, _| grid_contains(client, "READY"));
     let pane = client.snapshot().unwrap().focused;
-    let directory = fs::read_dir(server.directory.join("history"))
+    let directory = fs::read_dir(server.directory.join("nextty/history"))
         .unwrap()
         .next()
         .unwrap()
@@ -3692,7 +3926,7 @@ time.sleep(30)
 fn tab_activity_tracks_commands_even_when_the_tab_is_hidden() {
     let server = TestServer::start();
     let mut client = Client::connect(&server.socket()).unwrap();
-    let script = "import os,tty; tty.setraw(0); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); os.write(1,b'\x1b]133;C\x07running'); os.read(0,1); os.write(1,b'\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1)";
+    let script = "import os,tty,subprocess; tty.setraw(0); child=subprocess.Popen(['/bin/sleep','30']); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); os.write(1,b'\x1b]133;C\x07running'); os.read(0,1); os.write(1,b'\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); child.terminate(); child.wait()";
     client
         .send(Action::Create {
             name: "tab-activity".into(),
@@ -3781,4 +4015,505 @@ fn background_child_keeps_tab_running_until_it_exits() {
         client.snapshot().unwrap().tabs[0].activity,
         TabActivity::Idle
     );
+}
+
+fn attach_agent_owner(server: &TestServer, frontend: &mut Client, name: &str) -> Client {
+    frontend
+        .send(Action::AgentRequest(b"test".to_vec()))
+        .unwrap();
+    wait(frontend, |client, _| !client.agent_events.is_empty());
+    let token = frontend
+        .take_agent_events()
+        .into_iter()
+        .find_map(|event| {
+            if let AgentEvent::Start(token) = event {
+                Some(token)
+            } else {
+                None
+            }
+        })
+        .unwrap();
+    let mut owner = Client::connect(&server.socket()).unwrap();
+    owner
+        .send(Action::AgentAttach {
+            name: name.into(),
+            token,
+        })
+        .unwrap();
+    wait(&mut owner, |client, _| client.snapshot().is_some());
+    owner
+}
+
+#[test]
+fn agent_workspace_files_and_new_tab_use_selected_pane_without_changing_user_view() {
+    let server = TestServer::start();
+    let source = server.directory.join("source");
+    let project = source.join("project");
+    let other = server.directory.join("other");
+    fs::create_dir_all(&project).unwrap();
+    fs::create_dir(&other).unwrap();
+    fs::write(project.join("value.txt"), "selected needle\n").unwrap();
+    fs::write(other.join("value.txt"), "user data\n").unwrap();
+    let mut frontend = Client::connect(&server.socket()).unwrap();
+    frontend
+        .send(Action::Create {
+            name: "persist".into(),
+            options: CreateOptions {
+                directory: Some(source),
+                program: Some(Shell::new("/bin/sh".into(), vec!["-i".into()])),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| client.snapshot().is_some());
+    let pane = frontend.snapshot().unwrap().focused;
+    frontend
+        .send(Action::Input {
+            pane,
+            data: b"cd project; printf 'cwd-ready\\n'\n".to_vec(),
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| {
+        client.snapshot().unwrap().pane(pane).unwrap().cwd.as_ref() == Some(&project)
+    });
+    let mut owner = attach_agent_owner(&server, &mut frontend, "persist");
+    frontend.send(Action::NewTab { pane }).unwrap();
+    wait(&mut frontend, |client, _| {
+        client.snapshot().unwrap().tabs.len() == 2
+    });
+    let focused = frontend.snapshot().unwrap().focused;
+    let active_tab = frontend.snapshot().unwrap().active_tab;
+    frontend
+        .send(Action::Input {
+            pane: focused,
+            data: format!(
+                "cd '{}'; i=0; while [ $i -lt 60 ]; do printf 'other-%s\\n' $i; i=$((i+1)); done\n",
+                other.display()
+            )
+            .into_bytes(),
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| grid_contains(client, "other-59"));
+    wait(&mut owner, |client, _| {
+        client.snapshot().unwrap().panes.len() == 2
+    });
+    assert_eq!(owner.snapshot().unwrap().pane(pane).unwrap().tab, pane);
+    assert_eq!(
+        owner.snapshot().unwrap().pane(focused).unwrap().tab,
+        active_tab
+    );
+    for action in [
+        Action::AgentFile {
+            pane,
+            request: 1,
+            path: project.join("value.txt"),
+            operation: FileOperation::Edit {
+                old_text: None,
+                new_text: "denied".into(),
+            },
+        },
+        Action::AgentNewTab { pane, request: 2 },
+        Action::CancelAgentFile { request: 1 },
+    ] {
+        frontend.send(action).unwrap();
+        wait(&mut frontend, |_, events| {
+            events.iter().any(|event| matches!(event, ClientEvent::Error(error) if error.contains("not authorized")))
+        });
+    }
+    for (request, path, operation) in [
+        (
+            41,
+            PathBuf::from("value.txt"),
+            FileOperation::Read { offset: 0 },
+        ),
+        (
+            42,
+            PathBuf::from("."),
+            FileOperation::Search {
+                query: "needle".into(),
+            },
+        ),
+        (
+            43,
+            PathBuf::from("value.txt"),
+            FileOperation::Edit {
+                old_text: Some("selected".into()),
+                new_text: "edited".into(),
+            },
+        ),
+        (
+            44,
+            project.join("value.txt"),
+            FileOperation::Read { offset: 0 },
+        ),
+    ] {
+        owner
+            .send(Action::AgentFile {
+                pane,
+                request,
+                path,
+                operation,
+            })
+            .unwrap();
+    }
+    let mut received = Vec::new();
+    wait(&mut owner, |_, events| {
+        for event in events {
+            if let ClientEvent::AgentFile { request, result } = event {
+                let result = result.as_ref().unwrap();
+                match (request, result) {
+                    (41, FileResult::Read { path, text, .. }) => {
+                        assert_eq!(path, &project.join("value.txt"));
+                        assert_eq!(text, "selected needle\n");
+                    }
+                    (
+                        42,
+                        FileResult::Search {
+                            matches, truncated, ..
+                        },
+                    ) => {
+                        assert!(!truncated);
+                        assert_eq!(matches.len(), 1);
+                        assert_eq!(matches[0].line, 1);
+                        assert_eq!(matches[0].text, "selected needle");
+                    }
+                    (43, FileResult::Edited { path }) => {
+                        assert_eq!(path, &project.join("value.txt"))
+                    }
+                    (44, FileResult::Read { text, .. }) => assert_eq!(text, "edited needle\n"),
+                    _ => panic!("unexpected file result: {request} {result:?}"),
+                }
+                received.push(*request);
+            }
+        }
+        received.len() == 4
+    });
+    assert_eq!(received, [41, 42, 43, 44]);
+    assert_eq!(
+        fs::read_to_string(other.join("value.txt")).unwrap(),
+        "user data\n"
+    );
+    frontend
+        .send(Action::Scroll {
+            pane: focused,
+            scroll: Scroll::Top,
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| {
+        client.screens()[&focused].display_offset() > 0
+    });
+    let offset = frontend.screens()[&focused].display_offset();
+    let point = Point {
+        line: -(offset as i32),
+        column: 0,
+    };
+    frontend
+        .send(Action::SelectionStart {
+            pane: focused,
+            point,
+            side: Side::Left,
+            kind: SelectionType::Simple,
+        })
+        .unwrap();
+    frontend
+        .send(Action::SelectionUpdate {
+            pane: focused,
+            point: Point { column: 4, ..point },
+            side: Side::Right,
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| {
+        client.screens()[&focused].selection.is_some()
+    });
+    let before = frontend.screens()[&focused].clone();
+    owner
+        .send(Action::AgentNewTab { pane, request: 52 })
+        .unwrap();
+    let mut created = None;
+    wait(&mut owner, |_, events| {
+        for event in events {
+            if let ClientEvent::AgentNewTab {
+                request: 52,
+                result,
+            } = event
+            {
+                created = Some(*result.as_ref().unwrap());
+            }
+        }
+        created.is_some()
+    });
+    let created = created.unwrap();
+    wait(&mut owner, |client, _| {
+        client.snapshot().unwrap().pane(created).is_some()
+    });
+    let snapshot = owner.snapshot().unwrap();
+    assert_eq!(snapshot.pane(created).unwrap().cwd.as_ref(), Some(&project));
+    assert_eq!(snapshot.pane(created).unwrap().tab, created);
+    assert_eq!(snapshot.focused, focused);
+    assert_eq!(snapshot.active_tab, active_tab);
+    wait(&mut frontend, |client, _| {
+        client.snapshot().unwrap().tabs.len() == 3
+    });
+    let snapshot = frontend.snapshot().unwrap();
+    assert_eq!(snapshot.focused, focused);
+    assert_eq!(snapshot.active_tab, active_tab);
+    assert_eq!(snapshot.panes.len(), 1);
+    let after = &frontend.screens()[&focused];
+    assert_eq!(after.display_offset(), before.display_offset());
+    assert_eq!(after.selection, before.selection);
+    assert_eq!(after.columns, before.columns);
+    assert_eq!(
+        after.rows.iter().map(|row| &row.cells).collect::<Vec<_>>(),
+        before.rows.iter().map(|row| &row.cells).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn agent_file_cancellation_preserves_fifo_results_and_committed_edits() {
+    let server = TestServer::start();
+    let home = server.directory.join("home");
+    let path = home.join("value.txt");
+    fs::write(&path, "original").unwrap();
+    let mut frontend = Client::connect(&server.socket()).unwrap();
+    frontend
+        .send(Action::Create {
+            name: "persist".into(),
+            options: CreateOptions {
+                directory: Some(home),
+                program: Some(Shell::new("/bin/sh".into(), vec!["-i".into()])),
+                ..CreateOptions::default()
+            },
+        })
+        .unwrap();
+    wait(&mut frontend, |client, _| client.snapshot().is_some());
+    let pane = frontend.snapshot().unwrap().focused;
+    let mut owner = attach_agent_owner(&server, &mut frontend, "persist");
+    for action in [
+        Action::AgentFile {
+            pane,
+            request: 1,
+            path: "value.txt".into(),
+            operation: FileOperation::Edit {
+                old_text: None,
+                new_text: "cancelled".into(),
+            },
+        },
+        Action::CancelAgentFile { request: 1 },
+        Action::AgentFile {
+            pane,
+            request: 2,
+            path: "value.txt".into(),
+            operation: FileOperation::Read { offset: 0 },
+        },
+        Action::AgentFile {
+            pane,
+            request: 3,
+            path: "value.txt".into(),
+            operation: FileOperation::Edit {
+                old_text: Some("original".into()),
+                new_text: "committed".into(),
+            },
+        },
+    ] {
+        owner.send(action).unwrap();
+    }
+    let mut received = Vec::new();
+    wait(&mut owner, |_, events| {
+        for event in events {
+            if let ClientEvent::AgentFile { request, result } = event {
+                match request {
+                    1 => assert!(result.as_ref().unwrap_err().contains("cancel")),
+                    2 => assert!(
+                        matches!(result, Ok(FileResult::Read { text, .. }) if text == "original")
+                    ),
+                    3 => assert!(matches!(result, Ok(FileResult::Edited { .. }))),
+                    _ => panic!("unexpected request"),
+                }
+                received.push(*request);
+            }
+        }
+        received.len() == 3
+    });
+    owner.send(Action::CancelAgentFile { request: 3 }).unwrap();
+    owner
+        .send(Action::AgentFile {
+            pane,
+            request: 4,
+            path: path.clone(),
+            operation: FileOperation::Read { offset: 0 },
+        })
+        .unwrap();
+    wait(&mut owner, |_, events| {
+        events.iter().any(|event| matches!(event, ClientEvent::AgentFile { request: 4, result: Ok(FileResult::Read { text, .. }) } if text == "committed"))
+    });
+    assert_eq!(received, [1, 2, 3]);
+    assert_eq!(fs::read_to_string(path).unwrap(), "committed");
+}
+
+#[test]
+fn agent_file_inflight_cancellation_and_lifecycle_preserve_received_commits() {
+    let server = TestServer::start();
+    let path = server.directory.join("value.txt");
+    fs::write(&path, "original").unwrap();
+    let (controller_stream, _) = UnixStream::pair().unwrap();
+    let (owner_stream, client_stream) = UnixStream::pair().unwrap();
+    let mut clients = vec![
+        Connection::new(1, controller_stream).unwrap(),
+        Connection::new(2, owner_stream).unwrap(),
+    ];
+    let mut client = test_client(client_stream);
+    let mut workspaces = HashMap::new();
+    let mut closing = ClosingTerminals::default();
+    let mut dirty = HashSet::new();
+    apply_action(
+        0,
+        Action::Create {
+            name: "files".into(),
+            options: CreateOptions {
+                directory: Some(server.directory.clone()),
+                program: Some(Shell::new("/bin/sleep".into(), vec!["30".into()])),
+                ..CreateOptions::default()
+            },
+        },
+        &mut clients,
+        &mut workspaces,
+        &mut dirty,
+        &server.directory.join("nextty/history"),
+        &mut closing,
+    )
+    .unwrap();
+    let pane = workspaces["files"].focused();
+    clients[1].workspace = Some("files".into());
+    clients[1].agent = true;
+    let (started, starts) = mpsc::channel();
+    let (release, releases) = mpsc::channel();
+    clients[1].files = Some(FileWorker {
+        worker: crate::worker::Worker::new(
+            "controlled-agent-files",
+            Arc::new(crate::eventfd::new().unwrap()),
+            move |job: FileJob, publish| {
+                started.send(job.source.request).unwrap();
+                releases.recv().unwrap();
+                publish(crate::agent_files::execute(
+                    job.path,
+                    job.operation,
+                    &job.source.cancelled,
+                ));
+            },
+        )
+        .unwrap(),
+        queued: VecDeque::new(),
+        active: None,
+    });
+    let mut apply = |index, action, clients: &mut [Connection], workspaces: &mut HashMap<_, _>| {
+        apply_action(
+            index,
+            action,
+            clients,
+            workspaces,
+            &mut HashSet::new(),
+            &server.directory.join("nextty/history"),
+            &mut closing,
+        )
+        .unwrap();
+    };
+    let edit = |request, new_text: &str| Action::AgentFile {
+        pane,
+        request,
+        path: path.clone(),
+        operation: FileOperation::Edit {
+            old_text: Some("original".into()),
+            new_text: new_text.into(),
+        },
+    };
+    apply(1, edit(1, "cancelled"), &mut clients, &mut workspaces);
+    complete_requests(&mut clients, &workspaces, &mut dirty);
+    assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+    let cancelled = clients[1]
+        .files
+        .as_ref()
+        .unwrap()
+        .active
+        .as_ref()
+        .unwrap()
+        .cancelled
+        .clone();
+    apply(
+        1,
+        Action::CancelAgentFile { request: 1 },
+        &mut clients,
+        &mut workspaces,
+    );
+    assert!(cancelled.load(Ordering::Relaxed));
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    loop {
+        complete_requests(&mut clients, &workspaces, &mut dirty);
+        clients[1].peer.flush().unwrap();
+        if client.poll().unwrap().iter().any(|event| matches!(event, ClientEvent::AgentFile { request: 1, result: Err(error) } if error.contains("cancel"))) { break; }
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(fs::read_to_string(&path).unwrap(), "original");
+    apply(1, edit(2, "committed"), &mut clients, &mut workspaces);
+    complete_requests(&mut clients, &workspaces, &mut dirty);
+    assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(), 2);
+    release.send(()).unwrap();
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while !clients[1].files.as_ref().unwrap().worker.ready(|_| true) {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    apply(
+        1,
+        Action::CancelAgentFile { request: 2 },
+        &mut clients,
+        &mut workspaces,
+    );
+    complete_requests(&mut clients, &workspaces, &mut dirty);
+    clients[1].peer.flush().unwrap();
+    assert!(client.poll().unwrap().iter().any(|event| matches!(
+        event,
+        ClientEvent::AgentFile {
+            request: 2,
+            result: Ok(FileResult::Edited { .. })
+        }
+    )));
+    assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
+    apply(1, edit(3, "after close"), &mut clients, &mut workspaces);
+    apply(
+        1,
+        edit(4, "queued after close"),
+        &mut clients,
+        &mut workspaces,
+    );
+    complete_requests(&mut clients, &workspaces, &mut dirty);
+    assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+    let active = clients[1]
+        .files
+        .as_ref()
+        .unwrap()
+        .active
+        .as_ref()
+        .unwrap()
+        .cancelled
+        .clone();
+    let queued = clients[1].files.as_ref().unwrap().queued[0]
+        .source
+        .cancelled
+        .clone();
+    apply(0, Action::ClosePane(pane), &mut clients, &mut workspaces);
+    assert!(active.load(Ordering::Relaxed));
+    assert!(queued.load(Ordering::Relaxed));
+    let files = clients[1].files.take().unwrap();
+    let (dropped, drop_finished) = mpsc::channel();
+    let dropper = std::thread::spawn(move || {
+        drop(files);
+        dropped.send(()).unwrap();
+    });
+    let drop_result = drop_finished.recv_timeout(Duration::from_secs(2));
+    release.send(()).unwrap();
+    dropper.join().unwrap();
+    drop_result.unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
 }

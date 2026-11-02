@@ -7,7 +7,7 @@ use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
-use std::process::{Child, Command, ExitStatus, Stdio};
+use std::process::{Child, Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
@@ -61,28 +61,19 @@ struct EventProxy {
 }
 
 impl EventProxy {
-    fn notify(&self) {
-        if let Err(error) = notify(self.wakeup.fd.as_raw_fd()) {
+    fn wakeup(&self) {
+        if let Err(error) = self.wakeup.notify() {
             eprintln!("notify terminal UI: {error}");
         }
     }
 
-    fn wakeup(&self) {
-        if !self.wakeup.pending.swap(true, Ordering::AcqRel) {
-            self.notify();
-        }
-    }
-
     fn send(&self, event: Event) {
-        if self.sender.send(event).is_ok() {
-            self.notify();
+        if self.sender.send(event).is_ok()
+            && let Err(error) = notify(self.wakeup.fd.as_raw_fd())
+        {
+            eprintln!("notify terminal UI: {error}");
         }
     }
-}
-
-#[derive(Debug)]
-enum Message {
-    Shutdown,
 }
 
 // Shared so writers reach the PTY without waking the IO thread; one queue keeps
@@ -105,9 +96,7 @@ impl Input {
         if self.open
             && let Some(master) = &self.master
         {
-            let (open, written) = flush(master.as_raw_fd(), &mut self.pending, &mut self.offset)?;
-            self.open = open;
-            consumed = written;
+            (self.open, consumed) = flush(master.as_raw_fd(), &mut self.pending, &mut self.offset)?;
         }
         if !self.open || self.master.is_none() {
             consumed += self.pending.iter().map(|data| data.len()).sum::<usize>() - self.offset;
@@ -137,12 +126,21 @@ struct Wakeup {
     pending: AtomicBool,
 }
 
+impl Wakeup {
+    fn notify(&self) -> io::Result<()> {
+        if !self.pending.swap(true, Ordering::AcqRel) {
+            notify(self.fd.as_raw_fd())?;
+        }
+        Ok(())
+    }
+}
+
 pub struct Terminal {
     // Async shutdown releases this reference before disconnecting the IO owner.
     pub core: Arc<Mutex<Core>>,
     pub events: mpsc::Receiver<Event>,
     event_wakeup: Arc<Wakeup>,
-    sender: Option<mpsc::Sender<Message>>,
+    sender: Option<mpsc::Sender<()>>,
     wakeup: Arc<Wakeup>,
     input: Arc<Mutex<Input>>,
     reader: Option<JoinHandle<()>>,
@@ -222,9 +220,9 @@ impl Terminal {
         command
             .env("TERM", "xterm-256color")
             .env("COLORTERM", "truecolor")
-            .stdin(Stdio::from(slave.try_clone()?))
-            .stdout(Stdio::from(slave.try_clone()?))
-            .stderr(Stdio::from(slave));
+            .stdin(slave.try_clone()?)
+            .stdout(slave.try_clone()?)
+            .stderr(slave);
         unsafe {
             // Only async-signal-safe calls belong between fork and exec.
             command.pre_exec(|| {
@@ -280,7 +278,8 @@ impl Terminal {
             input: input.clone(),
             process_metadata: process_metadata.clone(),
             input_bytes: input_bytes.clone(),
-            process: ChildGuard { child, pidfd },
+            child,
+            pidfd,
             wakeup: wakeup.clone(),
             receiver,
             core: core.clone(),
@@ -377,8 +376,8 @@ impl Terminal {
         let queued = !input.pending.is_empty();
         drop(input);
         release_input(&self.input_bytes, consumed, &self.event_wakeup);
-        if queued && !self.wakeup.pending.swap(true, Ordering::AcqRel) {
-            notify(self.wakeup.fd.as_raw_fd())?;
+        if queued {
+            self.wakeup.notify()?;
         }
         Ok(())
     }
@@ -399,22 +398,16 @@ impl Terminal {
             set_size(master.as_raw_fd(), pty_size)?;
         }
         core.resize(size);
-        if !self.event_wakeup.pending.swap(true, Ordering::AcqRel) {
-            notify(self.event_wakeup.fd.as_raw_fd())?;
-        }
-        Ok(())
+        self.event_wakeup.notify()
     }
 
-    fn send(&self, message: Message) -> io::Result<()> {
+    fn send_shutdown(&self) -> io::Result<()> {
         self.sender
             .as_ref()
             .unwrap()
-            .send(message)
+            .send(())
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error))?;
-        if !self.wakeup.pending.swap(true, Ordering::AcqRel) {
-            notify(self.wakeup.fd.as_raw_fd())?;
-        }
-        Ok(())
+        self.wakeup.notify()
     }
 
     /// Clear before reading the grid so concurrent PTY changes schedule the next frame.
@@ -448,7 +441,7 @@ impl Terminal {
     }
 
     pub(crate) fn shutdown(mut self) -> JoinHandle<()> {
-        let _ = self.send(Message::Shutdown);
+        let _ = self.send_shutdown();
         self.reader.take().unwrap()
     }
 }
@@ -456,7 +449,7 @@ impl Terminal {
 impl Drop for Terminal {
     fn drop(&mut self) {
         if let Some(reader) = self.reader.take() {
-            let _ = self.send(Message::Shutdown);
+            let _ = self.send_shutdown();
             self.sender.take();
             if reader.join().is_err() {
                 eprintln!("terminal IO thread panicked");
@@ -470,9 +463,10 @@ struct PtyLoop {
     input: Arc<Mutex<Input>>,
     process_metadata: Arc<Mutex<Arc<ProcessMetadata>>>,
     input_bytes: Arc<AtomicUsize>,
-    process: ChildGuard,
+    child: Child,
+    pidfd: OwnedFd,
     wakeup: Arc<Wakeup>,
-    receiver: mpsc::Receiver<Message>,
+    receiver: mpsc::Receiver<()>,
     core: Arc<Mutex<Core>>,
     proxy: EventProxy,
 
@@ -488,6 +482,9 @@ fn process_refresh_time(last: Option<Instant>) -> Instant {
 impl Drop for PtyLoop {
     fn drop(&mut self) {
         self.close();
+        if let Err(error) = terminate_child(&mut self.child, self.pidfd.as_raw_fd()) {
+            eprintln!("cannot reap terminal child: {error}");
+        }
     }
 }
 
@@ -504,7 +501,7 @@ impl PtyLoop {
         if let Err(error) = result {
             self.proxy.send(Event::Error(error));
         }
-        match terminate_child(&mut self.process.child, self.process.pidfd.as_raw_fd()) {
+        match terminate_child(&mut self.child, self.pidfd.as_raw_fd()) {
             Ok(status) => self.proxy.send(Event::Exit(status)),
             Err(error) => self.proxy.send(Event::Error(error)),
         }
@@ -519,6 +516,7 @@ impl PtyLoop {
         let mut metadata = ProcessMetadata {
             launch_argv: current.launch_argv.clone(),
             child_pid: current.child_pid,
+            sampled_at_ms: current.sampled_at_ms,
             ..ProcessMetadata::default()
         };
         let pgid = unsafe { libc::tcgetpgrp(self.master) };
@@ -536,31 +534,23 @@ impl PtyLoop {
                     .unavailable
                     .push(format!("foreground executable: {error}")),
             }
-            if metadata.foreground_pgid == current.foreground_pgid
-                && metadata.foreground_executable == current.foreground_executable
-                && current.foreground_argv.is_some()
-            {
-                metadata.foreground_pid = current.foreground_pid;
-                metadata.foreground_argv = current.foreground_argv.clone();
-            } else {
-                match std::fs::read(directory.join("cmdline")) {
-                    Ok(bytes) => {
-                        metadata.foreground_pid = Some(pgid as u32);
-                        metadata.foreground_argv = Some(if bytes.is_empty() {
-                            Vec::new()
-                        } else {
-                            bytes
-                                .strip_suffix(&[0])
-                                .unwrap_or(&bytes)
-                                .split(|byte| *byte == 0)
-                                .map(|arg| String::from_utf8_lossy(arg).into_owned())
-                                .collect()
-                        });
-                    }
-                    Err(error) => metadata
-                        .unavailable
-                        .push(format!("foreground argv: {error}")),
+            match std::fs::read(directory.join("cmdline")) {
+                Ok(bytes) => {
+                    metadata.foreground_pid = Some(pgid as u32);
+                    metadata.foreground_argv = Some(if bytes.is_empty() {
+                        Vec::new()
+                    } else {
+                        bytes
+                            .strip_suffix(&[0])
+                            .unwrap_or(&bytes)
+                            .split(|byte| *byte == 0)
+                            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+                            .collect()
+                    });
                 }
+                Err(error) => metadata
+                    .unavailable
+                    .push(format!("foreground argv: {error}")),
             }
             match std::fs::read_link(directory.join("cwd")) {
                 Ok(path) => metadata.foreground_cwd = Some(path),
@@ -575,7 +565,6 @@ impl PtyLoop {
                 .unavailable
                 .push(format!("child processes: {error}")),
         }
-        metadata.sampled_at_ms = current.sampled_at_ms;
         let changed = metadata != *current;
         metadata.sampled_at_ms = Some(
             SystemTime::now()
@@ -602,7 +591,7 @@ impl PtyLoop {
 
         let mut history_notified = true;
         loop {
-            if let Ok(Message::Shutdown) = self.receiver.try_recv() {
+            if self.receiver.try_recv().is_ok() {
                 return Ok(());
             }
             let consumed = {
@@ -693,7 +682,7 @@ impl PtyLoop {
                     fd: if child_exited {
                         -1
                     } else {
-                        self.process.pidfd.as_raw_fd()
+                        self.pidfd.as_raw_fd()
                     },
                     events: libc::POLLIN,
                     revents: 0,
@@ -709,11 +698,7 @@ impl PtyLoop {
                 0
             } else {
                 deadline.map_or(-1, |deadline| {
-                    deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_nanos()
-                        .div_ceil(1_000_000)
-                        .min(i32::MAX as u128) as i32
+                    crate::poll::timeout_millis(deadline.saturating_duration_since(Instant::now()))
                 })
             };
             crate::poll::poll(&mut fds, timeout)?;
@@ -743,9 +728,9 @@ impl PtyLoop {
             {
                 let count =
                     unsafe { libc::read(self.master, buffer.as_mut_ptr().cast(), buffer.len()) };
-                if count == 0 {
-                    read_open = false;
-                    self.close_input()?;
+                if count > 0 {
+                    process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
+                    read_count = count as usize;
                     continue;
                 }
                 if count < 0 {
@@ -757,12 +742,12 @@ impl PtyLoop {
                         _ if error.raw_os_error() == Some(libc::EIO) => (),
                         _ => return Err(error),
                     }
-                    read_open = false;
-                    self.close_input()?;
-                    continue;
                 }
-                process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
-                read_count = count as usize;
+                read_open = false;
+                self.input
+                    .lock()
+                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .open = false;
             }
         }
     }
@@ -773,14 +758,6 @@ impl PtyLoop {
             .lock()
             .map_err(|error| io::Error::other(error.to_string()))?;
         Ok(input.open && !input.pending.is_empty())
-    }
-
-    fn close_input(&self) -> io::Result<()> {
-        self.input
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .open = false;
-        Ok(())
     }
 
     fn dispatch(&self, events: Vec<CoreEvent>) -> io::Result<()> {
@@ -807,19 +784,6 @@ impl PtyLoop {
     }
 }
 
-struct ChildGuard {
-    child: Child,
-    pidfd: OwnedFd,
-}
-
-impl Drop for ChildGuard {
-    fn drop(&mut self) {
-        if let Err(error) = terminate_child(&mut self.child, self.pidfd.as_raw_fd()) {
-            eprintln!("cannot reap terminal child: {error}");
-        }
-    }
-}
-
 fn terminate_child(child: &mut Child, pidfd: RawFd) -> io::Result<ExitStatus> {
     if let Some(status) = child.try_wait()? {
         return Ok(status);
@@ -837,10 +801,8 @@ fn terminate_child(child: &mut Child, pidfd: RawFd) -> io::Result<ExitStatus> {
         revents: 0,
     };
     crate::poll::poll(std::slice::from_mut(&mut pfd), 100)?;
-    if pfd.revents != 0 {
-        return child.wait();
-    }
-    if let Err(error) = child.kill()
+    if pfd.revents == 0
+        && let Err(error) = child.kill()
         && error.raw_os_error() != Some(libc::ESRCH)
     {
         return Err(error);
@@ -855,8 +817,9 @@ fn flush(
 ) -> io::Result<(bool, usize)> {
     const BUDGET: usize = 64 * 1024;
     let mut budget = BUDGET;
-    while budget != 0 {
-        let Some(data) = pending.front() else { break };
+    while budget != 0
+        && let Some(data) = pending.front()
+    {
         let count = if pending.len() == 1 {
             let bytes = &data[*offset..data.len().min(*offset + budget)];
             unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) }
@@ -867,8 +830,8 @@ fn flush(
             }; 64];
             let mut remaining = budget;
             let mut count = 0;
-            for (index, data) in pending.iter().take(vectors.len()).enumerate() {
-                let start = if index == 0 { *offset } else { 0 };
+            for data in pending.iter().take(vectors.len()) {
+                let start = if count == 0 { *offset } else { 0 };
                 let length = (data.len() - start).min(remaining);
                 vectors[count] = libc::iovec {
                     iov_base: data[start..].as_ptr().cast_mut().cast(),
@@ -901,10 +864,9 @@ fn flush(
         }
         *offset += count as usize;
         budget -= count as usize;
-        while let Some(data) = pending.front() {
-            if *offset < data.len() {
-                break;
-            }
+        while let Some(data) = pending.front()
+            && *offset >= data.len()
+        {
             *offset -= data.len();
             pending.pop_front();
         }
@@ -1174,6 +1136,18 @@ mod tests {
         assert_eq!(
             idle.sampled_at_ms,
             terminal.process_metadata().sampled_at_ms
+        );
+        terminal.write(b"exec /bin/sh -i -s\n".as_slice()).unwrap();
+        let reexecuted = wait(&|metadata| {
+            metadata
+                .foreground_argv
+                .as_ref()
+                .is_some_and(|args| args == &["/bin/sh", "-i", "-s"])
+        });
+        assert_eq!(reexecuted.foreground_pid, initial.foreground_pid);
+        assert_eq!(
+            reexecuted.foreground_executable,
+            initial.foreground_executable
         );
         terminal
             .write(b"cd /; exec /bin/sleep 30\n".as_slice())

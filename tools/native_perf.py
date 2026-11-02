@@ -165,11 +165,11 @@ def main():
     for line in (directory / "trace.log").read_text().splitlines():
         fields = line.split()
         if fields[0] == "frame":
-            frames[int(fields[1])] = {"begin": float(fields[2]), "snapshot": float(fields[3]),
-                                     "prepared": float(fields[4]), "swapped": float(fields[5]),
-                                     "marker": int(fields[7]),
-                                     "geometry": [int(fields[9]), int(fields[10]), float(fields[11])],
-                                     "focused": bool(int(fields[12]))}
+            frames[int(fields[1])] = {"begin": float(fields[2]),
+                                     "prepared": float(fields[3]), "swapped": float(fields[4]),
+                                     "marker": int(fields[6]),
+                                     "geometry": [int(fields[8]), int(fields[9]), float(fields[10])],
+                                     "focused": bool(int(fields[11]))}
         elif fields[0] == "frame_callback":
             callbacks[int(fields[1])] = {"received": float(fields[2]),
                                         "dispatched": float(fields[3]),
@@ -203,18 +203,14 @@ def main():
                      if f["marker"] in writes and writes[f["marker"]]["phase"] == phase
                      and writes[f["marker"]]["record"]]
         swap_times = sorted(f["swapped"] for _, f in submitted)
-        pairs = [(f, presented[n], writes[f["marker"]]) for n, f in frames.items()
-                 if n in presented and f["marker"] in writes and writes[f["marker"]]["phase"] == phase
-                 and writes[f["marker"]]["record"]]
+        pairs = [(f, presented[n], writes[f["marker"]]) for n, f in submitted if n in presented]
         first_presentations = {}
         for f, p, w in pairs:
             previous = first_presentations.get(f["marker"])
             if previous is None or p["time"] < previous[0]:
                 first_presentations[f["marker"]] = (p["time"], w["write_begin"])
         times = sorted(p["time"] for _, p, _ in pairs)
-        callback_pairs = [(f, callbacks[n]) for n, f in frames.items()
-                          if n in callbacks and f["marker"] in writes
-                          and writes[f["marker"]]["phase"] == phase and writes[f["marker"]]["record"]]
+        callback_pairs = [(f, callbacks[n]) for n, f in submitted if n in callbacks]
         if len(times) < 2:
             raise RuntimeError(f"insufficient presentation feedback for {phase}")
         report["phases"][phase] = {
@@ -226,11 +222,10 @@ def main():
             "presentation_interval_ms": percentile([(b - a) * 1e3 for a, b in zip(times, times[1:])]),
             "output_markers_presented": len(first_presentations),
             "pty_write_to_presentation_ms": percentile([(presented - written) * 1e3 for presented, written in first_presentations.values()]),
-            "snapshot_cpu_ms": percentile([(f["snapshot"] - f["begin"]) * 1e3 for f, _, _ in pairs]),
-            "prepare_cpu_ms": percentile([(f["prepared"] - f["snapshot"]) * 1e3 for f, _, _ in pairs]),
+            "prepare_cpu_ms": percentile([(f["prepared"] - f["begin"]) * 1e3 for f, _, _ in pairs]),
             "present_wrapper_ms": percentile([(f["swapped"] - f["prepared"]) * 1e3 for f, _, _ in pairs]),
             "draw_begin_to_presentation_ms": percentile([(p["time"] - f["begin"]) * 1e3 for f, p, _ in pairs]),
-            "snapshot_age_ms": percentile([(f["snapshot"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
+            "write_to_draw_begin_ms": percentile([(f["begin"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
             "focused_frames": sum(f["focused"] is True for f, _, _ in pairs),
             "unfocused_frames": sum(f["focused"] is False for f, _, _ in pairs),
             "geometry_logical_px_scale": [list(v) for v in sorted({tuple(f["geometry"]) for f, _, _ in pairs})],

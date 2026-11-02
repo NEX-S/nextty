@@ -3,19 +3,19 @@
 const DIGITS: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
-    if !input.len().is_multiple_of(4) {
+    let (quartets, tail) = input.as_chunks::<4>();
+    if !tail.is_empty() {
         return None;
     }
-    let (quartets, _) = input.as_chunks::<4>();
     let mut output = vec![0; quartets.len() * 3];
     let mut length = output.len();
     let (decoded, _) = output.as_chunks_mut::<3>();
-    for (index, (quartet, bytes)) in quartets.iter().zip(decoded.iter_mut()).enumerate() {
+    for (index, (&[a, b, c, d], bytes)) in quartets.iter().zip(decoded.iter_mut()).enumerate() {
         let last = index + 1 == quartets.len();
-        let a = digit(quartet[0])?;
-        let b = digit(quartet[1])?;
+        let a = digit(a)?;
+        let b = digit(b)?;
         bytes[0] = a << 2 | b >> 4;
-        match (quartet[2], quartet[3]) {
+        match (c, d) {
             (b'=', b'=') if last && b & 15 == 0 => length -= 2,
             (c, b'=') if last => {
                 let c = digit(c)?;
@@ -42,12 +42,12 @@ pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
     output.resize(start + bytes.len().div_ceil(3) * 4, b'=');
     let (chunks, tail) = bytes.as_chunks::<3>();
     let (encoded, _) = output[start..].as_chunks_mut::<4>();
-    for (part, encoded) in chunks.iter().zip(encoded.iter_mut()) {
+    for (&[a, b, c], encoded) in chunks.iter().zip(encoded.iter_mut()) {
         *encoded = [
-            DIGITS[(part[0] >> 2) as usize],
-            DIGITS[((part[0] & 3) << 4 | part[1] >> 4) as usize],
-            DIGITS[((part[1] & 15) << 2 | part[2] >> 6) as usize],
-            DIGITS[(part[2] & 63) as usize],
+            DIGITS[(a >> 2) as usize],
+            DIGITS[((a & 3) << 4 | b >> 4) as usize],
+            DIGITS[((b & 15) << 2 | c >> 6) as usize],
+            DIGITS[(c & 63) as usize],
         ];
     }
     if let Some(&a) = tail.first() {

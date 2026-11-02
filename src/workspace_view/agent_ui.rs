@@ -29,8 +29,7 @@ impl WorkspaceView {
             self.agent
                 .chat_rows
                 .iter()
-                .rev()
-                .find(|(_, rect)| f32::from(rect.y) * self.cell.1 <= self.pointer.1)
+                .rfind(|(_, rect)| f32::from(rect.y) * self.cell.1 <= self.pointer.1)
                 .or_else(|| self.agent.chat_rows.first())?
         } else {
             self.agent.chat_rows.iter().find(|(_, rect)| {
@@ -74,29 +73,17 @@ impl WorkspaceView {
         let Some(layout) = self.editor_viewport() else {
             return;
         };
-        let mut editor = self
+        let editor = self
             .ui
             .agent
             .active()
             .editor_layout(layout.columns, layout.rows);
-        if extend {
-            if self.pointer.1 < layout.y {
-                editor.first = editor.first.saturating_sub(1);
-            } else if self.pointer.1 >= layout.y + self.cell.1 * layout.rows as f32 {
-                editor.first =
-                    (editor.first + 1).min(editor.lines.len().saturating_sub(layout.rows));
-            }
-        }
-        self.ui.agent.active_mut().editor_scroll = Some(editor.first);
-        let row = ((self.pointer.1 - layout.y) / self.cell.1)
-            .floor()
-            .clamp(0., layout.rows.saturating_sub(1) as f32) as usize;
-        let range = editor.lines.get(editor.first + row).cloned().unwrap_or(
-            self.ui.agent.active().model.input.len()..self.ui.agent.active().model.input.len(),
-        );
+        let row = (self.pointer.1 - layout.y) / self.cell.1;
         let column = ((self.pointer.0 - layout.x) / self.cell.0).clamp(0., layout.columns as f32);
-        let offset = column_offset(&self.ui.agent.active().model.input, range, column);
-        self.ui.agent.active_mut().model.set_cursor(offset, extend);
+        self.ui
+            .agent
+            .active_mut()
+            .select_editor(editor, layout.rows, (column, row), extend);
         self.dirty = true;
     }
 
@@ -118,8 +105,7 @@ impl WorkspaceView {
             && let Some(action) = self
                 .control_hits
                 .iter()
-                .rev()
-                .find(|hit| {
+                .rfind(|hit| {
                     hit.contains(self.pointer)
                         && matches!(
                             hit.action,

@@ -8,7 +8,6 @@ fn run(command: &mut Command) {
 fn sources(directory: &Path, result: &mut Vec<std::path::PathBuf>) {
     for entry in fs::read_dir(directory).expect("read native sources") {
         let path = entry.expect("native source entry").path();
-        println!("cargo:rerun-if-changed={}", path.display());
         if path.is_dir() {
             sources(&path, result);
         } else if path.extension().is_some_and(|ext| ext == "c") {
@@ -21,6 +20,7 @@ fn main() {
     if env::var_os("CARGO_FEATURE_GUI").is_none() {
         return;
     }
+    println!("cargo:rerun-if-changed=native");
     let packages = [
         "fontconfig",
         "harfbuzz",
@@ -55,10 +55,13 @@ fn main() {
     let mut files = Vec::new();
     sources(Path::new("native"), &mut files);
     files.sort();
-    let mut objects = Vec::new();
+    let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let archive_path = out.join("libnextty_native.a");
+    let mut archive = Command::new("ar");
+    archive.arg("crs").arg(&archive_path);
     for (index, file) in files.iter().enumerate() {
         let object = out.join(format!("native-{index}.o"));
-        let mut cc = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()));
+        let mut cc = Command::new(&compiler);
         cc.args([
             "-std=c11",
             "-O2",
@@ -78,11 +81,14 @@ fn main() {
         .arg("-o")
         .arg(&object);
         run(&mut cc);
-        objects.push(object);
+        archive.arg(object);
     }
-    let archive = out.join("libnextty_native.a");
-    let _ = fs::remove_file(&archive);
-    run(Command::new("ar").arg("crs").arg(&archive).args(objects));
+    if let Err(error) = fs::remove_file(&archive_path)
+        && error.kind() != std::io::ErrorKind::NotFound
+    {
+        panic!("remove {}: {error}", archive_path.display());
+    }
+    run(&mut archive);
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=nextty_native");
     let output = Command::new("pkg-config")

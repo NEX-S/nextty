@@ -13,6 +13,8 @@
 #include <string.h>
 #include <utf8proc.h>
 
+enum { FONT_CHOICE_BITS = 11 };
+
 typedef struct {
     cairo_scaled_font_t *cairo;
     hb_font_t *hb;
@@ -38,7 +40,7 @@ struct NtFonts {
     hb_buffer_t *buffer;
     void *scratch; /* Per-line itemization arrays, reused across shaping calls. */
     size_t scratch_size;
-    struct { uint32_t key; Font *font; } choices[2048]; /* Borrowed from styles. */
+    struct { uint32_t key; Font *font; } choices[1u << FONT_CHOICE_BITS]; /* Borrowed from styles. */
 };
 
 typedef struct {
@@ -73,7 +75,8 @@ static int installed_family(NtFonts *f, const char *family) {
     if (set) {
         for (int i = 0; i < set->nfont && !found; ++i) {
             FcChar8 *name;
-            for (int j = 0; FcPatternGetString(set->fonts[i], FC_FAMILY, j, &name) == FcResultMatch; ++j)
+            for (int j = 0; !found &&
+                 FcPatternGetString(set->fonts[i], FC_FAMILY, j, &name) == FcResultMatch; ++j)
                 if (!FcStrCmpIgnoreCase(name, (const FcChar8 *)family)) found = 1;
         }
         FcFontSetDestroy(set);
@@ -87,13 +90,13 @@ static void clear_styles(NtFonts *f) {
     memset(f->choices, 0, sizeof f->choices);
     for (size_t i = 0; i < sizeof f->styles / sizeof *f->styles; ++i) {
         Style *s = &f->styles[i];
-        if (s->set) {
+        if (s->fonts) {
             for (int j = 0; j < s->set->nfont; ++j) {
-                if (s->fonts && s->fonts[j].hb) hb_font_destroy(s->fonts[j].hb);
-                if (s->fonts && s->fonts[j].cairo) cairo_scaled_font_destroy(s->fonts[j].cairo);
+                if (s->fonts[j].hb) hb_font_destroy(s->fonts[j].hb);
+                if (s->fonts[j].cairo) cairo_scaled_font_destroy(s->fonts[j].cairo);
             }
-            FcFontSetDestroy(s->set);
         }
+        if (s->set) FcFontSetDestroy(s->set);
         if (s->query) FcPatternDestroy(s->query);
         free(s->fonts);
         *s = (Style){0};
@@ -156,24 +159,21 @@ static Font *load_font(NtFonts *f, Style *s, int index) {
     cairo_font_face_t *face = cairo_ft_font_face_create_for_pattern(pattern);
     FcPatternDestroy(pattern);
     cairo_matrix_t matrix, ctm;
+    double size = f->size * f->scale;
     cairo_matrix_init(&matrix, transform.xx, -transform.yx, -transform.xy, transform.yy, 0, 0);
-    cairo_matrix_scale(&matrix, f->size * f->scale, f->size * f->scale);
+    cairo_matrix_scale(&matrix, size, size);
     cairo_matrix_init_identity(&ctm);
-    font->cairo = cairo_scaled_font_create(face, &matrix, &ctm, f->options);
+    cairo_scaled_font_t *cairo = cairo_scaled_font_create(face, &matrix, &ctm, f->options);
     cairo_font_face_destroy(face);
-    cairo_status_t status = cairo_scaled_font_status(font->cairo);
+    cairo_status_t status = cairo_scaled_font_status(cairo);
     if (status != CAIRO_STATUS_SUCCESS) {
         fail(f, "Cannot create Cairo font: %s", cairo_status_to_string(status));
-        cairo_scaled_font_destroy(font->cairo);
-        font->cairo = NULL;
-        return NULL;
+        goto failed;
     }
-    FT_Face ft = cairo_ft_scaled_font_lock_face(font->cairo);
+    FT_Face ft = cairo_ft_scaled_font_lock_face(cairo);
     if (!ft) {
         fail(f, "Cannot access Cairo FreeType face");
-        cairo_scaled_font_destroy(font->cairo);
-        font->cairo = NULL;
-        return NULL;
+        goto failed;
     }
     font->hb = hb_ft_font_create_referenced(ft);
     /* OT metrics avoid FreeType's hinted advances; Cairo still owns rasterization. */
@@ -185,11 +185,15 @@ static Font *load_font(NtFonts *f, Style *s, int index) {
     double yscale = fabs(transform.xx * transform.yy - transform.xy * transform.yx) / xscale;
     double slant = (transform.xy * transform.xx + transform.yy * transform.yx) /
                    (transform.xy * transform.xy + transform.yy * transform.yy);
-    hb_font_set_scale(font->hb, (int)llround(f->size * f->scale * xscale * 1024),
-                      (int)llround(f->size * f->scale * yscale * 1024));
+    hb_font_set_scale(font->hb, (int)llround(size * xscale * 1024),
+                      (int)llround(size * yscale * 1024));
     hb_font_set_synthetic_slant(font->hb, (float)slant);
-    cairo_ft_scaled_font_unlock_face(font->cairo);
+    cairo_ft_scaled_font_unlock_face(cairo);
+    font->cairo = cairo;
     return font;
+failed:
+    cairo_scaled_font_destroy(cairo);
+    return NULL;
 }
 
 int nt_fonts_scale(NtFonts *f, double scale) {
@@ -303,7 +307,7 @@ static inline Font *cluster_font(NtFonts *f, const FriBidiChar *codes, Character
     if (end != start + 1)
         return find_cluster_font(f, codes, chars, start, end, flags);
     uint32_t key = (codes[start] << 2) | flags;
-    size_t slot = (key * 2654435761u) >> 21;
+    size_t slot = (key * 2654435761u) >> (32 - FONT_CHOICE_BITS);
     if (f->choices[slot].font && f->choices[slot].key == key)
         return f->choices[slot].font;
     Font *font = find_cluster_font(f, codes, chars, start, end, flags);
@@ -370,7 +374,6 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     NtFontGlyph *out = NULL;
     size_t used = 0, capacity = 0;
     hb_buffer_t *buffer = f->buffer;
-    int success = 0;
     size_t byte = 0, run = 0, cluster = 0, n = 0;
     int32_t grapheme_state = 0;
     hb_unicode_funcs_t *unicode = hb_unicode_funcs_get_default();
@@ -382,7 +385,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         int boundary = 1;
         if (!printable_ascii) {
             bytes = utf8proc_iterate((const uint8_t *)text + byte, (ptrdiff_t)(length - byte), &decoded);
-            if (bytes < 0) { fail(f, "Cannot decode terminal text: %s", utf8proc_errmsg(bytes)); goto done; }
+            if (bytes < 0) { fail(f, "Cannot decode terminal text: %s", utf8proc_errmsg(bytes)); goto failed; }
             script = hb_unicode_script(unicode, (uint32_t)decoded);
             if (script != HB_SCRIPT_COMMON && script != HB_SCRIPT_INHERITED && script != HB_SCRIPT_UNKNOWN) previous = script;
             else script = previous;
@@ -412,10 +415,8 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         fribidi_get_bracket_types(codes, (FriBidiStrIndex)n, types, brackets);
         FriBidiParType base = FRIBIDI_PAR_ON;
         if (!fribidi_get_par_embedding_levels_ex(types, brackets, (FriBidiStrIndex)n, &base, levels)) {
-            fail(f, "FriBidi could not itemize terminal line"); goto done;
+            fail(f, "FriBidi could not itemize terminal line"); goto failed;
         }
-    }
-    if (!printable_ascii) {
         hb_script_t next = HB_SCRIPT_LATIN;
         for (size_t i = n; i--;) {
             if (chars[i].script == HB_SCRIPT_UNKNOWN) chars[i].script = next;
@@ -426,12 +427,12 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         size_t end = i + 1;
         while (end < n && chars[end].cluster == i) ++end;
         Font *font = cluster_font(f, codes, chars, i, end, chars[i].flags);
-        if (!font) goto done;
+        if (!font) goto failed;
         for (size_t j = i; j < end; ++j) {
             if (chars[j].flags == chars[i].flags) chars[j].font = font;
             else {
                 chars[j].font = cluster_font(f, codes, chars, i, end, chars[j].flags);
-                if (!chars[j].font) goto done;
+                if (!chars[j].font) goto failed;
             }
         }
         i = end;
@@ -456,7 +457,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         unsigned shaped;
         hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &shaped);
         hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(buffer, NULL);
-        if (!hb_buffer_allocation_successful(buffer)) { fail(f, "HarfBuzz could not allocate shaped line"); goto done; }
+        if (!hb_buffer_allocation_successful(buffer)) { fail(f, "HarfBuzz could not allocate shaped line"); goto failed; }
         /* The terminal column map uses UTF-8 byte offsets. */
         if (!printable_ascii)
             for (unsigned j = 0; j < shaped; ++j) info[j].cluster = chars[info[j].cluster].byte;
@@ -482,12 +483,12 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
                         (hb_font_get_glyph_extents(font->hb, info[j].codepoint, &extents) &&
                          (!extents.width || !extents.height)));
             if (blank) blank_glyph = info[j].codepoint;
-            if (!blank) {
+            else {
                 if (used == capacity) {
                     size_t needed = used + shaped - j;
                     capacity = capacity * 2 > needed ? capacity * 2 : needed;
                     NtFontGlyph *grown = realloc(out, capacity * sizeof *out);
-                    if (!grown) { fail(f, "Cannot allocate line glyphs"); goto done; }
+                    if (!grown) { fail(f, "Cannot allocate line glyphs"); goto failed; }
                     out = grown;
                 }
                 if (!used || out[used - 1].font != font->cairo) cairo_scaled_font_reference(font->cairo);
@@ -503,8 +504,8 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     }
     *glyphs = out;
     *count = used;
-    success = 1;
-done:
-    if (!success) nt_font_glyphs_free(out, used);
-    return success;
+    return 1;
+failed:
+    nt_font_glyphs_free(out, used);
+    return 0;
 }

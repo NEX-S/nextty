@@ -1,7 +1,6 @@
 use crate::config::Config;
 use crate::files::FileNav;
-use crate::panel::Grid;
-use crate::ui::mix_color;
+use crate::panel::{Grid, mix_color};
 use crate::workspace::Rect;
 
 pub(crate) struct Layout {

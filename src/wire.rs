@@ -1,15 +1,16 @@
 //! Length-prefixed, versioned messages on an owned Unix socket.
+use crate::agent_files::{FileMatch, FileOperation, FileResult};
 use crate::core::{
     Cell, Extra, Flags, Mode, Point, Row, Scroll, SelectionRange, SelectionType, Side, WindowSize,
 };
 use crate::eventfd::{consume_notification, notify};
 use crate::screen::Update;
 use crate::terminal::{ProcessMetadata, Shell};
-use crate::vt::{Color, CursorShape, NamedColor, Rgb};
+use crate::vt::{Color, CursorShape, NamedColor, PALETTE_SIZE, Rgb};
 use crate::workspace::{
     Action, AgentEvent, AgentMessage, AgentModelPatch, Axis, BlockMarker, CommandBlock,
-    CreateOptions, Direction, HistoryCursor, HistoryPage, PaneView, Snapshot, TabView,
-    WorkspaceInfo,
+    CreateOptions, Direction, HistoryCursor, HistoryPage, MAX_CELLS, MAX_COLUMNS, MAX_LINES,
+    PaneView, Snapshot, TabView, WorkspaceInfo,
 };
 use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
@@ -22,13 +23,21 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 17;
+pub(crate) const VERSION: u8 = 18;
 
 pub(crate) enum Response {
     ScreenDirty,
     AgentInput {
         request: u64,
         result: Result<Option<u64>, String>,
+    },
+    AgentFile {
+        request: u64,
+        result: Result<FileResult, String>,
+    },
+    AgentNewTab {
+        request: u64,
+        result: Result<u64, String>,
     },
     CopyError {
         request: u64,
@@ -97,6 +106,7 @@ enum ReceiveWork {
     Chunk(Vec<u8>),
     End,
 }
+#[derive(Default)]
 struct ReceiveState {
     work: Option<ReceiveWork>,
     ready: Option<io::Result<File>>,
@@ -111,11 +121,7 @@ struct ClipboardReceiver(Arc<ReceiveShared>);
 impl ClipboardReceiver {
     fn new() -> io::Result<Self> {
         let shared = Arc::new(ReceiveShared {
-            state: Mutex::new(ReceiveState {
-                work: None,
-                ready: None,
-                closed: false,
-            }),
+            state: Mutex::new(ReceiveState::default()),
             changed: Condvar::new(),
             notification: crate::eventfd::new()?,
         });
@@ -181,21 +187,19 @@ fn receive_clipboard(shared: Arc<ReceiveShared>) {
             ReceiveWork::Chunk(bytes) => file.as_mut().unwrap().write_all(&bytes).map(|()| None),
             ReceiveWork::End => file.as_mut().unwrap().rewind().map(|()| file.take()),
         });
-        let ready = match result {
-            Ok(None) => continue,
-            Ok(Some(file)) => Ok(file),
-            Err(error) => {
-                drop(file.take());
-                Err(error)
-            }
+        let Some(ready) = result.transpose() else {
+            continue;
         };
+        let failed = ready.is_err();
+        if failed {
+            drop(file.take());
+        }
         let mut state = shared.state.lock().unwrap();
         if state.closed {
             drop(state);
             drop(ready);
             continue;
         }
-        let failed = ready.is_err();
         state.ready = Some(ready);
         let pending = if failed {
             state.closed = true;
@@ -346,14 +350,7 @@ impl Peer {
         request: u64,
     ) -> io::Result<()> {
         let mut encoder = Encoder::with_capacity(256);
-        encoder.u8(1);
-        encoder.u64(request);
-        encode_snapshot(&mut encoder, snapshot, previous);
-        encoder.u32(updates.len() as u32);
-        for (id, update) in updates {
-            encoder.u64(*id);
-            encode_update(&mut encoder, update);
-        }
+        encoder.state(snapshot, updates.iter().copied(), previous, request);
         self.queue(encoder.0, None)
     }
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
@@ -366,19 +363,11 @@ impl Peer {
                 match result {
                     Ok(page) => {
                         encoder.string(&page.text);
-                        encoder.u64(page.cursor.epoch);
-                        encoder.u64(page.cursor.row);
-                        encoder.u64(page.cursor.offset);
+                        encoder.cursor(page.cursor);
                         encoder.bool(page.has_more);
-                        encoder.bool(page.matched.is_some());
-                        if let Some(matched) = page.matched {
-                            encoder.bool(matched);
-                        }
+                        encoder.optional(page.matched, Encoder::bool);
                         encoder.bool(page.incomplete);
-                        encoder.bool(page.command.is_some());
-                        if let Some(command) = page.command {
-                            encode_command(&mut encoder, &command);
-                        }
+                        encoder.optional(page.command.as_ref(), encode_command);
                     }
                     Err(error) => encoder.string(&error),
                 }
@@ -390,17 +379,32 @@ impl Peer {
                 encoder.string(&error);
                 None
             }
+            Response::AgentFile { request, result } => {
+                encoder.u8(17);
+                encoder.u64(request);
+                encoder.bool(result.is_ok());
+                match result {
+                    Ok(result) => encode_file_result(&mut encoder, &result),
+                    Err(error) => encoder.string(&error),
+                }
+                None
+            }
+            Response::AgentNewTab { request, result } => {
+                encoder.u8(18);
+                encoder.u64(request);
+                encoder.bool(result.is_ok());
+                match result {
+                    Ok(pane) => encoder.u64(pane),
+                    Err(error) => encoder.string(&error),
+                }
+                None
+            }
             Response::AgentInput { request, result } => {
                 encoder.u8(14);
                 encoder.u64(request);
                 encoder.bool(result.is_ok());
                 match result {
-                    Ok(block) => {
-                        encoder.bool(block.is_some());
-                        if let Some(block) = block {
-                            encoder.u64(block);
-                        }
-                    }
+                    Ok(block) => encoder.optional(block, Encoder::u64),
                     Err(error) => encoder.string(&error),
                 }
                 None
@@ -415,14 +419,12 @@ impl Peer {
                 None
             }
             Response::State(snapshot, updates, request) => {
-                encoder.u8(1);
-                encoder.u64(request);
-                encode_snapshot(&mut encoder, &snapshot, &HashMap::new());
-                encoder.u32(updates.len() as u32);
-                for (id, update) in updates {
-                    encoder.u64(id);
-                    encode_update(&mut encoder, &update);
-                }
+                encoder.state(
+                    &snapshot,
+                    updates.iter().map(|(id, update)| (*id, update)),
+                    &HashMap::new(),
+                    request,
+                );
                 None
             }
             Response::List(list) => {
@@ -498,14 +500,15 @@ impl Peer {
             return Err(invalid("file descriptors cannot cross the SSH bridge"));
         }
         let length = bytes.len() - 4;
-        if length > MAX_FRAME || self.queued + bytes.len() > MAX_PENDING {
+        let queued = self.queued + bytes.len();
+        if length > MAX_FRAME || queued > MAX_PENDING {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "workspace socket send queue is full",
             ));
         }
         bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
-        self.queued += bytes.len();
+        self.queued = queued;
         self.output.push_back(Packet {
             bytes,
             offset: 0,
@@ -516,10 +519,9 @@ impl Peer {
     pub fn flush(&mut self) -> io::Result<()> {
         let mut budget: usize = 256 * 1024;
         let output_fd = self.output_fd();
-        while budget > 0 {
-            let Some(packet) = self.output.front() else {
-                break;
-            };
+        while budget > 0
+            && let Some(packet) = self.output.front()
+        {
             let bytes = &packet.bytes[packet.offset..];
             let result = if let Some(file) = &packet.file {
                 send_with_fd(
@@ -562,31 +564,30 @@ impl Peer {
                     Ok(count as usize)
                 }
             };
-            match result {
+            let count = match result {
                 Ok(0) => {
                     return Err(io::Error::new(
                         io::ErrorKind::WriteZero,
                         "workspace socket closed while writing",
                     ));
                 }
-                Ok(count) => {
-                    self.queued -= count;
-                    budget -= count;
-                    let mut remaining = count;
-                    while remaining != 0 {
-                        let packet = self.output.front_mut().unwrap();
-                        let sent = remaining.min(packet.bytes.len() - packet.offset);
-                        packet.offset += sent;
-                        packet.file = None;
-                        remaining -= sent;
-                        if packet.offset == packet.bytes.len() {
-                            self.output.pop_front();
-                        }
-                    }
-                }
+                Ok(count) => count,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
                 Err(error) => return Err(error),
+            };
+            self.queued -= count;
+            budget -= count;
+            let mut remaining = count;
+            while remaining != 0 {
+                let packet = self.output.front_mut().unwrap();
+                let sent = remaining.min(packet.bytes.len() - packet.offset);
+                packet.offset += sent;
+                packet.file = None;
+                remaining -= sent;
+                if packet.offset == packet.bytes.len() {
+                    self.output.pop_front();
+                }
             }
         }
         Ok(())
@@ -596,12 +597,8 @@ impl Peer {
         self.queued = 0;
     }
     pub fn buffered_action(&self) -> bool {
-        let input = &self.input[self.consumed..];
-        if input.len() < 4 {
-            return false;
-        }
-        let length = u32::from_le_bytes(input[..4].try_into().unwrap()) as usize;
-        length > MAX_FRAME || input.len() >= length + 4
+        // Invalid headers are ready for the decoder to report.
+        !matches!(packet(&self.input[self.consumed..]), Ok(None))
     }
     fn read(&mut self) -> io::Result<()> {
         const READ_BUDGET: usize = 256 * 1024;
@@ -726,12 +723,10 @@ impl Peer {
         Ok((request, File::from(file), incomplete))
     }
     pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
-        let result = self.receive_responses(previous);
-        if result.is_err() {
+        self.receive_responses(previous).inspect_err(|_| {
             self.copy = None;
             self.receiver = None;
-        }
-        result
+        })
     }
     fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let mut result = Vec::new();
@@ -754,24 +749,34 @@ impl Peer {
         while let Some(packet) = packet(&self.input[self.consumed..])? {
             let mut d = Decoder::new(packet)?;
             let response = match d.u8()? {
+                17 => {
+                    let request = d.u64()?;
+                    let result = if d.bool()? {
+                        Ok(decode_file_result(&mut d)?)
+                    } else {
+                        Err(d.string(65536)?)
+                    };
+                    Some(Response::AgentFile { request, result })
+                }
+                18 => {
+                    let request = d.u64()?;
+                    let result = if d.bool()? {
+                        Ok(d.u64()?)
+                    } else {
+                        Err(d.string(65536)?)
+                    };
+                    Some(Response::AgentNewTab { request, result })
+                }
                 16 => {
                     let request = d.u64()?;
                     let result = if d.bool()? {
                         Ok(HistoryPage {
                             text: d.string(crate::history::READ_LIMIT)?,
-                            cursor: HistoryCursor {
-                                epoch: d.u64()?,
-                                row: d.u64()?,
-                                offset: d.u64()?,
-                            },
+                            cursor: d.cursor()?,
                             has_more: d.bool()?,
-                            matched: if d.bool()? { Some(d.bool()?) } else { None },
+                            matched: d.optional(Decoder::bool)?,
                             incomplete: d.bool()?,
-                            command: if d.bool()? {
-                                Some(decode_command(&mut d)?)
-                            } else {
-                                None
-                            },
+                            command: d.optional(decode_command)?,
                         })
                     } else {
                         Err(d.string(65536)?)
@@ -785,7 +790,7 @@ impl Peer {
                 14 => {
                     let request = d.u64()?;
                     let result = if d.bool()? {
-                        Ok(if d.bool()? { Some(d.u64()?) } else { None })
+                        Ok(d.optional(Decoder::u64)?)
                     } else {
                         Err(d.string(65536)?)
                     };
@@ -824,19 +829,15 @@ impl Peer {
                     }
                     Some(Response::List(list))
                 }
-                3 => {
-                    let request = d.u64()?;
-                    let incomplete = d.bool()?;
-                    let fd = self
+                3 => Some(Response::Clipboard {
+                    request: d.u64()?,
+                    incomplete: d.bool()?,
+                    file: self
                         .files
                         .pop_front()
-                        .ok_or_else(|| invalid("clipboard response has no file descriptor"))?;
-                    Some(Response::Clipboard {
-                        request,
-                        file: File::from(fd),
-                        incomplete,
-                    })
-                }
+                        .map(File::from)
+                        .ok_or_else(|| invalid("clipboard response has no file descriptor"))?,
+                }),
                 4 => Some(Response::Error(d.string(65536)?)),
                 5 => {
                     d.finish()?;
@@ -848,18 +849,12 @@ impl Peer {
                     primary: d.bool()?,
                     text: d.string(MAX_FRAME)?,
                 }),
-                11 => {
-                    let pane = d.u64()?;
-                    let request = d.u64()?;
-                    let truncated = d.bool()?;
-                    let count = d.u32()?;
-                    Some(Response::Search {
-                        pane,
-                        request,
-                        count,
-                        truncated,
-                    })
-                }
+                11 => Some(Response::Search {
+                    pane: d.u64()?,
+                    request: d.u64()?,
+                    truncated: d.bool()?,
+                    count: d.u32()?,
+                }),
                 7 if self.remote => {
                     let request = d.u64()?;
                     let incomplete = d.bool()?;
@@ -1032,9 +1027,10 @@ fn receive(
             }
             let count =
                 ((*header).cmsg_len - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
+            let descriptors = libc::CMSG_DATA(header).cast::<RawFd>();
             for index in 0..count {
                 files.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
-                    libc::CMSG_DATA(header).cast::<RawFd>().add(index),
+                    descriptors.add(index),
                 )));
             }
             header = libc::CMSG_NXTHDR(&message, header);
@@ -1064,6 +1060,12 @@ impl Encoder {
     fn bool(&mut self, value: bool) {
         self.u8(value as u8);
     }
+    fn optional<T>(&mut self, value: Option<T>, write: impl FnOnce(&mut Self, T)) {
+        self.bool(value.is_some());
+        if let Some(value) = value {
+            write(self, value);
+        }
+    }
     fn u16(&mut self, n: u16) {
         self.0.extend_from_slice(&n.to_le_bytes());
     }
@@ -1072,6 +1074,27 @@ impl Encoder {
     }
     fn u64(&mut self, n: u64) {
         self.0.extend_from_slice(&n.to_le_bytes());
+    }
+    fn cursor(&mut self, cursor: HistoryCursor) {
+        self.u64(cursor.epoch);
+        self.u64(cursor.row);
+        self.u64(cursor.offset);
+    }
+    fn state<'a>(
+        &mut self,
+        snapshot: &Snapshot,
+        updates: impl ExactSizeIterator<Item = (u64, &'a Update)>,
+        previous: &HashMap<u64, Arc<ProcessMetadata>>,
+        request: u64,
+    ) {
+        self.u8(1);
+        self.u64(request);
+        encode_snapshot(self, snapshot, previous);
+        self.u32(updates.len() as u32);
+        for (id, update) in updates {
+            self.u64(id);
+            encode_update(self, update);
+        }
     }
     fn i32(&mut self, n: i32) {
         self.0.extend_from_slice(&n.to_le_bytes());
@@ -1083,11 +1106,16 @@ impl Encoder {
     fn string(&mut self, value: &str) {
         self.bytes(value.as_bytes());
     }
-    fn path(&mut self, value: &Option<PathBuf>) {
-        self.bool(value.is_some());
-        if let Some(path) = value {
-            self.bytes(path.as_os_str().as_bytes());
+    fn strings(&mut self, values: &[String]) {
+        self.u32(values.len() as u32);
+        for value in values {
+            self.string(value);
         }
+    }
+    fn path(&mut self, value: &Option<PathBuf>) {
+        self.optional(value.as_ref(), |e, path| {
+            e.bytes(path.as_os_str().as_bytes())
+        });
     }
     fn size(&mut self, size: WindowSize) {
         self.u16(size.num_cols);
@@ -1131,6 +1159,16 @@ impl<'a> Decoder<'a> {
             _ => Err(invalid("invalid boolean")),
         }
     }
+    fn optional<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<Option<T>> {
+        if self.bool()? {
+            read(self).map(Some)
+        } else {
+            Ok(None)
+        }
+    }
     fn u16(&mut self) -> io::Result<u16> {
         Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
     }
@@ -1139,6 +1177,13 @@ impl<'a> Decoder<'a> {
     }
     fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    fn cursor(&mut self) -> io::Result<HistoryCursor> {
+        Ok(HistoryCursor {
+            epoch: self.u64()?,
+            row: self.u64()?,
+            offset: self.u64()?,
+        })
     }
     fn i32(&mut self) -> io::Result<i32> {
         Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
@@ -1168,13 +1213,11 @@ impl<'a> Decoder<'a> {
         Ok(strings)
     }
     fn path(&mut self) -> io::Result<Option<PathBuf>> {
-        if self.bool()? {
-            Ok(Some(PathBuf::from(std::ffi::OsString::from_vec(
-                self.bytes(65536)?.to_vec(),
-            ))))
-        } else {
-            Ok(None)
-        }
+        self.optional(|d| {
+            Ok(PathBuf::from(std::ffi::OsString::from_vec(
+                d.bytes(65536)?.to_vec(),
+            )))
+        })
     }
     fn size(&mut self) -> io::Result<WindowSize> {
         Ok(WindowSize {
@@ -1187,7 +1230,7 @@ impl<'a> Decoder<'a> {
     fn point(&mut self) -> io::Result<Point> {
         let line = self.i32()?;
         let column = self.u32()? as usize;
-        if column > 4096 {
+        if column > MAX_COLUMNS {
             return Err(invalid("column exceeds terminal limit"));
         }
         Ok(Point { line, column })
@@ -1208,38 +1251,19 @@ fn encode_options(e: &mut Encoder, options: &CreateOptions) {
     e.u32(options.foreground);
     e.u32(options.background);
     e.path(&options.directory);
-    e.bool(options.program.is_some());
-    if let Some(shell) = &options.program {
+    e.optional(options.program.as_ref(), |e, shell| {
         e.string(&shell.program);
-        e.u32(shell.args.len() as u32);
-        for arg in &shell.args {
-            e.string(arg);
-        }
-    }
+        e.strings(&shell.args);
+    });
     e.u64(options.history_capacity);
 }
 fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
-    let size = d.size()?;
-    let foreground = d.u32()?;
-    let background = d.u32()?;
-    let directory = d.path()?;
-    let program = if d.bool()? {
-        let program = d.string(65536)?;
-        let count = d.count(4096)?;
-        let mut args = Vec::with_capacity(count);
-        for _ in 0..count {
-            args.push(d.string(65536)?);
-        }
-        Some(Shell::new(program, args))
-    } else {
-        None
-    };
     Ok(CreateOptions {
-        size,
-        foreground,
-        background,
-        directory,
-        program,
+        size: d.size()?,
+        foreground: d.u32()?,
+        background: d.u32()?,
+        directory: d.path()?,
+        program: d.optional(|d| Ok(Shell::new(d.string(65536)?, d.strings(4096)?)))?,
         history_capacity: d.u64()?,
     })
 }
@@ -1255,38 +1279,33 @@ fn encode_agent_model(e: &mut Encoder, patch: &AgentModelPatch) {
         e.u64(message.turn);
         e.string(&message.role);
         e.string(&message.text);
-        e.bool(message.id.is_some());
-        if let Some(id) = &message.id {
-            e.string(id);
-        }
+        e.optional(message.id.as_deref(), Encoder::string);
     }
     e.bytes(&patch.recovery);
 }
 fn decode_agent_model(d: &mut Decoder<'_>) -> io::Result<AgentModelPatch> {
-    let mut patch = AgentModelPatch {
+    Ok(AgentModelPatch {
         session: d.u64()?,
         busy: d.bool()?,
         revision: d.u64()?,
         turn: d.u64()?,
         start: d.u32()?,
         prefix_bytes: d.u32()?,
-        ..AgentModelPatch::default()
-    };
-    let count = d.count(4096)?;
-    for _ in 0..count {
-        patch.messages.push(AgentMessage {
-            turn: d.u64()?,
-            role: d.string(65536)?,
-            text: d.string(MAX_FRAME)?,
-            id: if d.bool()? {
-                Some(d.string(65536)?)
-            } else {
-                None
-            },
-        });
-    }
-    patch.recovery = d.bytes(MAX_FRAME)?.to_vec();
-    Ok(patch)
+        messages: {
+            let count = d.count(4096)?;
+            let mut messages = Vec::with_capacity(count);
+            for _ in 0..count {
+                messages.push(AgentMessage {
+                    turn: d.u64()?,
+                    role: d.string(65536)?,
+                    text: d.string(MAX_FRAME)?,
+                    id: d.optional(|d| d.string(65536))?,
+                });
+            }
+            messages
+        },
+        recovery: d.bytes(MAX_FRAME)?.to_vec(),
+    })
 }
 fn encode_agent_event(e: &mut Encoder, event: &AgentEvent) {
     match event {
@@ -1322,8 +1341,128 @@ fn decode_agent_event(d: &mut Decoder<'_>) -> io::Result<AgentEvent> {
     })
 }
 
+fn encode_file_operation(e: &mut Encoder, operation: &FileOperation) {
+    match operation {
+        FileOperation::Read { offset } => {
+            e.u8(0);
+            e.u64(*offset);
+        }
+        FileOperation::Search { query } => {
+            e.u8(1);
+            e.string(query);
+        }
+        FileOperation::Edit { old_text, new_text } => {
+            e.u8(2);
+            e.optional(old_text.as_deref(), Encoder::string);
+            e.string(new_text);
+        }
+    }
+}
+fn decode_file_operation(d: &mut Decoder<'_>) -> io::Result<FileOperation> {
+    Ok(match d.u8()? {
+        0 => FileOperation::Read { offset: d.u64()? },
+        1 => FileOperation::Search {
+            query: d.string(MAX_FRAME)?,
+        },
+        2 => FileOperation::Edit {
+            old_text: d.optional(|d| d.string(MAX_FRAME))?,
+            new_text: d.string(MAX_FRAME)?,
+        },
+        _ => return Err(invalid("invalid file operation")),
+    })
+}
+fn encode_file_result(e: &mut Encoder, result: &FileResult) {
+    match result {
+        FileResult::Read {
+            path,
+            offset,
+            text,
+            next_offset,
+            has_more,
+        } => {
+            e.u8(0);
+            e.bytes(path.as_os_str().as_bytes());
+            e.u64(*offset);
+            e.string(text);
+            e.u64(*next_offset);
+            e.bool(*has_more);
+        }
+        FileResult::Search {
+            path,
+            matches,
+            truncated,
+        } => {
+            e.u8(1);
+            e.bytes(path.as_os_str().as_bytes());
+            e.u32(matches.len() as u32);
+            for found in matches {
+                e.bytes(found.path.as_os_str().as_bytes());
+                e.u64(found.line);
+                e.string(&found.text);
+            }
+            e.bool(*truncated);
+        }
+        FileResult::Edited { path } => {
+            e.u8(2);
+            e.bytes(path.as_os_str().as_bytes());
+        }
+    }
+}
+fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
+    let kind = d.u8()?;
+    let path = PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec()));
+    Ok(match kind {
+        0 => FileResult::Read {
+            path,
+            offset: d.u64()?,
+            text: d.string(MAX_FRAME)?,
+            next_offset: d.u64()?,
+            has_more: d.bool()?,
+        },
+        1 => {
+            let count = d.count(65536)?;
+            let mut matches = Vec::with_capacity(count);
+            for _ in 0..count {
+                matches.push(FileMatch {
+                    path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+                    line: d.u64()?,
+                    text: d.string(MAX_FRAME)?,
+                });
+            }
+            FileResult::Search {
+                path,
+                matches,
+                truncated: d.bool()?,
+            }
+        }
+        2 => FileResult::Edited { path },
+        _ => return Err(invalid("invalid file result")),
+    })
+}
+
 fn encode_action(e: &mut Encoder, action: &Action) {
     match action {
+        Action::AgentFile {
+            pane,
+            request,
+            path,
+            operation,
+        } => {
+            e.u8(37);
+            e.u64(*pane);
+            e.u64(*request);
+            e.bytes(path.as_os_str().as_bytes());
+            encode_file_operation(e, operation);
+        }
+        Action::CancelAgentFile { request } => {
+            e.u8(38);
+            e.u64(*request);
+        }
+        Action::AgentNewTab { pane, request } => {
+            e.u8(39);
+            e.u64(*pane);
+            e.u64(*request);
+        }
         Action::ScreenRequest { request, wait } => {
             e.u8(32);
             e.u64(*request);
@@ -1374,10 +1513,7 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.u64(*pane);
             e.u64(*request);
             e.u64(*generation);
-            e.bool(prompt.is_some());
-            if let Some(prompt) = prompt {
-                e.u64(*prompt);
-            }
+            e.optional(*prompt, Encoder::u64);
             e.bytes(data);
         }
         Action::CancelHistory { request } => {
@@ -1394,15 +1530,9 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.u8(34);
             e.u64(*pane);
             e.u64(*request);
-            e.bool(block.is_some());
-            if let Some(block) = block {
-                e.u64(*block);
-            }
-            encode_cursor(e, *cursor);
-            e.bool(query.is_some());
-            if let Some(query) = query {
-                e.string(query);
-            }
+            e.optional(*block, Encoder::u64);
+            e.optional(*cursor, Encoder::cursor);
+            e.optional(query.as_deref(), Encoder::string);
         }
         Action::Resize(size) => {
             e.u8(5);
@@ -1411,10 +1541,7 @@ fn encode_action(e: &mut Encoder, action: &Action) {
         Action::Split { pane, axis } => {
             e.u8(6);
             e.u64(*pane);
-            e.u8(match axis {
-                Axis::LeftRight => 0,
-                Axis::TopBottom => 1,
-            });
+            e.u8(*axis as u8);
         }
         Action::ResizeSplit {
             first,
@@ -1436,12 +1563,7 @@ fn encode_action(e: &mut Encoder, action: &Action) {
         }
         Action::Navigate(direction) => {
             e.u8(9);
-            e.u8(match direction {
-                Direction::Left => 0,
-                Direction::Down => 1,
-                Direction::Up => 2,
-                Direction::Right => 3,
-            });
+            e.u8(*direction as u8);
         }
         Action::Tab(delta) => {
             e.u8(10);
@@ -1476,19 +1598,14 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.u8(13);
             e.u64(*pane);
             e.point(*point);
-            encode_side(e, *side);
-            e.u8(match kind {
-                SelectionType::Simple => 0,
-                SelectionType::Semantic => 1,
-                SelectionType::Lines => 2,
-                SelectionType::Object => 3,
-            });
+            e.u8(*side as u8);
+            e.u8(*kind as u8);
         }
         Action::SelectionUpdate { pane, point, side } => {
             e.u8(14);
             e.u64(*pane);
             e.point(*point);
-            encode_side(e, *side);
+            e.u8(*side as u8);
         }
         Action::SelectionClear { pane } => {
             e.u8(15);
@@ -1552,12 +1669,6 @@ fn encode_input(e: &mut Encoder, pane: u64, data: &[u8]) {
     e.u64(pane);
     e.bytes(data);
 }
-fn encode_side(e: &mut Encoder, side: Side) {
-    e.u8(match side {
-        Side::Left => 0,
-        Side::Right => 1,
-    });
-}
 fn decode_side(d: &mut Decoder<'_>) -> io::Result<Side> {
     match d.u8()? {
         0 => Ok(Side::Left),
@@ -1567,24 +1678,31 @@ fn decode_side(d: &mut Decoder<'_>) -> io::Result<Side> {
 }
 fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
     Ok(match d.u8()? {
+        37 => Action::AgentFile {
+            pane: d.u64()?,
+            request: d.u64()?,
+            path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+            operation: decode_file_operation(d)?,
+        },
+        38 => Action::CancelAgentFile { request: d.u64()? },
+        39 => Action::AgentNewTab {
+            pane: d.u64()?,
+            request: d.u64()?,
+        },
         33 => Action::AgentInput {
             pane: d.u64()?,
             request: d.u64()?,
             generation: d.u64()?,
-            prompt: if d.bool()? { Some(d.u64()?) } else { None },
+            prompt: d.optional(Decoder::u64)?,
             data: d.bytes(MAX_FRAME)?.to_vec(),
         },
         35 => Action::CancelHistory { request: d.u64()? },
         34 => Action::ReadHistory {
             pane: d.u64()?,
             request: d.u64()?,
-            block: if d.bool()? { Some(d.u64()?) } else { None },
-            cursor: decode_cursor(d)?,
-            query: if d.bool()? {
-                Some(d.string(MAX_FRAME)?)
-            } else {
-                None
-            },
+            block: d.optional(Decoder::u64)?,
+            cursor: d.optional(Decoder::cursor)?,
+            query: d.optional(|d| d.string(MAX_FRAME))?,
         },
         32 => Action::ScreenRequest {
             request: d.u64()?,
@@ -1641,24 +1759,18 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
                 _ => return Err(invalid("invalid scroll operation")),
             },
         },
-        13 => {
-            let pane = d.u64()?;
-            let point = d.point()?;
-            let side = decode_side(d)?;
-            let kind = match d.u8()? {
+        13 => Action::SelectionStart {
+            pane: d.u64()?,
+            point: d.point()?,
+            side: decode_side(d)?,
+            kind: match d.u8()? {
                 0 => SelectionType::Simple,
                 1 => SelectionType::Semantic,
                 2 => SelectionType::Lines,
                 3 => SelectionType::Object,
                 _ => return Err(invalid("invalid selection kind")),
-            };
-            Action::SelectionStart {
-                pane,
-                point,
-                side,
-                kind,
-            }
-        }
+            },
+        },
         14 => Action::SelectionUpdate {
             pane: d.u64()?,
             point: d.point()?,
@@ -1705,10 +1817,7 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
     })
 }
 fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
-    e.u32(process.launch_argv.len() as u32);
-    for arg in &process.launch_argv {
-        e.string(arg);
-    }
+    e.strings(&process.launch_argv);
     e.u32(process.child_pid);
     e.u8(match process.has_children {
         None => 0,
@@ -1716,96 +1825,45 @@ fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
         Some(true) => 2,
     });
     for pid in [process.foreground_pgid, process.foreground_pid] {
-        e.bool(pid.is_some());
-        if let Some(pid) = pid {
-            e.u32(pid);
-        }
+        e.optional(pid, Encoder::u32);
     }
     e.path(&process.foreground_executable);
-    e.bool(process.foreground_argv.is_some());
-    if let Some(argv) = &process.foreground_argv {
-        e.u32(argv.len() as u32);
-        for arg in argv {
-            e.string(arg);
-        }
-    }
+    e.optional(process.foreground_argv.as_deref(), Encoder::strings);
     e.path(&process.foreground_cwd);
-    e.bool(process.sampled_at_ms.is_some());
-    if let Some(time) = process.sampled_at_ms {
-        e.u64(time);
-    }
-    e.u32(process.unavailable.len() as u32);
-    for reason in &process.unavailable {
-        e.string(reason);
-    }
+    e.optional(process.sampled_at_ms, Encoder::u64);
+    e.strings(&process.unavailable);
 }
 fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMetadata> {
-    let launch_argv = d.strings(65536)?;
-    let child_pid = d.u32()?;
-    let has_children = match d.u8()? {
-        0 => None,
-        1 => Some(false),
-        2 => Some(true),
-        _ => return Err(invalid("invalid child process state")),
-    };
-    let foreground_pgid = if d.bool()? { Some(d.u32()?) } else { None };
-    let foreground_pid = if d.bool()? { Some(d.u32()?) } else { None };
-    let foreground_executable = d.path()?;
-    let foreground_argv = if d.bool()? {
-        Some(d.strings(65536)?)
-    } else {
-        None
-    };
-    let foreground_cwd = d.path()?;
-    let sampled_at_ms = if d.bool()? { Some(d.u64()?) } else { None };
-    let unavailable = d.strings(16)?;
     Ok(crate::terminal::ProcessMetadata {
-        launch_argv,
-        child_pid,
-        has_children,
-        foreground_pgid,
-        foreground_pid,
-        foreground_executable,
-        foreground_argv,
-        foreground_cwd,
-        sampled_at_ms,
-        unavailable,
-    })
-}
-fn encode_cursor(e: &mut Encoder, cursor: Option<HistoryCursor>) {
-    e.bool(cursor.is_some());
-    if let Some(cursor) = cursor {
-        e.u64(cursor.epoch);
-        e.u64(cursor.row);
-        e.u64(cursor.offset);
-    }
-}
-fn decode_cursor(d: &mut Decoder<'_>) -> io::Result<Option<HistoryCursor>> {
-    Ok(if d.bool()? {
-        Some(HistoryCursor {
-            epoch: d.u64()?,
-            row: d.u64()?,
-            offset: d.u64()?,
-        })
-    } else {
-        None
+        launch_argv: d.strings(65536)?,
+        child_pid: d.u32()?,
+        has_children: match d.u8()? {
+            0 => None,
+            1 => Some(false),
+            2 => Some(true),
+            _ => return Err(invalid("invalid child process state")),
+        },
+        foreground_pgid: d.optional(Decoder::u32)?,
+        foreground_pid: d.optional(Decoder::u32)?,
+        foreground_executable: d.path()?,
+        foreground_argv: d.optional(|d| d.strings(65536))?,
+        foreground_cwd: d.path()?,
+        sampled_at_ms: d.optional(Decoder::u64)?,
+        unavailable: d.strings(16)?,
     })
 }
 fn encode_command(e: &mut Encoder, command: &CommandBlock) {
     e.u64(command.id);
     e.bool(command.complete);
     e.bool(command.has_output);
-    e.bool(command.status.is_some());
-    if let Some(status) = command.status {
-        e.i32(status);
-    }
+    e.optional(command.status, Encoder::i32);
 }
 fn decode_command(d: &mut Decoder<'_>) -> io::Result<CommandBlock> {
     Ok(CommandBlock {
         id: d.u64()?,
         complete: d.bool()?,
         has_output: d.bool()?,
-        status: if d.bool()? { Some(d.i32()?) } else { None },
+        status: d.optional(Decoder::i32)?,
     })
 }
 fn encode_snapshot(
@@ -1826,6 +1884,7 @@ fn encode_snapshot(
     e.u32(snapshot.panes.len() as u32);
     for pane in &snapshot.panes {
         e.u64(pane.id);
+        e.u64(pane.tab);
         e.u16(pane.rect.x);
         e.u16(pane.rect.y);
         e.u16(pane.rect.cols);
@@ -1833,31 +1892,24 @@ fn encode_snapshot(
         e.string(&pane.title);
         e.path(&pane.cwd);
         e.u64(pane.input_generation);
-        e.bool(pane.shell_prompt.is_some());
-        if let Some(prompt) = pane.shell_prompt {
-            e.u64(prompt);
-        }
-        let changed = previous
-            .get(&pane.id)
-            .is_none_or(|process| !Arc::ptr_eq(process, &pane.process));
-        e.bool(changed);
-        if changed {
-            encode_process(e, &pane.process);
-        }
+        e.optional(pane.shell_prompt, Encoder::u64);
+        e.optional(
+            previous
+                .get(&pane.id)
+                .is_none_or(|process| !Arc::ptr_eq(process, &pane.process))
+                .then_some(pane.process.as_ref()),
+            encode_process,
+        );
         e.u32(pane.blocks.len() as u32);
         for block in &pane.blocks {
             e.u64(block.id);
             e.i32(block.line);
             e.bool(block.complete);
-            e.bool(block.output.is_some());
-            if let Some((start, end)) = block.output {
+            e.optional(block.output, |e, (start, end)| {
                 e.point(start);
                 e.point(end);
-            }
-            e.bool(block.status.is_some());
-            if let Some(status) = block.status {
-                e.i32(status);
-            }
+            });
+            e.optional(block.status, Encoder::i32);
         }
         e.u32(pane.command_blocks.len() as u32);
         for block in &pane.command_blocks {
@@ -1867,6 +1919,7 @@ fn encode_snapshot(
 }
 fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Result<Snapshot> {
     let name = d.string(128)?;
+    let previous = previous.filter(|snapshot| snapshot.name == name);
     let controller = d.bool()?;
     let focused = d.u64()?;
     let active_tab = d.u64()?;
@@ -1890,6 +1943,7 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
     let mut panes = Vec::with_capacity(count);
     for _ in 0..count {
         let id = d.u64()?;
+        let tab = d.u64()?;
         let rect = crate::workspace::Rect {
             x: d.u16()?,
             y: d.u16()?,
@@ -1899,34 +1953,24 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
         let title = d.string(65536)?;
         let cwd = d.path()?;
         let input_generation = d.u64()?;
-        let shell_prompt = if d.bool()? { Some(d.u64()?) } else { None };
+        let shell_prompt = d.optional(Decoder::u64)?;
         let process = if d.bool()? {
             Arc::new(decode_process(d)?)
         } else {
             previous
-                .filter(|snapshot| snapshot.name == name)
-                .and_then(|snapshot| snapshot.panes.iter().find(|pane| pane.id == id))
+                .and_then(|snapshot| snapshot.pane(id))
                 .map(|pane| Arc::clone(&pane.process))
                 .ok_or_else(|| invalid("pane process metadata has no prior snapshot"))?
         };
         let count = d.count(4096)?;
         let mut blocks = Vec::with_capacity(count);
         for _ in 0..count {
-            let id = d.u64()?;
-            let line = d.i32()?;
-            let complete = d.bool()?;
-            let output = if d.bool()? {
-                Some((d.point()?, d.point()?))
-            } else {
-                None
-            };
-            let status = if d.bool()? { Some(d.i32()?) } else { None };
             blocks.push(BlockMarker {
-                id,
-                line,
-                complete,
-                status,
-                output,
+                id: d.u64()?,
+                line: d.i32()?,
+                complete: d.bool()?,
+                output: d.optional(|d| Ok((d.point()?, d.point()?)))?,
+                status: d.optional(Decoder::i32)?,
             });
         }
         let count = d.count(4)?;
@@ -1936,6 +1980,7 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
         }
         panes.push(PaneView {
             id,
+            tab,
             rect,
             title,
             cwd,
@@ -1972,12 +2017,8 @@ fn decode_color(d: &mut Decoder<'_>) -> io::Result<Color> {
         )),
         1 => Ok(Color::Indexed(d.u8()?)),
         2 => {
-            let rgb = d.take(3)?;
-            Ok(Color::Spec(Rgb {
-                r: rgb[0],
-                g: rgb[1],
-                b: rgb[2],
-            }))
+            let [r, g, b] = d.take(3)?.try_into().unwrap();
+            Ok(Color::Spec(Rgb { r, g, b }))
         }
         _ => Err(invalid("invalid color kind")),
     }
@@ -1986,27 +2027,20 @@ fn encode_update(e: &mut Encoder, update: &Update) {
     e.u16(update.columns as u16);
     e.u16(update.lines as u16);
     e.point(update.cursor.0);
-    e.u8(match update.cursor.1 {
-        CursorShape::Block => 0,
-        CursorShape::Underline => 1,
-        CursorShape::Beam => 2,
-        CursorShape::Hidden => 3,
-    });
+    e.u8(update.cursor.1 as u8);
     e.u32(update.mode.bits());
     e.u64(update.offset as u64);
     e.u64(update.history as u64);
-    e.bool(update.selection.is_some());
-    if let Some(selection) = update.selection {
+    e.optional(update.selection, |e, selection| {
         e.point(selection.start);
         e.point(selection.end);
-    }
-    e.bool(update.palette.is_some());
-    if let Some(palette) = &update.palette {
+    });
+    e.optional(update.palette.as_deref(), |e, palette| {
         e.0.reserve(palette.len() * 3);
         for rgb in palette.iter() {
             e.0.extend_from_slice(&[rgb.r, rgb.g, rgb.b]);
         }
-    }
+    });
     e.u32(update.rows.len() as u32);
     for (index, row) in &update.rows {
         e.u16(*index as u16);
@@ -2043,17 +2077,18 @@ fn encode_update(e: &mut Encoder, update: &Update) {
             for ch in zerowidth {
                 e.0.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
             }
-            e.bool(extra.underline_color.is_some());
-            if let Some(color) = extra.underline_color {
-                encode_color(e, color);
-            }
+            e.optional(extra.underline_color, encode_color);
         }
     }
 }
 fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
     let columns = d.u16()? as usize;
     let lines = d.u16()? as usize;
-    if !(1..=4096).contains(&columns) || lines == 0 || lines > 2048 || columns * lines > 1_048_576 {
+    if !(1..=MAX_COLUMNS).contains(&columns)
+        || lines == 0
+        || lines > MAX_LINES
+        || columns * lines > MAX_CELLS
+    {
         return Err(invalid("invalid screen dimensions"));
     }
     let cursor_point = d.point()?;
@@ -2070,31 +2105,22 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
     let mode = Mode::from_bits(d.u32()?).ok_or_else(|| invalid("invalid terminal mode"))?;
     let offset = usize::try_from(d.u64()?).map_err(|_| invalid("display offset overflow"))?;
     let history = usize::try_from(d.u64()?).map_err(|_| invalid("history size overflow"))?;
-    let selection = if d.bool()? {
-        Some(SelectionRange {
+    let selection = d.optional(|d| {
+        Ok(SelectionRange {
             start: d.point()?,
             end: d.point()?,
         })
-    } else {
-        None
-    };
-    let palette = if d.bool()? {
-        let mut palette = [Rgb::default(); 269];
-        let bytes = d.take(palette.len() * 3)?;
-        for (rgb, bytes) in palette.iter_mut().zip(bytes.chunks_exact(3)) {
-            *rgb = Rgb {
-                r: bytes[0],
-                g: bytes[1],
-                b: bytes[2],
-            };
-        }
-        Some(Box::new(palette))
-    } else {
-        None
-    };
+    })?;
+    let palette = d.optional(|d| {
+        let (colors, _) = d.take(PALETTE_SIZE * 3)?.as_chunks::<3>();
+        Ok(Box::new(std::array::from_fn(|index| {
+            let [r, g, b] = colors[index];
+            Rgb { r, g, b }
+        })))
+    })?;
     let count = d.count(lines)?;
     let mut rows = Vec::with_capacity(count);
-    let mut seen = [0u64; 32];
+    let mut seen = [0u64; MAX_LINES.div_ceil(64)];
     for _ in 0..count {
         let index = d.u16()? as usize;
         let mask = 1u64 << (index & 63);
@@ -2166,11 +2192,7 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
                 .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
                 .chars()
                 .collect();
-            let underline_color = if d.bool()? {
-                Some(decode_color(d)?)
-            } else {
-                None
-            };
+            let underline_color = d.optional(decode_color)?;
             extras.push((
                 column,
                 Extra {
@@ -2199,6 +2221,142 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_workspace_actions_roundtrip() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut sender = Peer::new(left).unwrap();
+        let mut receiver = Peer::new(right).unwrap();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"source-\xff".to_vec()));
+        for (request, operation) in [
+            (1, FileOperation::Read { offset: 17 }),
+            (
+                2,
+                FileOperation::Search {
+                    query: "literal\nquery".into(),
+                },
+            ),
+            (
+                3,
+                FileOperation::Edit {
+                    old_text: Some("before".into()),
+                    new_text: "after\n你好".into(),
+                },
+            ),
+            (
+                4,
+                FileOperation::Edit {
+                    old_text: None,
+                    new_text: String::new(),
+                },
+            ),
+        ] {
+            sender
+                .send_action(&Action::AgentFile {
+                    pane: 19,
+                    request,
+                    path: path.clone(),
+                    operation: operation.clone(),
+                })
+                .unwrap();
+            sender.flush().unwrap();
+            let actual = receiver.next_action().unwrap().unwrap();
+            assert!(
+                matches!(actual, Action::AgentFile { pane: 19, request: actual_request, path: actual_path, operation: actual_operation } if actual_request == request && actual_path == path && actual_operation == operation)
+            );
+        }
+        sender
+            .send_action(&Action::CancelAgentFile { request: 3 })
+            .unwrap();
+        sender
+            .send_action(&Action::AgentNewTab {
+                pane: 19,
+                request: 5,
+            })
+            .unwrap();
+        sender.flush().unwrap();
+        assert!(matches!(
+            receiver.next_action().unwrap().unwrap(),
+            Action::CancelAgentFile { request: 3 }
+        ));
+        assert!(matches!(
+            receiver.next_action().unwrap().unwrap(),
+            Action::AgentNewTab {
+                pane: 19,
+                request: 5
+            }
+        ));
+    }
+
+    #[test]
+    fn agent_workspace_responses_roundtrip_over_remote_transport() {
+        let (left, right) = UnixStream::pair().unwrap();
+        let mut sender = Peer::new(left).unwrap();
+        let mut receiver = Peer::remote(right).unwrap();
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/source-\xff".to_vec()));
+        let expected = vec![
+            (
+                1,
+                Ok(FileResult::Read {
+                    path: path.clone(),
+                    offset: 17,
+                    text: "你好\n".into(),
+                    next_offset: 24,
+                    has_more: true,
+                }),
+            ),
+            (
+                2,
+                Ok(FileResult::Search {
+                    path: path.clone(),
+                    matches: vec![FileMatch {
+                        path: path.join("a"),
+                        line: 19,
+                        text: "needle line".into(),
+                    }],
+                    truncated: true,
+                }),
+            ),
+            (3, Ok(FileResult::Edited { path })),
+            (4, Err("file request cancelled".into())),
+        ];
+        for (request, result) in &expected {
+            sender
+                .send_response(Response::AgentFile {
+                    request: *request,
+                    result: result.clone(),
+                })
+                .unwrap();
+        }
+        sender
+            .send_response(Response::AgentNewTab {
+                request: 5,
+                result: Ok(27),
+            })
+            .unwrap();
+        sender
+            .send_response(Response::AgentNewTab {
+                request: 6,
+                result: Err("pane does not exist".into()),
+            })
+            .unwrap();
+        sender.flush().unwrap();
+        let mut actual = Vec::new();
+        let mut tabs = Vec::new();
+        for response in receiver.responses(None).unwrap() {
+            match response {
+                Response::AgentFile { request, result } => actual.push((request, result)),
+                Response::AgentNewTab { request, result } => tabs.push((request, result)),
+                _ => panic!("unexpected response"),
+            }
+        }
+        assert_eq!(actual, expected);
+        assert_eq!(
+            tabs,
+            vec![(5, Ok(27)), (6, Err("pane does not exist".into()))]
+        );
+    }
+
     #[test]
     fn process_deltas_inherit_the_latest_snapshot_in_and_across_reads() {
         let (left, right) = UnixStream::pair().unwrap();
@@ -2212,6 +2370,7 @@ mod tests {
             tabs: Vec::new(),
             panes: vec![PaneView {
                 id: 1,
+                tab: 1,
                 rect: crate::workspace::Rect::default(),
                 title: String::new(),
                 cwd: None,
@@ -2316,6 +2475,7 @@ mod tests {
             tabs: Vec::new(),
             panes: vec![PaneView {
                 id: 1,
+                tab: 1,
                 rect: crate::workspace::Rect::default(),
                 title: "debugger".into(),
                 cwd: None,

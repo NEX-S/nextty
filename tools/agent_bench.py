@@ -37,6 +37,7 @@ def fixture(directory):
         index = 0
         activity = ''
         control = directory / 'activity'
+        response_delay = directory / 'response-delay'
         while True:
             if control.exists():
                 marker = control.read_text()
@@ -53,6 +54,8 @@ def fixture(directory):
             for _ in data:
                 index += 1
                 events.write(json.dumps({'index': index, 'at': at}) + '\n')
+                if response_delay.exists():
+                    time.sleep(float(response_delay.read_text()))
                 os.write(1, f'\x1b[Hprobe-{index:04}\x1b[K'.encode())
 
 
@@ -72,12 +75,15 @@ class Lab:
         self.input = None
         self.pids = {}
         self.requests = []
+        self.execution_requests = 0
+        self.goal_reviews = 0
         self.verified = threading.Event()
         self.expected = ""
         self.tool_mode = tool_mode
         self.tool_index = 0
         self.tool_sent = None
         self.tool_samples = {}
+        self.submission = None
         self.command = None
         self.page = None
         self.output_prefix = ''
@@ -97,11 +103,16 @@ class Lab:
                 try:
                     body = self.rfile.read(int(self.headers['Content-Length']))
                     lab.requests.append(len(body))
-                    if lab.tool_mode:
-                        self.tool_reply(json.loads(body))
+                    request = json.loads(body)
+                    if request.get('tool_choice', {}).get('type') == 'none' and request['messages'][-1]['content'].startswith('Harness goal review:'):
+                        self.goal_reply(request)
                         return
-                    if len(lab.requests) == 2:
-                        messages = json.loads(body)['messages']
+                    lab.execution_requests += 1
+                    if lab.tool_mode:
+                        self.tool_reply(request)
+                        return
+                    if lab.execution_requests == 2:
+                        messages = request['messages']
                         text = ''.join(block.get('text', '') for message in messages
                                        if message['role'] == 'assistant'
                                        for block in message['content'])
@@ -156,11 +167,36 @@ class Lab:
                     lab.errors.append(repr(error))
                     lab.done.set()
 
+            def goal_reply(self, body):
+                verdict = lab.goal_verdict(body)
+                self.send_response(200)
+                self.send_header('Content-Type', 'text/event-stream')
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                events = [
+                    {'type':'message_start','message':{'role':'assistant','content':[]}},
+                    {'type':'content_block_start','index':0,'content_block':{'type':'text','text':json.dumps(verdict)}},
+                    {'type':'content_block_stop','index':0},
+                    {'type':'message_delta','delta':{'stop_reason':'end_turn'}},
+                    {'type':'message_stop'},
+                ]
+                for event in events:
+                    self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode())
+                self.wfile.flush()
+                lab.goal_reviews += 1
+
             def tool_reply(self, body):
                 lab.ready.set()
                 if not lab.go.wait(10):
                     raise TimeoutError('driver did not start tools')
+                if lab.submission is None:
+                    content = next(message['content'] for message in reversed(body['messages'])
+                                   if isinstance(message['content'], str)
+                                   and message['content'].startswith('Target terminal at submission'))
+                    lab.submission, _ = json.JSONDecoder().raw_decode(content.split('\n', 1)[1])
                 action = lab.next_tool(body)
+                if action and 'pane' not in action[2] and not (action[1] == 'read' and action[2].get('source') == 'workspace'):
+                    action[2]['pane'] = lab.submission['pane']
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Connection', 'close')
@@ -182,6 +218,9 @@ class Lab:
                     lab.done.set()
 
         self.model = http.server.ThreadingHTTPServer(('127.0.0.1', 0), Model)
+
+    def goal_verdict(self, body):
+        return {'status':'complete', 'reason':'Fixture evidence verified.'}
 
     def start(self):
         threading.Thread(target=self.model.serve_forever, daemon=True).start()
@@ -213,6 +252,7 @@ class Lab:
             result = json.loads(block['content'])
             if name in ('shell-output', 'command-wait'):
                 if name == 'shell-output':
+                    assert result['input_queued'], result
                     self.command = result['command']
                 if result['running']:
                     assert result['outcome'] == 'timeout', result
@@ -237,6 +277,7 @@ class Lab:
             if name == 'input-ack':
                 assert result['input_queued']
             if name == 'shell-roundtrip':
+                assert result['input_queued'], result
                 assert not result['running'] and result['exit_code'] == 0, result
                 assert result['text'].strip() == 'tool-proof', result
             if name == 'input-verify':
@@ -275,6 +316,7 @@ class Lab:
         start = time.monotonic()
         self.go.set()
         self.wait(self.done.is_set, 'tools completed', 30)
+        self.wait(lambda: self.goal_reviews == 1, 'tools goal review')
         self.wait(lambda: b'tools-finished-proof' in self.output, 'tools final answer rendered')
         end = self.sample()
         return {'case':'tools', 'seconds':time.monotonic() - start,
@@ -282,6 +324,255 @@ class Lab:
                                 for name,values in self.tool_samples.items()},
                 'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds'] for role,value in begin.items()},
                 'request_bytes':self.requests}
+
+    def prepare_workspace(self, root, connection='local'):
+        broken = 'def add(a, b):\n    return a - b\n'
+        fixed = broken.replace('a - b', 'a + b')
+        (root / 'tiny.py').write_text(broken)
+        check = ('from pathlib import Path\nfrom tiny import add\n'
+                 'with Path("verification-count").open("a") as log:\n    log.write("run\\n")\n'
+                 'assert add(2, 3) == 5\nprint("workspace-check-proof")\n')
+        (root / 'check.py').write_text(check)
+        failure = subprocess.run([sys.executable, '-B', 'check.py'], cwd=root, capture_output=True)
+        assert failure.returncode != 0 and b'AssertionError' in failure.stderr, failure
+        (root / 'verification-count').unlink()
+        corpus = root / 'search-space'
+        corpus.mkdir()
+        for index in range(8):
+            (corpus / f'{index:02d}.txt').write_text('payload without the requested literal\n' * 100000)
+        (corpus / '99.txt').write_text('bounded-match payload\n' * 1000)
+        state = {'search_started':threading.Event(), 'search_result_bytes':0,
+                 'roundtrip_ms':{}, 'shell_submissions':0, 'original_pane':None,
+                 'new_pane':None, 'active_tab':None, 'command':None}
+
+        def next_tool(body):
+            original = self.submission['pane']
+            if self.tool_sent:
+                name, sent = self.tool_sent
+                state['roundtrip_ms'][name] = (time.monotonic_ns() - sent) / 1e6
+                block = body['messages'][-1]['content'][0]
+                assert not block.get('is_error'), block
+                result = json.loads(block['content'])
+                if name in ('workspace-before', 'workspace-opened', 'workspace-final'):
+                    assert result['connection'] == connection, result
+                    panes = {pane['pane']:pane for pane in result['panes']}
+                    assert panes[original]['cwd'] == str(root), result
+                    assert panes[original]['shell_prompt'] is None, result
+                    if name == 'workspace-before':
+                        state['original_pane'] = original
+                        state['active_tab'] = result['active_tab']
+                        assert len(panes) == 1, result
+                    else:
+                        assert result['active_tab'] == state['active_tab'], result
+                        assert len(panes) == 2 and panes[state['new_pane']]['cwd'] == str(root), result
+                    if name == 'workspace-final':
+                        assert any(command['exit_code'] == 0 for command in panes[state['new_pane']]['command_blocks']), result
+                if name == 'find-bug':
+                    assert len(result['matches']) == 1 and not result['truncated'], result
+                    match = result['matches'][0]
+                    assert match['path'] == str(root / 'tiny.py') and match['line'] == 2, result
+                if name in ('read-bug', 'read-check', 'read-fixed'):
+                    expected = check if name == 'read-check' else fixed if name == 'read-fixed' else broken
+                    assert result['text'] == expected and result['offset'] == 0, result
+                    assert result['next_offset'] == len(expected.encode()) and not result['has_more'], result
+                if name == 'bounded-search':
+                    assert result['truncated'] and result['matches'], result
+                    assert all(match['path'] == str(corpus / '99.txt') for match in result['matches']), result
+                    state['search_result_bytes'] = len(block['content'].encode())
+                    assert state['search_result_bytes'] < 64 * 1024, result
+                if name == 'fix-bug':
+                    assert result['written'] and result['path'] == str(root / 'tiny.py'), result
+                if name == 'open-terminal':
+                    assert result['created'] and result['pane'] != original, result
+                    state['new_pane'] = result['pane']
+                    assert 'screen' in result and 'input_generation' in result, result
+                    if result['shell_prompt'] is None:
+                        return ('new-prompt', 'read', {'source':'screen','pane':state['new_pane'],'wait':5})
+                if name == 'new-prompt' and result['shell_prompt'] is None:
+                    return ('new-prompt', 'read', {'source':'screen','pane':state['new_pane'],'wait':5})
+                if name in ('verify-fix', 'verify-wait'):
+                    if name == 'verify-fix':
+                        assert result['input_queued'], result
+                        state['command'] = result['command']
+                    if result['running']:
+                        return ('verify-wait', 'read', {'source':'command','pane':state['new_pane'],
+                                                       'command':state['command'],'wait':5})
+                    assert result['exit_code'] == 0 and 'workspace-check-proof' in result['text'], result
+                if name == 'original-screen':
+                    assert result['pane'] == original and result['shell_prompt'] is None, result
+            index = self.tool_index
+            self.tool_index += 1
+            if index == 0:
+                inventory = self.submission['workspace']
+                assert inventory['connection'] == connection, inventory
+                assert any(pane['pane'] == original for pane in inventory['panes']), inventory
+                return ('workspace-before', 'read', {'source':'workspace'})
+            if index == 1:
+                return ('find-bug', 'search_files', {'pane':original,'path':'tiny.py','query':'return a - b'})
+            if index == 2:
+                return ('read-bug', 'read_file', {'pane':original,'path':'tiny.py'})
+            if index == 3:
+                return ('read-check', 'read_file', {'pane':original,'path':'check.py'})
+            if index == 4:
+                state['search_started'].set()
+                return ('bounded-search', 'search_files', {'pane':original,'path':'search-space','query':'bounded-match'})
+            if index == 5:
+                return ('fix-bug', 'edit_file', {'pane':original,'path':'tiny.py','old_text':'return a - b','new_text':'return a + b'})
+            if index == 6:
+                return ('read-fixed', 'read_file', {'pane':original,'path':'tiny.py'})
+            if index == 7:
+                return ('open-terminal', 'open_terminal', {'pane':original})
+            if index == 8:
+                return ('workspace-opened', 'read', {'source':'workspace'})
+            if index == 9:
+                state['shell_submissions'] += 1
+                return ('verify-fix', 'shell', {'pane':state['new_pane'],'command':'python3 check.py'})
+            if index == 10:
+                return ('workspace-final', 'read', {'source':'workspace'})
+            if index == 11:
+                return ('original-screen', 'read', {'source':'screen','pane':original})
+            return None
+
+        self.tool_mode = True
+        self.next_tool = next_tool
+        return state
+
+    def run_workspace(self):
+        state = self.prepare_workspace(self.root)
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'Fix tiny.py and verify it while preserving my foreground application.\r')
+        self.wait(self.ready.is_set, 'workspace model request')
+        self.discover()
+        os.write(self.master, b'\x1bh')
+        self.drain(.05)
+        begin = self.sample()
+        start = time.monotonic()
+        self.go.set()
+        self.wait(state['search_started'].is_set, 'native file search started')
+        latency = self.probes(False)
+        self.wait(lambda: self.goal_reviews == 1, 'workspace verification reviewed')
+        self.wait(lambda: b'tools-finished-proof' in self.output, 'workspace final answer rendered')
+        assert (self.root / 'verification-count').read_text() == 'run\n'
+        assert state['shell_submissions'] == 1 and self.tool_index == 13, state
+        end = self.sample()
+        return {'case':'workspace-tools', 'seconds':time.monotonic()-start,
+                'input_ms':latency, 'original_pane':state['original_pane'],
+                'new_pane':state['new_pane'], 'verification_exit_code':0,
+                'shell_submissions':state['shell_submissions'], 'foreground_preserved':True,
+                'search_result_bytes':state['search_result_bytes'], 'roundtrip_ms':state['roundtrip_ms'],
+                'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds'] for role,value in begin.items()},
+                'request_bytes':self.requests}
+
+    def run_goal(self):
+        def next_tool(body):
+            index = self.tool_index
+            self.tool_index += 1
+            if index == 0:
+                return None
+            if index == 1:
+                assert 'goal-next-proof' in body['messages'][-1]['content']
+                return ('goal-command', 'shell', {'command':"printf 'goal-continuation-proof\\n'"})
+            result = json.loads(body['messages'][-1]['content'][0]['content'])
+            assert result['exit_code'] == 0 and result['text'].strip() == 'goal-continuation-proof', result
+            return None
+
+        def verdict(body):
+            if self.goal_reviews == 0:
+                return {'status':'continue', 'reason':'goal-next-proof: verify with a terminal command.'}
+            assert 'goal-continuation-proof' in json.dumps(body['messages'])
+            return {'status':'complete', 'reason':'The terminal command verified the goal.'}
+
+        self.next_tool = next_tool
+        self.goal_verdict = verdict
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'verify goal continuation\r')
+        self.wait(self.ready.is_set, 'goal model request')
+        self.discover()
+        start = time.monotonic()
+        self.go.set()
+        self.wait(lambda: self.goal_reviews == 2, 'goal continuation and verification')
+        self.wait(lambda: b'goal-next-proof' in self.output, 'goal continuation displayed')
+        self.drain(.1)
+        assert self.tool_index == 3 and len(self.requests) == 5, self.requests
+        return {'case':'default-goal', 'seconds':time.monotonic()-start,
+                'goal_reviews':self.goal_reviews, 'terminal_actions':1,
+                'request_bytes':self.requests}
+
+    def run_input_observation(self, delay):
+        (self.root / 'response-delay').write_text(str(delay))
+        sent = False
+        reads = 0
+        outcomes = []
+
+        def next_tool(body):
+            nonlocal sent, reads
+            if not sent:
+                sent = True
+                return ('input', 'input', {'text':'x'})
+            block = body['messages'][-1]['content'][0]
+            assert not block.get('is_error'), block
+            result = json.loads(block['content'])
+            if self.tool_sent[0] == 'input':
+                assert result['input_queued'], result
+                outcomes.append(result.get('outcome'))
+            if any('probe-0001' in text for _, text in result['screen']['rows']):
+                return None
+            reads += 1
+            return ('observe', 'read', {'source':'screen','wait':5})
+
+        self.tool_mode = True
+        self.next_tool = next_tool
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'operate the foreground application\r')
+        self.wait(self.ready.is_set, 'interactive input request')
+        self.discover()
+        start = time.monotonic()
+        self.go.set()
+        self.wait(lambda: self.goal_reviews == 1, 'interactive input result verified')
+        self.wait(lambda: b'tools-finished-proof' in self.output, 'input final answer rendered')
+        return {'case':'input-observation', 'response_delay_seconds':delay,
+                'seconds':time.monotonic()-start, 'tool_calls':1+reads,
+                'read_calls':reads, 'input_outcomes':outcomes, 'request_bytes':self.requests}
+
+    def run_input_cancel(self):
+        (self.root / 'response-delay').write_text('0.5')
+        sent = False
+
+        def next_tool(body):
+            nonlocal sent
+            if not sent:
+                sent = True
+                return ('input', 'input', {'text':'x'})
+            results = [block for message in body['messages'] if isinstance(message['content'], list)
+                       for block in message['content'] if block['type'] == 'tool_result']
+            assert len(results) == 1 and not results[0].get('is_error'), results
+            result = json.loads(results[0]['content'])
+            assert result['input_queued'] and result['observation_error'], result
+            return None
+
+        def delivered():
+            line = self.input.readline()
+            return bool(line and json.loads(line).get('index') == 1)
+
+        self.tool_mode = True
+        self.next_tool = next_tool
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'operate the foreground application\r')
+        self.wait(self.ready.is_set, 'cancelable input request')
+        self.go.set()
+        self.wait(delivered, 'input delivered before stop')
+        os.write(self.master, b'\x03')
+        self.drain(.1)
+        os.write(self.master, b'confirm the recorded input\r')
+        self.wait(lambda: self.goal_reviews == 1, 'canceled input fact preserved')
+        self.wait(lambda: b'tools-finished-proof' in self.output, 'cancellation recovery rendered')
+        assert self.execution_requests == 2, self.requests
+        return {'case':'input-observation-cancel', 'tool_calls':1,
+                'input_queued_preserved':True, 'request_bytes':self.requests}
 
     def run_interactive(self):
         samples = {}
@@ -366,11 +657,47 @@ class Lab:
         start = time.monotonic()
         self.go.set()
         self.wait(self.done.is_set, 'interactive command observations', 20)
+        self.wait(lambda: self.goal_reviews == 1, 'interactive goal review')
         self.wait(lambda: b'tools-finished-proof' in self.output, 'interactive final answer rendered')
-        assert len(self.requests) == 9, self.requests
+        assert len(self.requests) == 10, self.requests
         return {'case':'interactive-correctness', 'seconds':time.monotonic() - start,
                 'roundtrip_ms':samples, 'interactive_exit_code':0, 'continuous_wait_requests':1,
                 'wait_costs':wait_costs,
+                'request_bytes':self.requests}
+
+    def run_shell_observation_error(self):
+        command = None
+
+        def next_tool(body):
+            nonlocal command
+            index = self.tool_index
+            self.tool_index += 1
+            if index == 0:
+                return ('clear-history', 'shell', {'command': "printf 'submitted\\n' >> submission-count; printf '\\033[3J'"})
+            block = body['messages'][-1]['content'][0]
+            if index == 1:
+                assert not block.get('is_error'), block
+                result = json.loads(block['content'])
+                assert result['input_queued'], result
+                command = result['command']
+                assert isinstance(command, int), result
+                assert result['observation_error'] == 'command block no longer retained', result
+                return ('missing-command', 'read', {'source':'command', 'command':command})
+            assert block.get('is_error') and block['content'] == 'command block no longer retained', block
+            return None
+
+        self.next_tool = next_tool
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'benchmark accepted shell with cleared output\r')
+        self.wait(self.ready.is_set, 'clear-history model request')
+        self.go.set()
+        self.wait(self.done.is_set, 'clear-history observation')
+        self.wait(lambda: self.goal_reviews == 1, 'clear-history goal review')
+        assert (self.root / 'submission-count').read_text() == 'submitted\n'
+        assert self.execution_requests == 3, self.execution_requests
+        return {'case':'shell-observation-error', 'command':command,
+                'input_queued_preserved':True, 'terminal_submissions':1,
                 'request_bytes':self.requests}
 
     def run_waits(self):
@@ -488,6 +815,7 @@ class Lab:
         start = time.monotonic()
         self.go.set()
         self.wait(self.done.is_set, 'terminal wait observations', 18)
+        self.wait(lambda: self.goal_reviews == 1, 'terminal wait goal review')
         self.wait(lambda: b'tools-finished-proof' in self.output, 'wait final answer rendered')
         return {'case':'wait-observations', 'seconds':time.monotonic() - start,
                 'roundtrip_ms':samples, 'history_input_rejected':True,
@@ -554,8 +882,14 @@ class Lab:
     def run(self, name, prefix=0, hz=50, visible=True):
         self.hz = hz
         self.prefix = ('**agent** `shell` and history.\n\n' * 8192)[:prefix]
-        if name == 'code-stream':
-            self.prefix = '```text\n' + ('0123456789abcdef output line\n' * 8192)[:prefix] + '\n```\n'
+        if name in ('code-stream', 'open-code-stream'):
+            self.prefix = '```text\n' + ('0123456789abcdef output line\n' * 8192)[:prefix] + '\n'
+            if name == 'code-stream':
+                self.prefix += '```\n'
+        elif name == 'unicode-stream':
+            paragraph = ('终端响应 延迟 agent 输出 文本🙂 e\u0301 ' * 20) + '\n\n'
+            size = len(paragraph.encode())
+            self.prefix = paragraph * (prefix // size) + ' ' * (prefix % size)
         if name != 'idle':
             os.write(self.master, b'\x1ba')
             self.drain(.05)
@@ -572,6 +906,7 @@ class Lab:
         latency = self.probes(visible and name != 'idle')
         if name != 'idle':
             self.wait(self.done.is_set, 'model stream completed')
+            self.wait(lambda: self.goal_reviews == 1, 'stream goal review')
             if visible:
                 self.wait(lambda: b'stream-finished-proof' in self.output, 'final answer rendered')
         self.drain(.1)
@@ -583,6 +918,7 @@ class Lab:
             self.drain(.05)
             os.write(self.master, b'verify stream history\r')
             self.wait(self.verified.is_set, 'stream history verified')
+            self.wait(lambda: self.goal_reviews == 2, 'history goal review')
             self.wait(lambda: b'state-verified-proof' in self.output, 'verification rendered')
         return {'case': name, 'seconds': elapsed, 'input_ms': latency,
                 'product_cpu_seconds': {role: end[role]['cpu_seconds'] - before['cpu_seconds']
@@ -635,6 +971,7 @@ def main():
     binary = args.binary.resolve()
     cases = [('idle', 0, 50, False), ('short-stream', 0, 50, True),
              ('long-stream', 128 * 1024, 200, True), ('code-stream', 128 * 1024, 200, True),
+             ('open-code-stream', 128 * 1024, 200, True), ('unicode-stream', 128 * 1024, 200, True),
              ('long-hidden', 128 * 1024, 200, False)]
     report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
               'scope': __doc__, 'platform': list(os.uname()), 'samples_per_case': 80, 'cases': []}
@@ -658,7 +995,40 @@ def main():
     lab = Lab(binary, tool_mode=True)
     try:
         lab.start()
+        result = lab.run_goal()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    for delay in (.02, .3):
+        lab = Lab(binary)
+        try:
+            lab.start()
+            result = lab.run_input_observation(delay)
+            report['cases'].append(result)
+            print(json.dumps(result), file=sys.stderr, flush=True)
+        finally:
+            lab.close()
+    lab = Lab(binary)
+    try:
+        lab.start()
+        result = lab.run_input_cancel()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary, tool_mode=True)
+    try:
+        lab.start()
         result = lab.run_interactive()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary, tool_mode=True)
+    try:
+        lab.start()
+        result = lab.run_shell_observation_error()
         report['cases'].append(result)
         print(json.dumps(result), file=sys.stderr, flush=True)
     finally:
@@ -667,6 +1037,14 @@ def main():
     try:
         lab.start()
         result = lab.run_waits()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary)
+    try:
+        lab.start()
+        result = lab.run_workspace()
         report['cases'].append(result)
         print(json.dumps(result), file=sys.stderr, flush=True)
     finally:

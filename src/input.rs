@@ -165,53 +165,39 @@ pub(crate) fn character_key(ch: char) -> (u32, u32) {
 }
 
 pub(crate) fn sequence_key(bytes: &[u8]) -> Option<(u32, u32)> {
-    let (symbol, modifiers) = match bytes {
+    Some(match bytes {
         b"\x1b" => (keysym::ESCAPE, 0),
         b"\x1b[Z" => (keysym::LEFT_TAB, SHIFT),
         b"\x1b[5~" => (keysym::PAGE_UP, 0),
         b"\x1b[6~" => (keysym::PAGE_DOWN, 0),
         b"\x1b[2~" => (keysym::INSERT, 0),
         b"\x1b[13;2u" | b"\x1b[27;2;13~" => (keysym::RETURN, SHIFT),
+        b"\x1b[A" | b"\x1bOA" => (keysym::UP, 0),
+        b"\x1b[B" | b"\x1bOB" => (keysym::DOWN, 0),
+        b"\x1b[C" | b"\x1bOC" => (keysym::RIGHT, 0),
+        b"\x1b[D" | b"\x1bOD" => (keysym::LEFT, 0),
+        b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => (keysym::HOME, 0),
+        b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => (keysym::END, 0),
+        b"\x1b[3~" => (keysym::DELETE, 0),
         _ => {
-            if let Some(symbol) = editing_key(bytes) {
-                return Some((symbol, 0));
-            }
-            if let Some(body) = bytes.strip_prefix(b"\x1b[1;") {
-                let (&final_byte, modifier) = body.split_last()?;
-                if modifier.len() != 1 {
-                    return None;
-                }
-                let modifiers = u32::from(modifier[0].checked_sub(b'1')?);
-                let modifiers = ((modifiers & 1) * SHIFT)
-                    | (((modifiers >> 1) & 1) * ALT)
-                    | (((modifiers >> 2) & 1) * CONTROL);
-                let symbol = match final_byte {
-                    b'A' => keysym::UP,
-                    b'B' => keysym::DOWN,
-                    b'C' => keysym::RIGHT,
-                    b'D' => keysym::LEFT,
-                    b'H' => keysym::HOME,
-                    b'F' => keysym::END,
-                    _ => return None,
-                };
-                return Some((symbol, modifiers));
-            }
-            return None;
+            let &[modifier, final_byte] = bytes.strip_prefix(b"\x1b[1;")? else {
+                return None;
+            };
+            let modifiers = u32::from(modifier.checked_sub(b'1')?);
+            let modifiers = ((modifiers & 1) * SHIFT)
+                | (((modifiers >> 1) & 1) * ALT)
+                | (((modifiers >> 2) & 1) * CONTROL);
+            let symbol = match final_byte {
+                b'A' => keysym::UP,
+                b'B' => keysym::DOWN,
+                b'C' => keysym::RIGHT,
+                b'D' => keysym::LEFT,
+                b'H' => keysym::HOME,
+                b'F' => keysym::END,
+                _ => return None,
+            };
+            (symbol, modifiers)
         }
-    };
-    Some((symbol, modifiers))
-}
-
-pub(crate) fn editing_key(bytes: &[u8]) -> Option<u32> {
-    Some(match bytes {
-        b"\x1b[A" | b"\x1bOA" => keysym::UP,
-        b"\x1b[B" | b"\x1bOB" => keysym::DOWN,
-        b"\x1b[C" | b"\x1bOC" => keysym::RIGHT,
-        b"\x1b[D" | b"\x1bOD" => keysym::LEFT,
-        b"\x1b[H" | b"\x1bOH" | b"\x1b[1~" => keysym::HOME,
-        b"\x1b[F" | b"\x1bOF" | b"\x1b[4~" => keysym::END,
-        b"\x1b[3~" => keysym::DELETE,
-        _ => return None,
     })
 }
 
@@ -226,10 +212,10 @@ pub fn key_bytes(
         return None;
     }
 
-    let modifier = 1
-        + u8::from(modifiers & SHIFT != 0)
-        + 2 * u8::from(modifiers & ALT != 0)
-        + 4 * u8::from(modifiers & CONTROL != 0);
+    let shift = modifiers & SHIFT != 0;
+    let alt = modifiers & ALT != 0;
+    let control = modifiers & CONTROL != 0;
+    let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(control);
 
     let special = match symbol {
         keysym::UP | keysym::KP_UP => Some((b'A', true)),
@@ -284,11 +270,10 @@ pub fn key_bytes(
     }
 
     let mut utf8 = [0; 4];
-    let control;
     let data: &[u8] = match symbol {
         keysym::RETURN | keysym::KP_ENTER => b"\r",
         keysym::BACKSPACE => {
-            if modifiers & CONTROL != 0 {
+            if control {
                 b"\x08"
             } else {
                 b"\x7f"
@@ -296,11 +281,11 @@ pub fn key_bytes(
         }
         keysym::ESCAPE => b"\x1b",
         keysym::LEFT_TAB => b"\x1b[Z",
-        keysym::TAB | keysym::KP_TAB if modifiers & SHIFT != 0 => b"\x1b[Z",
+        keysym::TAB | keysym::KP_TAB if shift => b"\x1b[Z",
         keysym::TAB | keysym::KP_TAB => b"\t",
-        _ if modifiers & CONTROL != 0 => {
+        _ if control => {
             let ch = symbol_char(symbol)?.to_ascii_lowercase();
-            control = match ch {
+            utf8[0] = match ch {
                 ' ' | '@' | '2' => 0,
                 '[' | '3' => 0x1b,
                 '\\' | '4' => 0x1c,
@@ -311,9 +296,9 @@ pub fn key_bytes(
                 ch if ch.is_ascii_alphabetic() => ch as u8 & 0x1f,
                 _ => return None,
             };
-            std::slice::from_ref(&control)
+            &utf8[..1]
         }
-        _ if modifiers & ALT != 0 => {
+        _ if alt => {
             if text.is_empty() {
                 symbol_char(symbol)?.encode_utf8(&mut utf8).as_bytes()
             } else {
@@ -322,7 +307,6 @@ pub fn key_bytes(
         }
         _ => return None,
     };
-    let alt = modifiers & ALT != 0;
     let mut bytes = Vec::with_capacity(data.len() + usize::from(alt));
     if alt {
         bytes.push(0x1b);
@@ -368,9 +352,7 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
     let mut start = 0;
     for (index, &byte) in text.iter().enumerate() {
         if (byte == b'\r' && text.get(index + 1) == Some(&b'\n')) || byte == 0x1b {
-            if start < index {
-                data.extend_from_slice(&text[start..index]);
-            }
+            data.extend_from_slice(&text[start..index]);
             start = index + 1;
         }
     }
@@ -394,11 +376,8 @@ pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> 
         .unwrap();
         return Some(data.into_bytes());
     }
-    let limit = if mode.contains(Mode::UTF8_MOUSE) {
-        2015
-    } else {
-        223
-    };
+    let utf8 = mode.contains(Mode::UTF8_MOUSE);
+    let limit = if utf8 { 2015 } else { 223 };
     if x >= limit || y >= limit || code > 223 {
         return None;
     }
@@ -406,15 +385,16 @@ pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> 
     let mut data = Vec::with_capacity(8);
     data.extend_from_slice(&[0x1b, b'[', b'M', 32 + code as u8]);
     for coordinate in [x, y] {
-        if mode.contains(Mode::UTF8_MOUSE) {
+        let encoded = 33 + coordinate;
+        if utf8 {
             data.extend_from_slice(
-                char::from_u32(33 + coordinate as u32)
+                char::from_u32(encoded as u32)
                     .unwrap()
                     .encode_utf8(&mut [0; 4])
                     .as_bytes(),
             );
         } else {
-            data.push(33 + coordinate as u8);
+            data.push(encoded as u8);
         }
     }
     Some(data)

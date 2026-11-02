@@ -2,7 +2,7 @@
 
 use crate::core::{BlockMarker, Flags};
 use crate::core::{Core, Mode, Point, Row, SelectionRange};
-use crate::vt::{Color, CursorShape, NamedColor, Rgb};
+use crate::vt::{Color, CursorShape, PALETTE_SIZE, Rgb};
 
 #[derive(Clone, Debug)]
 pub struct Screen {
@@ -11,12 +11,13 @@ pub struct Screen {
     pub(crate) dirty: Vec<bool>,
     pub(crate) cursor: (Point, CursorShape),
     pub(crate) mode: Mode,
-    pub(crate) palette: [Rgb; 269],
+    pub(crate) palette: [Rgb; PALETTE_SIZE],
     pub(crate) selection: Option<SelectionRange>,
     pub(crate) offset: usize,
     pub(crate) history: usize,
 
     pub(crate) activity: u64,
+    pub(crate) output_activity: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -26,7 +27,7 @@ pub(crate) struct Update {
     pub rows: Vec<(usize, Row)>,
     pub cursor: (Point, CursorShape),
     pub mode: Mode,
-    pub palette: Option<Box<[Rgb; 269]>>,
+    pub palette: Option<Box<[Rgb; PALETTE_SIZE]>>,
     pub selection: Option<SelectionRange>,
     pub offset: usize,
     pub history: usize,
@@ -40,12 +41,13 @@ impl Default for Screen {
             dirty: Vec::new(),
             cursor: (Point::default(), CursorShape::Hidden),
             mode: Mode::NONE,
-            palette: [Rgb::default(); 269],
+            palette: [Rgb::default(); PALETTE_SIZE],
             selection: None,
             offset: 0,
             history: 0,
 
             activity: 0,
+            output_activity: 0,
         }
     }
 }
@@ -76,17 +78,8 @@ impl Update {
         Self::from_rows(core, rows, 0, true)
     }
     fn from_rows(core: &Core, rows: Vec<(usize, Row)>, offset: usize, palette: bool) -> Self {
-        let palette = palette.then(|| {
-            let mut palette = [Rgb::default(); 269];
-            for (index, color) in palette.iter_mut().enumerate() {
-                *color = if index < 256 {
-                    core.color(Color::Indexed(index as u8))
-                } else {
-                    core.color(Color::Named(NamedColor::from_index(index as u16).unwrap()))
-                };
-            }
-            Box::new(palette)
-        });
+        let palette =
+            palette.then(|| Box::new(std::array::from_fn(|index| core.palette_color(index))));
         Self {
             columns: core.columns(),
             lines: core.screen_lines(),
@@ -172,9 +165,7 @@ impl Screen {
             };
             for (row, dirty) in self.dirty.iter_mut().enumerate() {
                 let line = row as i32 - self.offset as i32;
-                if !*dirty && span(self.selection, line) != span(update.selection, line) {
-                    *dirty = true;
-                }
+                *dirty = *dirty || span(self.selection, line) != span(update.selection, line);
             }
         }
         if self.cursor != update.cursor {
@@ -425,6 +416,7 @@ mod tests {
         let pane = PaneView {
             process: Default::default(),
             id: 1,
+            tab: 1,
             rect: Rect {
                 x: 0,
                 y: 1,

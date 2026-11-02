@@ -46,15 +46,13 @@ impl Sse {
         for end in memchr::memchr_iter(b'\n', &self.pending[scanned..]).map(|end| scanned + end) {
             let line = &self.pending[start..end];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
-            if line.is_empty() {
-                if !self.data.is_empty() {
-                    self.bytes += self.data.len();
-                    if self.bytes > 1024 * 1024 {
-                        return Err(io::Error::other("Model response exceeds 1 MiB"));
-                    }
-                    emit(serde_json::from_slice(&self.data)?)?;
-                    self.data.clear();
+            if line.is_empty() && !self.data.is_empty() {
+                self.bytes += self.data.len();
+                if self.bytes > 1024 * 1024 {
+                    return Err(io::Error::other("Model response exceeds 1 MiB"));
                 }
+                emit(serde_json::from_slice(&self.data)?)?;
+                self.data.clear();
             } else if let Some(data) = line.strip_prefix(b"data:") {
                 let data = data.strip_prefix(b" ").unwrap_or(data);
                 if self.data.len() + data.len() + 1 > BUFFER_LIMIT {

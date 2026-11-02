@@ -25,14 +25,7 @@ pub(crate) fn color(style: u8, foreground: u32) -> u32 {
 pub(crate) struct Markdown {
     pub text: String,
     spans: Vec<(Range<usize>, u8)>,
-    prefix: Option<(usize, u64, usize, usize)>,
-}
-
-pub(crate) fn fingerprint(source: &str) -> u64 {
-    use std::hash::Hasher;
-    let mut hash = std::hash::DefaultHasher::new();
-    hash.write(source.as_bytes());
-    hash.finish()
+    prefix: Option<(usize, usize, usize)>,
 }
 
 impl Markdown {
@@ -96,20 +89,19 @@ impl Markdown {
         }
     }
 
-    pub fn render(source: &str, previous: Option<&Self>) -> Self {
+    pub fn render(source: &str, previous: Option<(&str, &Self)>) -> Self {
         // References and HTML can change earlier blocks when more source arrives.
-        let prefix = previous
-            .and_then(|document| document.prefix)
-            .filter(|&(end, hash, _, _)| {
-                source
-                    .get(..end)
-                    .is_some_and(|text| fingerprint(text) == hash)
-            });
-        let tail = &source.as_bytes()[prefix.map_or(0, |(end, _, _, _)| end)..];
+        let previous = previous.and_then(|(old, document)| {
+            document
+                .prefix
+                .filter(|&(end, _, _)| source.get(..end) == old.get(..end))
+                .map(|prefix| (document, prefix))
+        });
+        let tail = &source.as_bytes()[previous.map_or(0, |(_, (end, _, _))| end)..];
         let reusable = memchr::memchr2(b'[', b'<', tail).is_none();
-        let prefix = prefix.filter(|_| reusable);
-        let (mut output, offset) = if let Some((source_end, _, text_end, spans_end)) = prefix {
-            let previous = previous.unwrap();
+        let (mut output, offset) = if let Some((previous, (source_end, text_end, spans_end))) =
+            previous.filter(|_| reusable)
+        {
             let mut output = Self {
                 text: String::with_capacity(text_end + source.len() - source_end),
                 spans: previous.spans[..spans_end].to_vec(),
@@ -133,7 +125,7 @@ impl Markdown {
             if reusable && styles.len() == 1 && !matches!(&event, Event::End(_)) {
                 let start = offset + range.start;
                 let start = source[..start].rfind('\n').map_or(0, |index| index + 1);
-                output.prefix = Some((start, 0, output.text.len(), output.spans.len()));
+                output.prefix = Some((start, output.text.len(), output.spans.len()));
             }
             let style = *styles.last().unwrap();
             match event {
@@ -224,15 +216,7 @@ impl Markdown {
         output.text.truncate(end);
         output.prefix = output
             .prefix
-            .filter(|&(source_end, _, text_end, _)| source_end != 0 && text_end <= end)
-            .map(|(source_end, _, text_end, spans_end)| {
-                (
-                    source_end,
-                    fingerprint(&source[..source_end]),
-                    text_end,
-                    spans_end,
-                )
-            });
+            .filter(|&(source_end, text_end, _)| source_end != 0 && text_end <= end);
         output
     }
 }
@@ -264,16 +248,22 @@ mod tests {
                 .chain(std::iter::once(source.len()))
             {
                 let text = &source[..end];
-                let incremental = Markdown::render(text, previous.as_ref());
+                let incremental = Markdown::render(
+                    text,
+                    previous
+                        .as_ref()
+                        .map(|(source, document)| (*source, document)),
+                );
                 let full = Markdown::render(text, None);
                 assert_eq!(incremental.text, full.text, "{text:?}");
                 assert_eq!(incremental.spans, full.spans, "{text:?}");
-                previous = Some(incremental);
+                previous = Some((text, incremental));
             }
         }
-        let old = Markdown::render("old paragraph\n\nlast", None);
+        let old_source = "old paragraph\n\nlast";
+        let old = Markdown::render(old_source, None);
         let changed = "new paragraph\n\nlast";
-        let reused = Markdown::render(changed, Some(&old));
+        let reused = Markdown::render(changed, Some((old_source, &old)));
         let full = Markdown::render(changed, None);
         assert_eq!(reused.text, full.text);
         assert_eq!(reused.spans, full.spans);

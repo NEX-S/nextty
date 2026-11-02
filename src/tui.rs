@@ -4,18 +4,18 @@
 mod input;
 
 #[cfg(feature = "agent")]
-use crate::agent::panel::{AgentAction, AgentLine, column_offset, editor};
+use crate::agent::panel::{AgentAction, AgentLine, editor};
 use crate::clipboard_reader::ClipboardReader;
 use crate::config::Config;
 use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::input::{PasteTarget, TextDecoder, mouse_bytes};
+use crate::panel::mix_color;
 use crate::screen::Screen;
 use crate::ui::{Focus, Ui};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
 use crate::width::{fit_label, scalar_width, text_width};
 use crate::workspace::{
-    Action, Axis, Client, ClientEvent, Direction, PaneId, PaneView, Rect, Snapshot, SplitDrag,
-    tab_chrome,
+    Action, Axis, Client, ClientEvent, PaneId, PaneView, Rect, Snapshot, SplitDrag, tab_chrome,
 };
 use input::{Decoder, Input, Mouse};
 use std::io::{self, Write};
@@ -166,7 +166,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             let (resources, changed) = frontend.ui.service(&frontend.client, &fds)?;
             frontend.resource_dirty |= resources;
             frontend.dirty |= changed;
-            if frontend.running && output.is_empty() {
+            if output.is_empty() {
                 if let Some(transfer) = &mut frontend.clipboard {
                     if let Some(message) =
                         transfer.step(&mut output.bytes, frontend.clipboard_reader.as_mut())?
@@ -193,9 +193,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 return Err(error);
             }
             output_ready = output.is_empty();
-            if !frontend.running {
-                break;
-            }
             let now = Instant::now();
             let mut timeout = decoder.timeout(now);
 
@@ -217,15 +214,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 timeout = Some(Duration::ZERO);
             }
             frontend.client.flush()?;
-            let socket_events = if frontend.client.wants_read() {
-                libc::POLLIN
-            } else {
-                0
-            } | if frontend.client.wants_write() {
-                libc::POLLOUT
-            } else {
-                0
-            };
             fds.clear();
             fds.extend([
                 libc::pollfd {
@@ -233,15 +221,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                     events: libc::POLLIN,
                     revents: 0,
                 },
-                libc::pollfd {
-                    fd: if socket_events == 0 {
-                        -1
-                    } else {
-                        frontend.client.fd()
-                    },
-                    events: socket_events,
-                    revents: 0,
-                },
+                frontend.client.pollfd(),
                 libc::pollfd {
                     fd: terminal.signals.as_raw_fd(),
                     events: libc::POLLIN,
@@ -268,9 +248,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 },
             ]);
             fds.extend(frontend.ui.fds());
-            let milliseconds = timeout.map_or(-1, |timeout| {
-                timeout.as_nanos().div_ceil(1_000_000).min(i32::MAX as u128) as i32
-            });
+            let milliseconds = timeout.map_or(-1, crate::poll::timeout_millis);
             crate::poll::poll(&mut fds, milliseconds)?;
             output_ready |= fds[3].revents & libc::POLLOUT != 0;
             if fds[1].revents & libc::POLLOUT != 0 {
@@ -608,26 +586,25 @@ impl Frontend {
     }
 
     fn resize(&mut self) -> io::Result<()> {
-        if self.ui.search.open {
-            self.ui.search.close(&mut self.client)?;
-        }
+        self.ui.search.close(&mut self.client)?;
         let size = self.view_size();
-        self.full |= size != self.frame_size;
+        let changed = size != self.frame_size;
+        self.full |= changed;
         self.dirty = true;
-        if self.controller() && size != self.frame_size {
+        if self.controller() && changed {
             self.client.send(Action::Resize(size))?;
         }
         Ok(())
     }
 
-    fn copy_text(&mut self, text: String) -> bool {
+    fn copy_text(&mut self, text: String, primary: bool) -> bool {
         if self.clipboard.is_some() {
             self.message("Clipboard transfer already in progress");
             false
         } else {
             self.clipboard = Some(ClipboardTransfer {
                 reader: ClipboardSource::Memory(text.into_bytes()),
-                target: b'c',
+                target: if primary { b'p' } else { b'c' },
                 incomplete: false,
                 started: false,
                 bytes: 0,
@@ -682,7 +659,7 @@ impl Frontend {
         )? {
             KeyResult::Unhandled => return Ok(()),
             KeyResult::Copy(text, cut) => {
-                let copied = self.copy_text(text);
+                let copied = self.copy_text(text, false);
                 if copied && cut {
                     #[cfg(feature = "agent")]
                     self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
@@ -736,14 +713,13 @@ impl Frontend {
                 self.agent.dirty = true;
             }
         } else {
-            let mut offset = 0;
-            while offset < text.len() {
-                let remaining = &text[offset..];
+            let mut remaining = text.as_ref();
+            while !remaining.is_empty() {
                 if self.ui.text_target().is_some() {
                     let end = remaining.find(char::is_control).unwrap_or(remaining.len());
                     if end != 0 {
                         self.panel_key(0, 0, &remaining[..end])?;
-                        offset += end;
+                        remaining = &remaining[end..];
                         continue;
                     }
                 }
@@ -755,7 +731,7 @@ impl Frontend {
                     &remaining[..ch.len_utf8()]
                 };
                 self.panel_key(symbol, modifiers, key_text)?;
-                offset += ch.len_utf8();
+                remaining = &remaining[ch.len_utf8()..];
             }
         }
         Ok(())
@@ -805,25 +781,21 @@ impl Frontend {
                     }
                     cells.clear();
                     cells.resize(width, (0u32, GREEN));
-                    for (series, graph) in graphs.iter().enumerate() {
+                    for (series, graph) in plot.series.iter().zip(&graphs) {
+                        let color = crate::monitor::series_color(series.name);
                         for (column, &bits) in
                             graph[row * width..(row + 1) * width].iter().enumerate()
                         {
                             if bits != 0 {
                                 cells[column].0 |= u32::from(bits);
-                                cells[column].1 =
-                                    crate::monitor::series_color(plot.series[series].name);
+                                cells[column].1 = color;
                             }
                         }
                     }
                     let mut start = 0;
-                    while start < cells.len() {
-                        let color = cells[start].1;
-                        let end = (start + 1..cells.len())
-                            .find(|&i| cells[i].1 != color)
-                            .unwrap_or(cells.len());
+                    for run in cells.chunk_by(|a, b| a.1 == b.1) {
                         text.clear();
-                        text.extend(cells[start..end].iter().map(|(bits, _)| {
+                        text.extend(run.iter().map(|(bits, _)| {
                             if *bits == 0 {
                                 ' '
                             } else {
@@ -834,12 +806,12 @@ impl Frontend {
                             output,
                             plot.x + start as u16,
                             y as u16,
-                            (end - start) as u16,
+                            run.len() as u16,
                             &text,
-                            color,
+                            run[0].1,
                             BACKGROUND,
                         )?;
-                        start = end;
+                        start += run.len();
                     }
                 }
             }
@@ -974,7 +946,7 @@ impl Frontend {
                     .ui
                     .resources
                     .view(self.size.num_cols, last.saturating_sub(top + 1));
-                if let Some(hit) = view.hits.iter().rev().find(|hit| {
+                if let Some(hit) = view.hits.iter().rfind(|hit| {
                     mouse.row as i32 == i32::from(top) + 1 + hit.y
                         && (hit.x..hit.x.saturating_add(hit.width)).contains(&mouse.column)
                 }) {
@@ -1006,11 +978,9 @@ impl Frontend {
             return write!(output, "\x1b[1;{}H\x1b[?1l\x1b>\x1b[?25h", caret + 2);
         }
 
-        if self.ui.resources.open && (self.ui.focus == Focus::Monitor) {
-            return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
-        }
-
-        if self.ui.files_open && self.ui.focus == Focus::Files {
+        if self.ui.resources.open && self.ui.focus == Focus::Monitor
+            || self.ui.files_open && self.ui.focus == Focus::Files
+        {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         #[cfg(feature = "agent")]
@@ -1108,7 +1078,7 @@ impl Frontend {
             } => {
                 self.copy_pending = false;
                 if self.clipboard_reader.is_none() {
-                    self.clipboard_reader = Some(ClipboardReader::new(3072)?);
+                    self.clipboard_reader = Some(ClipboardReader::new(OSC52_CHUNK_SIZE)?);
                 }
                 if self.clipboard.is_some() {
                     self.clipboard_reader.as_ref().unwrap().discard(file)?;
@@ -1129,17 +1099,7 @@ impl Frontend {
                 }
             }
             ClientEvent::ClipboardStore { primary, text } => {
-                if self.clipboard.is_some() {
-                    self.message("Clipboard transfer already in progress");
-                } else {
-                    self.clipboard = Some(ClipboardTransfer {
-                        reader: ClipboardSource::Memory(text.into_bytes()),
-                        target: if primary { b'p' } else { b'c' },
-                        incomplete: false,
-                        started: false,
-                        bytes: 0,
-                    });
-                }
+                self.copy_text(text, primary);
             }
             ClientEvent::Search {
                 pane,
@@ -1155,8 +1115,11 @@ impl Frontend {
                     self.dirty = true;
                 }
             }
-            ClientEvent::List(_) | ClientEvent::AgentInput { .. } | ClientEvent::History { .. } => {
-            }
+            ClientEvent::List(_)
+            | ClientEvent::AgentInput { .. }
+            | ClientEvent::History { .. }
+            | ClientEvent::AgentFile { .. }
+            | ClientEvent::AgentNewTab { .. } => {}
         }
         Ok(())
     }
@@ -1214,27 +1177,25 @@ impl Frontend {
                 self.dirty = true;
                 return Ok(());
             }
-            if self.ui.search.open
-                && matches!(
-                    key,
-                    b'a' | b'f'
-                        | b'm'
-                        | b'o'
-                        | b'v'
-                        | b's'
-                        | b'h'
-                        | b'j'
-                        | b'k'
-                        | b'l'
-                        | b','
-                        | b'.'
-                        | b'\r'
-                        | b'\n'
-                        | b'p'
-                        | b'n'
-                        | b'c'
-                )
-            {
+            if matches!(
+                key,
+                b'a' | b'f'
+                    | b'm'
+                    | b'o'
+                    | b'v'
+                    | b's'
+                    | b'h'
+                    | b'j'
+                    | b'k'
+                    | b'l'
+                    | b','
+                    | b'.'
+                    | b'\r'
+                    | b'\n'
+                    | b'p'
+                    | b'n'
+                    | b'c'
+            ) {
                 self.ui.search.close(&mut self.client)?;
             }
             match key {
@@ -1347,7 +1308,10 @@ impl Frontend {
             }
             Input::Mouse(mouse) => {
                 #[cfg(feature = "agent")]
-                if self.ui.agent.active().context.preview.is_some() {
+                if self.ui.agent.active().context.preview.is_some()
+                    || self.agent.selecting_editor
+                    || self.ui.agent.active().selecting()
+                {
                     self.agent_mouse(mouse)?;
                     return Ok(());
                 }
@@ -1421,36 +1385,13 @@ impl Frontend {
             return Ok(false);
         };
         let action = match key {
-            b's' => Action::Split {
-                pane: 0,
-                axis: Axis::TopBottom,
-            },
-            b'v' => Action::Split {
-                pane: 0,
-                axis: Axis::LeftRight,
-            },
-            b'h' => Action::Navigate(Direction::Left),
-            b'j' => Action::Navigate(Direction::Down),
-            b'k' => Action::Navigate(Direction::Up),
-            b'l' => Action::Navigate(Direction::Right),
-            b',' => Action::Tab(-1),
-            b'.' => Action::Tab(1),
-            b'\r' | b'\n' => Action::NewTab { pane },
-            b'p' => Action::PromptJump {
-                pane,
-                previous: true,
-            },
-            b'n' => Action::PromptJump {
-                pane,
-                previous: false,
-            },
             b'c' => {
                 if self.copy_pending || self.clipboard.is_some() {
                     self.message("Clipboard transfer already in progress");
                     return Ok(true);
                 }
                 let snapshot = self.client.snapshot().unwrap();
-                let current = snapshot.panes.iter().find(|view| view.id == pane).unwrap();
+                let current = snapshot.pane(pane).unwrap();
                 let line = self.client.screens().get(&pane).map_or(0, |screen| {
                     let line = screen.cursor().0.line;
                     let offset = screen.display_offset() as i32;
@@ -1465,13 +1406,7 @@ impl Frontend {
                     .iter()
                     .filter(|block| block.output.is_some() && block.line <= line)
                     .max_by_key(|block| block.line)
-                    .or_else(|| {
-                        current
-                            .blocks
-                            .iter()
-                            .rev()
-                            .find(|block| block.output.is_some())
-                    });
+                    .or_else(|| current.blocks.iter().rfind(|block| block.output.is_some()));
                 let Some(block) = block else {
                     self.message("No command output block available; enable shell integration");
                     return Ok(true);
@@ -1482,7 +1417,12 @@ impl Frontend {
                     request: 0,
                 }
             }
-            _ => return Ok(false),
+            key => {
+                let Some(action) = crate::ui::workspace_action(char::from(key), pane) else {
+                    return Ok(false);
+                };
+                action
+            }
         };
         if !self.controller() {
             self.message("READ ONLY — attach again to take control; Alt+q detach");
@@ -1590,12 +1530,11 @@ impl Frontend {
             }
             return Ok(());
         }
-        let Some(view) = self.client.snapshot().and_then(|snapshot| {
-            snapshot
-                .panes
-                .iter()
-                .find(|pane| pane.rect.contains(mouse.column, mouse.row))
-        }) else {
+        let Some(view) = self
+            .client
+            .snapshot()
+            .and_then(|snapshot| snapshot.pane_at(mouse.column, mouse.row))
+        else {
             return Ok(());
         };
         let pane = view.id;
@@ -1609,11 +1548,7 @@ impl Frontend {
         let output_block = screen
             .row_output(view, usize::from(y))
             .map(|block| block.id);
-        let selected_pane = self
-            .client
-            .screens()
-            .iter()
-            .find_map(|(&pane, screen)| screen.selection_range().map(|_| pane));
+        let selected_pane = self.client.selected_pane();
         let x = usize::from(physical_x).min(screen.columns().saturating_sub(1)) as u16;
         if !self.controller() {
             return Ok(());
@@ -1733,7 +1668,7 @@ impl Frontend {
         let Some((snapshot, screens)) = self.client.snapshot_and_screens_mut() else {
             return;
         };
-        let Some(pane) = snapshot.panes.iter().find(|pane| pane.id == id) else {
+        let Some(pane) = snapshot.pane(id) else {
             return;
         };
         let Some(screen) = screens.get_mut(&id) else {
@@ -1820,12 +1755,7 @@ impl Frontend {
 
     fn hovered_block(&self) -> Option<(PaneId, u64)> {
         let (x, y) = self.pointer?;
-        let pane = self
-            .client
-            .snapshot()?
-            .panes
-            .iter()
-            .find(|pane| pane.rect.contains(x, y))?;
+        let pane = self.client.snapshot()?.pane_at(x, y)?;
         let screen = self.client.screens().get(&pane.id)?;
         screen
             .row_output(pane, usize::from(y - pane.rect.y))
@@ -1851,7 +1781,6 @@ impl Frontend {
             size.num_cols + self.file_width(),
             &label,
             self.pointer,
-            &self.ui,
             &self.config,
         )?;
         if self.full || self.damage[0] || self.header != output[start..] {
@@ -1961,9 +1890,8 @@ impl Frontend {
         }
         if let Some(prompt) = self.ui.close_prompt {
             let rect = self.close_rect();
-            let background =
-                crate::ui::mix_color(self.config.foreground, self.config.background, 9);
-            let muted = crate::ui::mix_color(self.config.foreground, self.config.background, 176);
+            let background = mix_color(self.config.foreground, self.config.background, 9);
+            let muted = mix_color(self.config.foreground, self.config.background, 176);
             let mut grid = crate::panel::Grid::new(rect, self.config.foreground, background);
             let cols = rect.cols.saturating_sub(4);
             grid.text(
@@ -2025,7 +1953,7 @@ impl Frontend {
                 width,
                 label,
                 color,
-                crate::ui::mix_color(self.config.foreground, self.config.background, 24),
+                mix_color(self.config.foreground, self.config.background, 24),
             );
             grid.ansi(output, None, &[])?;
         }
@@ -2056,22 +1984,13 @@ impl Frontend {
         let directory = self
             .client
             .snapshot()
-            .and_then(|snapshot| {
-                snapshot
-                    .panes
-                    .iter()
-                    .find(|pane| pane.id == snapshot.focused)
-            })
+            .and_then(Snapshot::focused_pane)
             .and_then(|pane| pane.cwd.clone());
         let Some(directory) = directory else {
             self.message("Active pane working directory is unavailable");
             return Ok(());
         };
-        if let Some(files) = &mut self.ui.files {
-            files.set_directory(directory)?;
-        } else {
-            self.ui.files = Some(crate::files::FileNav::new(directory)?);
-        }
+        self.ui.load_files(directory)?;
         self.panel_utf8.clear();
         self.ui.files_open = true;
         self.ui.focus = Focus::Files;
@@ -2079,20 +1998,21 @@ impl Frontend {
     }
 
     fn file_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let rect = self.file_rect();
-        let preview = self.file_preview_rect();
+        let preview = self.ui.files.as_ref().unwrap().focus() == crate::files::FileFocus::Preview;
+        let rect = if preview {
+            self.file_preview_rect()
+        } else {
+            self.file_rect()
+        };
         let files = self.ui.files.as_mut().unwrap();
-        if files.focus() == crate::files::FileFocus::Preview {
-            if preview.contains(mouse.column, mouse.row) && !mouse.release && mouse.code & 64 != 0 {
-                files.scroll_preview(
-                    if mouse.code & 1 == 0 { -3 } else { 3 },
-                    usize::from(preview.rows.saturating_sub(2)),
-                );
-            }
-        } else if rect.contains(mouse.column, mouse.row) {
+        if rect.contains(mouse.column, mouse.row) {
             if !mouse.release && mouse.code & 64 != 0 {
-                files.move_selection(if mouse.code & 1 == 0 { -3 } else { 3 });
-            } else if !mouse.release
+                files.scroll(
+                    if mouse.code & 1 == 0 { -3 } else { 3 },
+                    usize::from(rect.rows.saturating_sub(2)),
+                );
+            } else if !preview
+                && !mouse.release
                 && mouse.code & 0b1100_0011 == 0
                 && let Some(index) = crate::file_panel::Layout::new(rect, files).entry_at(
                     files,
@@ -2157,7 +2077,6 @@ fn draw_tabs(
     columns: u16,
     label: &str,
     pointer: Option<(u16, u16)>,
-    ui: &Ui,
     config: &Config,
 ) -> io::Result<()> {
     let style = config.tab_style;
@@ -2175,7 +2094,7 @@ fn draw_tabs(
         let active = tab.id == snapshot.active_tab;
         let bg = if active { 32 } else { 28 };
         let fg = if active { 204 } else { 150 };
-        let color = ui.tab_color(tab, config.foreground, config.background);
+        let color = crate::ui::tab_color(tab);
         let close = if active { "148;148;148" } else { "96;96;96" };
         let hovered =
             pointer.is_some_and(|(column, row)| row == 0 && (x..x + width).contains(&column));
@@ -2205,11 +2124,11 @@ fn draw_tabs(
         let close_hovered = pointer.is_some_and(|(column, row)| {
             row == 0 && (x + width - 4..x + width - 1).contains(&column)
         });
-        let close = if close_hovered { "204;204;204" } else { close };
-        let underline = if flat_active {
+        let close = if close_hovered { "232;117;117" } else { close };
+        let underline = if close_hovered {
+            "4;58;2;232;117;117"
+        } else if flat_active {
             "4;58;2;181;210;162"
-        } else if close_hovered {
-            "4;58;2;148;148;148"
         } else {
             "24;59"
         };
@@ -2263,12 +2182,13 @@ fn draw_tabs(
 }
 
 fn cursor_bytes(mut bytes: Vec<u8>, mode: Mode) -> Vec<u8> {
-    if bytes.len() == 3
-        && bytes[0] == 0x1b
-        && matches!(bytes[1], b'[' | b'O')
-        && matches!(bytes[2], b'A' | b'B' | b'C' | b'D' | b'H' | b'F')
+    if let [
+        0x1b,
+        prefix @ (b'[' | b'O'),
+        b'A' | b'B' | b'C' | b'D' | b'H' | b'F',
+    ] = bytes.as_mut_slice()
     {
-        bytes[1] = if mode.contains(Mode::APP_CURSOR) {
+        *prefix = if mode.contains(Mode::APP_CURSOR) {
             b'O'
         } else {
             b'['
@@ -2312,20 +2232,14 @@ fn draw_row(
             .max(selection.map_or(0, |selection| selection.end.column + 1))
             .min(columns)
     };
+    write!(output, "\x1b[{};{}H", rect.y + row as u16 + 1, rect.x + 1)?;
     if columns < physical_columns {
         let bg = screen.color(Color::Named(NamedColor::Background));
         write!(
             output,
-            "\x1b[{};{}H\x1b[0;48;2;{};{};{}m\x1b[{}X",
-            rect.y + row as u16 + 1,
-            rect.x + 1,
-            bg.r,
-            bg.g,
-            bg.b,
-            physical_columns
+            "\x1b[0;48;2;{};{};{}m\x1b[{}X",
+            bg.r, bg.g, bg.b, physical_columns
         )?;
-    } else {
-        write!(output, "\x1b[{};{}H", rect.y + row as u16 + 1, rect.x + 1)?;
     }
     let mut previous = None;
     for (column, cell, extra) in data.cells_with_extras(0..columns) {
@@ -2334,18 +2248,7 @@ fn draw_row(
         }
         let selected = !cell.flags.contains(Flags::PROMPT)
             && selection.is_some_and(|selection| selection.contains(Point { line, column }));
-        let style = (
-            cell.fg,
-            cell.bg,
-            cell.flags
-                & (Flags::BOLD
-                    | Flags::DIM
-                    | Flags::ITALIC
-                    | Flags::INVERSE
-                    | Flags::ALL_UNDERLINES
-                    | Flags::STRIKEOUT),
-            selected,
-        );
+        let style = (cell.fg, cell.bg, cell.flags & Flags::TEXT_STYLE, selected);
         if previous != Some(style) {
             let mut fg = screen.color(cell.fg);
             let mut bg = screen.color(cell.bg);
@@ -2374,45 +2277,43 @@ fn draw_row(
                 fg.r, fg.g, fg.b, bg.r, bg.g, bg.b
             )?;
             for (flag, sgr) in [
-                (Flags::BOLD, 1),
-                (Flags::DIM, 2),
-                (Flags::ITALIC, 3),
-                (Flags::STRIKEOUT, 9),
+                (Flags::BOLD, b'1'),
+                (Flags::DIM, b'2'),
+                (Flags::ITALIC, b'3'),
+                (Flags::STRIKEOUT, b'9'),
             ] {
                 if cell.flags.contains(flag) {
-                    write!(output, ";{sgr}")?;
+                    output.extend_from_slice(&[b';', sgr]);
                 }
             }
             if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-                output.write_all(b";4")?;
+                output.extend_from_slice(b";4");
             }
-            output.write_all(b"m")?;
+            output.push(b'm');
             previous = Some(style);
         }
         if cell.flags.contains(Flags::HIDDEN)
             || cell.c.is_control()
             || cell.flags.contains(Flags::WIDE_CHAR) && column + 1 >= columns
         {
-            output.write_all(b" ")?;
-            if cell.flags.contains(Flags::WIDE_CHAR) && column + 1 < columns {
-                output.write_all(b" ")?;
-            }
+            output.resize(output.len() + cell.width().min(columns - column), b' ');
         } else {
             if cell.c.is_ascii() {
                 output.push(cell.c as u8);
             } else {
-                output.write_all(cell.c.encode_utf8(&mut [0; 4]).as_bytes())?;
+                output.extend_from_slice(cell.c.encode_utf8(&mut [0; 4]).as_bytes());
             }
             if let Some(extra) = extra {
                 for ch in &extra.zerowidth {
                     if !ch.is_control() {
-                        output.write_all(ch.encode_utf8(&mut [0; 4]).as_bytes())?;
+                        output.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
                     }
                 }
             }
         }
     }
-    output.write_all(b"\x1b[0m")
+    output.extend_from_slice(b"\x1b[0m");
+    Ok(())
 }
 
 fn draw_separators(
@@ -2464,11 +2365,7 @@ fn draw_cursor(
     snapshot: &Snapshot,
     size: WindowSize,
 ) -> io::Result<()> {
-    let Some(pane) = snapshot
-        .panes
-        .iter()
-        .find(|pane| pane.id == snapshot.focused)
-    else {
+    let Some(pane) = snapshot.focused_pane() else {
         return output.write_all(b"\x1b[?25l");
     };
     let Some(screen) = client.screens().get(&pane.id) else {
@@ -2517,8 +2414,7 @@ fn fit_text(output: &mut Vec<u8>, text: &str, columns: u16) {
     let prefix = &text.as_bytes()[..end];
     // A non-ASCII scalar at the boundary may still use zero columns.
     if text.as_bytes().get(end).is_none_or(u8::is_ascii)
-        && prefix.is_ascii()
-        && !prefix.iter().any(u8::is_ascii_control)
+        && prefix.iter().all(|byte| (b' '..=b'~').contains(byte))
     {
         output.extend_from_slice(prefix);
         output.resize(output.len() + usize::from(columns) - end, b' ');
@@ -2549,6 +2445,9 @@ fn fit_text(output: &mut Vec<u8>, text: &str, columns: u16) {
     output.resize(output.len() + usize::from(columns - used), b' ');
 }
 
+// A multiple of three keeps intermediate base64 chunks unpadded.
+const OSC52_CHUNK_SIZE: usize = 3072;
+
 enum ClipboardSource {
     File,
     Memory(Vec<u8>),
@@ -2573,7 +2472,6 @@ impl ClipboardTransfer {
             output.extend_from_slice(&[self.target, b';']);
             self.started = true;
         }
-        // A fixed multiple of three keeps all intermediate base64 chunks unpadded.
         let file_chunk;
         let chunk = match &self.reader {
             ClipboardSource::File => {
@@ -2589,7 +2487,7 @@ impl ClipboardTransfer {
             }
             ClipboardSource::Memory(bytes) => {
                 let remaining = &bytes[self.bytes as usize..];
-                &remaining[..remaining.len().min(3072)]
+                &remaining[..remaining.len().min(OSC52_CHUNK_SIZE)]
             }
         };
         if chunk.is_empty() {

@@ -1,7 +1,7 @@
 //! Startup files private to this child shell; user dotfiles remain untouched.
 use std::fs;
 use std::io;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -35,8 +35,7 @@ impl Integration {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        fs::create_dir(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
         let integration = Self { directory };
         if zsh {
             let script = integration.directory.join("integration.zsh");
@@ -44,13 +43,9 @@ impl Integration {
             fs::write(integration.directory.join(".zshenv"), ZSHENV)?;
             command.env("NEXTTY_INTEGRATION", script);
             if let Some(original) = std::env::var_os("ZDOTDIR") {
-                command
-                    .env("NEXTTY_ZDOTDIR", original)
-                    .env("NEXTTY_ZDOTDIR_SET", "1");
+                command.env("NEXTTY_ZDOTDIR", original);
             } else {
-                command
-                    .env_remove("NEXTTY_ZDOTDIR")
-                    .env_remove("NEXTTY_ZDOTDIR_SET");
+                command.env_remove("NEXTTY_ZDOTDIR");
             }
             command.env("ZDOTDIR", &integration.directory);
         } else {
@@ -70,12 +65,12 @@ impl Drop for Integration {
         }
     }
 }
-const ZSHENV: &str = r#"if [[ $NEXTTY_ZDOTDIR_SET == 1 ]]; then
+const ZSHENV: &str = r#"if [[ -v NEXTTY_ZDOTDIR ]]; then
   ZDOTDIR=$NEXTTY_ZDOTDIR
 else
   unset ZDOTDIR
 fi
-unset NEXTTY_ZDOTDIR NEXTTY_ZDOTDIR_SET
+unset NEXTTY_ZDOTDIR
 [[ -r ${ZDOTDIR-$HOME}/.zshenv ]] && source "${ZDOTDIR-$HOME}/.zshenv"
 autoload -Uz add-zsh-hook
 _nextty_initialize() {
@@ -112,7 +107,6 @@ _nextty_precmd() {
   PROMPT=$begin$PROMPT$end
   local scope_begin=$'%{\e]133;P;1\a%}' scope_end=$'%{\e]133;P;0\a%}'
   local right_begin=$'%{\e]133;P;2\a%}'
-  [[ $RPROMPT == $scope_begin* ]] && RPROMPT=${RPROMPT#$scope_begin}
   [[ $RPROMPT == $right_begin* ]] && RPROMPT=${RPROMPT#$right_begin}
   [[ $RPROMPT == *$scope_end ]] && RPROMPT=${RPROMPT%$scope_end}
   RPROMPT=$right_begin$RPROMPT$scope_end

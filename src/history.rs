@@ -4,7 +4,7 @@ use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
@@ -15,7 +15,7 @@ use crate::eventfd::{consume_notification, notify};
 use crate::vt::{Color, NamedColor, Rgb};
 
 pub const HOT_ROWS: usize = 512;
-const BATCH: usize = 32;
+pub(crate) const BATCH: usize = 32;
 const SEGMENT_BYTES: u64 = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
 
@@ -38,8 +38,7 @@ impl HistoryBudget {
                 "history capacity must be nonzero",
             ));
         }
-        fs::create_dir(&directory)?;
-        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
+        fs::DirBuilder::new().mode(0o700).create(&directory)?;
         Ok(Arc::new(Self {
             directory,
             capacity,
@@ -73,15 +72,14 @@ impl HistoryBudget {
         } else {
             let start = files.files.partition_point(|(_, _, age)| *age < order);
             // Another pane can evict this segment while its write is in progress.
-            let Some(index) = files
+            let Some((_, previous, _)) = files
                 .files
-                .range(start..end)
-                .position(|(existing, _, _)| existing == path)
+                .range_mut(start..end)
+                .find(|(existing, _, _)| existing == path)
             else {
                 return Ok(false);
             };
-            let previous = files.files[start + index].1;
-            files.files[start + index].1 = bytes;
+            let previous = std::mem::replace(previous, bytes);
             files.used = files.used - previous + bytes;
         }
         let mut evicted = Vec::new();
@@ -353,16 +351,14 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
                 id += empty as u64;
                 continue;
             }
-            if !wrapped {
-                let skip = plain_row_text(reader.fill_buf()?)
-                    .filter(|(_, text)| finder.find(text).is_none())
-                    .map(|(length, _)| length);
-                if let Some(length) = skip {
-                    reader.consume(length);
-                    matcher.line_break();
-                    id += 1;
-                    continue;
-                }
+            if !wrapped
+                && let Some((length, text)) = plain_row_text(reader.fill_buf()?)
+                && finder.find(text).is_none()
+            {
+                reader.consume(length);
+                matcher.line_break();
+                id += 1;
+                continue;
             }
             let row = read_row::<false>(&mut reader, cells)?;
             matcher.row(id, &row);
@@ -401,10 +397,6 @@ pub(crate) enum Reply {
     Error(io::Error),
 }
 enum Request {
-    Read {
-        read: HistoryRead,
-        sender: mpsc::Sender<io::Result<HistoryPage>>,
-    },
     Append {
         start: u64,
         rows: Vec<Row>,
@@ -423,7 +415,7 @@ enum Request {
         incomplete: bool,
         sender: mpsc::Sender<io::Result<HistoryCopy>>,
     },
-    Search(SearchJob),
+    Search(SearchWork),
     Clear,
     Status,
     Reflow(Reflow),
@@ -469,41 +461,6 @@ impl History {
                 let mut search_worker: Option<SearchWorker> = None;
                 while let Ok(request) = requests.recv() {
                     let result = match request {
-                        Request::Read { read, sender } => {
-                            let setup = archive.first().and_then(|_| {
-                                if search_worker.is_none() {
-                                    search_worker = Some(SearchWorker::new()?);
-                                }
-                                Ok(())
-                            });
-                            match setup {
-                                Ok(()) => {
-                                    let begin = archive
-                                        .segments
-                                        .partition_point(|segment| segment.end <= read.cursor.row);
-                                    let segments = archive
-                                        .segments
-                                        .range(begin..)
-                                        .take_while(|segment| segment.start <= read.end.0)
-                                        .map(|segment| {
-                                            (segment.path.clone(), segment.start, segment.end)
-                                        })
-                                        .collect();
-                                    search_worker.as_ref().unwrap().submit(SearchWork::Read(
-                                        ReadJob {
-                                            read,
-                                            segments,
-                                            sender,
-                                            wake: Arc::clone(&wake),
-                                        },
-                                    ));
-                                }
-                                Err(error) => {
-                                    let _ = sender.send(Err(error));
-                                }
-                            }
-                            None
-                        }
                         Request::Append { start, rows } => Some(
                             archive
                                 .append(start, &rows)
@@ -535,32 +492,59 @@ impl History {
                                 .send(archive.copy(start, end, hot_start, &hot, kind, incomplete));
                             None
                         }
-                        Request::Search(mut job) => {
-                            if !job.cancelled.load(Ordering::Relaxed) {
-                                if !job.alternate {
-                                    job.segments = archive
+                        Request::Search(mut work) => {
+                            if !work.cancelled().load(Ordering::Relaxed) {
+                                let setup = (|| {
+                                    let (segments, range) = match &mut work {
+                                        SearchWork::Read(job) => {
+                                            archive.first()?;
+                                            let begin =
+                                                archive.segments.partition_point(|segment| {
+                                                    segment.end <= job.read.cursor.row
+                                                });
+                                            let end = archive.segments.partition_point(|segment| {
+                                                segment.start <= job.read.end.0
+                                            });
+                                            (&mut job.segments, begin..end.max(begin))
+                                        }
+                                        SearchWork::Find(job) => {
+                                            let end = if job.alternate {
+                                                0
+                                            } else {
+                                                archive.segments.partition_point(|segment| {
+                                                    segment.start < job.hot_start
+                                                })
+                                            };
+                                            (&mut job.segments, 0..end)
+                                        }
+                                    };
+                                    *segments = archive
                                         .segments
-                                        .iter()
-                                        .filter(|segment| segment.start < job.hot_start)
+                                        .range(range)
                                         .map(|segment| {
                                             (segment.path.clone(), segment.start, segment.end)
                                         })
                                         .collect();
-                                }
-                                if search_worker.is_none() {
-                                    match SearchWorker::new() {
-                                        Ok(worker) => search_worker = Some(worker),
-                                        Err(error) => {
+                                    if search_worker.is_none() {
+                                        search_worker = Some(SearchWorker::new()?);
+                                    }
+                                    Ok(())
+                                })();
+                                match setup {
+                                    Ok(()) => search_worker.as_ref().unwrap().submit(work),
+                                    Err(error) => match work {
+                                        SearchWork::Read(job) => {
                                             let _ = job.sender.send(Err(error));
-                                            let _ = notify(job.wake.as_raw_fd());
+                                        }
+                                        SearchWork::Find(job) => {
+                                            let _ = job.sender.send(Err(error));
+                                            if let Err(error) = notify(job.wake.as_raw_fd()) {
+                                                eprintln!("notify pane search: {error}");
+                                            }
                                             continue;
                                         }
-                                    }
+                                    },
                                 }
-                                search_worker
-                                    .as_ref()
-                                    .unwrap()
-                                    .submit(SearchWork::Find(job));
                             }
                             None
                         }
@@ -683,7 +667,7 @@ impl History {
         let (hot_start, hot) = hot;
         let (columns, alternate) = geometry;
         let (sender, receiver) = mpsc::channel();
-        self.send(Request::Search(SearchJob {
+        self.send(Request::Search(SearchWork::Find(SearchJob {
             segments: Vec::new(),
             hot_start,
             hot,
@@ -693,7 +677,7 @@ impl History {
             cancelled,
             wake,
             sender,
-        }))?;
+        })))?;
         Ok(receiver)
     }
     pub fn copy(
@@ -720,7 +704,12 @@ impl History {
 
     pub fn read(&self, read: HistoryRead) -> io::Result<mpsc::Receiver<io::Result<HistoryPage>>> {
         let (sender, receiver) = mpsc::channel();
-        self.send(Request::Read { read, sender })?;
+        self.send(Request::Search(SearchWork::Read(ReadJob {
+            read,
+            segments: Vec::new(),
+            sender,
+            wake: Arc::clone(&self.notification),
+        })))?;
         Ok(receiver)
     }
 }
@@ -750,10 +739,7 @@ struct ReadText<'a> {
 }
 impl ReadText<'_> {
     fn append(&mut self, cursor: HistoryCursor, input: &str) -> bool {
-        let mut count = (READ_LIMIT - self.text.len()).min(input.len());
-        while !input.is_char_boundary(count) {
-            count -= 1;
-        }
+        let count = input.floor_char_boundary(READ_LIMIT - self.text.len());
         self.text.push_str(&input[..count]);
         self.advance(cursor, count, input.len());
         count < input.len() || self.text.len() == READ_LIMIT
@@ -839,11 +825,9 @@ impl ReadText<'_> {
                 row_start += line.text.len();
             }
             // Preserve the match before spending the byte budget on preceding context.
-            excerpt_start =
-                excerpt_start.max(found.saturating_sub(READ_LIMIT.saturating_sub(query.len())));
-            while !pending.is_char_boundary(excerpt_start) {
-                excerpt_start += 1;
-            }
+            let excerpt_start = pending.ceil_char_boundary(
+                excerpt_start.max(found.saturating_sub(READ_LIMIT.saturating_sub(query.len()))),
+            );
             let mut skipped = 0;
             while let Some(line) = self.pending.pop_front() {
                 if skipped + line.text.len() <= excerpt_start {
@@ -1060,6 +1044,7 @@ impl Archive {
             ));
         }
         for chunk in rows.chunks(BATCH) {
+            let end = self.end + chunk.len() as u64;
             self.encoded.clear();
             for row in chunk {
                 write_row(&mut self.encoded, row);
@@ -1080,7 +1065,7 @@ impl Archive {
             if let Some(bytes) = bytes {
                 let segment = self.segments.back_mut().unwrap();
                 segment.bytes = bytes;
-                segment.end += chunk.len() as u64;
+                segment.end = end;
             } else {
                 let id = NEXT.fetch_add(1, Ordering::Relaxed);
                 let path: Arc<Path> = self.budget.directory.join(format!("{id}.rows")).into();
@@ -1089,12 +1074,12 @@ impl Archive {
                 self.segments.push_back(Segment {
                     path,
                     start: self.end,
-                    end: self.end + chunk.len() as u64,
+                    end,
                     bytes,
                     order,
                 });
             }
-            self.end += chunk.len() as u64;
+            self.end = end;
         }
         Ok(())
     }
@@ -1172,13 +1157,8 @@ impl Archive {
         incomplete |= start.0 < first;
         let mut write = |id: u64, row: &Row| -> io::Result<()> {
             let mut from = if id == start.0 { start.1 } else { 0 };
-            if from > 0
-                && row
-                    .cells
-                    .get(from)
-                    .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            {
-                from -= 1;
+            if from < row.cells.len() {
+                from = row.leading_column(from);
             }
             let to = if id == end.0 { end.1 } else { row.used() }.min(row.used());
             write_text(file, row, from, to, skip_prompt)?;
@@ -1239,7 +1219,11 @@ impl Archive {
         kind: SelectionType,
     ) -> io::Result<()> {
         let mut input: Option<(u64, u64, VecDeque<Row>, BufReader<File>)> = None;
-        let mut source_row = |id: u64| -> io::Result<Option<Cow<'_, Row>>> {
+        let mut source_row = |id: i64| -> io::Result<Option<Cow<'_, Row>>> {
+            if id < first as i64 {
+                return Ok(None);
+            }
+            let id = id as u64;
             if id >= hot_start {
                 return Ok(hot.get((id - hot_start) as usize).map(Cow::Borrowed));
             }
@@ -1288,63 +1272,38 @@ impl Archive {
             Ok(rows.back().cloned().map(Cow::Owned))
         };
         if kind == SelectionType::Object {
-            if let Some([first, _]) = object_selection((start.0 as i64, start.1), |id| {
-                if id < first as i64 {
-                    Ok(None)
-                } else {
-                    source_row(id as u64)
-                }
-            })? {
+            if let Some([first, _]) = object_selection((start.0 as i64, start.1), &mut source_row)?
+            {
                 *start = (first.0 as u64, first.1);
             }
             if let Some([_, last]) =
-                object_selection((end.0 as i64, end.1.saturating_sub(1)), |id| {
-                    if id < first as i64 {
-                        Ok(None)
-                    } else {
-                        source_row(id as u64)
-                    }
-                })?
+                object_selection((end.0 as i64, end.1.saturating_sub(1)), &mut source_row)?
             {
-                let row = source_row(last.0 as u64)?.unwrap();
-                *end = (
-                    last.0 as u64,
-                    last.1
-                        + if row.cells[last.1].flags.contains(Flags::WIDE_CHAR) {
-                            2
-                        } else {
-                            1
-                        },
-                );
+                let row = source_row(last.0)?.unwrap();
+                *end = (last.0 as u64, last.1 + row.cells[last.1].width());
             }
         } else {
             let mut first_point = (start.0 as i64, start.1);
             let mut last_point = (end.0 as i64, end.1.saturating_sub(1));
-            crate::core::expand_selection(kind, &mut first_point, &mut last_point, |id| {
-                if id < first as i64 {
-                    Ok(None)
-                } else {
-                    source_row(id as u64)
-                }
-            })?;
+            crate::core::expand_selection(
+                kind,
+                &mut first_point,
+                &mut last_point,
+                &mut source_row,
+            )?;
             *start = (first_point.0 as u64, first_point.1);
-            let row = source_row(last_point.0 as u64)?;
+            let row = source_row(last_point.0)?;
             *end = (
                 last_point.0 as u64,
                 last_point.1
-                    + if row
+                    + row
                         .as_ref()
-                        .is_some_and(|row| row.cells[last_point.1].flags.contains(Flags::WIDE_CHAR))
-                    {
-                        2
-                    } else {
-                        1
-                    },
+                        .map_or(1, |row| row.cells[last_point.1].width()),
             );
         }
         Ok(())
     }
-    fn reflow(&mut self, mut request: Reflow) -> io::Result<Reply> {
+    fn reflow(&mut self, request: Reflow) -> io::Result<Reply> {
         let first = self.first()?;
         let mut output = ReflowOutput::new(self.budget.clone(), &request);
         let mut anchors: Vec<_> = request
@@ -1397,7 +1356,7 @@ impl Archive {
         }
         output.archive.order_hint = Some(NEXT.fetch_add(1, Ordering::Relaxed));
         let hot_len = request.hot.len();
-        for (index, row) in std::mem::take(&mut request.hot).into_iter().enumerate() {
+        for (index, row) in request.hot.into_iter().enumerate() {
             output.row(request.hot_start + index as u64, row, &anchors, &mut anchor)?;
         }
         if let Some(row) = output.flow.finish() {
@@ -1513,7 +1472,7 @@ impl ReflowOutput {
         keep: usize,
     ) -> io::Result<()> {
         tail.push_back(row);
-        while tail.len() > keep {
+        if tail.len() > keep {
             pending.push(tail.pop_front().unwrap());
             if pending.len() == BATCH {
                 archive.append(archive.end, pending)?;
@@ -1567,74 +1526,54 @@ fn write_text(
     }
     let mut bytes = [0; 512];
     let mut length = 0;
-    let mut push = |ch: char| -> io::Result<()> {
+    for (column, ch) in row.characters(start..end) {
+        if skip_prompt && row.cells[column].flags.contains(Flags::PROMPT) {
+            continue;
+        }
         if length + 4 > bytes.len() {
             file.write_all(&bytes[..length])?;
             length = 0;
         }
         length += ch.encode_utf8(&mut bytes[length..]).len();
-        Ok(())
-    };
-    for (column, ch) in row.characters(start..end) {
-        if !skip_prompt || !row.cells[column].flags.contains(Flags::PROMPT) {
-            push(ch)?;
-        }
     }
     file.write_all(&bytes[..length])
 }
 fn color_bytes(color: Color) -> [u8; 4] {
     match color {
         Color::Named(value) => {
-            let n = (value as u16).to_le_bytes();
-            [0, n[0], n[1], 0]
+            let [lo, hi] = (value as u16).to_le_bytes();
+            [0, lo, hi, 0]
         }
         Color::Indexed(n) => [1, n, 0, 0],
         Color::Spec(c) => [2, c.r, c.g, c.b],
     }
 }
 fn read_color(bytes: [u8; 4]) -> io::Result<Color> {
-    match bytes[0] {
-        0 => {
-            let n = u16::from_le_bytes([bytes[1], bytes[2]]);
-            NamedColor::from_index(n)
-                .map(Color::Named)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history color"))
-        }
-        1 => Ok(Color::Indexed(bytes[1])),
-        2 => Ok(Color::Spec(Rgb {
-            r: bytes[1],
-            g: bytes[2],
-            b: bytes[3],
-        })),
-        _ => Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid history color",
-        )),
+    match bytes {
+        [0, lo, hi, _] => NamedColor::from_index(u16::from_le_bytes([lo, hi])).map(Color::Named),
+        [1, index, _, _] => Some(Color::Indexed(index)),
+        [2, r, g, b] => Some(Color::Spec(Rgb { r, g, b })),
+        _ => None,
     }
+    .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history color"))
 }
 // Bit 15 is not a cell flag: the run holds wide characters whose spacer cells the
 // reader derives, so wide text needs neither spacer text nor one run per cell.
 const WIDE_PAIRS: u16 = 1 << 15;
 
-fn wide_spacer(cell: &Cell) -> Cell {
-    Cell {
-        c: ' ',
-        flags: (cell.flags - Flags::WIDE_CHAR) | Flags::WIDE_CHAR_SPACER,
-        ..*cell
-    }
-}
-
 fn write_row(bytes: &mut Vec<u8>, row: &Row) {
-    let stored = row.cells[row.used()..]
+    let used = row.used();
+    let extras = row.extras();
+    let stored = row.cells[used..]
         .iter()
         .rposition(|cell| *cell != Cell::default())
-        .map_or(row.used(), |column| row.used() + column + 1);
+        .map_or(used, |column| used + column + 1);
     bytes.extend_from_slice(&(row.cells.len() as u16).to_le_bytes());
-    bytes.extend_from_slice(&(row.used() as u16).to_le_bytes());
+    bytes.extend_from_slice(&(used as u16).to_le_bytes());
     bytes.extend_from_slice(&(stored as u16).to_le_bytes());
     bytes.push(u8::from(row.wrapped));
-    bytes.extend_from_slice(&(row.extras().len() as u16).to_le_bytes());
-    if stored == 0 && row.extras().is_empty() {
+    bytes.extend_from_slice(&(extras.len() as u16).to_le_bytes());
+    if stored == 0 && extras.is_empty() {
         return;
     }
     // Length, text length and run count are filled in once the row is written.
@@ -1643,7 +1582,7 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
     let cells = &row.cells[..stored];
     let pair = |column: usize| {
         cells[column].flags.contains(Flags::WIDE_CHAR)
-            && cells.get(column + 1) == Some(&wide_spacer(&cells[column]))
+            && cells.get(column + 1) == Some(&cells[column].wide_spacer())
     };
     let mut column = 0;
     while column < stored {
@@ -1674,7 +1613,7 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
             runs += 1;
         }
     }
-    for (column, extra) in row.extras() {
+    for (column, extra) in extras {
         bytes.extend_from_slice(&(*column as u16).to_le_bytes());
         bytes.extend_from_slice(&(extra.zerowidth.len() as u32).to_le_bytes());
         for c in &extra.zerowidth {
@@ -1741,6 +1680,7 @@ fn read_array<const N: usize>(file: &mut impl Read) -> io::Result<[u8; N]> {
     Ok(bytes)
 }
 fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -> io::Result<Row> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let header = read_array::<9>(file)?;
     let columns = u16::from_le_bytes([header[0], header[1]]) as usize;
     let used = u16::from_le_bytes([header[2], header[3]]) as usize;
@@ -1748,10 +1688,7 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
     let wrapped = header[6] != 0;
     let count = u16::from_le_bytes([header[7], header[8]]) as usize;
     if columns == 0 || used > stored || stored > columns {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid history row",
-        ));
+        return Err(invalid("invalid history row"));
     }
     cells.clear();
     cells.resize(columns, Cell::default());
@@ -1762,18 +1699,10 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
     let mut file = file.take(u64::from(length));
     let text_bytes = u32::from_le_bytes(read_array(&mut file)?) as usize;
     let runs = u16::from_le_bytes(read_array(&mut file)?) as usize;
-    let mut short = [0; 1024];
-    let mut long = Vec::new();
-    let text = if text_bytes <= short.len() {
-        &mut short[..text_bytes]
-    } else {
-        long.resize(text_bytes, 0);
-        &mut long
-    };
-    file.read_exact(text)?;
-    let text = std::str::from_utf8(text)
+    let mut text = smallvec::SmallVec::<[u8; 1024]>::from_elem(0, text_bytes);
+    file.read_exact(&mut text)?;
+    let text = std::str::from_utf8(&text)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let invalid = |message| io::Error::new(io::ErrorKind::InvalidData, message);
     let mut chars = text.chars();
     let mut next = || chars.next().ok_or_else(|| invalid("short history text"));
     let mut column = 0;
@@ -1811,7 +1740,7 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
                     bg,
                     flags,
                 };
-                pair[1] = wide_spacer(&pair[0]);
+                pair[1] = pair[0].wide_spacer();
             }
         } else {
             for cell in &mut cells[start..end] {
@@ -1838,12 +1767,8 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
         let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
         for _ in 0..count {
             zerowidth.push(
-                char::from_u32(u32::from_le_bytes(read_array(&mut file)?)).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        "invalid history combining character",
-                    )
-                })?,
+                char::from_u32(u32::from_le_bytes(read_array(&mut file)?))
+                    .ok_or_else(|| invalid("invalid history combining character"))?,
             );
         }
         let underline_color = if read_array::<1>(&mut file)?[0] == 0 {
@@ -1860,13 +1785,9 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
         ));
     }
     if file.limit() != 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid history row length",
-        ));
+        return Err(invalid("invalid history row length"));
     }
-    Row::from_parts(cells, wrapped, used, extras)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "invalid history row"))
+    Row::from_parts(cells, wrapped, used, extras).ok_or_else(|| invalid("invalid history row"))
 }
 
 #[cfg(test)]
@@ -1885,14 +1806,14 @@ mod tests {
         let mut cells = vec![Cell::default(); 12];
         cells[0].c = 'a';
         cells[1] = wide('中');
-        cells[2] = wide_spacer(&cells[1]);
+        cells[2] = cells[1].wide_spacer();
         cells[3] = wide('文');
-        cells[4] = wide_spacer(&cells[3]);
+        cells[4] = cells[3].wide_spacer();
         cells[5] = wide('字');
         // Spacers that differ from the derived one, and wide cells without one, stay exact.
         cells[6] = Cell {
             bg: Color::Named(NamedColor::Blue),
-            ..wide_spacer(&cells[5])
+            ..cells[5].wide_spacer()
         };
         cells[7].c = 'b';
         cells[9] = wide('尾');
@@ -2086,10 +2007,10 @@ mod tests {
                         c: '界',
                         ..Cell::default()
                     };
-                    100
+                    1200
                 ],
                 false,
-                100,
+                1200,
                 Vec::new(),
             )
             .unwrap(),
@@ -2513,9 +2434,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let timeout = deadline
-                    .saturating_duration_since(Instant::now())
-                    .as_millis() as i32;
+                let timeout =
+                    crate::poll::timeout_millis(deadline.saturating_duration_since(Instant::now()));
                 assert!(unsafe { libc::poll(&mut fd, 1, timeout) } > 0);
                 terminal.drain_notification().unwrap();
                 terminal.acknowledge_wakeup();
@@ -2727,10 +2647,9 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                         events: libc::POLLIN,
                         revents: 0,
                     };
-                    let remaining = deadline
-                        .saturating_duration_since(Instant::now())
-                        .as_millis()
-                        .saturating_add(1) as i32;
+                    let remaining = crate::poll::timeout_millis(
+                        deadline.saturating_duration_since(Instant::now()),
+                    );
                     assert_eq!(unsafe { libc::poll(&mut fd, 1, remaining) }, 1);
                     assert_ne!(fd.revents & libc::POLLIN, 0);
                 }

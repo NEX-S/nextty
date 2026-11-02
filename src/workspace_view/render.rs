@@ -1,4 +1,5 @@
 use super::*;
+use crate::core::Flags;
 use crate::width::{fit_label, scalar_width};
 use std::borrow::Cow;
 
@@ -17,7 +18,6 @@ impl WorkspaceView {
         };
         let controller = snapshot.controller;
         let cell = self.cell;
-        self.tab_hits.clear();
         let label = if self.client.is_remote() { "SSH" } else { "" };
         let columns = ((layout.width - self.control_width()) / cell.0).max(0.) as u16;
         self.text.draw(
@@ -34,15 +34,17 @@ impl WorkspaceView {
             let active = tab.id == snapshot.active_tab;
             let x = f32::from(column) * cell.0;
             let w = f32::from(columns) * cell.0;
-            let hovered =
-                (x..x + w).contains(&self.pointer.0) && (0. ..layout.top).contains(&self.pointer.1);
-            let mut background = self.config.background;
-            if !active && !hovered {
-                background = 0;
-                for shift in [16, 8, 0] {
-                    background |= ((self.config.background >> shift & 255) * 4 / 5) << shift;
-                }
-            }
+            let hit = GuiHit {
+                bounds: (x, 0., w, layout.top),
+                action: GuiAction::SelectTab(index),
+            };
+            let hovered = hit.contains(self.pointer);
+            self.control_hits.push(hit);
+            let background = if active {
+                self.config.background
+            } else {
+                mix_color(self.config.background, 0, 204)
+            };
             match self.config.tab_style {
                 crate::config::TabStyle::Angled => {
                     self.renderer
@@ -58,11 +60,7 @@ impl WorkspaceView {
                 "•",
                 x + cell.0 * 2.,
                 0.,
-                (self
-                    .ui
-                    .tab_color(tab, self.config.foreground, self.config.background)
-                    << 8)
-                    | 255,
+                (crate::ui::tab_color(tab) << 8) | 255,
             )?;
             self.text.draw(
                 &self.renderer,
@@ -76,28 +74,23 @@ impl WorkspaceView {
                 },
             )?;
             let close_x = x + w - cell.0 * 3.;
-            let close_hovered = self.pointer.0 >= close_x - cell.0
-                && self.pointer.0 < close_x + cell.0 * 2.
-                && self.pointer.1 < layout.top;
-            self.control_feedback(
-                (close_x - cell.0, 0., cell.0 * 3., layout.top),
-                GuiAction::CloseTab(tab.id),
-            );
+            let hit = GuiHit {
+                bounds: (close_x - cell.0, 0., cell.0 * 3., layout.top),
+                action: GuiAction::CloseTab(tab.id),
+            };
+            let close_hovered = hit.contains(self.pointer);
+            self.control_feedback(hit);
             self.text.draw(
                 &self.renderer,
                 "×",
                 close_x,
                 0.,
-                if close_hovered { INK } else { MUTED },
+                if close_hovered { 0xe87575ff } else { MUTED },
             )?;
-            self.control_hits.push(GuiHit {
-                bounds: (close_x - cell.0, 0., cell.0 * 3., layout.top),
-                action: GuiAction::CloseTab(tab.id),
-            });
+            self.control_hits.push(hit);
             if active && self.config.tab_style == crate::config::TabStyle::Flat {
                 self.renderer.rect(x, cell.1 - 2., w, 1., ACCENT, false);
             }
-            self.tab_hits.push((x, x + w, index));
             end = column + columns + 1;
         }
         if end.saturating_add(3) < columns.saturating_sub(text_width(&label) as u16 + 2) {
@@ -105,8 +98,9 @@ impl WorkspaceView {
             self.header_button(x - cell.0, cell.0 * 3., layout, GuiAction::NewTab)?;
         }
         let label = fit_label(&label, columns.saturating_sub(end + 4));
-        let label_x = (f32::from(columns) - text_width(&label) as f32 - 2.) * cell.0;
-        self.overflow_hits(label_x, 0., before, after, text_width(&label));
+        let label_width = text_width(&label);
+        let label_x = (f32::from(columns) - label_width as f32 - 2.) * cell.0;
+        self.overflow_hits(label_x, 0., before, after, label_width);
         self.text.draw(
             &self.renderer,
             &label,
@@ -162,7 +156,7 @@ impl WorkspaceView {
             INK
         };
         if !disabled {
-            self.control_feedback(hit.bounds, action);
+            self.control_feedback(hit);
         }
         self.text.draw(
             &self.renderer,
@@ -196,15 +190,13 @@ impl WorkspaceView {
         }
         self.renderer.clip(0., 0., 0., 0.)
     }
-    fn control_feedback(&self, bounds: (f32, f32, f32, f32), action: GuiAction) {
-        let hovered = GuiHit { bounds, action }.contains(self.pointer);
-        if hovered {
-            let underline = match action {
-                GuiAction::CloseTab(_) | GuiAction::Close => Some(MUTED),
-                GuiAction::NewTab
-                | GuiAction::Tab(_)
-                | GuiAction::Minimize
-                | GuiAction::Maximize => Some(ACCENT),
+    fn control_feedback(&self, hit: GuiHit) {
+        if hit.contains(self.pointer) {
+            let bounds = hit.bounds;
+            let underline = match hit.action {
+                GuiAction::CloseTab(_) | GuiAction::Close => Some(0xe87575ff),
+                GuiAction::NewTab => Some(ACCENT),
+                GuiAction::Tab(_) | GuiAction::Minimize | GuiAction::Maximize => Some(INK),
                 _ => None,
             };
             if let Some(color) = underline {
@@ -405,9 +397,12 @@ impl WorkspaceView {
                 self.cell.1 + 12.,
             );
             if let Some(hit) = view.hits.iter().find(|hit| hit.x == text.x) {
-                let action = GuiAction::Monitor(hit.action);
-                self.control_feedback(bounds, action);
-                self.control_hits.push(GuiHit { bounds, action });
+                let hit = GuiHit {
+                    bounds,
+                    action: GuiAction::Monitor(hit.action),
+                };
+                self.control_feedback(hit);
+                self.control_hits.push(hit);
             }
             if text.emphasis(self.ui.focus == Focus::Monitor) != crate::monitor::Emphasis::None {
                 self.renderer.rect(
@@ -454,30 +449,29 @@ impl WorkspaceView {
             }
             let width = count.ilog10() as usize + 2;
             if column + width <= visible {
-                let bounds = (
-                    x + column as f32 * self.cell.0,
-                    y,
-                    width as f32 * self.cell.0,
-                    self.cell.1,
-                );
-                self.control_feedback(bounds, GuiAction::Tab(direction));
-                self.control_hits.push(GuiHit {
-                    bounds,
+                let hit = GuiHit {
+                    bounds: (
+                        x + column as f32 * self.cell.0,
+                        y,
+                        width as f32 * self.cell.0,
+                        self.cell.1,
+                    ),
                     action: GuiAction::Tab(direction),
-                });
+                };
+                self.control_feedback(hit);
+                self.control_hits.push(hit);
             }
             column += width + 1;
         }
     }
     pub(super) fn draw_help(&mut self, layout: GuiLayout) -> Result<()> {
-        let cols = ((layout.width / self.cell.0).floor() as u16)
-            .saturating_sub(4)
-            .min(78);
-        let rows = (self.ui.help_lines().count() as u16 + 4)
-            .min(((layout.height / self.cell.1).floor() as u16).saturating_sub(2));
+        let columns = (layout.width / self.cell.0).floor() as u16;
+        let lines = (layout.height / self.cell.1).floor() as u16;
+        let cols = columns.saturating_sub(4).min(78);
+        let rows = (self.ui.help_lines().count() as u16 + 4).min(lines.saturating_sub(2));
         let rect = crate::workspace::Rect {
-            x: ((layout.width / self.cell.0).floor() as u16 - cols) / 2,
-            y: ((layout.height / self.cell.1).floor() as u16 - rows) / 2,
+            x: (columns - cols) / 2,
+            y: (lines - rows) / 2,
             cols,
             rows,
         };
@@ -498,12 +492,11 @@ impl WorkspaceView {
         Ok(())
     }
     pub(super) fn draw_search(&mut self, layout: GuiLayout) -> Result<()> {
-        let Some(pane) = self.client.snapshot().and_then(|snapshot| {
-            snapshot
-                .panes
-                .iter()
-                .find(|pane| pane.id == self.ui.search.pane)
-        }) else {
+        let Some(pane) = self
+            .client
+            .snapshot()
+            .and_then(|snapshot| snapshot.pane(self.ui.search.pane))
+        else {
             return Ok(());
         };
         let (grid_x, grid_y) = layout.origin(self.cell);
@@ -579,24 +572,22 @@ impl WorkspaceView {
             y + h * 0.22,
             MUTED,
         )?;
-        let name = if name
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
-        {
-            name.to_owned()
+        let message = if prompt.tab.is_some() {
+            Cow::Borrowed("Closing terminates all panes in this tab")
         } else {
-            format!("'{}'", name.replace('\'', "'\\''"))
+            let name = if name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
+            {
+                Cow::Borrowed(name)
+            } else {
+                Cow::Owned(format!("'{}'", name.replace('\'', "'\\''")))
+            };
+            Cow::Owned(format!("Resume with: nextty attach {name}"))
         };
         self.text.draw(
             &self.renderer,
-            &fit(
-                &if prompt.tab.is_some() {
-                    "Closing terminates all panes in this tab".into()
-                } else {
-                    format!("Resume with: nextty attach {name}")
-                },
-                columns,
-            ),
+            &fit(&message, columns),
             x + padding,
             y + h * 0.36,
             MUTED,
@@ -679,10 +670,9 @@ fn fit(text: &str, limit: usize) -> Cow<'_, str> {
         let w = usize::from(scalar_width(c).min(2));
         if width + w > limit {
             if limit > 0 {
-                while width >= limit {
-                    let Some(previous) = result.pop() else {
-                        break;
-                    };
+                while width >= limit
+                    && let Some(previous) = result.pop()
+                {
                     width -= usize::from(scalar_width(previous).min(2));
                 }
                 result.push('…');
@@ -701,19 +691,14 @@ impl WorkspaceView {
         for run in grid.runs(None, &[]) {
             let x = f32::from(run.x) * self.cell.0;
             let y = f32::from(run.y) * self.cell.1;
-            self.renderer.rect(
-                x,
-                y,
-                f32::from(run.columns) * self.cell.0,
-                self.cell.1,
-                (run.background << 8) | 255,
-                false,
-            );
-            if run.flags.contains(crate::core::Flags::UNDERLINE) {
+            let width = f32::from(run.columns) * self.cell.0;
+            self.renderer
+                .rect(x, y, width, self.cell.1, (run.background << 8) | 255, false);
+            if run.flags.contains(Flags::UNDERLINE) {
                 self.renderer.rect(
                     x,
                     y + self.cell.1 - 2.,
-                    f32::from(run.columns) * self.cell.0,
+                    width,
                     1.,
                     (run.underline_color.unwrap_or(run.foreground) << 8) | 255,
                     false,
@@ -725,8 +710,7 @@ impl WorkspaceView {
                 x,
                 y,
                 (run.foreground << 8) | 255,
-                u32::from(run.flags.contains(crate::core::Flags::BOLD))
-                    | (u32::from(run.flags.contains(crate::core::Flags::ITALIC)) << 1),
+                u32::from((run.flags & (Flags::BOLD | Flags::ITALIC)).bits()),
             )?;
         }
         Ok(())

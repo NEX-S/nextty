@@ -20,6 +20,7 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
             .next_power_of_two(),
     );
     let mut row_ranges = Vec::with_capacity(screen.rows.len());
+    let mut wrapped_rows = Vec::new();
     let cursor = screen.cursor();
     let cursor_row = i64::from(cursor.0.line) + screen.display_offset() as i64;
     let cursor_visible =
@@ -28,7 +29,9 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         let start = text.len();
         text.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
         row_ranges.push(start..text.len());
-        if !row.wrapped && index + 1 < screen.rows.len() {
+        if row.wrapped {
+            wrapped_rows.push(Value::from(index));
+        } else if index + 1 < screen.rows.len() {
             text.push('\n');
         }
     }
@@ -60,8 +63,7 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     }
     let mut rows = Vec::new();
     let mut omitted = Vec::<Value>::new();
-    let mut omitted_reason = None;
-    let mut omitted_start = 0;
+    let mut omission: Option<(&str, usize)> = None;
     for (index, range) in row_ranges.iter().enumerate() {
         let text = &text[range.clone()];
         if query.is_some() {
@@ -84,30 +86,20 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         } else {
             None
         };
-        if reason != omitted_reason {
-            if let Some(reason) = omitted_reason {
-                omitted.push(
-                    json!({"start_row": omitted_start, "end_row": index - 1, "reason": reason}),
-                );
+        if reason != omission.map(|(reason, _)| reason) {
+            if let Some((reason, start)) = omission {
+                omitted.push(json!({"start_row": start, "end_row": index - 1, "reason": reason}));
             }
-            omitted_reason = reason;
-            omitted_start = index;
+            omission = reason.map(|reason| (reason, index));
         }
         if reason.is_none() {
             rows.push(json!([index, text]));
         }
     }
-    if let Some(reason) = omitted_reason {
-        omitted.push(
-            json!({"start_row": omitted_start, "end_row": row_ranges.len() - 1, "reason": reason}),
-        );
+    if let Some((reason, start)) = omission {
+        omitted
+            .push(json!({"start_row": start, "end_row": row_ranges.len() - 1, "reason": reason}));
     }
-    let wrapped_rows: Vec<_> = screen
-        .rows
-        .iter()
-        .enumerate()
-        .filter_map(|(index, row)| row.wrapped.then_some(Value::from(index)))
-        .collect();
     let mut result = json!({
         "columns": screen.columns(),
         "lines": screen.screen_lines(),

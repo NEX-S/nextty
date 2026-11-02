@@ -1,4 +1,4 @@
-use crate::core::{Flags, Row};
+use crate::core::Row;
 use crate::input::keysym;
 use crate::workspace::{Action, Client, PaneId};
 use std::collections::VecDeque;
@@ -7,7 +7,7 @@ use std::io;
 const MATCH_LIMIT: usize = 10_000;
 
 // Separate row IDs and columns avoid padding each coordinate pair.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct SearchMatch {
     pub start_row: u64,
     pub end_row: u64,
@@ -98,15 +98,7 @@ impl Matcher {
     pub fn row(&mut self, id: u64, row: &Row) {
         for (column, character) in row.characters(0..row.used()) {
             let start = (id, column as u16);
-            let end = (
-                id,
-                (column
-                    + if row.cells[column].flags.contains(Flags::WIDE_CHAR) {
-                        2
-                    } else {
-                        1
-                    }) as u16,
-            );
+            let end = (id, (column + row.cells[column].width()) as u16);
             self.character(character, start, end);
         }
         if !row.wrapped {
@@ -138,9 +130,7 @@ pub(crate) struct Search {
 }
 impl Search {
     pub fn begin(&mut self, client: &mut Client, pane: PaneId) -> io::Result<()> {
-        if self.open {
-            self.close(client)?;
-        }
+        self.close(client)?;
         self.open = true;
         self.controller = client
             .snapshot()
@@ -150,17 +140,15 @@ impl Search {
         self.cursor = 0;
         self.submit(client)
     }
-    pub fn observe(&mut self, client: &mut Client) -> io::Result<bool> {
+    pub fn observe(&mut self, client: &mut Client) -> io::Result<()> {
         if self.open
             && !client.snapshot().is_some_and(|snapshot| {
-                snapshot.controller == self.controller
-                    && snapshot.panes.iter().any(|pane| pane.id == self.pane)
+                snapshot.controller == self.controller && snapshot.pane(self.pane).is_some()
             })
         {
             self.close(client)?;
-            return Ok(true);
         }
-        Ok(false)
+        Ok(())
     }
     fn submit(&mut self, client: &mut Client) -> io::Result<()> {
         if !self.open {
@@ -187,7 +175,9 @@ impl Search {
         self.submit(client)
     }
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
-        self.open = false;
+        if !std::mem::take(&mut self.open) {
+            return Ok(());
+        }
         self.pending = false;
         self.count = 0;
         client.send(Action::SearchCancel {
@@ -255,13 +245,13 @@ impl Search {
             keysym::RIGHT => self.cursor = self.following(),
             keysym::HOME => self.cursor = 0,
             keysym::END => self.cursor = self.query.len(),
-            keysym::BACKSPACE => {
-                if self.delete(self.previous()..self.cursor) {
-                    self.submit(client)?;
-                }
-            }
-            keysym::DELETE => {
-                if self.delete(self.cursor..self.following()) {
+            keysym::BACKSPACE | keysym::DELETE => {
+                let range = if symbol == keysym::BACKSPACE {
+                    self.previous()..self.cursor
+                } else {
+                    self.cursor..self.following()
+                };
+                if self.delete(range) {
                     self.submit(client)?;
                 }
             }
@@ -276,17 +266,11 @@ impl Search {
         Ok(())
     }
     fn previous(&self) -> usize {
-        self.query[..self.cursor]
-            .char_indices()
-            .next_back()
-            .map_or(0, |(index, _)| index)
+        self.query
+            .floor_char_boundary(self.cursor.saturating_sub(1))
     }
     fn following(&self) -> usize {
-        self.cursor
-            + self.query[self.cursor..]
-                .chars()
-                .next()
-                .map_or(0, char::len_utf8)
+        self.query.ceil_char_boundary(self.cursor + 1)
     }
     fn delete(&mut self, range: std::ops::Range<usize>) -> bool {
         self.cursor = range.start;
@@ -312,7 +296,8 @@ impl Search {
             status.push_str(if columns >= 40 { " read-only" } else { " RO" });
         }
         let status = fit_label(&status, (columns.saturating_sub(5).min(columns / 2)) as u16);
-        let budget = columns.saturating_sub(text_width(&status) + 4);
+        let status_width = text_width(&status);
+        let budget = columns.saturating_sub(status_width + 4);
         let before = format!("{}{preedit}", &self.query[..self.cursor]);
         let mut width = 0;
         let start = before
@@ -334,10 +319,11 @@ impl Search {
             &self.query[self.cursor..],
             budget.saturating_sub(width + 1) as u16,
         );
-        let query = format!("⌕ {before}▏{after}");
         let caret = 2 + text_width(before);
-        let padding = columns.saturating_sub(text_width(&query) + text_width(&status));
-        let label = format!("{query}{}{status}", " ".repeat(padding));
+        let mut label = format!("⌕ {before}▏{after}");
+        let padding = columns.saturating_sub(text_width(&label) + status_width);
+        label.extend(std::iter::repeat_n(' ', padding));
+        label.push_str(&status);
         (
             fit_label(&label, columns as u16).into_owned(),
             caret.min(columns.saturating_sub(1)),

@@ -800,7 +800,7 @@ fn line_edit_repair_keeps_styled_blanks_before_the_cursor() {
     row.cells[10].bg = Color::Indexed(1);
     row.used = 3;
     core.goto(0, 70);
-    core.insert_blank(1);
+    core.shift_chars(1, true);
     assert_eq!(core.row(0).used(), 11);
     assert_eq!(core.row(0).cells[10].bg, Color::Indexed(1));
 }

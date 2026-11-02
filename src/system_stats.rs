@@ -48,18 +48,18 @@ pub struct Network {
 }
 
 impl Network {
-    pub fn details(&self) -> [(String, String); 3] {
+    pub fn details(&self) -> [(&'static str, String); 3] {
         [
             (
-                "Total RX / TX".into(),
+                "Total RX / TX",
                 format!("{} / {}", bytes(self.received), bytes(self.transmitted)),
             ),
             (
-                "Errors RX / TX".into(),
+                "Errors RX / TX",
                 format!("{} / {}", self.rx_errors, self.tx_errors),
             ),
             (
-                "Dropped RX / TX".into(),
+                "Dropped RX / TX",
                 format!("{} / {}", self.rx_dropped, self.tx_dropped),
             ),
         ]
@@ -152,7 +152,6 @@ struct CpuCounters {
 
 #[derive(Clone, Copy)]
 struct ProcessCounters {
-    start: u64,
     ticks: u64,
     io: Option<[u64; 2]>,
 }
@@ -168,9 +167,6 @@ struct DiskCounters {
     busy_ms: u64,
 }
 
-fn number<T: std::fmt::Display>(value: Option<T>) -> String {
-    value.map_or_else(|| "—".into(), |value| value.to_string())
-}
 fn percent(value: Option<f32>) -> String {
     value.map_or_else(|| "—".into(), |value| format!("{value:.0}%"))
 }
@@ -302,15 +298,16 @@ impl SystemStats {
     }
 
     fn disk(&self) -> Option<Usage> {
-        (self.sample.directory == self.directory)
-            .then_some(self.sample.disk)
-            .flatten()
+        self.sample
+            .disk
+            .filter(|_| self.sample.directory == self.directory)
     }
 
     pub fn branch(&self) -> Option<&str> {
-        (self.sample.directory == self.directory)
-            .then_some(self.sample.branch.as_deref())
-            .flatten()
+        self.sample
+            .branch
+            .as_deref()
+            .filter(|_| self.sample.directory == self.directory)
     }
 
     pub fn networks(&self) -> &[Network] {
@@ -332,7 +329,10 @@ impl SystemStats {
                 name: ["CPU", "MEMORY", "READ", "WRITE", "SWAP", "IN", "OUT"][index],
                 value: values[index],
                 summary: match index {
-                    0 => format!("{} logical cores", number(self.sample.cores)),
+                    0 => self.sample.cores.map_or_else(
+                        || "— logical cores".into(),
+                        |cores| format!("{cores} logical cores"),
+                    ),
                     1 => capacity(self.sample.memory),
                     2 | 3 => "Physical disks · read / write".into(),
                     4 => capacity(self.sample.swap),
@@ -396,8 +396,8 @@ impl SystemStats {
                 .find(|(name, _)| *name == network.name)
                 .map(|(_, values)| *values)
                 .unwrap_or([None; 2]);
-            for index in 0..2 {
-                points[index].push((age, values[index]));
+            for (points, value) in points.iter_mut().zip(values) {
+                points.push((age, value));
             }
         }
         drop(state);
@@ -407,29 +407,25 @@ impl SystemStats {
             .filter_map(|(_, v)| *v)
             .fold(0.125f32, f32::max);
         let maximum = 2f32.powf(peak.log2().ceil());
-        let mut result = Vec::with_capacity(2);
-        for (index, points) in points.into_iter().enumerate() {
-            result.push(ResourceTrend {
-                name: ["RX", "TX"][index],
-                value: [network.rx, network.tx][index].map(|v| (v / 1048576.) as f32),
-                summary: format!(
-                    "{} · {}",
-                    network.name,
-                    rate([network.rx, network.tx][index])
-                ),
+        [("RX", network.rx), ("TX", network.tx)]
+            .into_iter()
+            .zip(points)
+            .map(|((name, value), points)| ResourceTrend {
+                name,
+                value: value.map(|v| (v / 1048576.) as f32),
+                summary: format!("{} · {}", network.name, rate(value)),
                 points,
                 maximum,
                 unit: "MiB/s",
-            });
-        }
-        result
+            })
+            .collect()
     }
 
-    pub fn overview(&self) -> Vec<(String, String)> {
-        vec![
-            ("Load · 1/5/15 min".into(), self.load()),
+    pub fn overview(&self) -> [(&'static str, String); 2] {
+        [
+            ("Load · 1/5/15 min", self.load()),
             (
-                "Uptime".into(),
+                "Uptime",
                 self.sample.uptime.map_or_else(
                     || "—".into(),
                     |s| format!("{}d {:02}h {:02}m", s / 86400, s / 3600 % 24, s / 60 % 60),
@@ -443,16 +439,13 @@ impl SystemStats {
             |v| format!("{:.2} / {:.2} / {:.2}", v[0], v[1], v[2]),
         )
     }
-    pub fn cpu_details(&self) -> Vec<(String, String)> {
-        vec![
-            ("Load · 1/5/15 min".into(), self.load()),
-            ("I/O wait".into(), percent(self.sample.iowait)),
+    pub fn cpu_details(&self) -> [(&'static str, String); 4] {
+        [
+            ("Load · 1/5/15 min", self.load()),
+            ("I/O wait", percent(self.sample.iowait)),
+            ("CPU pressure · 10s", percent(self.sample.pressure[0])),
             (
-                "CPU pressure · 10s".into(),
-                percent(self.sample.pressure[0]),
-            ),
-            (
-                "Tasks · running/total".into(),
+                "Tasks · running/total",
                 self.sample.tasks.clone().unwrap_or_else(|| "—".into()),
             ),
         ]
@@ -460,43 +453,39 @@ impl SystemStats {
     pub fn cpu_cores(&self) -> &[(String, Option<f32>)] {
         &self.sample.cpu_cores
     }
-    pub fn memory_details(&self) -> Vec<(String, String)> {
-        let mut rows = vec![(
-            "Available".into(),
-            self.sample
-                .memory
-                .map_or_else(|| "—".into(), |u| bytes(u.available)),
-        )];
-        for (index, label) in ["Free", "Cached", "Buffers"].into_iter().enumerate() {
-            rows.push((
-                label.into(),
-                self.sample.memory_parts[index].map_or_else(|| "—".into(), bytes),
-            ));
-        }
-        rows.push((
-            "Memory pressure · 10s".into(),
-            percent(self.sample.pressure[1]),
-        ));
-        rows
+    pub fn memory_details(&self) -> [(&'static str, String); 5] {
+        let [free, cached, buffers] = self
+            .sample
+            .memory_parts
+            .map(|part| part.map_or_else(|| "—".into(), bytes));
+        [
+            (
+                "Available",
+                self.sample
+                    .memory
+                    .map_or_else(|| "—".into(), |u| bytes(u.available)),
+            ),
+            ("Free", free),
+            ("Cached", cached),
+            ("Buffers", buffers),
+            ("Memory pressure · 10s", percent(self.sample.pressure[1])),
+        ]
     }
     pub fn disks(&self) -> &[Disk] {
         &self.sample.disks
     }
-    pub fn disk_details(&self) -> Vec<(String, String)> {
-        vec![
+    pub fn disk_details(&self) -> [(&'static str, String); 4] {
+        [
             (
-                "Filesystem path".into(),
+                "Filesystem path",
                 self.directory
                     .as_ref()
                     .map_or_else(|| "—".into(), |p| p.display().to_string()),
             ),
-            ("Used / total".into(), capacity(self.disk())),
+            ("Used / total", capacity(self.disk())),
+            ("I/O pressure · 10s", percent(self.sample.pressure[2])),
             (
-                "I/O pressure · 10s".into(),
-                percent(self.sample.pressure[2]),
-            ),
-            (
-                "Available / inodes".into(),
+                "Available / inodes",
                 self.disk().map_or_else(
                     || "—".into(),
                     |u| {
@@ -534,7 +523,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
     let mut previous_disk: HashMap<String, DiskCounters> = HashMap::new();
     let mut previous_cores: HashMap<String, CpuCounters> = HashMap::new();
     let mut previous_swap: Option<[u64; 2]> = None;
-    let mut previous_processes: HashMap<u32, ProcessCounters> = HashMap::new();
+    let mut previous_processes = HashMap::new();
     let mut previous_at: Option<Instant> = None;
     let ticks_per_second = unsafe { libc::sysconf(libc::_SC_CLK_TCK) } as f64;
     let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u64;
@@ -618,8 +607,9 @@ fn sample_resources(sampler: Arc<Sampler>) {
             }
         }
         if let Ok(text) = fs::read_to_string("/proc/meminfo") {
-            sample.memory = memory_usage(&text);
-            sample.swap = swap_usage(&text);
+            sample.memory = meminfo_usage(&text, ["MemTotal:", "MemAvailable:"])
+                .filter(|usage| usage.total > 0);
+            sample.swap = meminfo_usage(&text, ["SwapTotal:", "SwapFree:"]);
             sample.memory_parts =
                 ["MemFree:", "Cached:", "Buffers:"].map(|name| memory_field(&text, name));
         }
@@ -641,20 +631,7 @@ fn sample_resources(sampler: Arc<Sampler>) {
             .as_deref()
             .and_then(|path| disk_usage(path).ok());
         if expanded {
-            let disks = physical_disk_counters();
-            for (name, disk) in &disks {
-                let previous = previous_disk.get(name);
-                sample.disks.push(Disk {
-                    name: name.clone(),
-                    rates: std::array::from_fn(|i| {
-                        previous.and_then(|old| per_second(disk.bytes[i], old.bytes[i], elapsed))
-                    }),
-                    utilization: previous
-                        .and_then(|old| per_second(disk.busy_ms, old.busy_ms, elapsed))
-                        .map(|v| (v / 10.).min(100.)),
-                });
-            }
-            previous_disk = disks.into_iter().collect();
+            (sample.disks, previous_disk) = sample_physical_disks(&previous_disk, elapsed);
         } else {
             previous_disk.clear();
         }
@@ -670,16 +647,16 @@ fn sample_resources(sampler: Arc<Sampler>) {
                             .exists()
                     })
             });
-            for net in &mut sample.networks {
-                if let Some((rx, tx)) = previous_net.get(&net.name) {
-                    net.rx = per_second(net.received, *rx, elapsed);
-                    net.tx = per_second(net.transmitted, *tx, elapsed);
-                }
-            }
             previous_net = sample
                 .networks
-                .iter()
-                .map(|net| (net.name.clone(), (net.received, net.transmitted)))
+                .iter_mut()
+                .map(|net| {
+                    if let Some((rx, tx)) = previous_net.get(&net.name) {
+                        net.rx = per_second(net.received, *rx, elapsed);
+                        net.tx = per_second(net.transmitted, *tx, elapsed);
+                    }
+                    (net.name.clone(), (net.received, net.transmitted))
+                })
                 .collect();
         } else {
             previous_net.clear();
@@ -759,13 +736,8 @@ fn per_second(current: u64, previous: u64, elapsed: Option<f64>) -> Option<f64> 
 }
 fn counter_percent(total: u64, old_total: u64, counter: u64, old_counter: u64) -> Option<f32> {
     let total = total.checked_sub(old_total)?;
-    (total > 0)
-        .then(|| {
-            counter
-                .checked_sub(old_counter)
-                .map(|v| v as f32 * 100. / total as f32)
-        })
-        .flatten()
+    let counter = counter.checked_sub(old_counter)?;
+    (total > 0).then(|| counter as f32 * 100. / total as f32)
 }
 fn sample_values(sample: &Sample) -> [Option<f32>; 7] {
     let disk_rates: [Option<f64>; 2] = std::array::from_fn(|i| {
@@ -806,9 +778,6 @@ fn record_history(history: &mut VecDeque<TrendPoint>, point: TrendPoint) {
         });
     }
     history.push_back(point);
-    while history.len() > 3602 {
-        history.pop_front();
-    }
 }
 fn cpu_counters(text: &str) -> Option<CpuCounters> {
     let mut fields = text.lines().next()?.split_whitespace();
@@ -825,27 +794,21 @@ fn cpu_counters(text: &str) -> Option<CpuCounters> {
         iowait: counters[4],
     })
 }
-fn memory_field(text: &str, name: &str) -> Option<u64> {
+fn counter(text: &str, name: &str) -> Option<u64> {
     text.lines().find_map(|line| {
         let mut fields = line.split_whitespace();
-        (fields.next()? == name)
-            .then(|| fields.next()?.parse::<u64>().ok()?.checked_mul(1024))
-            .flatten()
+        if fields.next()? != name {
+            return None;
+        }
+        fields.next()?.parse().ok()
     })
 }
-fn memory_usage(text: &str) -> Option<Usage> {
-    let total = memory_field(text, "MemTotal:").filter(|&v| v > 0)?;
-    let available = memory_field(text, "MemAvailable:")?;
-    Some(Usage {
-        used: total.checked_sub(available)?,
-        total,
-        available,
-        inodes: None,
-    })
+fn memory_field(text: &str, name: &str) -> Option<u64> {
+    counter(text, name)?.checked_mul(1024)
 }
-fn swap_usage(text: &str) -> Option<Usage> {
-    let total = memory_field(text, "SwapTotal:")?;
-    let available = memory_field(text, "SwapFree:")?;
+fn meminfo_usage(text: &str, fields: [&str; 2]) -> Option<Usage> {
+    let total = memory_field(text, fields[0])?;
+    let available = memory_field(text, fields[1])?;
     Some(Usage {
         used: total.checked_sub(available)?,
         total,
@@ -860,15 +823,7 @@ fn pressure(text: &str) -> Option<f32> {
         .find_map(|field| field.strip_prefix("avg10=")?.parse().ok())
 }
 fn counter_pair(text: &str, names: [&str; 2]) -> Option<[u64; 2]> {
-    let value = |name| {
-        text.lines().find_map(|line| {
-            let mut fields = line.split_whitespace();
-            (fields.next()? == name)
-                .then(|| fields.next()?.parse().ok())
-                .flatten()
-        })
-    };
-    Some([value(names[0])?, value(names[1])?])
+    Some([counter(text, names[0])?, counter(text, names[1])?])
 }
 fn git_branch(directory: &Path) -> Option<String> {
     for parent in directory.ancestors() {
@@ -922,29 +877,45 @@ fn network_counters(text: &str) -> Vec<Network> {
     result.sort_by(|a, b| a.name.cmp(&b.name));
     result
 }
-fn physical_disk_counters() -> Vec<(String, DiskCounters)> {
+fn sample_physical_disks(
+    previous: &HashMap<String, DiskCounters>,
+    elapsed: Option<f64>,
+) -> (Vec<Disk>, HashMap<String, DiskCounters>) {
+    let mut disks = Vec::new();
+    let mut counters = HashMap::new();
     let Ok(text) = fs::read_to_string("/proc/diskstats") else {
-        return Vec::new();
+        return (disks, counters);
     };
-    text.lines()
-        .filter_map(|line| {
-            let mut values = line.split_whitespace().skip(2);
-            let name = values.next()?;
-            if !Path::new("/sys/block").join(name).join("device").exists() {
-                return None;
-            }
-            Some((
-                name.to_owned(),
-                DiskCounters {
-                    bytes: [
-                        values.nth(2)?.parse::<u64>().ok()?.checked_mul(512)?,
-                        values.nth(3)?.parse::<u64>().ok()?.checked_mul(512)?,
-                    ],
-                    busy_ms: values.nth(2)?.parse().ok()?,
-                },
-            ))
-        })
-        .collect()
+    for (name, disk) in text.lines().filter_map(|line| {
+        let mut values = line.split_whitespace().skip(2);
+        let name = values.next()?;
+        if !Path::new("/sys/block").join(name).join("device").exists() {
+            return None;
+        }
+        Some((
+            name.to_owned(),
+            DiskCounters {
+                bytes: [
+                    values.nth(2)?.parse::<u64>().ok()?.checked_mul(512)?,
+                    values.nth(3)?.parse::<u64>().ok()?.checked_mul(512)?,
+                ],
+                busy_ms: values.nth(2)?.parse().ok()?,
+            },
+        ))
+    }) {
+        let old = previous.get(&name);
+        disks.push(Disk {
+            name: name.clone(),
+            rates: std::array::from_fn(|i| {
+                old.and_then(|old| per_second(disk.bytes[i], old.bytes[i], elapsed))
+            }),
+            utilization: old
+                .and_then(|old| per_second(disk.busy_ms, old.busy_ms, elapsed))
+                .map(|v| (v / 10.).min(100.)),
+        });
+        counters.insert(name, disk);
+    }
+    (disks, counters)
 }
 fn disk_usage(path: &Path) -> io::Result<Usage> {
     let path = CString::new(path.as_os_str().as_bytes())?;
@@ -986,19 +957,18 @@ fn process_stat(text: &str, page_size: u64) -> Option<(Process, ProcessCounters)
     for field in &mut fields {
         *field = values.next()?;
     }
-    let value = |i: usize| fields.get(i)?.parse::<u64>().ok();
+    let value = |i: usize| fields[i].parse::<u64>().ok();
     let counters = ProcessCounters {
-        start: value(19)?,
         ticks: value(11)?.checked_add(value(12)?)?,
         io: None,
     };
     Some((
         Process {
             pid: pid.parse().ok()?,
-            start: counters.start,
+            start: value(19)?,
             name: name.into(),
             uid: 0,
-            state: fields.first()?.chars().next()?,
+            state: fields[0].chars().next()?,
             cpu: None,
             rss: value(21)?.checked_mul(page_size)?,
             read: None,
@@ -1020,12 +990,12 @@ fn process_text(path: PathBuf) -> io::Result<String> {
 }
 
 fn sample_processes(
-    previous: &HashMap<u32, ProcessCounters>,
+    previous: &HashMap<(u32, u64), ProcessCounters>,
     elapsed: Option<f64>,
     ticks_per_second: f64,
     page_size: u64,
     detail: Option<(u32, u64)>,
-) -> (Vec<Process>, HashMap<u32, ProcessCounters>) {
+) -> (Vec<Process>, HashMap<(u32, u64), ProcessCounters>) {
     let mut processes = Vec::new();
     let mut counters = HashMap::new();
     let Ok(entries) = fs::read_dir("/proc") else {
@@ -1049,7 +1019,8 @@ fn sample_processes(
         current.io = process_text(path.join("io"))
             .ok()
             .and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
-        if let Some(old) = previous.get(&pid).filter(|old| old.start == current.start) {
+        let identity = (pid, process.start);
+        if let Some(old) = previous.get(&identity) {
             process.cpu = per_second(current.ticks, old.ticks, elapsed)
                 .map(|v| (v * 100. / ticks_per_second) as f32);
             if let Some((old, new)) = old.io.zip(current.io) {
@@ -1057,14 +1028,14 @@ fn sample_processes(
                 process.write = per_second(new[1], old[1], elapsed);
             }
         }
-        if detail == Some((pid, current.start))
-            && let Some(detail) = process_details((pid, current.start), page_size)
+        if detail == Some(identity)
+            && let Some(detail) = process_details(identity, page_size)
         {
             process.command = detail.command;
             process.directory = detail.directory;
         }
         processes.push(process);
-        counters.insert(pid, current);
+        counters.insert(identity, current);
     }
     processes.sort_by_key(|p| p.pid);
     (processes, counters)
@@ -1104,12 +1075,17 @@ mod tests {
         assert_eq!(counter_percent(200, 100, 70, 20), Some(50.));
         assert_eq!(per_second(1100, 100, Some(2.)), Some(500.));
         assert_eq!(per_second(10, 100, Some(1.)), None);
-        let mem = memory_usage(
+        let mem = meminfo_usage(
             "MemTotal: 1000 kB\nMemAvailable: 666 kB\nSwapTotal: 400 kB\nSwapFree: 100 kB\n",
+            ["MemTotal:", "MemAvailable:"],
         )
         .unwrap();
         assert_eq!((mem.used, mem.total), (334 * 1024, 1000 * 1024));
-        let swap = swap_usage("SwapTotal: 400 kB\nSwapFree: 100 kB\n").unwrap();
+        let swap = meminfo_usage(
+            "SwapTotal: 400 kB\nSwapFree: 100 kB\n",
+            ["SwapTotal:", "SwapFree:"],
+        )
+        .unwrap();
         assert_eq!((swap.used, swap.total), (300 * 1024, 400 * 1024));
         let net =
             network_counters("Inter-| Receive\n eth0: 1024 1 2 3 0 0 0 0 2048 4 5 6 0 0 0 0\n");
@@ -1130,7 +1106,7 @@ mod tests {
             (123, 1, 3, 20 * 4096)
         );
         assert_eq!(process.name, "name ) with spaces");
-        assert_eq!((counters.start, counters.ticks), (900, 50));
+        assert_eq!((process.start, counters.ticks), (900, 50));
         assert_eq!(
             counter_pair(
                 "read_bytes: 42\nwrite_bytes: 84\n",
@@ -1172,7 +1148,7 @@ mod tests {
     }
     #[test]
     fn process_view_keeps_scroll_focus_and_filter_matching() {
-        use crate::monitor::{Action, Monitor};
+        use crate::monitor::{Action, Emphasis, Monitor};
         let mut monitor = Monitor::new().unwrap();
         monitor.stats.sample.processes = (1..=200)
             .map(|pid| Process {
@@ -1222,11 +1198,9 @@ mod tests {
         monitor.action(Action::Process(1));
         let view = monitor.view(80, 10);
         assert!(view.hits.iter().any(|hit| hit.action == Action::Process(1)));
-        assert!(
-            view.texts
-                .iter()
-                .any(|text| { text.text.contains("p1") && text.selected && text.focused })
-        );
+        assert!(view.texts.iter().any(|text| {
+            text.text.contains("p1") && text.emphasis(false) == Emphasis::Selected && text.focused
+        }));
         monitor.stats.sample.processes[0].uid = 0;
         monitor.stats.sample.processes[99].name = "ΟΣ".into();
         monitor.stats.sample.processes[100].name = "K-worker".into();
@@ -1263,7 +1237,7 @@ mod tests {
         assert!(
             view.texts
                 .iter()
-                .any(|t| t.selected && t.text.contains("p2"))
+                .any(|t| { t.emphasis(false) == Emphasis::Selected && t.text.contains("p2") })
         );
         let mut processes = std::mem::take(&mut monitor.stats.sample.processes);
         processes[2].rss = 40;
@@ -1292,7 +1266,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             [3, 1, 2]
         );
-        assert!(!view.texts.iter().any(|t| t.selected));
+        assert!(
+            !view
+                .texts
+                .iter()
+                .any(|t| t.emphasis(false) == Emphasis::Selected)
+        );
         monitor.key(crate::input::keysym::UP, "", false);
         assert_eq!(monitor.focus, Action::Process(1));
         monitor.action(Action::Sort(1));

@@ -112,24 +112,16 @@ impl Frame {
             && cursor_shape != CursorShape::Hidden
             && (0..row_count as i32).contains(&cursor_row))
         .then(|| {
-            let width = if term.row(cursor_row as usize).cells[cursor_point.column]
-                .flags
-                .contains(Flags::WIDE_CHAR)
-            {
-                2
-            } else {
-                1
-            };
             (
                 cursor_point.column,
                 cursor_row as usize,
                 cursor_shape,
-                width,
+                term.row(cursor_row as usize).cells[cursor_point.column].width(),
             )
         });
         let block_cursor = cursor
             .filter(|(_, _, shape, _)| focused && *shape == CursorShape::Block)
-            .map(|(_, row, _, _)| (row, cursor_point.column));
+            .map(|(column, row, _, _)| (row, column));
         // The filled cursor changes cached text colors; focus and overlays can change
         // its visibility without any PTY damage.
         if !full && cache.block_cursor != block_cursor {
@@ -172,16 +164,11 @@ impl Frame {
                 if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     continue;
                 }
-                let width = if cell.flags.contains(Flags::WIDE_CHAR) {
-                    2
-                } else {
-                    1
-                };
+                let width = cell.width();
                 let p = Point { line, column };
                 let selected = selection.as_ref().is_some_and(|s| s.contains(p))
                     && !cell.flags.contains(Flags::PROMPT);
-                let block_cursor =
-                    p == cursor_point && !preedit && focused && cursor_shape == CursorShape::Block;
+                let block_cursor = block_cursor == Some((index, column));
                 let start = text.len();
                 if cell.flags.contains(Flags::HIDDEN) {
                     text.extend(std::iter::repeat_n(' ', width));
@@ -198,17 +185,13 @@ impl Frame {
                     }
                     column_map.extend(std::iter::repeat_n(column as u16, text.len() - start));
                 }
+                let flags = cell.flags & Flags::TEXT_STYLE;
+                let underline_color = extra.and_then(|extra| extra.underline_color);
                 let style = (
                     cell.fg,
                     cell.bg,
-                    cell.flags
-                        & (Flags::BOLD
-                            | Flags::ITALIC
-                            | Flags::DIM
-                            | Flags::INVERSE
-                            | Flags::ALL_UNDERLINES
-                            | Flags::STRIKEOUT),
-                    extra.and_then(|e| e.underline_color),
+                    flags,
+                    underline_color,
                     selected,
                     block_cursor,
                 );
@@ -222,13 +205,13 @@ impl Frame {
                 }
                 previous_style = Some(style);
                 let mut fg = term.color(cell.fg);
-                if cell.flags.contains(Flags::DIM) {
+                if flags.contains(Flags::DIM) {
                     fg = fg.dimmed();
                 }
                 let mut fg = fg.rgba();
                 let mut bg = term.color(cell.bg).rgba();
                 let mut default_bg = cell.bg == Color::Named(NamedColor::Background);
-                if cell.flags.contains(Flags::INVERSE) {
+                if flags.contains(Flags::INVERSE) {
                     std::mem::swap(&mut fg, &mut bg);
                     default_bg = false;
                 }
@@ -247,27 +230,25 @@ impl Frame {
                         start: start as u32,
                         end: text.len() as u32,
                         color: fg,
-                        flags: u32::from(cell.flags.contains(Flags::BOLD))
-                            | (u32::from(cell.flags.contains(Flags::ITALIC)) << 1),
+                        flags: u32::from((flags & (Flags::BOLD | Flags::ITALIC)).bits()),
                     },
                     start: column as u16,
                     end: (column + width) as u16,
                     background: NonZeroU32::new(if default_bg { 0 } else { bg }),
-                    underline: cell.flags.intersects(Flags::ALL_UNDERLINES).then(|| {
+                    underline: flags.intersects(Flags::ALL_UNDERLINES).then(|| {
                         (
-                            extra
-                                .and_then(|e| e.underline_color)
-                                .map_or(fg, |c| term.color(c).rgba()),
-                            cell.flags.contains(Flags::UNDERCURL),
+                            underline_color.map_or(fg, |c| term.color(c).rgba()),
+                            flags.contains(Flags::UNDERCURL),
                         )
                     }),
-                    strike: cell.flags.contains(Flags::STRIKEOUT),
+                    strike: flags.contains(Flags::STRIKEOUT),
                 });
             }
-            while let Some(run) = runs.last_mut() {
-                if run.background.is_some() || run.underline.is_some() || run.strike {
-                    break;
-                }
+            while let Some(run) = runs.last_mut()
+                && run.background.is_none()
+                && run.underline.is_none()
+                && !run.strike
+            {
                 let start = run.text.start as usize;
                 let trimmed = text[start..].trim_end_matches(' ').len();
                 text.truncate(start + trimmed);
@@ -348,12 +329,10 @@ impl Frame {
         cache.rows.truncate(self.row_count);
         let mut native_runs = Vec::new();
         for row in self.rows {
-            if cache
-                .rows
-                .get(row.index)
-                .is_some_and(|cached| cached.matches(&row))
+            if let Some(cached) = cache.rows.get_mut(row.index)
+                && cached.matches(&row)
             {
-                cache.rows[row.index].runs = row.runs;
+                cached.runs = row.runs;
                 continue;
             }
             native_runs.clear();
@@ -367,8 +346,8 @@ impl Frame {
                 line,
                 runs: row.runs,
             };
-            if row.index < cache.rows.len() {
-                cache.rows[row.index] = cached;
+            if let Some(slot) = cache.rows.get_mut(row.index) {
+                *slot = cached;
             } else {
                 cache.rows.push(cached);
             }
@@ -385,17 +364,14 @@ impl Frame {
                 if let Some(color) = run.background {
                     let x = origin.0 + cell.0 * run.start as f32;
                     let end = runs.last().unwrap().end;
-                    let width = if usize::from(end) == self.columns {
-                        cell.0 * (end - run.start) as f32
-                            + (size.0 - cell.0 * self.columns as f32).max(0.)
-                    } else {
-                        cell.0 * (end - run.start) as f32
-                    };
-                    let height = if row + 1 == self.row_count {
-                        cell.1 + (size.1 - cell.1 * self.row_count as f32).max(0.)
-                    } else {
-                        cell.1
-                    };
+                    let mut width = cell.0 * (end - run.start) as f32;
+                    if usize::from(end) == self.columns {
+                        width += (size.0 - cell.0 * self.columns as f32).max(0.);
+                    }
+                    let mut height = cell.1;
+                    if row + 1 == self.row_count {
+                        height += (size.1 - cell.1 * self.row_count as f32).max(0.);
+                    }
                     renderer.rect(x, y, width, height, color.get(), false);
                 }
             }

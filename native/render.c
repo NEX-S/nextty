@@ -1156,8 +1156,8 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
     line->text = (char *)line->runs + run_bytes + (columns ? length * sizeof *columns : 0);
     memcpy(line->text, text, length);
     line->text[length] = 0;
-    if (run_count) memcpy(line->runs, runs, run_count * sizeof *runs);
-    if (columns && length) memcpy(line->columns, columns, length * sizeof *columns);
+    if (run_count) memcpy(line->runs, runs, run_bytes);
+    if (line->columns) memcpy(line->columns, columns, length * sizeof *columns);
     return line;
 }
 
@@ -1243,11 +1243,8 @@ static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
         single.x = -left;
         single.y = -top;
         cairo_show_glyphs(cr, &single, 1);
-        if (!finish_raster(r, cr, surface)) {
-            cairo_surface_destroy(surface);
-            return NULL;
-        }
-        int uploaded = upload_glyph(r, color, x, y, width, height, surface);
+        int uploaded = finish_raster(r, cr, surface) &&
+            upload_glyph(r, color, x, y, width, height, surface);
         cairo_surface_destroy(surface);
         if (!uploaded) return NULL;
         r->atlas_x[color] += width;
@@ -1310,10 +1307,10 @@ void nt_renderer_tab(NtRenderer *r, float x, float y, float width, float height,
     add_op(r, op);
 }
 
-void nt_renderer_line(NtRenderer *r, const NtLine *line, float x, float y) {
+void nt_renderer_line(NtRenderer *r, NtLine *line, float x, float y) {
     if (r->error[0] || (!line->text && !line->count)) return;
-    if (add_op(r, (Op){.kind = OP_LINE, .line = {(NtLine *)line, x, y}}))
-        ++((NtLine *)line)->references;
+    if (add_op(r, (Op){.kind = OP_LINE, .line = {line, x, y}}))
+        ++line->references;
 }
 
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {

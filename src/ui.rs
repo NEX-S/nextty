@@ -1,5 +1,7 @@
 use crate::files::FileNav;
 use crate::input::keysym;
+use crate::panel::mix_color;
+use crate::workspace::{Action, Axis, Direction, PaneId};
 
 #[cfg(feature = "agent")]
 use crate::agent::panel::AgentPanel;
@@ -11,12 +13,41 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
-    [0, 8, 16].into_iter().fold(0, |rgb, shift| {
-        rgb | ((((foreground >> shift & 255) * weight
-            + (background >> shift & 255) * (255 - weight))
-            / 255)
-            << shift)
+pub(crate) fn tab_color(tab: &crate::workspace::TabView) -> u32 {
+    use crate::workspace::TabActivity;
+    match tab.activity {
+        TabActivity::Running => 0xfe9b30,
+        TabActivity::Finished | TabActivity::Idle | TabActivity::Unknown => 0xb5d2a2,
+        TabActivity::Failed => 0xef5350,
+    }
+}
+
+pub(crate) fn workspace_action(key: char, pane: PaneId) -> Option<Action> {
+    Some(match key {
+        's' => Action::Split {
+            pane: 0,
+            axis: Axis::TopBottom,
+        },
+        'v' => Action::Split {
+            pane: 0,
+            axis: Axis::LeftRight,
+        },
+        'h' => Action::Navigate(Direction::Left),
+        'j' => Action::Navigate(Direction::Down),
+        'k' => Action::Navigate(Direction::Up),
+        'l' => Action::Navigate(Direction::Right),
+        ',' => Action::Tab(-1),
+        '.' => Action::Tab(1),
+        '\r' | '\n' => Action::NewTab { pane },
+        'p' => Action::PromptJump {
+            pane,
+            previous: true,
+        },
+        'n' => Action::PromptJump {
+            pane,
+            previous: false,
+        },
+        _ => return None,
     })
 }
 
@@ -71,6 +102,16 @@ impl Ui {
             files_open: false,
         })
     }
+
+    pub fn load_files(&mut self, directory: std::path::PathBuf) -> io::Result<()> {
+        if let Some(files) = &mut self.files {
+            files.set_directory(directory)?;
+        } else {
+            self.files = Some(FileNav::new(directory)?);
+        }
+        Ok(())
+    }
+
     pub fn input_target(&self) -> Option<crate::input::PasteTarget> {
         use crate::input::PasteTarget;
         #[cfg(feature = "agent")]
@@ -109,15 +150,12 @@ impl Ui {
     }
 
     pub fn text_target(&self) -> Option<crate::input::PasteTarget> {
-        let target = self.paste_target()?;
-        if target == crate::input::PasteTarget::Files
-            && !self.files.as_ref().is_some_and(|files| {
-                files.is_search() && files.focus() == crate::files::FileFocus::List
-            })
-        {
-            return None;
-        }
-        Some(target)
+        self.paste_target().filter(|target| {
+            *target != crate::input::PasteTarget::Files
+                || self.files.as_ref().is_some_and(|files| {
+                    files.is_search() && files.focus() == crate::files::FileFocus::List
+                })
+        })
     }
 
     pub fn key(
@@ -199,39 +237,24 @@ impl Ui {
                         files.focus_preview();
                     }
                 }
+                keysym::ESCAPE | keysym::BACKSPACE | keysym::LEFT if preview => files.focus_list(),
                 keysym::ESCAPE => {
-                    if preview {
-                        files.focus_list();
-                    } else if files.is_search() {
+                    if files.is_search() {
                         files.stop_search();
                     } else {
                         self.files_open = false;
                         self.focus = Focus::Terminal;
                     }
                 }
-                keysym::BACKSPACE => {
-                    if preview {
-                        files.focus_list();
-                    } else if files.is_search() {
-                        files.backspace_query();
-                    } else {
+                keysym::BACKSPACE if files.is_search() => files.backspace_query(),
+                keysym::BACKSPACE | keysym::LEFT => {
+                    if !files.is_search() {
                         files.parent();
                     }
                 }
                 keysym::UP | keysym::DOWN => {
                     let delta = if symbol == keysym::UP { -1 } else { 1 };
-                    if preview {
-                        files.scroll_preview(delta, viewport.1);
-                    } else {
-                        files.move_selection(delta);
-                    }
-                }
-                keysym::LEFT => {
-                    if preview {
-                        files.focus_list();
-                    } else if !files.is_search() {
-                        files.parent();
-                    }
+                    files.scroll(delta, viewport.1);
                 }
                 keysym::RIGHT => {
                     if !files.enter_selected() {
@@ -320,11 +343,7 @@ impl Ui {
             } else if self.files_open && self.focus == Focus::Files {
                 self.files.as_ref().map(FileNav::directory)
             } else {
-                snapshot
-                    .panes
-                    .iter()
-                    .find(|pane| pane.id == snapshot.focused)
-                    .and_then(|pane| pane.cwd.as_deref())
+                snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
             };
             resources = self
                 .resources
@@ -344,21 +363,6 @@ impl Ui {
             changed |= files.poll();
         }
         Ok((resources, changed))
-    }
-
-    pub fn tab_color(
-        &self,
-        tab: &crate::workspace::TabView,
-        foreground: u32,
-        background: u32,
-    ) -> u32 {
-        use crate::workspace::TabActivity;
-        match tab.activity {
-            TabActivity::Running => 0xfe9b30,
-            TabActivity::Finished => 0xb5d2a2,
-            TabActivity::Failed => 0xe87575,
-            TabActivity::Idle | TabActivity::Unknown => mix_color(foreground, background, 64),
-        }
     }
 
     pub fn request_close_tab(&mut self, tab: &crate::workspace::TabView) -> bool {
@@ -389,11 +393,7 @@ impl Ui {
         let directory = if self.files_open && self.focus == Focus::Files {
             self.files.as_ref().map(FileNav::directory)
         } else {
-            snapshot
-                .panes
-                .iter()
-                .find(|pane| pane.id == snapshot.focused)
-                .and_then(|pane| pane.cwd.as_deref())
+            snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
         };
         let Some(directory) = directory else {
             return Cow::Borrowed("");
@@ -419,16 +419,9 @@ impl Ui {
     }
 
     pub fn expire_status(&mut self) -> bool {
-        if self
-            .status
-            .as_ref()
-            .is_some_and(|(_, until)| Instant::now() >= *until)
-        {
-            self.status = None;
-            true
-        } else {
-            false
-        }
+        self.status
+            .take_if(|(_, until)| Instant::now() >= *until)
+            .is_some()
     }
     pub fn cycle_focus(&mut self, reverse: bool) {
         let targets = [
@@ -440,15 +433,13 @@ impl Ui {
             self.agent.open.then_some(Focus::Output),
             self.resources.open.then_some(Focus::Monitor),
         ];
-        let count = targets.iter().flatten().count();
+        let mut targets = targets.iter().flatten();
+        let count = targets.clone().count();
         let index = targets
-            .iter()
-            .flatten()
+            .clone()
             .position(|target| *target == self.focus)
             .unwrap_or(0);
         self.focus = *targets
-            .iter()
-            .flatten()
             .nth((index + if reverse { count - 1 } else { 1 }) % count)
             .unwrap();
     }

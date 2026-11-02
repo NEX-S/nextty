@@ -3,7 +3,7 @@
 use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
-use crate::core::Core;
+use crate::core::{Core, Flags};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rgb {
@@ -13,6 +13,18 @@ pub struct Rgb {
 }
 
 impl Rgb {
+    pub(crate) const fn from_packed(value: u32) -> Self {
+        Self {
+            r: (value >> 16) as u8,
+            g: (value >> 8) as u8,
+            b: value as u8,
+        }
+    }
+
+    pub(crate) const fn packed(self) -> u32 {
+        u32::from_be_bytes([0, self.r, self.g, self.b])
+    }
+
     #[cfg(feature = "gui")]
     pub(crate) fn dimmed(self) -> Self {
         let channels = [self.r, self.g, self.b];
@@ -34,7 +46,7 @@ impl Rgb {
 
     #[cfg(feature = "gui")]
     pub(crate) fn rgba(self) -> u32 {
-        u32::from_be_bytes([self.r, self.g, self.b, 255])
+        self.packed() << 8 | 255
     }
 }
 
@@ -71,6 +83,8 @@ pub enum NamedColor {
     BrightForeground,
     DimForeground,
 }
+
+pub(crate) const PALETTE_SIZE: usize = NamedColor::DimForeground as usize + 1;
 
 impl NamedColor {
     pub fn from_index(index: u16) -> Option<Self> {
@@ -122,35 +136,20 @@ pub enum Color {
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(u8)]
 pub enum CursorShape {
     #[default]
-    Block,
-    Underline,
-    Beam,
-    Hidden,
+    Block = 0,
+    Underline = 1,
+    Beam = 2,
+    Hidden = 3,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum Attr {
     Reset,
-    Bold,
-    Dim,
-    Italic,
-    Underline,
-    DoubleUnderline,
-    Undercurl,
-    DottedUnderline,
-    DashedUnderline,
-    Reverse,
-    Hidden,
-    Strike,
-    CancelBold,
-    CancelBoldDim,
-    CancelItalic,
-    CancelUnderline,
-    CancelReverse,
-    CancelHidden,
-    CancelStrike,
+    Flags(Flags, bool),
+    Underline(Flags),
     Foreground(Color),
     Background(Color),
     UnderlineColor(Option<Color>),
@@ -225,7 +224,7 @@ enum State {
     #[default]
     Ground,
     Escape,
-    EscapeIntermediate,
+    EscapeIntermediate(u8),
     Csi,
     Osc,
     OscEscape,
@@ -290,11 +289,7 @@ impl Csi {
     }
 
     fn value(&self, index: usize) -> u16 {
-        self.values
-            .get(index)
-            .copied()
-            .filter(|_| index < self.count)
-            .unwrap_or(0)
+        self.values[..self.count].get(index).copied().unwrap_or(0)
     }
     fn count(&self, index: usize) -> usize {
         usize::from(self.value(index).max(1))
@@ -312,7 +307,6 @@ const OSC_RETAIN_LIMIT: usize = 16 * 1024;
 pub struct Parser {
     state: State,
     csi: Csi,
-    escape_intermediate: u8,
     utf8: [u8; 4],
     utf8_len: usize,
     last_char: Option<char>,
@@ -388,15 +382,11 @@ impl Parser {
         let mut committed = false;
         // Keep one batch under the Core lock while respecting history backpressure.
         let mut remaining = 16 * 1024;
-        loop {
-            let next = input.take().or_else(|| {
-                self.queued
-                    .pop_front()
-                    .map(|(data, position)| (Cow::Owned(data), position))
-            });
-            let Some((data, mut position)) = next else {
-                break;
-            };
+        while let Some((data, mut position)) = input.take().or_else(|| {
+            self.queued
+                .pop_front()
+                .map(|(data, position)| (Cow::Owned(data), position))
+        }) {
             while position < data.len() && remaining != 0 && core.history_read_ready() {
                 let end = (position + remaining.min(512)).min(data.len());
                 committed |= self.advance(core, &data[position..end]);
@@ -440,17 +430,17 @@ impl Parser {
                         self.utf8_len = 0;
                         break;
                     }
-                    Err(error) if error.error_len().is_some() => {
-                        let length = error.error_len().unwrap();
-                        core.input('\u{fffd}');
-                        self.last_char = Some('\u{fffd}');
+                    Err(error) => {
+                        let Some(length) = error.error_len() else {
+                            break;
+                        };
+                        self.print(core, "\u{fffd}");
                         self.utf8.copy_within(length..self.utf8_len, 0);
                         self.utf8_len -= length;
                         if self.utf8_len == 0 {
                             break;
                         }
                     }
-                    Err(_) => break,
                 }
             }
         }
@@ -482,7 +472,7 @@ impl Parser {
     fn control(&mut self, core: &mut Core, byte: u8) {
         match byte {
             0x08 => core.move_backward(1),
-            0x09 => core.move_forward_tabs(1),
+            0x09 => core.move_tabs(1, true),
             0x0a..=0x0c => core.newline(),
             0x0d => core.carriage_return(),
             0x0e => core.set_active_charset(1),
@@ -581,22 +571,18 @@ impl Parser {
                     self.state = State::Osc;
                 }
                 b'P' | b'X' | b'^' | b'_' => self.state = State::IgnoreString,
-                0x20..=0x2f => {
-                    self.escape_intermediate = byte;
-                    self.state = State::EscapeIntermediate;
-                }
+                0x20..=0x2f => self.state = State::EscapeIntermediate(byte),
                 _ => {
                     self.state = State::Ground;
                     self.escape(core, 0, byte);
                 }
             },
-            State::EscapeIntermediate => {
+            State::EscapeIntermediate(intermediate) => {
                 if byte >= 0x30 {
                     self.state = State::Ground;
-
-                    self.escape(core, self.escape_intermediate, byte);
+                    self.escape(core, intermediate, byte);
                 } else {
-                    self.escape_intermediate = 0xff;
+                    self.state = State::EscapeIntermediate(0xff);
                 }
             }
             State::Csi if (0x40..=0x7e).contains(&byte) => {
@@ -622,8 +608,7 @@ impl Parser {
             (0, b'H') => core.set_horizontal_tabstop(),
             (0, b'M') => core.reverse_index(),
             (0, b'Z') => core.identify_terminal(None),
-            (0, b'=') => core.set_keypad_application_mode(),
-            (0, b'>') => core.unset_keypad_application_mode(),
+            (0, b'=' | b'>') => core.set_keypad_application_mode(final_byte == b'='),
             (0, b'c') => {
                 core.reset_state();
                 self.last_char = None;
@@ -649,18 +634,19 @@ impl Parser {
         }
         let count = p.count(0);
         match (p.prefix, p.intermediate, final_byte) {
-            (0, 0, b'@') => core.insert_blank(count),
-            (0, 0, b'A') => core.move_up(count),
-            (0, 0, b'B' | b'e') => core.move_down(count),
+            (0, 0, b'@' | b'P') => core.shift_chars(count, final_byte == b'@'),
+            (0, 0, b'A' | b'B' | b'e' | b'E' | b'F') => {
+                core.move_vertical(count, matches!(final_byte, b'B' | b'e' | b'E'));
+                if matches!(final_byte, b'E' | b'F') {
+                    core.carriage_return();
+                }
+            }
             (0, 0, b'C' | b'a') => core.move_forward(count),
             (0, 0, b'D') => core.move_backward(count),
-            (0, 0, b'E') => core.move_down_and_cr(count),
-            (0, 0, b'F') => core.move_up_and_cr(count),
             (0, 0, b'G' | b'`') => core.goto_col(count - 1),
             (0, 0, b'H' | b'f') => core.goto((count - 1) as i32, p.count(1) - 1),
             (0, 0, b'd') => core.goto_line((count - 1) as i32),
-            (0, 0, b'I') => core.move_forward_tabs(count as u16),
-            (0, 0, b'Z') => core.move_backward_tabs(count as u16),
+            (0, 0, b'I' | b'Z') => core.move_tabs(count as u16, final_byte == b'I'),
             (0, 0, b'J') => match p.value(0) {
                 0 => core.clear_screen(ClearMode::Below),
                 1 => core.clear_screen(ClearMode::Above),
@@ -674,11 +660,8 @@ impl Parser {
                 2 => core.clear_line(LineClearMode::All),
                 _ => (),
             },
-            (0, 0, b'L') => core.insert_blank_lines(count),
-            (0, 0, b'M') => core.delete_lines(count),
-            (0, 0, b'P') => core.delete_chars(count),
-            (0, 0, b'S') => core.scroll_up(count),
-            (0, 0, b'T') => core.scroll_down(count),
+            (0, 0, b'L' | b'M') => core.shift_lines(count, final_byte == b'L'),
+            (0, 0, b'S' | b'T') => core.scroll(count, final_byte == b'T'),
             (0, 0, b'X') => core.erase_chars(count),
             (0, 0, b'b') => {
                 if let Some(c) = self.last_char {
@@ -694,11 +677,7 @@ impl Parser {
             },
             (0, 0, b'h' | b'l') => {
                 for mode in &p.values[..p.count] {
-                    if final_byte == b'h' {
-                        core.set_mode(*mode);
-                    } else {
-                        core.unset_mode(*mode);
-                    }
+                    core.set_mode(*mode, final_byte == b'h');
                 }
             }
             (b'?', 0, b'h' | b'l') => {
@@ -711,15 +690,10 @@ impl Parser {
             }
             (0, 0, b'm') => self.sgr(core),
             (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => {
-                core.identify_terminal(if p.prefix == 0 {
-                    None
-                } else {
-                    Some(char::from(p.prefix))
-                })
+                core.identify_terminal((p.prefix != 0).then_some(char::from(p.prefix)))
             }
             (0, 0, b'n') => core.device_status(usize::from(p.value(0))),
-            (0, b'$', b'p') => core.report_mode(p.value(0)),
-            (b'?', b'$', b'p') => core.report_private_mode(p.value(0)),
+            (0 | b'?', b'$', b'p') => core.report_mode(p.value(0), p.prefix == b'?'),
             (0, b' ', b'q') => core.set_cursor_shape(match p.value(0) {
                 0..=2 => CursorShape::Block,
                 3..=4 => CursorShape::Underline,
@@ -754,34 +728,31 @@ impl Parser {
             while end < p.count && p.colon(end) {
                 end += 1;
             }
+            let colon = end > index + 1;
             let attr = match value {
                 0 => Some(Attr::Reset),
-                1 => Some(Attr::Bold),
-                2 => Some(Attr::Dim),
-                3 => Some(Attr::Italic),
-                4 => match if end > index + 1 {
-                    p.values[index + 1]
-                } else {
-                    1
-                } {
-                    0 => Some(Attr::CancelUnderline),
-                    1 => Some(Attr::Underline),
-                    2 => Some(Attr::DoubleUnderline),
-                    3 => Some(Attr::Undercurl),
-                    4 => Some(Attr::DottedUnderline),
-                    5 => Some(Attr::DashedUnderline),
+                1 => Some(Attr::Flags(Flags::BOLD, true)),
+                2 => Some(Attr::Flags(Flags::DIM, true)),
+                3 => Some(Attr::Flags(Flags::ITALIC, true)),
+                4 => match if colon { p.values[index + 1] } else { 1 } {
+                    0 => Some(Attr::Flags(Flags::ALL_UNDERLINES, false)),
+                    1 => Some(Attr::Underline(Flags::UNDERLINE)),
+                    2 => Some(Attr::Underline(Flags::DOUBLE_UNDERLINE)),
+                    3 => Some(Attr::Underline(Flags::UNDERCURL)),
+                    4 => Some(Attr::Underline(Flags::DOTTED_UNDERLINE)),
+                    5 => Some(Attr::Underline(Flags::DASHED_UNDERLINE)),
                     _ => None,
                 },
-                7 => Some(Attr::Reverse),
-                8 => Some(Attr::Hidden),
-                9 => Some(Attr::Strike),
-                21 => Some(Attr::CancelBold),
-                22 => Some(Attr::CancelBoldDim),
-                23 => Some(Attr::CancelItalic),
-                24 => Some(Attr::CancelUnderline),
-                27 => Some(Attr::CancelReverse),
-                28 => Some(Attr::CancelHidden),
-                29 => Some(Attr::CancelStrike),
+                7 => Some(Attr::Flags(Flags::INVERSE, true)),
+                8 => Some(Attr::Flags(Flags::HIDDEN, true)),
+                9 => Some(Attr::Flags(Flags::STRIKEOUT, true)),
+                21 => Some(Attr::Flags(Flags::BOLD, false)),
+                22 => Some(Attr::Flags(Flags::BOLD | Flags::DIM, false)),
+                23 => Some(Attr::Flags(Flags::ITALIC, false)),
+                24 => Some(Attr::Flags(Flags::ALL_UNDERLINES, false)),
+                27 => Some(Attr::Flags(Flags::INVERSE, false)),
+                28 => Some(Attr::Flags(Flags::HIDDEN, false)),
+                29 => Some(Attr::Flags(Flags::STRIKEOUT, false)),
                 30..=37 | 90..=97 => Some(Attr::Foreground(ansi_color(if value < 90 {
                     value - 30
                 } else {
@@ -795,7 +766,6 @@ impl Parser {
                 }))),
                 49 => Some(Attr::Background(Color::Named(NamedColor::Background))),
                 38 | 48 | 58 => {
-                    let colon = end > index + 1;
                     let mode = p.value(index + 1);
                     let channels = if mode == 2 {
                         3
@@ -847,16 +817,13 @@ impl Parser {
 
     fn dispatch_osc(&self, core: &mut Core, terminator: &str) {
         let mut parts = self.osc.split(|b| *b == b';');
-        let Some(command) = parts.next().and_then(decimal) else {
+        let command_bytes = parts.next().unwrap();
+        let Some(command) = decimal(command_bytes) else {
             return;
         };
         match command {
             0 | 2 => {
-                let offset = self
-                    .osc
-                    .iter()
-                    .position(|b| *b == b';')
-                    .map_or(self.osc.len(), |i| i + 1);
+                let offset = (command_bytes.len() + 1).min(self.osc.len());
                 core.set_title(Some(String::from_utf8_lossy(&self.osc[offset..])));
             }
 
@@ -881,22 +848,18 @@ impl Parser {
                                 terminator,
                             );
                         } else if let Some(color) = parse_color(value) {
-                            core.set_color(index, color);
+                            core.set_color(index, Some(color));
                         }
                     }
                 }
             }
             10..=12 => {
-                for (offset, value) in parts.enumerate() {
-                    let command = command + offset;
-                    if command > 12 {
-                        break;
-                    }
+                for (command, value) in (command..=12).zip(parts) {
                     let index = command + 246;
                     if value == b"?" {
                         core.dynamic_color_sequence(command, index, terminator);
                     } else if let Some(color) = parse_color(value) {
-                        core.set_color(index, color);
+                        core.set_color(index, Some(color));
                     }
                 }
             }
@@ -917,10 +880,13 @@ impl Parser {
             52 => {
                 if let (Some(target), Some(data)) = (parts.next(), parts.next()) {
                     let clipboard = target.first().copied().unwrap_or(b'c');
+                    if !matches!(clipboard, b'c' | b'p' | b's') {
+                        return;
+                    }
                     if data == b"?" {
                         core.clipboard_load(clipboard, terminator);
                     } else {
-                        core.clipboard_store(clipboard, data);
+                        core.clipboard_store(clipboard == b'p', data);
                     }
                 }
             }
@@ -929,16 +895,16 @@ impl Parser {
                 for part in parts {
                     supplied |= !part.is_empty();
                     if let Some(index) = decimal(part).filter(|i| *i < 256) {
-                        core.reset_color(index);
+                        core.set_color(index, None);
                     }
                 }
                 if !supplied {
                     for index in 0..256 {
-                        core.reset_color(index);
+                        core.set_color(index, None);
                     }
                 }
             }
-            110..=112 => core.reset_color(command + 146),
+            110..=112 => core.set_color(command + 146, None),
             _ => (),
         }
     }
@@ -996,15 +962,12 @@ fn parse_color(bytes: &[u8]) -> Option<Rgb> {
     }
     let rgb = bytes.strip_prefix(b"rgb:")?;
     let mut parts = rgb.split(|b| *b == b'/');
-    let channels = [parts.next()?, parts.next()?, parts.next()?];
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(Rgb {
-        r: channel(channels[0])?,
-        g: channel(channels[1])?,
-        b: channel(channels[2])?,
-    })
+    let color = Rgb {
+        r: channel(parts.next()?)?,
+        g: channel(parts.next()?)?,
+        b: channel(parts.next()?)?,
+    };
+    parts.next().is_none().then_some(color)
 }
 
 #[cfg(test)]

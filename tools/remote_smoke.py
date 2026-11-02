@@ -28,7 +28,10 @@ import subprocess
 import sys
 import tempfile
 import termios
+import threading
 import time
+
+from agent_bench import Lab as AgentLab
 
 
 ANSI = re.compile(rb'\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]')
@@ -51,6 +54,16 @@ def process_start(pid):
         return None
 
 
+def stop_process(process):
+    if process.poll() is None:
+        process.terminate()
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=3)
+
+
 def fixture(root):
     """The private sshd ForceCommand: preserve the real bridge and wire codec."""
     command = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
@@ -61,7 +74,7 @@ def fixture(root):
                XDG_RUNTIME_DIR=str(root / 'r'),
                XDG_CACHE_HOME=str(root / 'remote-cache'),
                XDG_CONFIG_HOME=str(root / 'remote-config'),
-               SHELL='/bin/sh', PS1='smoke> ', ENV='', LANG='C.UTF-8',
+               SHELL='/bin/bash', PS1='smoke> ', ENV='', LANG='C.UTF-8',
                PATH='/usr/bin:/bin')
     with (root / 'fixture.jsonl').open('a') as log:
         log.write(json.dumps({'pid': os.getpid(), 'command': command, 'mode': mode,
@@ -181,13 +194,7 @@ class Terminal:
             raise AssertionError('TUI detach failed: ' + repr(self.process.returncode))
 
     def close(self):
-        if self.process.poll() is None:
-            self.process.terminate()
-            try:
-                self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.process.kill()
-                self.process.wait(timeout=3)
+        stop_process(self.process)
         self.read(.02)
         os.close(self.master)
         self.log.close()
@@ -314,6 +321,55 @@ class Lab:
                     added_rtt_ms=self.rtt_ms, samples=len(samples),
                     p50_ms=statistics.median(samples), p99_ms=sorted(samples)[-1])
 
+    def exercise_agent_files(self):
+        agent = AgentLab(self.binary, tool_mode=True)
+        remote = self.root / 'remote-home'
+        local_decoy = self.root / 'local-home' / 'tiny.py'
+        local_decoy.write_text('local owner file must stay unchanged\n')
+        state = agent.prepare_workspace(remote, connection='ssh')
+        threading.Thread(target=agent.model.serve_forever, daemon=True).start()
+        config = self.root / 'local-home' / 'agent.toml'
+        config.write_text(f'base_url = "http://127.0.0.1:{agent.model.server_port}"\nmodel = "benchmark"\n')
+        self.env['ANTHROPIC_AUTH_TOKEN'] = 'benchmark'
+        try:
+            terminal = Terminal(self, ['new', self.destination, 'agent-workspace', '--tui',
+                                      '--config', str(config), '-e', sys.executable,
+                                      str(Path(__file__).resolve().with_name('agent_bench.py')),
+                                      '--fixture', str(remote)], 'agent-workspace')
+            terminal.expect('fixture-ready')
+            terminal.send(b'\x1ba')
+            terminal.read(.05)
+            terminal.command('Fix tiny.py and verify it while preserving my foreground application.')
+
+            def observed(predicate):
+                terminal.read(.02)
+                if agent.errors:
+                    raise RuntimeError(agent.errors)
+                return predicate()
+
+            wait_for(lambda: observed(agent.ready.is_set), 'remote agent model request')
+            terminal.send(b'\x1bh')
+            terminal.read(.05)
+            agent.go.set()
+            wait_for(lambda: observed(lambda: agent.goal_reviews == 1), 'remote native file and terminal tools', 20)
+            terminal.expect('tools-finished-proof')
+            assert self.file('verification-count') == b'run\n'
+            assert state['shell_submissions'] == 1 and agent.tool_index == 13, state
+            assert local_decoy.read_text() == 'local owner file must stay unchanged\n'
+            terminal.send(b'x')
+            wait_for(lambda: observed(lambda: '"index": 1' in (remote / 'input.jsonl').read_text()),
+                     'original remote foreground application still receives user input')
+            self.record('native agent tools use the SSH workspace filesystem and preserve the foreground application',
+                        original_pane=state['original_pane'], new_pane=state['new_pane'],
+                        verification_exit_code=0, shell_submissions=state['shell_submissions'],
+                        bounded_search_result_bytes=state['search_result_bytes'],
+                        roundtrip_ms=state['roundtrip_ms'], model_requests=len(agent.requests))
+        finally:
+            agent.go.set()
+            agent.model.shutdown()
+            agent.model.server_close()
+            agent.temp.cleanup()
+
     def exercise(self):
         target = self.destination
         empty = self.cli('list', target)
@@ -380,6 +436,7 @@ class Lab:
         recovered.detach()
         attached.detach()
         self.record('abrupt local frontend exit leaves the remote shell attachable')
+        self.exercise_agent_files()
         for mode in ['missing', 'invalid-protocol', 'unsupported-version']:
             (self.root / 'mode').write_text(mode)
             error = self.cli('list', target, success=False)
@@ -415,7 +472,7 @@ class Lab:
         env = dict(self.env, HOME=str(self.root / 'remote-home'),
                    XDG_RUNTIME_DIR=str(self.root / 'r'),
                    XDG_CACHE_HOME=str(self.root / 'remote-cache'))
-        for name in ['smoke', 'explicit']:
+        for name in ['smoke', 'explicit', 'agent-workspace']:
             try:
                 subprocess.run([str(self.binary), 'terminate', name], env=env,
                                capture_output=True, timeout=5)
@@ -432,12 +489,7 @@ class Lab:
             except (FileNotFoundError, ProcessLookupError, PermissionError):
                 pass
         if self.server is not None:
-            self.server.terminate()
-            try:
-                self.server.wait(timeout=3)
-            except subprocess.TimeoutExpired:
-                self.server.kill()
-                self.server.wait(timeout=3)
+            stop_process(self.server)
         if self.server_log:
             self.server_log.close()
         fixture_log = self.root / 'fixture.jsonl'

@@ -96,7 +96,7 @@ def traces(path):
     for line in complete.splitlines():
         f = line.split()
         if f[0] == "frame":
-            frames[int(f[1])] = {"begin": float(f[2]), "marker": int(f[7]), "focused": bool(int(f[12]))}
+            frames[int(f[1])] = {"begin": float(f[2]), "marker": int(f[6]), "focused": bool(int(f[11]))}
         elif f[0] == "presented" and f[4] == "0":
             if f[3] != "1":
                 raise RuntimeError("presentation feedback must use CLOCK_MONOTONIC")

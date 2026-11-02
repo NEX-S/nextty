@@ -30,6 +30,8 @@
 #include <xkbcommon/xkbcommon-compose.h>
 #include <xkbcommon/xkbcommon.h>
 
+enum { TRANSFER_TIMEOUT_MS = 10000, FILE_CHUNK_SIZE = 16384 };
+
 typedef struct Queued Queued;
 struct Queued {
     NtEvent event;
@@ -106,9 +108,7 @@ struct NtWindow {
     int cursor_x, cursor_y, cursor_w, cursor_h;
     uint32_t pointer_serial;
     int pointer_inside, resize_cursor;
-    char *pending_selection[2];
-    int pending_selection_file[2];
-    size_t pending_selection_len[2];
+    Source *pending_source[2];
     int paste_pending, paste_primary;
     Transfer *transfers;
     FileSender *file_sender;
@@ -157,10 +157,13 @@ struct NtWindow {
 };
 
 static _Thread_local char startup_error[256];
+static int64_t now_ns(void) {
+    struct timespec time;
+    clock_gettime(CLOCK_MONOTONIC, &time);
+    return (int64_t)time.tv_sec * 1000000000 + time.tv_nsec;
+}
 static int64_t now_ms(void) {
-    struct timespec t;
-    clock_gettime(CLOCK_MONOTONIC, &t);
-    return (int64_t)t.tv_sec * 1000 + t.tv_nsec / 1000000;
+    return now_ns() / 1000000;
 }
 static void fail(NtWindow *w, const char *format, ...) {
     if (w->error[0])
@@ -171,11 +174,6 @@ static void fail(NtWindow *w, const char *format, ...) {
     va_end(ap);
 }
 static void emit(NtWindow *w, NtEvent event);
-static int64_t now_ns(void) {
-    struct timespec time;
-    clock_gettime(CLOCK_MONOTONIC, &time);
-    return (int64_t)time.tv_sec * 1000000000 + time.tv_nsec;
-}
 static void schedule_frame(NtWindow *w, int64_t deadline) {
     if (w->frame_deadline_ns == deadline)
         return;
@@ -352,8 +350,8 @@ static void *file_sender_run(void *data) {
                 done = 1;
             if (!done && t->write_ready && t->sent == t->buffered) {
                 size_t count = t->length - (size_t)t->offset;
-                if (count > 16384)
-                    count = 16384;
+                if (count > FILE_CHUNK_SIZE)
+                    count = FILE_CHUNK_SIZE;
                 do n = pread(t->file_fd, t->buffer, count, t->offset);
                 while (n < 0 && errno == EINTR && !file_sender_closed(sender));
                 if (file_sender_closed(sender))
@@ -374,7 +372,7 @@ static void *file_sender_run(void *data) {
                     goto done;
                 if (n > 0) {
                     t->sent += (size_t)n;
-                    t->deadline = now_ms() + 10000;
+                    t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
                 }
                 done = ((size_t)t->offset == t->length && t->sent == t->buffered) || !n ||
                        (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
@@ -485,19 +483,18 @@ static int file_sender_start(NtWindow *w) {
     return 1;
 }
 static void queue_file(NtWindow *w, int fd, int file_fd) {
-    FileTransfer *t = calloc(1, sizeof *t + (fd < 0 ? 0 : 16384));
+    FileTransfer *t = calloc(1, sizeof *t + (fd < 0 ? 0 : FILE_CHUNK_SIZE));
     if (!t) {
-        int error = errno;
+        fail(w, "allocating clipboard file transfer: %s", strerror(errno));
         if (fd >= 0)
             close(fd);
         close(file_fd);
-        fail(w, "allocating clipboard file transfer: %s", strerror(error));
         return;
     }
     t->fd = fd;
     t->file_fd = file_fd;
     t->write_ready = 1;
-    t->deadline = now_ms() + 10000;
+    t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
     FileSender *sender = w->file_sender;
     pthread_mutex_lock(&sender->mutex);
     int error = sender->error;
@@ -529,16 +526,15 @@ static void add_transfer(NtWindow *w, int fd, int writing, const char *bytes, si
     int flags = fcntl(fd, F_GETFL);
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0 || flags < 0 ||
         fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0) {
-        int error = errno;
+        fail(w, "configuring clipboard descriptor: %s", strerror(errno));
         close(fd);
-        fail(w, "configuring clipboard descriptor: %s", strerror(error));
         return;
     }
     if (writing && file_fd >= 0) {
         int copy = fcntl(file_fd, F_DUPFD_CLOEXEC, 0);
         if (copy < 0) {
-            close(fd);
             fail(w, "duplicating clipboard file: %s", strerror(errno));
+            close(fd);
             return;
         }
         queue_file(w, fd, copy);
@@ -546,19 +542,19 @@ static void add_transfer(NtWindow *w, int fd, int writing, const char *bytes, si
     }
     Transfer *t = calloc(1, sizeof *t);
     if (!t) {
-        close(fd);
         fail(w, "allocating clipboard transfer: %s", strerror(errno));
+        close(fd);
         return;
     }
     t->fd = fd;
     t->writing = writing;
-    t->deadline = now_ms() + 10000;
+    t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
     if (writing) {
         t->bytes = malloc(length ? length : 1);
         if (!t->bytes) {
+            fail(w, "allocating clipboard transfer: %s", strerror(errno));
             close(fd);
             free(t);
-            fail(w, "allocating clipboard transfer: %s", strerror(errno));
             return;
         }
         if (length)
@@ -592,7 +588,7 @@ static void process_transfers(NtWindow *w, const struct pollfd *fds) {
                                : read(t->fd, buffer, count);
             } while (n < 0 && errno == EINTR);
             if (n > 0) {
-                t->deadline = now_ms() + 10000;
+                t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
                 if (t->writing) {
                     t->offset += (size_t)n;
                     done = t->offset == t->length;
@@ -614,7 +610,7 @@ static void process_transfers(NtWindow *w, const struct pollfd *fds) {
         *link = t->next;
         close(t->fd);
         if (!t->writing)
-            finish_paste(w, good ? (t->bytes ? t->bytes : "") : NULL, t->length);
+            finish_paste(w, good ? t->bytes : NULL, t->length);
         free(t->bytes);
         free(t);
     }
@@ -631,10 +627,14 @@ static uint32_t xkb_modifiers(struct xkb_state *state) {
         m |= NT_SUPER;
     return m;
 }
-static int printable_utf8(const char *text, int n) {
-    return n > 0 && (unsigned char)text[0] >= 32 && (unsigned char)text[0] != 127;
-}
-static void keyboard_text(NtWindow *w, xkb_keysym_t sym, const char *text, int n, int compose) {
+static void keyboard_text(NtWindow *w, uint32_t key, int composing) {
+    if (!w->key_state)
+        return;
+    xkb_keysym_t sym = xkb_state_key_get_one_sym(w->key_state, key + 8);
+    char text[128];
+    int n = xkb_state_key_get_utf8(w->key_state, key + 8, text, sizeof text);
+    if (n >= (int)sizeof text)
+        n = 0;
     int key_text = n > 0 && (w->modifiers & NT_ALT);
     emit(w, (NtEvent){.kind = NT_KEY,
                       .code = sym,
@@ -643,7 +643,7 @@ static void keyboard_text(NtWindow *w, xkb_keysym_t sym, const char *text, int n
                       .length = key_text ? (size_t)n : 0});
     if (w->modifiers & (NT_CONTROL | NT_ALT | NT_SUPER))
         return;
-    if (compose && w->compose) {
+    if (composing && w->compose) {
         xkb_compose_state_feed(w->compose, sym);
         switch (xkb_compose_state_get_status(w->compose)) {
         case XKB_COMPOSE_COMPOSING:
@@ -671,7 +671,7 @@ static void keyboard_text(NtWindow *w, xkb_keysym_t sym, const char *text, int n
             break;
         }
     }
-    if (printable_utf8(text, n))
+    if (n > 0 && (unsigned char)text[0] >= 32 && (unsigned char)text[0] != 127)
         emit(w, (NtEvent){.kind = NT_TEXT, .text = text, .length = (size_t)n});
 }
 static void size_changed(NtWindow *w);
@@ -685,10 +685,8 @@ static const struct xdg_wm_base_listener shell_listener = {.ping = shell_ping};
 static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
     NtWindow *w = data;
     NtEvent event = {.kind = NT_FRAME};
-    struct timespec received;
-    clock_gettime(CLOCK_MONOTONIC, &received);
     event.code = w->frame_callback_id;
-    event.x = received.tv_sec + received.tv_nsec / 1e9;
+    event.x = now_ns() / 1e9;
     event.y = time;
     wl_callback_destroy(cb);
     w->frame = NULL;
@@ -719,12 +717,7 @@ static void toplevel_configure(void *data, struct xdg_toplevel *top, int32_t wid
         if (!suspended)
             emit(w, (NtEvent){.kind = NT_EXPOSE});
     }
-    double received = 0;
-    if (w->tracing) {
-        struct timespec timestamp;
-        clock_gettime(CLOCK_MONOTONIC, &timestamp);
-        received = timestamp.tv_sec + timestamp.tv_nsec / 1e9;
-    }
+    double received = w->tracing ? now_ns() / 1e9 : 0;
     emit(w, (NtEvent){.kind = NT_WINDOW_STATE, .code = flags, .x = received});
 }
 static void toplevel_close(void *data, struct xdg_toplevel *top) {
@@ -858,25 +851,14 @@ static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t se
     emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
     emit(w, (NtEvent){.kind = NT_FOCUS});
 }
-static void wayland_key(NtWindow *w, uint32_t key, int composing) {
-    if (!w->key_state)
-        return;
-    xkb_keysym_t sym = xkb_state_key_get_one_sym(w->key_state, key + 8);
-    char text[128];
-    int n = xkb_state_key_get_utf8(w->key_state, key + 8, text, sizeof text);
-    if (n >= (int)sizeof text)
-        n = 0;
-    keyboard_text(w, sym, text, n, composing);
-}
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
                          uint32_t key, uint32_t state) {
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
-        if (w->pending_selection[i] || w->pending_selection_file[i] >= 0)
-            wayland_selection(w, i);
+        wayland_selection(w, i);
     if (state == WL_KEYBOARD_KEY_STATE_PRESSED || state == WL_KEYBOARD_KEY_STATE_REPEATED)
-        wayland_key(w, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
+        keyboard_text(w, key, state == WL_KEYBOARD_KEY_STATE_PRESSED);
 }
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t depressed, uint32_t latched, uint32_t locked,
@@ -929,8 +911,7 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
-        if (w->pending_selection[i] || w->pending_selection_file[i] >= 0)
-            wayland_selection(w, i);
+        wayland_selection(w, i);
     uint32_t code = button == 0x110 ? 1 : button == 0x112 ? 2 : button == 0x111 ? 3 : button;
     emit(w, (NtEvent){.kind = NT_BUTTON,
                       .code = code,
@@ -984,6 +965,12 @@ static const struct wl_pointer_listener pointer_listener = {.enter = pointer_ent
                                                             .axis_value120 = pointer_axis_value,
                                                             .axis_relative_direction =
                                                                 pointer_axis_direction};
+static void clear_pending_text(NtWindow *w) {
+    free(w->pending_commit);
+    w->pending_commit = NULL;
+    free(w->pending_preedit);
+    w->pending_preedit = NULL;
+}
 static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
     NtWindow *w = data;
     w->text_enabled = 1;
@@ -1001,10 +988,7 @@ static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_su
         zwp_text_input_v3_commit(w->text_input);
     }
     w->text_enabled = 0;
-    free(w->pending_commit);
-    w->pending_commit = NULL;
-    free(w->pending_preedit);
-    w->pending_preedit = NULL;
+    clear_pending_text(w);
     emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
 }
 static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char *text,
@@ -1040,22 +1024,20 @@ static void text_done(void *data, struct zwp_text_input_v3 *input, uint32_t seri
     NtWindow *w = data;
     /* Stale serials still carry valid edits. No state requests are issued from
        done: application cursor changes have already committed their own state. */
-    if (w->pending_commit)
+    if (w->pending_commit) {
         emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
-    if (w->pending_commit && *w->pending_commit)
-        emit(w, (NtEvent){.kind = NT_TEXT,
-                          .text = w->pending_commit,
-                          .length = strlen(w->pending_commit)});
+        if (*w->pending_commit)
+            emit(w, (NtEvent){.kind = NT_TEXT,
+                              .text = w->pending_commit,
+                              .length = strlen(w->pending_commit)});
+    }
     const char *s = w->pending_preedit ? w->pending_preedit : "";
     emit(w, (NtEvent){.kind = NT_PREEDIT,
                       .text = s,
                       .length = strlen(s),
                       .start = w->pending_preedit ? w->preedit_begin : 0,
                       .end = w->pending_preedit ? w->preedit_end : 0});
-    free(w->pending_commit);
-    w->pending_commit = NULL;
-    free(w->pending_preedit);
-    w->pending_preedit = NULL;
+    clear_pending_text(w);
 }
 static const struct zwp_text_input_v3_listener text_listener = {.enter = text_enter,
                                                                 .leave = text_leave,
@@ -1073,10 +1055,14 @@ static void source_remove(Source *source) {
         *link = source->next;
     if (w->current_source[source->primary] == source)
         w->current_source[source->primary] = NULL;
-    if (source->primary)
-        zwp_primary_selection_source_v1_destroy(source->proxy);
-    else
-        wl_data_source_destroy(source->proxy);
+    if (w->pending_source[source->primary] == source)
+        w->pending_source[source->primary] = NULL;
+    if (source->proxy) {
+        if (source->primary)
+            zwp_primary_selection_source_v1_destroy(source->proxy);
+        else
+            wl_data_source_destroy(source->proxy);
+    }
     free(source->bytes);
     if (source->file_fd >= 0)
         queue_file(w, -1, source->file_fd);
@@ -1111,20 +1097,9 @@ static void primary_cancel(void *data, struct zwp_primary_selection_source_v1 *s
 static const struct zwp_primary_selection_source_v1_listener primary_source_listener = {
     .send = primary_send, .cancelled = primary_cancel};
 static void wayland_selection(NtWindow *w, int primary) {
-    if (!w->serial)
+    Source *s = w->pending_source[primary];
+    if (!w->serial || !s)
         return;
-    Source *s = calloc(1, sizeof *s);
-    if (!s) {
-        fail(w, "allocating clipboard source: %s", strerror(errno));
-        return;
-    }
-    s->window = w;
-    s->primary = primary;
-    s->length = w->pending_selection_len[primary];
-    s->bytes = w->pending_selection[primary];
-    s->file_fd = w->pending_selection_file[primary];
-    w->pending_selection_file[primary] = -1;
-    w->pending_selection[primary] = NULL;
     if (primary) {
         s->proxy = zwp_primary_selection_device_manager_v1_create_source(w->primary_manager);
         zwp_primary_selection_source_v1_add_listener(s->proxy, &primary_source_listener, s);
@@ -1140,8 +1115,7 @@ static void wayland_selection(NtWindow *w, int primary) {
         wl_data_source_offer(s->proxy, "text/plain");
         wl_data_device_set_selection(w->data_device, s->proxy, w->serial);
     }
-    s->next = w->sources;
-    w->sources = s;
+    w->pending_source[primary] = NULL;
     w->current_source[primary] = s;
 }
 static void offer_mime(Offer *o, const char *mime) {
@@ -1505,6 +1479,7 @@ static int poll_timeout(NtWindow *w, int timeout) {
 int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int timeout_ms, NtEventFn callback, void *data) {
     if (!w || !callback)
         return -1;
+    struct pollfd local[16], *fds = local;
     w->callback = callback;
     w->callback_data = data;
     w->delivered = 0;
@@ -1529,7 +1504,6 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
     int count = 2 + (int)source_count;
     for (Transfer *t = w->transfers; t; t = t->next)
         count++;
-    struct pollfd local[16], *fds = local;
     if ((size_t)count > sizeof local / sizeof *local) {
         fds = malloc((size_t)count * sizeof *fds);
         if (!fds) {
@@ -1544,8 +1518,6 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
             fds[0].events |= POLLOUT;
         else {
             wl_display_cancel_read(w->display);
-            if (fds != local)
-                free(fds);
             wayland_error(w, "flushing Wayland events");
             goto done;
         }
@@ -1582,9 +1554,9 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
         fail(w, "display connection closed");
     for (size_t i = 0; i < source_count; ++i)
         sources[i].revents = fds[i + 2].revents;
+done:
     if (fds != local)
         free(fds);
-done:
     w->callback = NULL;
     w->callback_data = NULL;
     return w->error[0] ? -1 : (int)w->delivered;
@@ -1592,7 +1564,6 @@ done:
 
 NtWindow *nt_window_new(int width, int height) {
     NtWindow *w = calloc(1, sizeof *w);
-    if (w) w->pending_selection_file[0] = w->pending_selection_file[1] = -1;
     if (!w) {
         snprintf(startup_error, sizeof startup_error, "allocating native window: %s",
                  strerror(errno));
@@ -1604,7 +1575,6 @@ NtWindow *nt_window_new(int width, int height) {
     w->scale = 1;
     w->cursor_w = w->cursor_h = 1;
     w->queued_tail = &w->queued;
-    w->frame_fd = -1;
     w->frame_fd = timerfd_create(CLOCK_MONOTONIC, TFD_CLOEXEC | TFD_NONBLOCK);
     if (w->frame_fd < 0) {
         fail(w, "creating frame timer: %s", strerror(errno));
@@ -1676,6 +1646,27 @@ void nt_window_cursor_rect(NtWindow *w, int x, int y, int width, int height) {
         zwp_text_input_v3_commit(w->text_input);
     }
 }
+static void set_selection(NtWindow *w, int primary, char *bytes, size_t length, int fd) {
+    Source *source = malloc(sizeof *source);
+    if (!source) {
+        fail(w, "allocating clipboard source: %s", strerror(errno));
+        free(bytes);
+        if (fd >= 0)
+            queue_file(w, -1, fd);
+        return;
+    }
+    if (w->pending_source[primary])
+        source_remove(w->pending_source[primary]);
+    *source = (Source){.next = w->sources,
+                       .window = w,
+                       .primary = primary,
+                       .file_fd = fd,
+                       .bytes = bytes,
+                       .length = length};
+    w->sources = source;
+    w->pending_source[primary] = source;
+    wayland_selection(w, primary);
+}
 void nt_window_set_selection(NtWindow *w, int primary, const char *bytes, size_t length) {
     primary = !!primary;
     char *copy = malloc(length + 1);
@@ -1685,13 +1676,7 @@ void nt_window_set_selection(NtWindow *w, int primary, const char *bytes, size_t
     }
     memcpy(copy, bytes, length);
     copy[length] = 0;
-    free(w->pending_selection[primary]);
-    if (w->pending_selection_file[primary] >= 0)
-        queue_file(w, -1, w->pending_selection_file[primary]);
-    w->pending_selection_file[primary] = -1;
-    w->pending_selection[primary] = copy;
-    w->pending_selection_len[primary] = length;
-    wayland_selection(w, primary);
+    set_selection(w, primary, copy, length, -1);
 }
 void nt_window_set_selection_file(NtWindow *w, int primary, int fd) {
     primary = !!primary;
@@ -1705,13 +1690,7 @@ void nt_window_set_selection_file(NtWindow *w, int primary, int fd) {
         close(fd);
         return;
     }
-    free(w->pending_selection[primary]);
-    w->pending_selection[primary] = NULL;
-    if (w->pending_selection_file[primary] >= 0)
-        queue_file(w, -1, w->pending_selection_file[primary]);
-    w->pending_selection_file[primary] = fd;
-    w->pending_selection_len[primary] = 0;
-    wayland_selection(w, primary);
+    set_selection(w, primary, NULL, 0, fd);
 }
 void nt_window_paste(NtWindow *w, int primary) {
     if (w->paste_pending) {
@@ -1776,6 +1755,8 @@ void *nt_window_surface(NtWindow *w) {
 void nt_window_free(NtWindow *w) {
     if (!w)
         return;
+    while (w->sources)
+        source_remove(w->sources);
     if (w->display) {
         if (w->frame)
             wl_callback_destroy(w->frame);
@@ -1783,8 +1764,6 @@ void nt_window_free(NtWindow *w) {
             feedback_remove(w->feedbacks);
         if (w->presentation)
             wp_presentation_destroy(w->presentation);
-        while (w->sources)
-            source_remove(w->sources);
         while (w->offers)
             offer_destroy(w->offers);
         if (w->text_input)
@@ -1838,8 +1817,7 @@ void nt_window_free(NtWindow *w) {
         wl_display_flush(w->display);
         wl_display_disconnect(w->display);
         xkb_state_unref(w->key_state);
-        free(w->pending_commit);
-        free(w->pending_preedit);
+        clear_pending_text(w);
     }
     while (w->transfers) {
         Transfer *t = w->transfers;
@@ -1851,11 +1829,6 @@ void nt_window_free(NtWindow *w) {
     if (w->frame_fd >= 0)
         close(w->frame_fd);
     clear_events(w->queued);
-    free(w->pending_selection[0]);
-    free(w->pending_selection[1]);
-    for (int i = 0; i < 2; i++)
-        if (w->pending_selection_file[i] >= 0)
-            queue_file(w, -1, w->pending_selection_file[i]);
     if (w->file_sender) {
         FileSender *sender = w->file_sender;
         pthread_mutex_lock(&sender->mutex);

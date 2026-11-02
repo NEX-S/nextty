@@ -8,7 +8,7 @@ pub struct RemoteTarget {
 
 impl RemoteTarget {
     pub fn recognizes(value: &str) -> bool {
-        value.starts_with("ssh://") || value.contains(['@', ':'])
+        value.contains(['@', ':'])
     }
 
     pub fn parse(value: &str) -> io::Result<Self> {

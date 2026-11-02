@@ -1,16 +1,13 @@
 use crate::input::PasteTarget;
 use crate::input::keysym;
+use crate::panel::mix_color;
 #[cfg(feature = "agent")]
 mod agent_ui;
 mod render;
 
-use crate::files::{FileFocus, FileNav};
+use crate::files::FileFocus;
 #[cfg(feature = "agent")]
-use crate::{
-    agent::panel::{AgentAction, column_offset},
-    context::Object,
-    workspace_view::agent_ui::AgentScroll,
-};
+use crate::{agent::panel::AgentAction, context::Object, workspace_view::agent_ui::AgentScroll};
 use crate::{
     config::Config,
     context,
@@ -18,7 +15,7 @@ use crate::{
     error::{Error, Result},
     ui::{ClosePrompt, Focus, Ui},
     width::text_width,
-    workspace::{Action, Axis, Client, ClientEvent, Direction, PaneId, SplitDrag, TabId},
+    workspace::{Action, Axis, Client, ClientEvent, PaneId, SplitDrag, TabId},
 };
 use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
@@ -96,14 +93,15 @@ impl TextCache {
                 }],
                 &text_columns(text),
             )?;
-            let entries = self.lines.entry(text.to_owned()).or_default();
-            entries.push(CachedText {
-                color,
-                flags,
-                line,
-                used: false,
-            });
-            entries.last_mut().unwrap()
+            self.lines
+                .entry(text.to_owned())
+                .or_default()
+                .push_mut(CachedText {
+                    color,
+                    flags,
+                    line,
+                    used: false,
+                })
         };
         entry.used = true;
         renderer.line(&entry.line, x, y);
@@ -111,11 +109,7 @@ impl TextCache {
     }
     fn finish(&mut self) {
         self.lines.retain(|_, entries| {
-            entries.retain_mut(|entry| {
-                let used = entry.used;
-                entry.used = false;
-                used
-            });
+            entries.retain_mut(|entry| std::mem::take(&mut entry.used));
             !entries.is_empty()
         });
     }
@@ -263,6 +257,7 @@ enum GuiAction {
     NewTab,
     CloseTab(TabId),
     Tab(i32),
+    SelectTab(usize),
     DismissHelp,
     Minimize,
     Maximize,
@@ -318,7 +313,6 @@ pub struct WorkspaceView {
     scrollbars: Vec<Scrollbar>,
     scrollbar_drag: Option<ScrollbarDrag>,
     maximized: bool,
-    tab_hits: Vec<(f32, f32, usize)>,
     hovered: Option<(PaneId, crate::context::Object)>,
 
     hovered_block: Option<(PaneId, u64)>,
@@ -370,7 +364,6 @@ impl WorkspaceView {
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             maximized: false,
-            tab_hits: Vec::new(),
             hovered: None,
 
             hovered_block: None,
@@ -398,11 +391,8 @@ impl WorkspaceView {
                 -1
             };
             if let Some(until) = self.ui.deadline() {
-                let remaining = until
-                    .saturating_duration_since(Instant::now())
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(i32::MAX as u128) as i32;
+                let remaining =
+                    crate::poll::timeout_millis(until.saturating_duration_since(Instant::now()));
                 timeout = if timeout < 0 {
                     remaining
                 } else {
@@ -414,33 +404,20 @@ impl WorkspaceView {
                 timeout = 0;
             }
             self.client.flush()?;
-            let socket_events = if self.client.wants_read() {
-                libc::POLLIN
-            } else {
-                0
-            } | if self.client.wants_write() {
-                libc::POLLOUT
-            } else {
-                0
-            };
-            let socket_fd = if socket_events == 0 {
-                -1
-            } else {
-                self.client.fd()
-            };
             pollfds.clear();
-            pollfds.extend(
-                [
-                    (socket_fd, socket_events),
-                    (self.renderer.fd(), libc::POLLIN),
-                    (self.client.receiver_fd(), libc::POLLIN),
-                ]
-                .map(|(fd, events)| libc::pollfd {
-                    fd,
-                    events,
+            pollfds.extend([
+                self.client.pollfd(),
+                libc::pollfd {
+                    fd: self.renderer.fd(),
+                    events: libc::POLLIN,
                     revents: 0,
-                }),
-            );
+                },
+                libc::pollfd {
+                    fd: self.client.receiver_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+            ]);
             pollfds.extend(self.ui.fds());
             self.window.wait(&mut pollfds, timeout, &mut events)?;
             if pollfds[0].revents & libc::POLLOUT != 0 {
@@ -527,6 +504,8 @@ impl WorkspaceView {
                     ClientEvent::Detached => self.running = false,
                     ClientEvent::List(_)
                     | ClientEvent::AgentInput { .. }
+                    | ClientEvent::AgentFile { .. }
+                    | ClientEvent::AgentNewTab { .. }
                     | ClientEvent::History { .. } => (),
                     ClientEvent::ClipboardStore { primary, text } => {
                         self.window.selection(primary, &text)
@@ -579,9 +558,7 @@ impl WorkspaceView {
                 | Action::ClosePane(_)
                 | Action::CloseTab(_)
         ) {
-            if self.ui.search.open {
-                self.ui.search.close(&mut self.client)?;
-            }
+            self.ui.search.close(&mut self.client)?;
             self.ui.focus = Focus::Terminal;
             #[cfg(feature = "agent")]
             {
@@ -623,9 +600,7 @@ impl WorkspaceView {
         Ok(())
     }
     fn resize(&mut self) -> Result<()> {
-        if self.ui.search.open {
-            self.ui.search.close(&mut self.client)?;
-        }
+        self.ui.search.close(&mut self.client)?;
         let (_, _, scale) = self.window.size();
         if scale != self.scale {
             self.caches.clear();
@@ -776,7 +751,11 @@ impl WorkspaceView {
         if !self.composition_finished() {
             return Ok(true);
         }
-        match symbol_char(symbol).map(|c| c.to_ascii_lowercase()) {
+        let key = match symbol {
+            keysym::RETURN | keysym::KP_ENTER => Some('\r'),
+            _ => symbol_char(symbol).map(|c| c.to_ascii_lowercase()),
+        };
+        match key {
             Some('?') => {
                 self.ui.help = true;
                 self.ui.help_scroll = 0;
@@ -790,9 +769,7 @@ impl WorkspaceView {
             }
 
             Some('m') => {
-                if self.ui.search.open {
-                    self.ui.search.close(&mut self.client)?;
-                }
+                self.ui.search.close(&mut self.client)?;
                 self.gui_action(GuiAction::Resources)?;
                 return Ok(true);
             }
@@ -805,61 +782,25 @@ impl WorkspaceView {
                 self.dirty = true;
                 return Ok(true);
             }
-            _ => (),
-        }
-        let action = match symbol_char(symbol).map(|c| c.to_ascii_lowercase()) {
-            Some('s') => Some(Action::Split {
-                pane: 0,
-                axis: Axis::TopBottom,
-            }),
-            Some('v') => Some(Action::Split {
-                pane: 0,
-                axis: Axis::LeftRight,
-            }),
-            Some('h') => Some(Action::Navigate(Direction::Left)),
-            Some('j') => Some(Action::Navigate(Direction::Down)),
-            Some('k') => Some(Action::Navigate(Direction::Up)),
-            Some('l') => Some(Action::Navigate(Direction::Right)),
-            Some(',') => Some(Action::Tab(-1)),
-            Some('.') => Some(Action::Tab(1)),
-
-            Some('p') => Some(Action::PromptJump {
-                pane,
-                previous: true,
-            }),
-
-            Some('n') => Some(Action::PromptJump {
-                pane,
-                previous: false,
-            }),
-
             Some('c') => {
                 self.copy_block(pane, None)?;
                 return Ok(true);
             }
 
             Some('f') => {
-                if self.ui.search.open {
-                    self.ui.search.close(&mut self.client)?;
-                }
+                self.ui.search.close(&mut self.client)?;
                 self.open_files(pane)?;
                 return Ok(true);
             }
-            _ => {
-                if symbol == keysym::RETURN || symbol == keysym::KP_ENTER {
-                    Some(Action::NewTab { pane })
-                } else {
-                    None
-                }
-            }
-        };
-        if let Some(action) = action {
-            if self.controller() {
-                self.action(action)?;
-            }
-            return Ok(true);
+            _ => (),
         }
-        Ok(false)
+        let Some(action) = key.and_then(|key| crate::ui::workspace_action(key, pane)) else {
+            return Ok(false);
+        };
+        if self.controller() {
+            self.action(action)?;
+        }
+        Ok(true)
     }
     fn key(&mut self, symbol: u32, modifiers: u32, text: &str) -> Result<()> {
         if let Some(prompt) = self.ui.close_prompt.as_mut() {
@@ -917,9 +858,7 @@ impl WorkspaceView {
             if !self.composition_finished() {
                 return Ok(());
             }
-            if self.ui.search.open {
-                self.ui.search.close(&mut self.client)?;
-            }
+            self.ui.search.close(&mut self.client)?;
             self.ui.toggle_agent();
             self.resize()?;
             return Ok(());
@@ -1057,13 +996,10 @@ impl WorkspaceView {
         let block = block.or_else(|| {
             self.client
                 .snapshot()?
-                .panes
-                .iter()
-                .find(|p| p.id == pane)?
+                .pane(pane)?
                 .blocks
                 .iter()
-                .rev()
-                .find(|b| b.output.is_some())
+                .rfind(|b| b.output.is_some())
                 .map(|b| b.id)
         });
         if let Some(block) = block {
@@ -1084,11 +1020,6 @@ impl WorkspaceView {
         if !self.composition_finished() {
             return;
         }
-        let target = PasteTarget::Pane {
-            pane,
-            bracketed: self.mode(pane).contains(Mode::BRACKETED_PASTE),
-        };
-
         let target = if self.ui.files_open {
             if let Some(files) = &mut self.ui.files {
                 files.focus_list();
@@ -1099,7 +1030,10 @@ impl WorkspaceView {
             self.dirty = true;
             PasteTarget::Files
         } else {
-            target
+            PasteTarget::Pane {
+                pane,
+                bracketed: self.mode(pane).contains(Mode::BRACKETED_PASTE),
+            }
         };
         self.request_paste(target, primary);
     }
@@ -1183,15 +1117,15 @@ impl WorkspaceView {
     }
     fn hit(&self, captured: Option<PaneId>) -> Option<(PaneId, Point, Side)> {
         let layout = self.layout();
-        let panes = &self.client.snapshot()?.panes;
+        let snapshot = self.client.snapshot()?;
         let pane = if let Some(id) = captured {
-            panes.iter().find(|pane| pane.id == id)?
+            snapshot.pane(id)?
         } else {
             if self.preview_open() || !layout.terminal_contains(self.pointer) {
                 return None;
             }
             let (x, y) = layout.pointer_cell(self.cell, self.pointer);
-            panes.iter().find(|pane| pane.rect.contains(x, y))?
+            snapshot.pane_at(x, y)?
         };
         let rect = pane.rect;
         let screen = self.client.screens().get(&pane.id)?;
@@ -1273,8 +1207,7 @@ impl WorkspaceView {
         let control = self
             .control_hits
             .iter()
-            .rev()
-            .find(|hit| hit.contains(self.pointer))
+            .rfind(|hit| hit.contains(self.pointer))
             .copied();
         if self.hovered_control != control {
             self.hovered_control = control;
@@ -1333,25 +1266,32 @@ impl WorkspaceView {
                 }
             }
             GuiAction::CloseTab(tab) => {
-                if self.composition_finished() && self.controller() {
-                    let target = self
-                        .client
-                        .snapshot()
-                        .and_then(|snapshot| {
-                            snapshot.tabs.iter().find(|candidate| candidate.id == tab)
-                        })
-                        .cloned();
-                    if let Some(target) = target
-                        && self.ui.request_close_tab(&target)
-                    {
-                        self.action(Action::CloseTab(tab))?;
-                    }
+                if self.composition_finished()
+                    && self.controller()
+                    && let Some(target) = self.client.snapshot().and_then(|snapshot| {
+                        snapshot.tabs.iter().find(|candidate| candidate.id == tab)
+                    })
+                    && self.ui.request_close_tab(target)
+                {
+                    self.action(Action::CloseTab(tab))?;
                 }
             }
             GuiAction::Tab(direction) => {
                 if self.controller() {
                     self.ui.focus = Focus::Terminal;
                     self.action(Action::Tab(direction))?;
+                }
+            }
+            GuiAction::SelectTab(index) => {
+                if self.composition_finished()
+                    && let Some(snapshot) = self.client.snapshot()
+                {
+                    let active = snapshot
+                        .tabs
+                        .iter()
+                        .position(|tab| tab.id == snapshot.active_tab)
+                        .unwrap_or(0);
+                    self.action(Action::Tab(index as i32 - active as i32))?;
                 }
             }
             GuiAction::DismissHelp => self.ui.help = false,
@@ -1387,12 +1327,7 @@ impl WorkspaceView {
         if self.ui.files_open {
             return None;
         }
-        let pane = self
-            .client
-            .snapshot()?
-            .panes
-            .iter()
-            .find(|pane| pane.id == id)?;
+        let pane = self.client.snapshot()?.pane(id)?;
         let screen = self.client.screens().get(&id)?;
         let row = (point.line + screen.display_offset() as i32) as usize;
         screen.row_output(pane, row).map(|block| (id, block.id))
@@ -1477,8 +1412,7 @@ impl WorkspaceView {
                 .scrollbars
                 .iter()
                 .copied()
-                .rev()
-                .find(|bar| bar.contains(self.pointer) && (self.scrollbar_visible(bar.target)))
+                .rfind(|bar| bar.contains(self.pointer) && (self.scrollbar_visible(bar.target)))
         {
             let (top, height) = bar.thumb();
             let grab = if (top..top + height).contains(&self.pointer.1) {
@@ -1537,8 +1471,7 @@ impl WorkspaceView {
         if let Some(action) = self
             .control_hits
             .iter()
-            .rev()
-            .find(|hit| hit.contains(self.pointer))
+            .rfind(|hit| hit.contains(self.pointer))
             .map(|hit| hit.action)
         {
             #[cfg(feature = "agent")]
@@ -1558,28 +1491,6 @@ impl WorkspaceView {
         if self.pointer.1 >= layout.footer
             || self.pointer.0 >= layout.side && self.pointer.1 >= layout.top
         {
-            return Ok(());
-        }
-        if button == 1
-            && let Some((_, _, index)) = self
-                .tab_hits
-                .iter()
-                .find(|(a, b, _)| {
-                    self.pointer.1 < layout.top && self.pointer.0 >= *a && self.pointer.0 < *b
-                })
-                .copied()
-        {
-            if !self.composition_finished() {
-                return Ok(());
-            }
-            if let Some(s) = self.client.snapshot() {
-                let active = s
-                    .tabs
-                    .iter()
-                    .position(|t| t.id == s.active_tab)
-                    .unwrap_or(0);
-                self.action(Action::Tab(index as i32 - active as i32))?;
-            }
             return Ok(());
         }
         if button == 1
@@ -1603,19 +1514,7 @@ impl WorkspaceView {
                     .hit(None)
                     .is_some_and(|(pane, _, _)| !self.mode(pane).intersects(Mode::MOUSE_MODE)))
         {
-            if let Some(pane) = self
-                .client
-                .snapshot()
-                .and_then(|snapshot| {
-                    snapshot.panes.iter().find(|pane| {
-                        self.client
-                            .screens()
-                            .get(&pane.id)
-                            .is_some_and(|screen| screen.selection_range().is_some())
-                    })
-                })
-                .map(|pane| pane.id)
-            {
+            if let Some(pane) = self.client.selected_pane() {
                 return self.copy(pane, false);
             }
             if let Some((_, object)) = &self.hovered {
@@ -1698,8 +1597,7 @@ impl WorkspaceView {
             if let Some(action) = self
                 .control_hits
                 .iter()
-                .rev()
-                .find(|hit| hit.contains(self.pointer))
+                .rfind(|hit| hit.contains(self.pointer))
                 .map(|hit| hit.action)
             {
                 if button == 1 {
@@ -1788,19 +1686,6 @@ impl WorkspaceView {
     fn motion(&mut self, pointer: (f32, f32), modifiers: u32) -> Result<()> {
         let layout = self.layout();
         let previous = std::mem::replace(&mut self.pointer, pointer);
-        let header_tab = |point: (f32, f32)| {
-            (point.1 >= 0. && point.1 < layout.top)
-                .then(|| {
-                    self.tab_hits
-                        .iter()
-                        .find(|(left, right, _)| point.0 >= *left && point.0 < *right)
-                        .map(|(_, _, index)| *index)
-                })
-                .flatten()
-        };
-        if header_tab(previous) != header_tab(pointer) {
-            self.dirty = true;
-        }
         let hovered_bar = |point| self.scrollbars.iter().position(|bar| bar.contains(point));
         if hovered_bar(previous) != hovered_bar(pointer) {
             self.dirty = true;
@@ -1963,14 +1848,10 @@ impl WorkspaceView {
         if self.ui.files_open {
             let rect = self.file_preview_layout(self.layout());
             if let Some(files) = &mut self.ui.files {
-                if files.focus() == FileFocus::Preview {
-                    files.scroll_preview(
-                        -amount.round() as isize,
-                        usize::from(rect.rows.saturating_sub(2)),
-                    );
-                } else {
-                    files.move_selection(-amount.round() as isize);
-                }
+                files.scroll(
+                    -amount.round() as isize,
+                    usize::from(rect.rows.saturating_sub(2)),
+                );
             }
             self.dirty = true;
             return Ok(());
@@ -2046,8 +1927,7 @@ impl WorkspaceView {
                 .map(|pane| pane.rect.y + pane.rect.rows)
                 .max()
                 .unwrap_or(0);
-            self.caches
-                .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
+            self.caches.retain(|id, _| snapshot.pane(*id).is_some());
             for pane in &snapshot.panes {
                 let origin = (
                     grid_x + f32::from(pane.rect.x) * self.cell.0,
@@ -2229,8 +2109,7 @@ impl WorkspaceView {
         self.footer(layout)?;
         self.renderer
             .clip(0., layout.top, layout.width, layout.footer - layout.top)?;
-        let divider =
-            (crate::ui::mix_color(self.config.foreground, self.config.background, 24) << 8) | 255;
+        let divider = (mix_color(self.config.foreground, self.config.background, 24) << 8) | 255;
         if self.ui.files_open {
             let x = (self.file_rect(layout).cols as f32 - 0.5) * self.cell.0;
             self.renderer.rect(
@@ -2282,10 +2161,7 @@ impl WorkspaceView {
                 .map(|screen| {
                     let cell = screen.row(0).cells[0];
                     let color = screen.color(cell.bg);
-                    (
-                        cell.c as u32,
-                        (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b),
-                    )
+                    (cell.c as u32, color.packed())
                 })
                 .unwrap_or((0, 0));
             trace.frame(
@@ -2337,14 +2213,10 @@ impl WorkspaceView {
             let directory = self
                 .client
                 .snapshot()
-                .and_then(|s| s.panes.iter().find(|p| p.id == pane))
+                .and_then(|snapshot| snapshot.pane(pane))
                 .and_then(|p| p.cwd.clone())
                 .map_or_else(std::env::current_dir, Ok)?;
-            if let Some(files) = &mut self.ui.files {
-                files.set_directory(directory)?;
-            } else {
-                self.ui.files = Some(FileNav::new(directory)?);
-            }
+            self.ui.load_files(directory)?;
         }
         self.preedit.clear();
         self.resize()

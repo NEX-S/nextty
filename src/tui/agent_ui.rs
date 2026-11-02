@@ -30,27 +30,14 @@ impl Frontend {
 
     pub(super) fn editor_pointer(&mut self, mouse: Mouse, extend: bool) {
         let (rect, layout) = editor(&self.ui, self.agent_rect());
-        let (lines, mut first) = (layout.lines, layout.first);
-        if extend {
-            if mouse.row < rect.y {
-                first = first.saturating_sub(1);
-            } else if mouse.row >= rect.y + rect.rows {
-                first = (first + 1).min(lines.len().saturating_sub(usize::from(rect.rows)));
-            }
-        }
-        let row = usize::from(
-            mouse
-                .row
-                .saturating_sub(rect.y)
-                .min(rect.rows.saturating_sub(1)),
-        );
-        let range = lines.get(first + row).cloned().unwrap_or(
-            self.ui.agent.active().model.input.len()..self.ui.agent.active().model.input.len(),
-        );
+        let row = f32::from(mouse.row) - f32::from(rect.y);
         let column = mouse.column.saturating_sub(rect.x).min(rect.cols) as f32;
-        let offset = column_offset(&self.ui.agent.active().model.input, range, column);
-        self.ui.agent.active_mut().editor_scroll = Some(first);
-        self.ui.agent.active_mut().model.set_cursor(offset, extend);
+        self.ui.agent.active_mut().select_editor(
+            layout,
+            usize::from(rect.rows),
+            (column, row),
+            extend,
+        );
         self.dirty = true;
         self.agent.dirty = true;
     }
@@ -143,8 +130,7 @@ impl Frontend {
             .agent
             .hits
             .iter()
-            .rev()
-            .find(|(rect, _)| rect.contains(mouse.column, mouse.row))
+            .rfind(|(rect, _)| rect.contains(mouse.column, mouse.row))
             .map(|(_, action)| *action);
         let right = mouse.code & 3 == 2;
         if right
@@ -152,7 +138,7 @@ impl Frontend {
             && self.ui.agent.active().context.preview.is_none()
             && let Some(text) = self.ui.agent.active().selected_text()
         {
-            self.copy_text(text);
+            self.copy_text(text, false);
             return Ok(true);
         }
         if !right && let Some(AgentAction::Copy(_) | AgentAction::Tool(_)) = hit {
@@ -253,7 +239,7 @@ impl Frontend {
     pub(super) fn activate_agent(&mut self, action: AgentAction) -> io::Result<()> {
         match self.ui.activate_agent(action, &self.client) {
             Ok(Some(text)) => {
-                self.copy_text(text);
+                self.copy_text(text, false);
             }
             Ok(None) => (),
             Err(error) => self.message(error.to_string()),

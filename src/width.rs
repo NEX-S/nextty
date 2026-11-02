@@ -27,11 +27,12 @@ pub fn text_width(text: &str) -> usize {
 
 /// One clipping policy keeps the GUI and TUI header labels on the same columns.
 pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
+    let columns = usize::from(columns);
     // With widths capped at two columns, UTF-8 byte length is an upper bound.
-    if text.len() <= usize::from(columns) && !text.chars().any(char::is_control) {
+    if text.len() <= columns && !text.chars().any(char::is_control) {
         return std::borrow::Cow::Borrowed(text.trim_end());
     }
-    let end = text.len().min(usize::from(columns));
+    let end = text.len().min(columns);
     // A non-ASCII scalar at the boundary may extend the label without using a column.
     if end < text.len()
         && text.as_bytes()[end].is_ascii()
@@ -51,7 +52,7 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
         } else {
             usize::from(scalar_width(ch).min(2))
         };
-        if used > usize::from(columns) {
+        if used > columns {
             break;
         }
         controls |= control;

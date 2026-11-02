@@ -51,10 +51,7 @@ impl Decoder {
         while consumed < self.pending.len() {
             let pending = &self.pending[consumed..];
             if self.paste {
-                if let Some(end) = pending
-                    .windows(PASTE_END.len())
-                    .position(|part| part == PASTE_END)
-                {
+                if let Some(end) = memchr::memmem::find(pending, PASTE_END) {
                     if end != 0 {
                         output.push(Input::PasteData(pending[..end].to_vec()));
                     }
@@ -64,8 +61,7 @@ impl Decoder {
                     continue;
                 }
                 let keep = (1..PASTE_END.len())
-                    .rev()
-                    .find(|&length| pending.ends_with(&PASTE_END[..length]))
+                    .rfind(|&length| pending.ends_with(&PASTE_END[..length]))
                     .unwrap_or(0);
                 let ready = pending.len() - keep;
                 if ready != 0 {
@@ -75,10 +71,7 @@ impl Decoder {
                 break;
             }
             if pending[0] != 0x1b {
-                let length = pending
-                    .iter()
-                    .position(|&byte| byte == 0x1b)
-                    .unwrap_or(pending.len());
+                let length = memchr::memchr(0x1b, pending).unwrap_or(pending.len());
                 output.push(Input::Bytes(pending[..length].to_vec()));
                 consumed += length;
                 continue;
@@ -110,18 +103,16 @@ impl Decoder {
                     };
                     let sequence = &pending[..=end];
                     consumed += end + 1;
-                    match sequence {
+                    output.push(match sequence {
                         b"\x1b[200~" => {
                             self.paste = true;
-                            output.push(Input::PasteStart);
+                            Input::PasteStart
                         }
-                        b"\x1b[I" => output.push(Input::Focus(true)),
-                        b"\x1b[O" => output.push(Input::Focus(false)),
-                        _ => match mouse(sequence) {
-                            Some(mouse) => output.push(Input::Mouse(mouse)),
-                            None => output.push(Input::Bytes(sequence.to_vec())),
-                        },
-                    }
+                        b"\x1b[I" => Input::Focus(true),
+                        b"\x1b[O" => Input::Focus(false),
+                        _ => mouse(sequence)
+                            .map_or_else(|| Input::Bytes(sequence.to_vec()), Input::Mouse),
+                    });
                 }
                 b'O' => {
                     if pending.len() < 3 {
@@ -136,9 +127,7 @@ impl Decoder {
                     consumed += 2;
                 }
                 _ => {
-                    let length = pending[1..]
-                        .iter()
-                        .position(|&byte| byte == 0x1b)
+                    let length = memchr::memchr(0x1b, &pending[1..])
                         .map_or(pending.len(), |index| index + 1);
                     output.push(Input::Bytes(pending[..length].to_vec()));
                     consumed += length;
@@ -150,20 +139,14 @@ impl Decoder {
     }
 
     pub fn expire(&mut self, now: Instant) -> Option<Input> {
-        if self
-            .escape_since
-            .is_some_and(|start| now.duration_since(start) >= ESCAPE_WAIT)
-        {
-            let event = match self.pending.as_slice() {
-                [0x1b, byte] => Input::Alt(*byte),
-                _ => Input::Escape,
-            };
-            self.pending.clear();
-            self.escape_since = None;
-            Some(event)
-        } else {
-            None
-        }
+        self.escape_since
+            .take_if(|start| now.duration_since(*start) >= ESCAPE_WAIT)?;
+        let event = match self.pending.as_slice() {
+            [0x1b, byte] => Input::Alt(*byte),
+            _ => Input::Escape,
+        };
+        self.pending.clear();
+        Some(event)
     }
 
     pub fn timeout(&self, now: Instant) -> Option<Duration> {
@@ -173,11 +156,11 @@ impl Decoder {
 }
 
 fn mouse(sequence: &[u8]) -> Option<Mouse> {
-    let final_byte = *sequence.last()?;
-    if !sequence.starts_with(b"\x1b[<") || !matches!(final_byte, b'M' | b'm') {
+    let (&final_byte, body) = sequence.strip_prefix(b"\x1b[<")?.split_last()?;
+    if !matches!(final_byte, b'M' | b'm') {
         return None;
     }
-    let mut fields = std::str::from_utf8(&sequence[3..sequence.len() - 1])
+    let mut fields = std::str::from_utf8(body)
         .ok()?
         .split(';')
         .map(str::parse::<u16>);

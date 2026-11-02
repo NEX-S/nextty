@@ -3,14 +3,14 @@ use crate::screen::Screen;
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq)]
 pub(crate) struct Object {
     pub range: SelectionRange,
     pub text: String,
     pub kind: &'static str,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Default, PartialEq)]
 pub(crate) struct Snapshot {
     pub text: String,
     pub incomplete: bool,
@@ -19,14 +19,8 @@ pub(crate) struct Snapshot {
 pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
     let offset = screen.display_offset() as i64;
     let row = screen.rows.get((i64::from(point.line) + offset) as usize)?;
-    if row
-        .cells
-        .get(point.column)?
-        .flags
-        .contains(Flags::WIDE_CHAR_SPACER)
-    {
-        point.column -= 1;
-    }
+    row.cells.get(point.column)?;
+    point.column = row.leading_column(point.column);
     let cell = &row.cells[point.column];
     if cell.flags.contains(Flags::HIDDEN) {
         return None;
@@ -221,7 +215,8 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
         },
     });
     result.incomplete = range.start.line < first || range.end.line > last;
-    for line in range.start.line.max(first)..=range.end.line.min(last) {
+    let last_line = range.end.line.min(last);
+    for line in range.start.line.max(first)..=last_line {
         let row = &screen.rows[(line - first) as usize];
         let mut from = if line == range.start.line {
             range.start.column
@@ -229,13 +224,8 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
             0
         }
         .min(row.used());
-        if from > 0
-            && row
-                .cells
-                .get(from)
-                .is_some_and(|cell| cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-        {
-            from -= 1;
+        if from < row.cells.len() {
+            from = row.leading_column(from);
         }
         let to = if line == range.end.line {
             range.end.column + 1
@@ -243,22 +233,16 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
             row.used()
         }
         .min(row.used());
-        for (_, ch) in row.characters(from..to) {
+        for ch in row
+            .characters(from..to)
+            .map(|(_, ch)| ch)
+            .chain((line < last_line && !row.wrapped).then_some('\n'))
+        {
+            if result.text.len() + ch.len_utf8() > SNAPSHOT_LIMIT {
+                result.incomplete = true;
+                return result;
+            }
             result.text.push(ch);
-            if result.text.len() > SNAPSHOT_LIMIT {
-                while result.text.len() > SNAPSHOT_LIMIT {
-                    result.text.pop();
-                }
-                result.incomplete = true;
-                return result;
-            }
-        }
-        if line < range.end.line.min(last) && !row.wrapped {
-            if result.text.len() == SNAPSHOT_LIMIT {
-                result.incomplete = true;
-                return result;
-            }
-            result.text.push('\n');
         }
     }
     result

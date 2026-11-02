@@ -13,6 +13,15 @@ pub(crate) const SELECTED: u32 = 0x303830;
 pub(crate) const HOVER: u32 = 0x343434;
 pub(crate) const ACCENT: u32 = 0xb5d2a2;
 
+pub(crate) fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
+    [0, 8, 16].into_iter().fold(0, |rgb, shift| {
+        rgb | ((((foreground >> shift & 255) * weight
+            + (background >> shift & 255) * (255 - weight))
+            / 255)
+            << shift)
+    })
+}
+
 pub(crate) struct Grid {
     pub rect: Rect,
     pub rows: Vec<Row>,
@@ -31,18 +40,14 @@ pub(crate) struct TextRun {
 }
 
 pub(crate) fn rgb(color: u32) -> Color {
-    Color::Spec(Rgb {
-        r: (color >> 16) as u8,
-        g: (color >> 8) as u8,
-        b: color as u8,
-    })
+    Color::Spec(Rgb::from_packed(color))
 }
 
 fn packed(color: Color) -> u32 {
     let Color::Spec(color) = color else {
         unreachable!()
     };
-    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
+    color.packed()
 }
 
 impl Grid {
@@ -124,57 +129,41 @@ impl Grid {
             let width = usize::from(scalar_width(c).min(2));
             if width == 0 {
                 if column > start {
-                    let previous = column
-                        - 1
-                        - usize::from(
-                            row.cells[column - 1]
-                                .flags
-                                .contains(Flags::WIDE_CHAR_SPACER),
-                        );
+                    let previous = row.leading_column(column - 1);
                     row.extra_mut(previous).zerowidth.push(c);
                 }
                 continue;
             }
-            if column + width > end {
-                break;
-            }
             row.cells[column] = Cell { c, ..blank };
             if width == 2 {
                 row.cells[column].flags.insert(Flags::WIDE_CHAR);
-                row.cells[column + 1] = Cell {
-                    flags: blank.flags | Flags::WIDE_CHAR_SPACER,
-                    ..blank
-                };
+                row.cells[column + 1] = blank.wide_spacer();
             }
             column += width;
         }
         row.used = row.used.max(end);
     }
 
-    pub fn recolor(&mut self, rect: Rect, background: u32) {
+    fn edit_region(&mut self, rect: Rect, mut edit: impl FnMut(&mut Row, std::ops::Range<usize>)) {
+        let start = usize::from(rect.x.saturating_sub(self.rect.x).min(self.rect.cols));
+        let end = usize::from(
+            (rect.x + rect.cols)
+                .saturating_sub(self.rect.x)
+                .min(self.rect.cols),
+        );
         for y in rect.y.max(self.rect.y)..(rect.y + rect.rows).min(self.rect.y + self.rect.rows) {
             let row = &mut self.rows[usize::from(y - self.rect.y)];
-            let start = usize::from(rect.x.saturating_sub(self.rect.x)).min(row.cells.len());
-            let end =
-                usize::from((rect.x + rect.cols).saturating_sub(self.rect.x)).min(row.cells.len());
-            for cell in &mut row.cells[start..end] {
-                cell.bg = rgb(background);
-            }
+            edit(row, start..end);
         }
     }
 
-    #[cfg(feature = "agent")]
-    pub fn underline(&mut self, rect: Rect, color: u32) {
-        for y in rect.y.max(self.rect.y)..(rect.y + rect.rows).min(self.rect.y + self.rect.rows) {
-            let row = &mut self.rows[usize::from(y - self.rect.y)];
-            let start = usize::from(rect.x.saturating_sub(self.rect.x)).min(row.cells.len());
-            let end =
-                usize::from((rect.x + rect.cols).saturating_sub(self.rect.x)).min(row.cells.len());
-            for column in start..end {
-                row.cells[column].flags.insert(Flags::UNDERLINE);
-                row.extra_mut(column).underline_color = Some(rgb(color));
+    pub fn recolor(&mut self, rect: Rect, background: u32) {
+        let background = rgb(background);
+        self.edit_region(rect, |row, columns| {
+            for cell in &mut row.cells[columns] {
+                cell.bg = background;
             }
-        }
+        });
     }
 
     pub fn runs<'a>(
@@ -198,39 +187,37 @@ impl Grid {
                     })
             })
             .flat_map(move |(index, row)| {
-                let mut column = 0;
+                let mut cells = row.cells_with_extras(0..row.cells.len()).peekable();
                 std::iter::from_fn(move || {
-                    let start = column;
-                    let cell = row.cells.get(start)?;
+                    let &(start, cell, extra) = cells.peek()?;
                     let style = cell.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
                     let underline_color = if style.contains(Flags::UNDERLINE) {
-                        row.extra(start).and_then(|extra| extra.underline_color)
+                        extra.and_then(|extra| extra.underline_color)
                     } else {
                         None
                     };
                     let mut text = String::with_capacity(row.cells.len() - start);
-                    while let Some(next) = row.cells.get(column) {
-                        let extra = row.extra(column);
-                        if next.fg != cell.fg
-                            || next.bg != cell.bg
-                            || next.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) != style
-                            || style.contains(Flags::UNDERLINE)
-                                && extra.and_then(|extra| extra.underline_color) != underline_color
-                        {
-                            break;
-                        }
+                    while let Some((_, next, extra)) = cells.next_if(|(_, next, extra)| {
+                        next.fg == cell.fg
+                            && next.bg == cell.bg
+                            && next.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) == style
+                            && (!style.contains(Flags::UNDERLINE)
+                                || extra.and_then(|extra| extra.underline_color) == underline_color)
+                    }) {
                         if !next.flags.contains(Flags::WIDE_CHAR_SPACER) {
                             text.push(next.c);
                             if let Some(extra) = extra {
                                 text.extend(extra.zerowidth.iter());
                             }
                         }
-                        column += 1;
                     }
+                    let end = cells
+                        .peek()
+                        .map_or(row.cells.len(), |(column, _, _)| *column);
                     Some(TextRun {
                         x: self.rect.x + start as u16,
                         y: self.rect.y + index as u16,
-                        columns: (column - start) as u16,
+                        columns: (end - start) as u16,
                         text,
                         foreground: packed(cell.fg),
                         background: packed(cell.bg),
@@ -273,10 +260,10 @@ impl Grid {
                     run.background & 255
                 )?;
                 if run.flags.contains(Flags::BOLD) {
-                    output.write_all(b"\x1b[1m")?;
+                    output.extend_from_slice(b"\x1b[1m");
                 }
                 if run.flags.contains(Flags::ITALIC) {
-                    output.write_all(b"\x1b[3m")?;
+                    output.extend_from_slice(b"\x1b[3m");
                 }
                 if run.flags.contains(Flags::UNDERLINE) {
                     let color = run.underline_color.unwrap_or(run.foreground);
@@ -291,7 +278,8 @@ impl Grid {
             }
             output.extend_from_slice(run.text.as_bytes());
         }
-        output.write_all(b"\x1b[0m")
+        output.extend_from_slice(b"\x1b[0m");
+        Ok(())
     }
 }
 

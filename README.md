@@ -1,8 +1,10 @@
 # nextty
 
-A Linux terminal with a Wayland/Vulkan desktop frontend and an ANSI frontend that runs inside another terminal. Both can connect to the same persistent workspace, locally or over SSH.
+A Linux terminal workspace with a Wayland/Vulkan desktop frontend and an ANSI frontend that runs inside another terminal. Use either frontend to attach to the same running sessions, locally or over SSH.
 
-nextty is built around a small terminal core, explicit ownership of background work, and bounded queues. Input should keep moving while output is being parsed, history is going to disk, or the GPU is busy.
+Keep your shell, debugger, and CLI tools in their normal terminal. Open the Agent panel when you want help inspecting output, changing files, or running and verifying work. nextty supplies terminal facts and tools; the Agent decides how to use them.
+
+The implementation uses a small Rust terminal core, a native desktop backend, and bounded background work. Input should keep moving while output is being parsed, history is going to disk, or the GPU is busy.
 
 ![Desktop split view](docs/assets/workspace.png)
 
@@ -14,7 +16,7 @@ nextty is built around a small terminal core, explicit ownership of background w
 - **Workspaces:** tabs, nested splits, draggable dividers, named sessions, detach/attach, and multiple viewers. The latest attachment controls input and size; earlier attachments remain read-only.
 - **SSH sessions:** the same workspace UI through system OpenSSH. Authentication, host keys, aliases, and jump hosts use your SSH configuration. The remote machine needs no display server or extra listening port.
 - **Command-aware output:** Bash/Zsh integration records prompts, command output, and exit status. Jump between prompts, copy a command's output, or search retained history without sending search text to the shell.
-- **Agent panel:** separate conversations, streamed Markdown, terminal-context attachments, current-shell execution, paged history, and conversation rewind. Conversations keep running after the frontend detaches.
+- **Agent panel:** terminal context, direct file reading/search/editing, shell execution, foreground-program interaction, and verification in a separate visible terminal. Separate conversations stream Markdown and continue after the frontend detaches.
 - **Local tools:** an asynchronous file browser with fuzzy search and text preview, plus CPU, memory, network, process, and storage monitoring.
 
 ## Design philosophy
@@ -24,6 +26,8 @@ nextty is built around a small terminal core, explicit ownership of background w
 **Give slow work an owner.** History storage, file traversal, HTTP requests, shell tools, Markdown parsing, and GPU submission run away from the frontend's input loop. Bulk output, history, and file-transfer buffers have explicit limits. Slow consumers apply backpressure to those paths.
 
 **Share state, keep platform code at the edges.** The desktop and ANSI frontends use the same workspace protocol and UI state. Wayland, font shaping, and Vulkan stay in the native backend; terminal parsing and workspace behavior stay in Rust.
+
+**Give the Agent facts and bounded access.** nextty handles terminal identity, exact reads, input conflicts, and execution state. The Agent chooses commands, interprets evidence, and verifies the task. Keep one small model/tool loop and use ordinary shell tools for application-specific work. Existing terminal programs do not need Agent hooks or adapters.
 
 **Use libraries where the problem calls for them.** nextty implements its parser, screen, PTY backend, and workspace transport. It uses system libraries for fonts, shaping, rasterization, HTTP, and TLS. There is no embedded browser, JavaScript runtime, or external Agent executable.
 
@@ -90,7 +94,11 @@ nextty --gui -e /bin/bash --noprofile --norc
 
 `nextty` defaults to the ANSI frontend. `--gui` opens a desktop window; `--tui` selects the current terminal explicitly. Put nextty options before `-e`: everything after it belongs to the child command. Explicit `-e` commands run as supplied; automatic shell integration is installed only for default interactive Bash/Zsh sessions.
 
-Set `tab_style = "angled"` (default) or `tab_style = "flat"` in the configuration. Both styles use orange dots for running programs, green for successful completion, red for failure, and gray for idle or unknown state; close buttons are gray. Closing a tab with running programs or unknown state asks for confirmation, with Cancel selected by default. The footer shows the focused file browser's directory, or otherwise the focused terminal's directory, with its local Git branch on the left. The right side shows local CPU/MEM/DSK/SWP usage with `` / `` / `` / `` icons. Each resource item opens its own CPU, Memory, Disk, or Swap monitor page, with independent hover feedback. The monitor sidebar contains Overview, CPU, Memory, Disk, Network, Swap, and Processes; the expand arrow restores the last page. Overview shows compact resource trends, while the individual pages expose per-core CPU usage, memory availability and cache, physical-disk I/O, swap activity, hardware network interfaces, and the process list. Filesystem capacity follows the focused pane’s directory and is separate from physical-disk I/O. Wide layouts place resource graphs beside their details; narrow layouts stack them. Inline colored legends identify graph series, and process filtering and column headers stay visible while the list scrolls. The `` button expands the monitor; when expanded, it contains `60s`, `5m`, `15m`, `1h` and `` to collapse. Both arrow buttons leave one non-clickable character of space at the right edge. Network monitoring lists all interfaces backed by hardware devices, excluding virtual interfaces such as loopback, tunnels and bridges. Remote directories are displayed as supplied by the remote terminal; local Git branches are never inferred for them.
+Set `tab_style = "angled"` (default) or `tab_style = "flat"` in the configuration. Tab dots show running programs in orange, successful completion in green, failure in red, and idle or unknown state in gray. Closing a tab with running programs or unknown state asks for confirmation.
+
+The footer shows the focused file browser's directory, or otherwise the focused terminal's directory, with its local Git branch. Remote directories are displayed as supplied by the remote terminal; local Git branches are never inferred for them.
+
+Click the footer's CPU, memory, disk, or swap counters to open the corresponding monitor page. The monitor also has Overview, Network, and Processes pages, resource trends, process filtering, and selectable `60s`, `5m`, `15m`, and `1h` history ranges. Network graphs cover hardware-backed interfaces. Filesystem capacity follows the focused directory and is separate from physical-disk I/O. Resource counters describe the local frontend machine.
 
 `Alt+q` detaches without terminating the workspace. Closing a desktop window offers **Keep running** or **End session**. Session state lives in the daemon; it survives a frontend exit or disconnection, but not a reboot or daemon crash.
 
@@ -139,27 +147,39 @@ base_url = "https://gateway.example.com/anthropic"
 model = "your-model"
 ```
 
-nextty appends `/v1/messages` to `base_url`; an empty URL uses `https://api.anthropic.com`. Agent turns enable automatic prompt caching with `cache_control`; custom endpoints must support this Messages API field. Set `ANTHROPIC_AUTH_TOKEN` for Bearer authentication or `ANTHROPIC_API_KEY` for API-key authentication in the environment before starting nextty.
+nextty appends `/v1/messages` to `base_url`; an empty URL uses `https://api.anthropic.com`. Agent turns enable automatic prompt caching with `cache_control`; custom endpoints must support this Messages API field. If the endpoint requires authentication, set `ANTHROPIC_AUTH_TOKEN` for Bearer authentication or `ANTHROPIC_API_KEY` for API-key authentication in the environment before starting nextty.
 
-Open the panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C copies a selection; without a selection, it stops a running reply from the input or output area. The stop button does the same. In the ANSI frontend, End in the Agent output returns to the latest reply; the editor starts with three rows and grows with the draft. Esc in the editor selects an earlier user message; Enter confirms rewind. Rewind removes later conversation history and restores the draft and attachments. It does not undo shell commands or file changes.
+Open the right-side panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C copies a selection; without a selection, it stops a running reply from the input or output area. Esc in the editor selects an earlier user message, and Enter confirms rewind.
 
-Each conversation has its own draft, attachments, transcript, and worker. A local background owner keeps these conversations alive when a frontend detaches. Closing a conversation cancels it; terminating the workspace ends the owner. Conversation state does not survive a machine restart.
+Each submission includes the focused pane's live screen and a workspace inventory: pane IDs, directories, foreground state, and recent commands. Selected text and screen attachments are historical snapshots. Reading terminal state does not move your viewport, change your selection, or issue commands to the foreground program.
 
-A submission includes the focused pane's live application screen and backend process metadata, captured by the Agent owner independently of the user's scroll position. Selection and visible-screen attachments are immutable historical snapshots. They do not read process memory or issue debugger commands.
+### Seven tools, one loop
 
-The Agent works in the selected pane's existing PTY. It has three tools: `shell` submits a command at an untouched integrated shell prompt, `input` operates the current foreground program, and `read` retrieves the screen, command output, or terminal history. Shell submissions preserve the user's current directory, environment, aliases, functions, and job control. They require Bash/Zsh shell integration; if the foreground program or input state is unclear, the Agent must inspect it rather than start another shell. Input versions prevent a delayed Agent action from overwriting intervening user input.
+- **`shell`:** submit a command to a selected untouched integrated shell prompt. Uses that shell's current directory, environment, aliases, functions, and jobs. Requires Bash/Zsh integration and a non-null `shell_prompt`.
+- **`input`:** send text or control characters to the selected pane's current foreground program. It returns a fresh screen after a short observation, so the Agent can often continue without a separate read.
+- **`read`:** inspect the workspace, live screen, one command's output and exit state, or retained terminal history. Supports literal queries, bounded text pages, continuation cursors, and waits.
+- **`open_terminal`:** create a visible tab in a source pane's directory without taking focus. Returns the new pane ID and its first screen observation. The fresh default shell does not copy another shell's runtime environment or jobs.
+- **`read_file`:** read exact UTF-8 text from one regular file, in pages of at most 16 KiB with byte offsets.
+- **`search_files`:** search literal file contents and return paths, line numbers, and excerpts, bounded to 100 matches and 16 KiB of text. Search skips binary files and symlink directories and reports truncation, including files over 8 MiB.
+- **`edit_file`:** replace one exact, unique occurrence of text, or create a file without overwriting an existing one. Edits support UTF-8 files up to 8 MiB, preserve unrelated content and existing permissions, and check for intervening changes before committing staged text.
 
-Reads do not scroll the window or alter selections. Screen reads show the live application even while the user is viewing older output. They omit blank lines and decorative horizontal rules while retaining original row and column positions, titles, debugger markers and cursor visibility. A literal `query` selects matching content with neighboring rows; a screen query also retains the visible input row. Selected rows preserve their original text, including titles and layout marks. Command output and history are read asynchronously from the existing history store, including retained disk history. Text pages are bounded to 16 KiB. Every text result returns a `cursor`, including at the current end, so later reads can retrieve appends to the same unfinished line. `has_more` reports unread content in the current snapshot; `incomplete` reports missing retained content. A text query returns one matching excerpt with neighboring rows and a `matched` flag, rather than a whole page of unrelated text after the match. Pass the returned cursor to continue reading or searching the remaining range. A read does not export or duplicate the entire history. Search runs away from the owner event loop. History reads refer to the main terminal's retained text; repainted TUI frames and evicted history cannot be recovered.
+The Agent selects explicit pane IDs. Terminal input is checked against intervening user input. Native file tools operate asynchronously on the workspace daemon's host, including over nextty SSH, and work while the selected pane is occupied. A foreground `ssh` command inside a local pane does not change the file tools' host.
 
-`read.wait` specifies how many seconds to observe, from 0 through 1800; omission or 0 reads immediately. Its `outcome` distinguishes an immediate read (`current`), command completion (`completed`), screen/history activity (`changed`) and an elapsed observation window (`timeout`). Command waits do not return for every output line. If the command is still running at timeout, the result includes its live screen so the Agent can respond to interactive prompts. A timeout does not stop the program. Shell completion is reported by OSC 133, not inferred from a screen refresh or a quiet interval.
+For example, while a debugger occupies your current terminal, the Agent can inspect and edit project files, open a separate terminal, run the tests there, and report the result. It uses `input` only when it intends to interact with the debugger itself. Existing CLI agents remain ordinary foreground programs; nextty does not require modifying their configuration or installing hooks.
 
-For conditional monitoring, the Agent can run a command in the existing shell that exits when the requested condition holds, then wait on that command, for example `read` with `{"source":"command","command":123,"wait":300}`. This uses one pending tool call without repeatedly querying the model. The frontend and other conversations remain available. The Agent chooses and interprets the condition; screen/history waits still wake on activity, and `query` remains an excerpt search. Monitoring programs should carry their own lifetime bounds when needed, since stopping an observation does not stop them.
+### Waiting, completion, and stopping
 
-Stopping a reply cancels model requests and waits; it does not send Ctrl+C or terminate programs already running in the user's terminal. Interrupting a foreground program is an explicit `input` action. The Agent runs locally, including for SSH workspaces, and credentials stay local. There is no independent command shell, subagent spawning, or `/goal` command. Long conversations retain recent complete exchanges and one rolling summary; older terminal output remains available through the history tools while retained.
+`read.wait` observes for 0 through 1800 seconds; omission or 0 reads immediately. Command reads can wait for command completion without repeated model calls. Screen/history waits return on activity. Timeouts leave programs running, and screen activity alone does not establish readiness or success. Text reads provide continuation cursors and report missing evidence; overwritten TUI frames and evicted history cannot be recovered.
+
+Every submission is a goal by default. After a final response, the same model reviews the request and available evidence with tools disabled. It continues when concrete work remains, finishes when satisfied, or reports a blocker. Ordinary questions can finish with an answer. This review normally adds one model request and is not independent proof of correctness. There is no goal-wide token, iteration, or time budget; bounded reads, context compaction, per-request limits, and transport timeouts still apply. API errors remain visible without automatic retries.
+
+Stopping cancels Agent requests and waits; it does not send Ctrl+C or kill programs already running in your terminals. An uncertain action may already have happened, so the Agent must inspect current state before repeating it. Rewind removes later conversation history and restores the draft and attachments; it does not undo commands or file changes.
+
+Each conversation has its own draft, attachments, transcript, and model worker. A local background owner keeps conversations alive after a frontend detaches; terminating the workspace ends the owner. State does not survive a machine restart. Long conversations keep recent complete exchanges and summarize older work. Model requests run locally even for SSH workspaces; credentials stay local, while configured model endpoints receive submitted context and tool results.
 
 ## Architecture
 
-With workspace support, the daemon owns PTYs and terminal state. Frontends own presentation and interaction. The Agent owner is a separate local process connected to the workspace protocol.
+The daemon owns PTYs and terminal state. Frontends own presentation and interaction. A separate local Agent owner manages conversations and model requests; terminal actions and native file work go through the workspace protocol. Filesystem operations run on the daemon host, so SSH uses the same tool boundary as local workspaces.
 
 ```mermaid
 flowchart TB
@@ -177,7 +197,9 @@ flowchart TB
         PTY["PTY I/O threads"]
         Core["Parser + Core<br/>cells, cursor, VT modes"]
         History["History workers<br/>archive, paging, reflow, export"]
+        Files["Native file worker<br/>read, search, edit"]
         Workspace <--> PTY
+        Workspace <--> Files
         PTY <--> Core
         Core <--> History
     end
@@ -192,7 +214,7 @@ The desktop's UI thread builds drawing packets. A render worker owns font select
 ```mermaid
 flowchart LR
     Input["Wayland input"] --> Actions["Frontend actions"]
-    Actions --> IO["PTY I/O"]
+    Actions --> IO["PTY I/O<br/>direct input, queued remainder"]
     IO --> Parse["VT parser + Core"]
     Parse --> Snapshot["Visible row updates"]
     Snapshot --> Paint["Damage tracking + line cache"]
@@ -212,7 +234,8 @@ The ANSI frontend emits terminal escape sequences from those visible rows instea
 - [workspace_view.rs](src/workspace_view.rs), [tui.rs](src/tui.rs): desktop workspace and ANSI frontends.
 - [paint.rs](src/paint.rs), [native/](native/): drawing packets, Wayland, font shaping, and Vulkan.
 - [history.rs](src/history.rs): bounded disk history and asynchronous history operations.
-- [agent/owner.rs](src/agent/owner.rs), [agent/harness.rs](src/agent/harness.rs), [agent/http.rs](src/agent/http.rs): conversation ownership, model/tool loop, HTTP, and terminal tools.
+- [agent/owner.rs](src/agent/owner.rs), [agent/harness.rs](src/agent/harness.rs), [agent/http.rs](src/agent/http.rs), [agent/mod.rs](src/agent/mod.rs): conversation ownership, model/tool loop, HTTP, and terminal operations.
+- [agent_files.rs](src/agent_files.rs), [worker.rs](src/worker.rs): daemon-side file operations and the reusable background worker used by file navigation and Markdown parsing.
 - [files.rs](src/files.rs), [monitor.rs](src/monitor.rs), [system_stats.rs](src/system_stats.rs): file navigation and local resource monitoring.
 
 ## Performance details
@@ -221,7 +244,7 @@ These are implementation choices, not a claim of a particular frame rate or inpu
 
 ### Input and output scheduling
 
-A PTY read is at most **8 KiB**. Workspace parsing consumes at most 16 KiB under one Core lock and checks history backpressure in chunks of at most **512 bytes**. The I/O loop services pending input between batches. History backpressure pauses output consumption while leaving input writes available.
+When its queue is empty, input first attempts a nonblocking PTY write; any remainder is queued to the PTY's I/O thread. A PTY read is at most **8 KiB**. Workspace parsing consumes at most 16 KiB under one Core lock and checks history backpressure in chunks of at most **512 bytes**. The I/O loop services pending input between batches. History backpressure pauses output consumption while leaving input writes available.
 
 Ordinary ANSI input has no merge delay. A lone Escape waits up to **25 ms** so it can be distinguished from an escape sequence. Linux eventfd notifications wake consumers; redundant terminal redraw notifications are coalesced.
 
@@ -249,7 +272,9 @@ Large clipboard exports stream through anonymous files and file descriptors. The
 
 File navigation uses separate persistent scan and preview workers, keeps only their latest pending request, and cancels stale work. Text previews are limited to 256 KiB and 4,096 lines. Pane search starts a worker only when used, searches a snapshot, and retains at most 10,000 matches.
 
-Resource sampling runs off the input thread once per second. A closed panel samples only its summary counters; process scans run only while the process page is open. Agent HTTP uses nonblocking libcurl multi I/O; cancellation wakes workers through eventfd. Empty conversation tabs do not start model workers.
+Resource sampling runs off the input thread once per second. A collapsed monitor skips detailed per-core CPU, pressure, physical-disk I/O, and swap-rate sampling; footer, filesystem, Git, and network sampling continue. Process scans run only while the process page is open.
+
+Agent HTTP uses nonblocking libcurl multi I/O; cancellation wakes workers through eventfd. Empty conversation tabs do not start model workers, and native file operations start their worker only when used. Stable tool definitions and conversation prefixes support provider caching; bounded retrieval avoids sending the entire history. Input and terminal creation include an observation to avoid a mandatory follow-up read. Streamed transcript updates append changed content, and oversized display transcripts trim in chunks to avoid rebuilding the whole view for every delta. These choices reduce repeated work; actual token use and task quality still depend on the model and workload.
 
 ## Configuration
 
@@ -303,7 +328,7 @@ python3 tools/agent_bench.py target/release/nextty
 
 [wayland_input.py](tools/wayland_input.py) measures synthetic key input to presentation in an existing isolated Mutter session, including frontend and daemon CPU/PSS. See each tool's `--help`. Synthetic input excludes physical keyboard and panel scanout latency. Measurements need a recorded build, workload, and environment to be useful.
 
-[agent_bench.py](tools/agent_bench.py) uses a local SSE model and private workspaces to measure the real ANSI frontend, Agent owner, and daemon. Its input latency is PTY injection to the child application's read, with 80 probes across each four-second workload; it does not measure GUI presentation or an online model. The large-response stress case starts with 128 KiB of Markdown and adds 200 deltas per second. It verifies streamed conversation content and tool results, and reports process CPU, end-of-workload PSS, and tool round trips as JSON. Compare saved release binaries with the same script and repeat runs to account for scheduling noise.
+[agent_bench.py](tools/agent_bench.py) uses a local SSE model and private workspaces to measure the real ANSI frontend, Agent owner, and daemon. Its input latency is PTY injection to the child application's read, with 80 probes across each four-second workload; it does not measure GUI presentation or an online model. The large-response stress case starts with 128 KiB of Markdown and adds 200 deltas per second. It verifies streamed conversation content, tool results, native workspace file repair in an unfocused terminal and default goal continuation after a premature final response, and reports process CPU, end-of-workload PSS, and tool round trips as JSON. Compare saved release binaries with the same script and repeat runs to account for scheduling noise.
 
 ## Scope and limits
 

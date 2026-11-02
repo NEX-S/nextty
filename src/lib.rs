@@ -9,7 +9,9 @@ pub mod error;
 mod eventfd;
 pub mod width;
 
+pub(crate) mod agent_files;
 pub mod files;
+mod worker;
 
 pub mod history;
 

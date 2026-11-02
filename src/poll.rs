@@ -1,6 +1,13 @@
 use std::io;
 use std::time::{Duration, Instant};
 
+pub fn timeout_millis(duration: Duration) -> i32 {
+    duration
+        .as_nanos()
+        .div_ceil(1_000_000)
+        .min(i32::MAX as u128) as i32
+}
+
 pub fn poll(fds: &mut [libc::pollfd], mut timeout: i32) -> io::Result<()> {
     let deadline = (timeout >= 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
     loop {
@@ -12,11 +19,7 @@ pub fn poll(fds: &mut [libc::pollfd], mut timeout: i32) -> io::Result<()> {
             return Err(error);
         }
         timeout = deadline.map_or(-1, |deadline| {
-            deadline
-                .saturating_duration_since(Instant::now())
-                .as_nanos()
-                .div_ceil(1_000_000)
-                .min(i32::MAX as u128) as i32
+            timeout_millis(deadline.saturating_duration_since(Instant::now()))
         });
     }
 }

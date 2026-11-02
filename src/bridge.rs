@@ -99,33 +99,27 @@ fn bridge(remote: &mut Peer, daemon: &mut Peer, list: bool) -> io::Result<()> {
     let mut copy_turn = false;
     let mut initial = true;
     let mut ending = false;
-    let mut daemon_ready = true;
+    daemon.flush()?;
     loop {
-        if daemon_ready {
-            daemon.flush()?;
-        }
-        daemon_ready = !daemon.pending();
         // Alternate file chunks and screen messages so history copies remain bounded
         // without delaying interactive state or a session termination behind the file.
         if !remote.pending() {
-            if !copy && !copies.is_empty() {
-                let (request, incomplete) = copies.pop_front().unwrap();
+            if !copy && let Some((request, incomplete)) = copies.pop_front() {
                 remote.begin_copy(request, incomplete)?;
                 copy = true;
             } else {
-                let mut sent_chunk = false;
-                if copy
-                    && (copy_turn || pending.is_none())
-                    && let Some(bytes) = reader.as_mut().unwrap().read()?
-                {
+                let chunk = if copy && (copy_turn || pending.is_none()) {
+                    reader.as_mut().unwrap().read()?
+                } else {
+                    None
+                };
+                if let Some(bytes) = chunk {
                     remote.copy_chunk(&bytes)?;
                     if bytes.is_empty() {
                         copy = false;
                     }
                     copy_turn = false;
-                    sent_chunk = true;
-                }
-                if !sent_chunk && let Some(frame) = pending.take() {
+                } else if let Some(frame) = pending.take() {
                     remote.send_frame(frame)?;
                     copy_turn = true;
                 }
@@ -171,8 +165,6 @@ fn bridge(remote: &mut Peer, daemon: &mut Peer, list: bool) -> io::Result<()> {
         if fds[1].revents & libc::POLLOUT != 0 {
             remote.flush()?;
         }
-        daemon_ready |=
-            fds[2].revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0;
         if read_remote
             && (remote.buffered_action()
                 || fds[0].revents & (libc::POLLIN | libc::POLLHUP | libc::POLLERR) != 0)
@@ -197,26 +189,32 @@ fn bridge(remote: &mut Peer, daemon: &mut Peer, list: bool) -> io::Result<()> {
             && (daemon.buffered_action() || fds[2].revents != 0)
             && let Some(frame) = daemon.next_frame()?
         {
-            if frame.kind() == 5 || list && frame.kind() == 2 || initial && frame.kind() == 4 {
+            let kind = frame.kind();
+            if kind == 5 || list && kind == 2 || initial && kind == 4 {
                 ending = true;
                 reader = None;
                 copy = false;
                 copies.clear();
             }
-            if frame.kind() == 1 || frame.kind() == 12 {
+            if kind == 1 || kind == 12 {
                 initial = false;
             }
-            match frame.kind() {
-                3 => {
-                    let (request, file, incomplete) = daemon.take_clipboard(frame)?;
-                    if reader.is_none() {
-                        reader = Some(ClipboardReader::new(65536)?);
-                    }
-                    reader.as_ref().unwrap().queue(file)?;
-                    copies.push_back((request, incomplete));
+            if kind == 3 {
+                let (request, file, incomplete) = daemon.take_clipboard(frame)?;
+                if reader.is_none() {
+                    reader = Some(ClipboardReader::new(65536)?);
                 }
-                _ => pending = Some(frame),
+                reader.as_ref().unwrap().queue(file)?;
+                copies.push_back((request, incomplete));
+            } else {
+                pending = Some(frame);
             }
+        }
+        if read_remote
+            || fds[2].revents & (libc::POLLOUT | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL)
+                != 0
+        {
+            daemon.flush()?;
         }
     }
 }

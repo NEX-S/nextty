@@ -165,9 +165,8 @@ impl Trace {
         if let Some(frame) = self.pending.take() {
             writeln!(
                 self.output,
-                "frame {} {:.9} {:.9} {:.9} {time:.9} {} {} {} {} {} {:.9} {}",
+                "frame {} {:.9} {:.9} {time:.9} {} {} {} {} {} {:.9} {}",
                 self.frame,
-                frame.begin,
                 frame.begin,
                 frame.prepared,
                 frame.marker.0,

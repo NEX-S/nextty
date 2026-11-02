@@ -68,7 +68,7 @@ fn run() -> Result<()> {
                 if args.next().is_some() {
                     return Err(Error::msg("unexpected server argument"));
                 }
-                nextty::workspace::run_server(&path, nextty::workspace::ServerOptions::default())?;
+                nextty::workspace::run_server(&path)?;
                 return Ok(());
             }
             "-e" => {
@@ -87,15 +87,16 @@ fn run() -> Result<()> {
         }
     }
 
-    let (remote, name) = match (command.as_deref(), positions.as_slice()) {
-        (_, []) => (None, None),
-        (Some("list"), [host]) => (Some(ssh::RemoteTarget::parse(host)?), None),
-        (Some("list"), _) => return Err(Error::msg("list takes at most one remote target")),
-        (_, [host, name]) => (Some(ssh::RemoteTarget::parse(host)?), Some(name.clone())),
-        (_, [host]) if ssh::RemoteTarget::recognizes(host) => {
-            (Some(ssh::RemoteTarget::parse(host)?), None)
+    let mut positions = positions.into_iter();
+    let (remote, name) = match (command.as_deref(), positions.next(), positions.next()) {
+        (_, None, None) => (None, None),
+        (Some("list"), Some(host), None) => (Some(ssh::RemoteTarget::parse(&host)?), None),
+        (Some("list"), _, _) => return Err(Error::msg("list takes at most one remote target")),
+        (_, Some(host), Some(name)) => (Some(ssh::RemoteTarget::parse(&host)?), Some(name)),
+        (_, Some(host), None) if ssh::RemoteTarget::recognizes(&host) => {
+            (Some(ssh::RemoteTarget::parse(&host)?), None)
         }
-        (_, [name]) => (None, Some(name.clone())),
+        (_, Some(name), None) => (None, Some(name)),
         _ => unreachable!(),
     };
     let command = command.as_deref().unwrap_or("new");
@@ -114,21 +115,18 @@ fn run() -> Result<()> {
             "this build has no gui frontend; enable its Cargo feature",
         ));
     }
-    let socket = if remote.is_none() {
-        Some(workspace::socket_path()?)
-    } else {
-        None
-    };
+    let socket = remote.is_none().then(workspace::socket_path).transpose()?;
     let connect = || match &remote {
         Some(target) => Client::connect_remote(target.command(), target.label()),
         None => Client::connect(socket.as_ref().unwrap()),
     };
     if matches!(command, "list" | "terminate") {
+        let list = command == "list";
         // Control commands do not need a default frontend configuration.
         if config_path.is_some() {
             Config::load(config_path)?;
         }
-        let action = if command == "list" {
+        let action = if list {
             Action::List
         } else {
             Action::TerminateName(name.unwrap())
@@ -136,7 +134,7 @@ fn run() -> Result<()> {
         let mut client = match connect() {
             Ok(client) => client,
             Err(error)
-                if command == "list"
+                if list
                     && remote.is_none()
                     && matches!(
                         error.kind(),
@@ -149,7 +147,7 @@ fn run() -> Result<()> {
             Err(error) => return Err(Error::context("connect workspace server", error)),
         };
         client.send(action)?;
-        return control_reply(&mut client, command == "list");
+        return control_reply(&mut client, list);
     }
     let config = Config::load(config_path)?;
     let size = CreateOptions::default().size;
@@ -168,12 +166,10 @@ fn run() -> Result<()> {
                 directory: if remote.is_some() {
                     directory
                 } else {
-                    Some({
-                        match directory {
-                            Some(path) if path.is_absolute() => path,
-                            Some(path) => std::env::current_dir()?.join(path),
-                            None => std::env::current_dir()?,
-                        }
+                    Some(match directory {
+                        Some(path) if path.is_absolute() => path,
+                        Some(path) => std::env::current_dir()?.join(path),
+                        None => std::env::current_dir()?,
                     })
                 },
                 program,
@@ -223,19 +219,10 @@ fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<(
         if remaining.is_zero() {
             return Err(Error::msg("workspace server did not reply"));
         }
-        let mut fd = libc::pollfd {
-            fd: client.fd(),
-            events: libc::POLLIN
-                | if client.wants_write() {
-                    libc::POLLOUT
-                } else {
-                    0
-                },
-            revents: 0,
-        };
+        let mut fd = client.pollfd();
         nextty::poll::poll(
             std::slice::from_mut(&mut fd),
-            remaining.as_millis().min(i32::MAX as u128) as i32,
+            nextty::poll::timeout_millis(remaining),
         )?;
         if fd.revents & libc::POLLOUT != 0 {
             client.flush()?;

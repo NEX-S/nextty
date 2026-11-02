@@ -5,10 +5,13 @@ pub(crate) mod markdown;
 pub mod owner;
 pub(crate) mod panel;
 
-use crate::agent::harness::{Event, Harness, MAX_READ_WAIT, TerminalRequest};
+use crate::agent::harness::{Event, Harness, MAX_READ_WAIT, TOOL_OUTPUT_LIMIT, Tool, ToolRequest};
 use crate::input::keysym;
-use crate::workspace::{Action, AgentMessage, AgentModelPatch, Client, ClientEvent};
+use crate::workspace::{
+    Action, AgentMessage, AgentModelPatch, Client, ClientEvent, FileOperation, FileResult, PaneView,
+};
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
@@ -16,6 +19,7 @@ use std::{io, ops::Range};
 
 const INPUT_LIMIT: usize = 64 * 1024;
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
+const INPUT_OBSERVE: Duration = Duration::from_millis(100);
 
 #[derive(Default)]
 pub(crate) struct AgentView {
@@ -27,13 +31,17 @@ pub(crate) struct AgentView {
     pub scroll: usize,
     pub revision: u64,
     pub pending: Vec<serde_json::Value>,
-    pub(crate) turn: u64,
 }
 
 impl AgentView {
     pub fn restore_patch(&mut self, patch: &AgentModelPatch) -> io::Result<bool> {
         let start = patch.start as usize;
-        let redraw = self.busy != patch.busy
+        let busy = patch.busy
+            || self
+                .pending
+                .iter()
+                .any(|request| request["action"] == "send");
+        let redraw = self.busy != busy
             || self.messages.len() != start + patch.messages.len()
             || patch.messages.iter().enumerate().any(|(index, new)| {
                 self.messages.get(start + index).is_none_or(|old| {
@@ -53,9 +61,8 @@ impl AgentView {
                 })
             });
         patch.apply_messages(&mut self.messages)?;
-        self.busy = patch.busy;
+        self.busy = busy;
         self.revision = patch.revision;
-        self.turn = patch.turn;
         Ok(redraw)
     }
 
@@ -71,8 +78,7 @@ impl AgentView {
 
     pub fn clear_input(&mut self) {
         self.input.clear();
-        self.cursor = 0;
-        self.anchor = None;
+        self.set_cursor(0, false);
     }
 
     pub fn set_cursor(&mut self, offset: usize, extend: bool) {
@@ -89,26 +95,17 @@ impl AgentView {
         if self.input.len() - range.len() + text.len() > INPUT_LIMIT {
             return Err("Agent input exceeds 64 KiB".into());
         }
-        self.cursor = range.start + text.len();
+        self.set_cursor(range.start + text.len(), false);
         self.input.replace_range(range, text);
-        self.anchor = None;
         Ok(())
     }
 
-    pub fn key(&mut self, symbol: u32, shift: bool) -> bool {
+    pub fn key(&mut self, symbol: u32, shift: bool) {
         let before = || {
-            self.input[..self.cursor]
-                .char_indices()
-                .next_back()
-                .map_or(0, |(i, _)| i)
+            self.input
+                .floor_char_boundary(self.cursor.saturating_sub(1))
         };
-        let after = || {
-            self.cursor
-                + self.input[self.cursor..]
-                    .chars()
-                    .next()
-                    .map_or(0, char::len_utf8)
-        };
+        let after = || self.input.ceil_char_boundary(self.cursor + 1);
         let selection = self.selection();
         let offset = match symbol {
             keysym::LEFT => {
@@ -126,12 +123,9 @@ impl AgentView {
                 }
             }
             keysym::HOME => self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1),
-            keysym::END => {
-                self.cursor
-                    + self.input[self.cursor..]
-                        .find('\n')
-                        .unwrap_or(self.input.len() - self.cursor)
-            }
+            keysym::END => self.input[self.cursor..]
+                .find('\n')
+                .map_or(self.input.len(), |offset| self.cursor + offset),
             keysym::BACKSPACE | keysym::DELETE => {
                 let range = selection.unwrap_or_else(|| {
                     if symbol == keysym::BACKSPACE {
@@ -140,15 +134,13 @@ impl AgentView {
                         self.cursor..after()
                     }
                 });
-                self.cursor = range.start;
+                self.set_cursor(range.start, false);
                 self.input.replace_range(range, "");
-                self.anchor = None;
-                return true;
+                return;
             }
-            _ => return false,
+            _ => return,
         };
         self.set_cursor(offset, shift);
-        true
     }
 }
 
@@ -163,8 +155,8 @@ pub(crate) struct Agent {
     runtime: Option<Harness>,
     response: Option<usize>,
     operation: Option<Operation>,
-    observed_input: Option<(u64, u64)>,
-    observed_activity: Option<(u64, u64)>,
+    observed_input: BTreeMap<u64, u64>,
+    observed_activity: BTreeMap<u64, u64>,
 }
 
 impl Agent {
@@ -174,7 +166,7 @@ impl Agent {
 
     pub fn send(
         &mut self,
-        input: &str,
+        input: &mut String,
         prompt: String,
         config: &crate::config::Config,
         pane: u64,
@@ -193,14 +185,13 @@ impl Agent {
         let generation = target["input_generation"].as_u64();
         let turn = self.runtime.as_ref().unwrap().send(prompt, pane, target)?;
         self.turn = turn;
-        self.observed_input = generation.map(|generation| (pane, generation));
-        self.observed_activity = Some((pane, activity));
-        self.messages.push(AgentMessage {
-            turn,
-            role: "You".into(),
-            text: input.to_owned(),
-            id: None,
-        });
+        if let Some(generation) = generation {
+            self.observed_input.insert(pane, generation);
+        } else {
+            self.observed_input.remove(&pane);
+        }
+        self.observed_activity.insert(pane, activity);
+        self.message("You", std::mem::take(input));
         self.response = None;
         self.busy = true;
         self.trim();
@@ -230,29 +221,41 @@ impl Agent {
     }
 
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
-        let history = if let Some(operation) = self.operation.take() {
-            let (command, history) = match operation.stage {
+        let cancel = if let Some(operation) = self.operation.take() {
+            let (command, cancel) = match operation.stage {
                 Stage::Command { command, .. } => (Some(command), None),
-                Stage::Read { id, command, .. } => (command, Some(id)),
+                Stage::Read { id, command, .. } => {
+                    (command, Some(Action::CancelHistory { request: id }))
+                }
+                Stage::File { id } => (None, Some(Action::CancelAgentFile { request: id })),
                 _ => (None, None),
             };
             let result = match command {
-                Some(command) if operation.request.name == "shell" => {
+                Some(command) if operation.request.tool == Tool::Shell => {
                     Ok(json!({"input_queued":true,"command":command}).to_string())
+                }
+                _ if matches!(operation.stage, Stage::InputOutput { .. }) => {
+                    Ok(queued_input(Err(io::ErrorKind::Interrupted.into()), None))
+                }
+                _ if matches!(operation.stage, Stage::NewTerminalOutput { .. }) => {
+                    Ok(created_terminal(
+                        operation.request.pane,
+                        Err(io::ErrorKind::Interrupted.into()),
+                    ))
                 }
                 _ => Err(io::ErrorKind::Interrupted.into()),
             };
             // Queue known execution facts before abort publishes cancellation and wakes the worker.
             let _ = operation.request.reply.send(result);
-            history
+            cancel
         } else {
             None
         };
         if let Some(runtime) = &self.runtime {
             runtime.abort()?;
         }
-        if let Some(request) = history {
-            client.send(Action::CancelHistory { request })?;
+        if let Some(action) = cancel {
+            client.send(action)?;
         }
         Ok(())
     }
@@ -265,7 +268,7 @@ impl Agent {
         let events = runtime.poll()?;
         let mut changed = false;
         for event in events {
-            changed |= !matches!(event, Event::Terminal(_));
+            changed |= !matches!(event, Event::Request(_));
             match event {
                 Event::Text(text) => {
                     let index = *self.response.get_or_insert_with(|| {
@@ -317,34 +320,22 @@ impl Agent {
                         });
                     }
                 }
-                Event::Terminal(request) => self.begin(request, client)?,
+                Event::Request(request) => self.begin(request, client)?,
                 Event::Notice(text) => {
-                    self.messages.push(AgentMessage {
-                        turn: self.turn,
-                        role: "Context".into(),
-                        text,
-                        id: None,
-                    });
+                    self.response = None;
+                    self.message("Context", text);
                 }
-                Event::Error(error) => {
-                    self.messages.push(AgentMessage {
-                        turn: self.turn,
-                        role: "Error".into(),
-                        text: error,
-                        id: None,
-                    });
+                Event::Blocked(reason) => {
+                    self.response = None;
+                    self.message("Blocked", reason);
                 }
+                Event::Error(error) => self.message("Error", error),
                 Event::Rewound { turn, error } => {
                     let text = self.rewind.take().unwrap();
                     self.busy = false;
                     self.response = None;
                     if let Some(error) = error {
-                        self.messages.push(AgentMessage {
-                            turn: self.turn,
-                            role: "Error".into(),
-                            text: error,
-                            id: None,
-                        });
+                        self.message("Error", error);
                     } else {
                         self.messages.retain(|message| message.turn < turn);
                         self.revision += 1;
@@ -366,6 +357,15 @@ impl Agent {
         }
         self.advance(client)?;
         Ok(changed)
+    }
+
+    fn message(&mut self, role: &str, text: String) {
+        self.messages.push(AgentMessage {
+            turn: self.turn,
+            role: role.into(),
+            text,
+            id: None,
+        });
     }
 
     fn trim(&mut self) {
@@ -399,10 +399,10 @@ impl Agent {
                 .position(|m| m.role != "You")
                 .unwrap_or(0);
             let message = &mut self.messages[index];
-            let mut start = bytes - TRANSCRIPT_LIMIT;
-            while !message.text.is_char_boundary(start) {
-                start += 1;
-            }
+            // Leave room for new deltas so trimming does not reset the whole transcript every time.
+            let start = message
+                .text
+                .ceil_char_boundary((bytes - TRANSCRIPT_LIMIT).max(TRANSCRIPT_LIMIT / 8));
             message.text.drain(..start);
             self.revision += 1;
         }
@@ -412,11 +412,11 @@ impl Agent {
 pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> {
     let mut context = terminal_observation(client, pane, None)?;
     let snapshot = client.snapshot().unwrap();
-    let view = snapshot.panes.iter().find(|view| view.id == pane).unwrap();
+    let view = snapshot.pane(pane).unwrap();
     context["target"] = json!({
         "workspace": snapshot.name,
         "pane": pane,
-        "tab": snapshot.active_tab,
+        "tab": view.tab,
         "connection": if client.is_remote() { "ssh" } else { "local" },
         "ssh_target": client.remote_target(),
         "writable": client.can_agent_input(),
@@ -425,6 +425,7 @@ pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> 
         "launch_argv": view.process.launch_argv,
         "child_pid": view.process.child_pid,
     });
+    context["workspace"] = workspace_context(client)?;
     Ok(context)
 }
 
@@ -433,58 +434,76 @@ fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?;
     let view = snapshot
-        .panes
-        .iter()
-        .find(|view| view.id == pane)
+        .pane(pane)
         .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
     let screen = client
         .screens()
         .get(&pane)
         .ok_or_else(|| io::Error::other("No screen for pane"))?;
-    let mut observation = json!({
-        "pane": pane,
-        "process": {
-            "foreground_pgid": view.process.foreground_pgid,
-            "foreground_pid": view.process.foreground_pid,
-            "foreground_scope": "pty_process_group_leader",
-            "foreground_executable": view.process.foreground_executable,
-            "foreground_argv": view.process.foreground_argv,
-            "foreground_cwd": view.process.foreground_cwd,
-            "sampled_at_ms": view.process.sampled_at_ms,
-            "unavailable": view.process.unavailable,
-        },
-        "history_rows": screen.history,
-        "input_generation": view.input_generation,
-        "shell_prompt": view.shell_prompt,
-    });
+    let mut observation = pane_context(view);
+    observation["history_rows"] = json!(screen.history);
     observation["screen"] = crate::agent::context::shape(screen, query);
-    observation["command_blocks"] = Value::Array(
-        view.command_blocks
-            .iter()
-            .rev()
-            .map(|b| {
-                json!({
-                    "id":b.id,"has_output":b.has_output,"exit_code":b.status,
-                    "output_incomplete":!b.complete,
-                })
-            })
-            .collect(),
-    );
     Ok(observation)
+}
+
+fn pane_context(view: &PaneView) -> Value {
+    json!({
+        "pane":view.id,"tab":view.tab,"title":view.title,"cwd":view.cwd,
+        "input_generation":view.input_generation,"shell_prompt":view.shell_prompt,
+        "process":{
+            "foreground_pgid":view.process.foreground_pgid,
+            "foreground_pid":view.process.foreground_pid,
+            "foreground_scope":"pty_process_group_leader",
+            "foreground_executable":view.process.foreground_executable,
+            "foreground_argv":view.process.foreground_argv,
+            "foreground_cwd":view.process.foreground_cwd,
+            "sampled_at_ms":view.process.sampled_at_ms,
+            "unavailable":view.process.unavailable,
+        },
+        "command_blocks":view.command_blocks.iter().rev().map(|b| json!({
+            "id":b.id,"has_output":b.has_output,"exit_code":b.status,"output_incomplete":!b.complete,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn workspace_context(client: &Client) -> io::Result<Value> {
+    let snapshot = client
+        .snapshot()
+        .ok_or_else(|| io::Error::other("No workspace"))?;
+    Ok(json!({
+        "workspace":snapshot.name,"active_tab":snapshot.active_tab,
+        "connection":if client.is_remote() {"ssh"} else {"local"},
+        "ssh_target":client.remote_target(),
+        "panes":snapshot.panes.iter().map(pane_context).collect::<Vec<_>>(),
+    }))
 }
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
 
 struct Operation {
-    request: TerminalRequest,
+    request: ToolRequest,
     stage: Stage,
 }
 
 enum Stage {
     Refresh,
+    File {
+        id: u64,
+    },
+    NewTerminal {
+        id: u64,
+    },
+    NewTerminalOutput {
+        until: Instant,
+    },
     Input {
         id: u64,
         generation: u64,
+        before: u64,
+    },
+    InputOutput {
+        before: u64,
+        until: Instant,
     },
     Command {
         command: u64,
@@ -503,7 +522,12 @@ enum Stage {
 
 impl Agent {
     pub fn needs_screen(&self) -> bool {
-        self.operation.is_some()
+        self.operation.as_ref().is_some_and(|operation| {
+            !matches!(
+                operation.stage,
+                Stage::File { .. } | Stage::NewTerminal { .. }
+            )
+        })
     }
 
     pub fn deadline(&self, client: &Client) -> Option<Instant> {
@@ -511,77 +535,125 @@ impl Agent {
             .as_ref()
             .filter(|_| !client.screen_stale())
             .and_then(|operation| match operation.stage {
-                Stage::Command { until, .. } | Stage::Change { until, .. } => Some(until),
+                Stage::Command { until, .. }
+                | Stage::Change { until, .. }
+                | Stage::InputOutput { until, .. }
+                | Stage::NewTerminalOutput { until } => Some(until),
                 _ => None,
             })
     }
 
-    fn begin(&mut self, request: TerminalRequest, client: &mut Client) -> io::Result<()> {
+    fn begin(&mut self, mut request: ToolRequest, client: &mut Client) -> io::Result<()> {
         if request.canceled.load(Ordering::Acquire) {
             return request.respond(Err(io::ErrorKind::Interrupted.into()));
         }
-        match client.refresh_screen() {
-            Ok(()) => {
-                self.operation = Some(Operation {
-                    request,
-                    stage: Stage::Refresh,
-                })
-            }
+        let result = if matches!(
+            request.tool,
+            Tool::ReadFile | Tool::SearchFiles | Tool::EditFile | Tool::OpenTerminal
+        ) {
+            (|| {
+                let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
+                if request.tool == Tool::OpenTerminal {
+                    client.send(Action::AgentNewTab {
+                        pane: request.pane,
+                        request: id,
+                    })?;
+                    return Ok(Stage::NewTerminal { id });
+                }
+                let path = serde_json::from_value(request.input["path"].take())?;
+                let operation = match request.tool {
+                    Tool::ReadFile => FileOperation::Read {
+                        offset: request
+                            .input
+                            .get_mut("offset")
+                            .map(|value| serde_json::from_value(value.take()))
+                            .transpose()?
+                            .unwrap_or(0),
+                    },
+                    Tool::SearchFiles => FileOperation::Search {
+                        query: serde_json::from_value(request.input["query"].take())?,
+                    },
+                    Tool::EditFile => FileOperation::Edit {
+                        old_text: serde_json::from_value(request.input["old_text"].take())?,
+                        new_text: serde_json::from_value(request.input["new_text"].take())?,
+                    },
+                    _ => unreachable!(),
+                };
+                client.send(Action::AgentFile {
+                    pane: request.pane,
+                    request: id,
+                    path,
+                    operation,
+                })?;
+                Ok(Stage::File { id })
+            })()
+        } else {
+            client.refresh_screen().map(|()| Stage::Refresh)
+        };
+        match result {
+            Ok(stage) => self.operation = Some(Operation { request, stage }),
             Err(error) => request.respond(Err(error))?,
         }
         Ok(())
     }
 
-    fn begin_ready(&mut self, request: TerminalRequest, client: &mut Client) -> io::Result<()> {
+    fn begin_ready(&mut self, request: ToolRequest, client: &mut Client) -> io::Result<()> {
+        if request.tool == Tool::Read && request.input["source"] == "workspace" {
+            let result = if request.canceled.load(Ordering::Acquire) {
+                Err(io::ErrorKind::Interrupted.into())
+            } else {
+                workspace_context(client).map(|context| context.to_string())
+            };
+            return request.respond(result);
+        }
         let result = (|| {
             if request.canceled.load(Ordering::Acquire) {
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            let pane = request.input["pane"].as_u64().unwrap();
-            match request.name.as_str() {
-                "shell" | "input" => {
-                    let shell = request.name == "shell";
+            let pane = request.pane;
+            match request.tool {
+                Tool::Shell | Tool::Input => {
+                    let shell = request.tool == Tool::Shell;
                     let view = client
                         .snapshot()
-                        .and_then(|snapshot| snapshot.panes.iter().find(|view| view.id == pane))
+                        .and_then(|snapshot| snapshot.pane(pane))
                         .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
                     let field = if shell { "command" } else { "text" };
                     let text = request.input[field]
                         .as_str()
                         .ok_or_else(|| io::Error::other(format!("Missing string {field}")))?;
                     let prompt = if shell {
-                        Some(view.shell_prompt.ok_or_else(|| io::Error::other("The terminal is not at an untouched integrated shell prompt; read its state and use input for the current program"))?)
+                        Some(view.shell_prompt.ok_or_else(|| io::Error::other("This pane has no untouched integrated shell prompt. Use input only to interact with its current foreground program. For independent shell commands, use open_terminal and the returned new pane ID."))?)
                     } else {
                         None
                     };
-                    let mut data = text.as_bytes().to_vec();
-                    if shell {
-                        if client.screens().get(&pane).is_some_and(|screen| {
+                    let data = if shell
+                        && client.screens().get(&pane).is_some_and(|screen| {
                             screen.mode.contains(crate::core::Mode::BRACKETED_PASTE)
                         }) {
-                            data = [
-                                b"\x1b[200~".as_slice(),
-                                data.as_slice(),
-                                b"\x1b[201~\r".as_slice(),
-                            ]
-                            .concat();
-                        } else {
-                            if text.chars().any(char::is_control) {
-                                return Err(io::Error::other(
-                                    "Shell editing controls require bracketed paste; use a single printable command",
-                                ));
-                            }
+                        [
+                            b"\x1b[200~".as_slice(),
+                            text.as_bytes(),
+                            b"\x1b[201~\r".as_slice(),
+                        ]
+                        .concat()
+                    } else {
+                        if shell && text.chars().any(char::is_control) {
+                            return Err(io::Error::other(
+                                "Shell editing controls require bracketed paste; use a single printable command",
+                            ));
+                        }
+                        let mut data = text.as_bytes().to_vec();
+                        if shell {
                             data.push(b'\r');
                         }
-                    }
+                        data
+                    };
                     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-                    let generation = self
-                        .observed_input
-                        .filter(|(target, _)| *target == pane)
-                        .map(|(_, generation)| generation)
-                        .ok_or_else(|| {
-                            io::Error::other("Read the current terminal state before sending input")
-                        })?;
+                    let generation = self.observed_input.get(&pane).copied().ok_or_else(|| {
+                        io::Error::other("Read the current terminal state before sending input")
+                    })?;
+                    let before = client.screen_revision(pane)?;
                     client.send(Action::AgentInput {
                         pane,
                         request: id,
@@ -589,9 +661,13 @@ impl Agent {
                         prompt,
                         data,
                     })?;
-                    Ok(Stage::Input { id, generation })
+                    Ok(Stage::Input {
+                        id,
+                        generation,
+                        before,
+                    })
                 }
-                "read" => {
+                Tool::Read => {
                     let source = request.input["source"]
                         .as_str()
                         .ok_or_else(|| io::Error::other("Missing read source"))?;
@@ -643,7 +719,7 @@ impl Agent {
                         read_output(client, &request, command, "current")
                     }
                 }
-                _ => Err(io::Error::other("Unknown terminal tool")),
+                _ => unreachable!(),
             }
         })();
         match result {
@@ -653,30 +729,79 @@ impl Agent {
         Ok(())
     }
 
-    pub fn handle_event(&mut self, event: &mut ClientEvent, client: &Client) -> io::Result<()> {
+    pub fn handle_event(&mut self, event: &mut ClientEvent, client: &mut Client) -> io::Result<()> {
         let id = match event {
-            ClientEvent::AgentInput { request, .. } | ClientEvent::History { request, .. } => {
-                *request
-            }
+            ClientEvent::AgentInput { request, .. }
+            | ClientEvent::History { request, .. }
+            | ClientEvent::AgentFile { request, .. }
+            | ClientEvent::AgentNewTab { request, .. } => *request,
             _ => return Ok(()),
         };
-        if !self.operation.as_ref().is_some_and(|operation| matches!(operation.stage, Stage::Input {id:pending,..} | Stage::Read {id:pending,..} if pending == id)) {
+        if !self.operation.as_ref().is_some_and(|operation| matches!(operation.stage, Stage::Input {id:pending,..} | Stage::Read {id:pending,..} | Stage::File {id:pending} | Stage::NewTerminal {id:pending} if pending == id)) {
             return Ok(());
         }
         let mut operation = self.operation.take().unwrap();
         let event = std::mem::replace(event, ClientEvent::Updated);
         match event {
+            ClientEvent::AgentFile { result, .. } => {
+                operation.request.respond(result.map_err(io::Error::other).map(|result| {
+                    match result {
+                        FileResult::Read { path, offset, text, next_offset, has_more } => json!({"path":path,"offset":offset,"text":text,"next_offset":next_offset,"has_more":has_more}),
+                        FileResult::Search { path, matches, truncated } => json!({"path":path,"matches":matches.into_iter().map(|found|json!({"path":found.path,"line":found.line,"text":found.text})).collect::<Vec<_>>(),"truncated":truncated}),
+                        FileResult::Edited { path } => json!({"path":path,"written":true}),
+                    }.to_string()
+                }))?;
+            }
+            ClientEvent::AgentNewTab { result, .. } => match result {
+                Ok(pane) => {
+                    operation.request.pane = pane;
+                    operation.stage = Stage::NewTerminalOutput {
+                        until: Instant::now() + Duration::from_secs(1),
+                    };
+                    let refreshed = if operation.request.canceled.load(Ordering::Acquire) {
+                        Err(io::ErrorKind::Interrupted.into())
+                    } else {
+                        client.refresh_screen()
+                    };
+                    match refreshed {
+                        Ok(()) => self.operation = Some(operation),
+                        Err(error) => operation
+                            .request
+                            .respond(Ok(created_terminal(pane, Err(error))))?,
+                    }
+                }
+                Err(error) => operation.request.respond(Err(io::Error::other(error)))?,
+            },
             ClientEvent::AgentInput { result, .. } => {
-                let Stage::Input { generation, .. } = operation.stage else {
+                let Stage::Input {
+                    generation, before, ..
+                } = operation.stage
+                else {
                     unreachable!()
                 };
                 if result.is_ok() {
-                    self.observed_input = Some((
-                        operation.request.input["pane"].as_u64().unwrap(),
-                        generation + 1,
-                    ));
+                    self.observed_input
+                        .insert(operation.request.pane, generation + 1);
                 }
                 match result {
+                    Ok(None) => {
+                        operation.stage = Stage::InputOutput {
+                            before,
+                            until: Instant::now() + INPUT_OBSERVE,
+                        };
+                        if operation.request.canceled.load(Ordering::Acquire) {
+                            return operation.request.respond(Ok(queued_input(
+                                Err(io::ErrorKind::Interrupted.into()),
+                                None,
+                            )));
+                        }
+                        match client.refresh_screen() {
+                            Ok(()) => self.operation = Some(operation),
+                            Err(error) => operation
+                                .request
+                                .respond(Ok(queued_input(Err(error), None)))?,
+                        }
+                    }
                     Ok(Some(command)) if !operation.request.canceled.load(Ordering::Acquire) => {
                         operation.stage = Stage::Command {
                             command,
@@ -684,35 +809,32 @@ impl Agent {
                         };
                         self.operation = Some(operation);
                     }
-                    Ok(command) => {
-                        let pane = operation.request.input["pane"].as_u64().unwrap();
-                        operation
-                            .request
-                            .respond(terminal_observation(client, pane, None).map(
-                                |mut context| {
-                                    self.observed_activity =
-                                        Some((pane, client.terminal_revision(pane).unwrap()));
-                                    context["input_queued"] = json!(true);
-                                    if let Some(command) = command {
-                                        context["command"] = json!(command);
-                                    }
-                                    context.to_string()
-                                },
-                            ))?;
+                    Ok(Some(command)) => {
+                        let pane = operation.request.pane;
+                        operation.request.respond(Ok(queued_input(
+                            terminal_observation(client, pane, None).inspect(|_| {
+                                self.observed_activity
+                                    .insert(pane, client.terminal_revision(pane).unwrap());
+                            }),
+                            Some(command),
+                        )))?;
                     }
                     Err(error) => operation.request.respond(Err(io::Error::other(error)))?,
                 }
             }
             ClientEvent::History { result, .. } => {
                 let Stage::Read {
-                    before, outcome, ..
+                    command,
+                    before,
+                    outcome,
+                    ..
                 } = operation.stage
                 else {
                     unreachable!()
                 };
                 if result.is_ok() {
-                    self.observed_activity =
-                        Some((operation.request.input["pane"].as_u64().unwrap(), before));
+                    self.observed_activity
+                        .insert(operation.request.pane, before);
                 }
                 let result = result.map_err(io::Error::other).and_then(|page| {
                     let marker = page.command.as_ref();
@@ -737,16 +859,21 @@ impl Agent {
                         result["running"] = json!(marker.status.is_none());
                     }
                     if outcome == "timeout" && marker.is_some() {
-                        let pane = operation.request.input["pane"].as_u64().unwrap();
+                        let pane = operation.request.pane;
                         let mut context = terminal_observation(client, pane, None)?;
-                        self.observed_input = Some((pane, context["input_generation"].as_u64().unwrap()));
+                        self.observed_input.insert(pane, context["input_generation"].as_u64().unwrap());
                         result["screen"] = context["screen"].take();
                         result["shell_prompt"] = context["shell_prompt"].take();
                         result["input_generation"] = context["input_generation"].take();
                         result["process"] = context["process"].take();
                     }
-                    Ok(result.to_string())
+                    Ok(result)
                 });
+                let result = if operation.request.tool == Tool::Shell {
+                    Ok(queued_input(result, command))
+                } else {
+                    result.map(|result| result.to_string())
+                };
                 operation.request.respond(result)?;
             }
             _ => unreachable!(),
@@ -755,95 +882,187 @@ impl Agent {
     }
 
     fn advance(&mut self, client: &mut Client) -> io::Result<()> {
-        if let Some(mut operation) = self.operation.take() {
-            if matches!(operation.stage, Stage::Refresh)
-                && !operation.request.canceled.load(Ordering::Acquire)
-                && !client.screen_stale()
-            {
-                return self.begin_ready(operation.request, client);
+        let Some(mut operation) = self.operation.take() else {
+            return Ok(());
+        };
+        if matches!(operation.stage, Stage::Refresh)
+            && !operation.request.canceled.load(Ordering::Acquire)
+            && !client.screen_stale()
+        {
+            return self.begin_ready(operation.request, client);
+        }
+        let result = (|| -> io::Result<Option<String>> {
+            let pane = operation.request.pane;
+            if operation.request.canceled.load(Ordering::Acquire) {
+                if let Stage::Read { id, .. } = operation.stage {
+                    client.send(Action::CancelHistory { request: id })?;
+                } else if let Stage::File { id } = operation.stage {
+                    client.send(Action::CancelAgentFile { request: id })?;
+                }
+                return Err(io::ErrorKind::Interrupted.into());
             }
-            let result = (|| -> io::Result<Option<String>> {
-                let pane = operation.request.input["pane"].as_u64().unwrap();
-                if operation.request.canceled.load(Ordering::Acquire) {
-                    if let Stage::Read { id, .. } = operation.stage {
-                        client.send(Action::CancelHistory { request: id })?;
+            if matches!(
+                operation.stage,
+                Stage::Command { .. }
+                    | Stage::Change { .. }
+                    | Stage::InputOutput { .. }
+                    | Stage::NewTerminalOutput { .. }
+            ) && client.screen_stale()
+            {
+                client.request_screen()?;
+                return Ok(None);
+            }
+            match &operation.stage {
+                Stage::NewTerminalOutput { until } => {
+                    let view = client
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.pane(pane))
+                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    if view.shell_prompt.is_some() || Instant::now() >= *until {
+                        let mut context = terminal_observation(client, pane, None)?;
+                        self.observed_input
+                            .insert(pane, context["input_generation"].as_u64().unwrap());
+                        self.observed_activity
+                            .insert(pane, client.terminal_revision(pane)?);
+                        context["outcome"] = json!(if view.shell_prompt.is_some() {
+                            "current"
+                        } else {
+                            "timeout"
+                        });
+                        return Ok(Some(created_terminal(pane, Ok(context))));
                     }
-                    return Err(io::ErrorKind::Interrupted.into());
                 }
-                if matches!(
-                    operation.stage,
-                    Stage::Command { .. } | Stage::Change { .. }
-                ) && client.screen_stale()
-                {
-                    client.request_screen()?;
-                    return Ok(None);
+                Stage::InputOutput { before, until } => {
+                    let activity = client.screen_revision(pane)?;
+                    let changed = activity != *before;
+                    if changed || Instant::now() >= *until {
+                        let mut context = terminal_observation(client, pane, None)?;
+                        self.observed_input
+                            .insert(pane, context["input_generation"].as_u64().unwrap());
+                        self.observed_activity
+                            .insert(pane, client.terminal_revision(pane)?);
+                        context["outcome"] = json!(if changed { "changed" } else { "timeout" });
+                        return Ok(Some(queued_input(Ok(context), None)));
+                    }
                 }
-                match &operation.stage {
-                    Stage::Command { command, until } => {
-                        let view = client
-                            .snapshot()
-                            .and_then(|snapshot| snapshot.panes.iter().find(|view| view.id == pane))
-                            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
-                        let marker = view
-                            .command_blocks
-                            .iter()
-                            .find(|block| block.id == *command);
-                        // Older completed commands fall outside the recent-status window.
-                        let completed = marker.is_none_or(|marker| marker.status.is_some());
-                        if completed || Instant::now() >= *until {
-                            operation.stage = read_output(
+                Stage::Command { command, until } => {
+                    let view = client
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.pane(pane))
+                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    let marker = view
+                        .command_blocks
+                        .iter()
+                        .find(|block| block.id == *command);
+                    // Older completed commands fall outside the recent-status window.
+                    let completed = marker.is_none_or(|marker| marker.status.is_some());
+                    if completed || Instant::now() >= *until {
+                        operation.stage = read_output(
+                            client,
+                            &operation.request,
+                            Some(*command),
+                            if completed { "completed" } else { "timeout" },
+                        )?;
+                    }
+                }
+                Stage::Change { until } => {
+                    let activity = client.terminal_revision(pane)?;
+                    let changed = self.observed_activity.get(&pane) != Some(&activity);
+                    if changed || Instant::now() >= *until {
+                        let outcome = if operation.request.input["wait"].as_u64().unwrap_or(0) == 0
+                        {
+                            "current"
+                        } else if changed {
+                            "changed"
+                        } else {
+                            "timeout"
+                        };
+                        if operation.request.input["source"] == "screen" {
+                            let mut context = terminal_observation(
                                 client,
-                                &operation.request,
-                                Some(*command),
-                                if completed { "completed" } else { "timeout" },
+                                pane,
+                                operation.request.input["query"].as_str(),
                             )?;
+                            self.observed_input
+                                .insert(pane, context["input_generation"].as_u64().unwrap());
+                            self.observed_activity.insert(pane, activity);
+                            context["outcome"] = json!(outcome);
+                            return Ok(Some(context.to_string()));
                         }
+                        operation.stage = read_output(client, &operation.request, None, outcome)?;
                     }
-                    Stage::Change { until } => {
-                        let activity = client.terminal_revision(pane)?;
-                        let changed = self.observed_activity != Some((pane, activity));
-                        if changed || Instant::now() >= *until {
-                            let outcome =
-                                if operation.request.input["wait"].as_u64().unwrap_or(0) == 0 {
-                                    "current"
-                                } else if changed {
-                                    "changed"
-                                } else {
-                                    "timeout"
-                                };
-                            if operation.request.input["source"] == "screen" {
-                                let mut context = terminal_observation(
-                                    client,
-                                    pane,
-                                    operation.request.input["query"].as_str(),
-                                )?;
-                                self.observed_input =
-                                    Some((pane, context["input_generation"].as_u64().unwrap()));
-                                self.observed_activity = Some((pane, activity));
-                                context["outcome"] = json!(outcome);
-                                return Ok(Some(context.to_string()));
-                            }
-                            operation.stage =
-                                read_output(client, &operation.request, None, outcome)?;
-                        }
-                    }
-                    _ => (),
                 }
-                Ok(None)
-            })();
-            match result {
-                Ok(Some(text)) => operation.request.respond(Ok(text))?,
-                Ok(None) => self.operation = Some(operation),
-                Err(error) => operation.request.respond(Err(error))?,
+                _ => (),
+            }
+            Ok(None)
+        })();
+        match result {
+            Ok(Some(text)) => operation.request.respond(Ok(text))?,
+            Ok(None) => self.operation = Some(operation),
+            Err(error) => {
+                let command = match operation.stage {
+                    Stage::Command { command, .. }
+                    | Stage::Read {
+                        command: Some(command),
+                        ..
+                    } if operation.request.tool == Tool::Shell => Some(command),
+                    _ => None,
+                };
+                let result = if matches!(operation.stage, Stage::NewTerminalOutput { .. }) {
+                    Ok(created_terminal(operation.request.pane, Err(error)))
+                } else if command.is_some() || matches!(operation.stage, Stage::InputOutput { .. })
+                {
+                    Ok(queued_input(Err(error), command))
+                } else {
+                    Err(error)
+                };
+                operation.request.respond(result)?;
             }
         }
         Ok(())
     }
 }
 
+fn created_terminal(pane: u64, observation: io::Result<Value>) -> String {
+    let mut result =
+        observation.unwrap_or_else(|error| json!({"observation_error":error.to_string()}));
+    result["created"] = json!(true);
+    result["pane"] = json!(pane);
+    let text = result.to_string();
+    if text.len() <= TOOL_OUTPUT_LIMIT {
+        text
+    } else {
+        json!({
+            "created":true,"pane":pane,
+            "observation_error":"Terminal observation exceeds 64 KiB; use read with a focused query",
+        }).to_string()
+    }
+}
+
+fn queued_input(observation: io::Result<Value>, command: Option<u64>) -> String {
+    let mut result =
+        observation.unwrap_or_else(|error| json!({"observation_error":error.to_string()}));
+    result["input_queued"] = json!(true);
+    if let Some(command) = command {
+        result["command"] = json!(command);
+    }
+    let text = result.to_string();
+    if text.len() <= TOOL_OUTPUT_LIMIT {
+        return text;
+    }
+    let mut facts = json!({
+        "input_queued": true,
+        "observation_error": "Terminal observation exceeds 64 KiB; use read with a focused query",
+    });
+    if let Some(command) = command {
+        facts["command"] = json!(command);
+    }
+    facts.to_string()
+}
+
 fn read_output(
     client: &mut Client,
-    request: &TerminalRequest,
+    request: &ToolRequest,
     command: Option<u64>,
     outcome: &'static str,
 ) -> io::Result<Stage> {
@@ -860,7 +1079,7 @@ fn read_output(
         })
         .transpose()?;
     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
-    let pane = request.input["pane"].as_u64().unwrap();
+    let pane = request.pane;
     let before = client.terminal_revision(pane)?;
     client.send(Action::ReadHistory {
         pane,
@@ -881,40 +1100,68 @@ fn read_output(
 mod tests {
     use super::*;
 
-    fn snapshot(agent: &AgentView) -> AgentModelPatch {
-        AgentModelPatch {
-            busy: agent.busy,
-            revision: agent.revision,
-            turn: agent.turn,
-            messages: agent.messages.clone(),
-            ..AgentModelPatch::default()
+    #[test]
+    fn failed_or_oversized_first_observation_preserves_created_terminal() {
+        for observation in [
+            Err(io::ErrorKind::Interrupted.into()),
+            Ok(json!({"screen":{"rows":[[0, "终".repeat(TOOL_OUTPUT_LIMIT / 3)]]}})),
+        ] {
+            let text = created_terminal(37, observation);
+            assert!(text.len() <= TOOL_OUTPUT_LIMIT);
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["created"], true);
+            assert_eq!(result["pane"], 37);
+            assert!(result["observation_error"].is_string());
+            assert!(result.get("screen").is_none());
+        }
+    }
+
+    #[test]
+    fn oversized_observation_preserves_accepted_input_and_command() {
+        for command in [None, Some(37)] {
+            let text = queued_input(
+                Ok(json!({"screen":{"rows":[[0, "终".repeat(TOOL_OUTPUT_LIMIT / 3)]]}})),
+                command,
+            );
+            assert!(text.len() <= TOOL_OUTPUT_LIMIT);
+            let result: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(result["input_queued"], true);
+            assert!(
+                result["observation_error"]
+                    .as_str()
+                    .unwrap()
+                    .contains("64 KiB")
+            );
+            assert_eq!(result.get("command").and_then(Value::as_u64), command);
+            assert!(result.get("screen").is_none());
         }
     }
 
     #[test]
     fn mirror_restores_canonical_messages_without_overwriting_next_draft() {
-        let mut owner = AgentView::default();
-        owner.messages.push(AgentMessage {
-            role: "You".into(),
-            text: "first request".into(),
+        let patch = AgentModelPatch {
+            busy: true,
+            revision: 9,
             turn: 3,
-            id: None,
-        });
-        owner.busy = true;
-        owner.turn = 3;
-        owner.revision = 9;
+            messages: vec![AgentMessage {
+                role: "You".into(),
+                text: "first request".into(),
+                turn: 3,
+                id: None,
+            }],
+            ..AgentModelPatch::default()
+        };
         let mut mirror = AgentView::default();
         mirror.insert("下一条🙂").unwrap();
         mirror.anchor = Some(3);
         mirror.scroll = 7;
         let cursor = mirror.cursor;
-        assert!(mirror.restore_patch(&snapshot(&owner)).unwrap());
+        assert!(mirror.restore_patch(&patch).unwrap());
         assert_eq!(mirror.input, "下一条🙂");
         assert_eq!(mirror.cursor, cursor);
         assert_eq!(mirror.anchor, Some(3));
         assert_eq!(mirror.scroll, 7);
         assert_eq!(mirror.messages[0].turn, 3);
-        assert_eq!(mirror.turn, 3);
         assert_eq!(mirror.revision, 9);
         assert!(mirror.busy);
     }
@@ -1034,6 +1281,27 @@ mod tests {
         assert_eq!(agent.messages[agent.response.unwrap()].text, "working");
         assert!(agent.messages.iter().map(|m| m.text.len()).sum::<usize>() <= TRANSCRIPT_LIMIT);
         assert!(agent.messages.len() <= 128);
+
+        agent.messages[agent.response.unwrap()]
+            .text
+            .push_str(&"🙂中文".repeat(TRANSCRIPT_LIMIT / 10 + 1));
+        agent.trim();
+        assert_eq!(agent.messages[0].text, "inspect the debugger");
+        let response = agent.response.unwrap();
+        assert_eq!(response, 1);
+        let revision = agent.revision;
+        for _ in 0..100 {
+            agent.messages[response].text.push_str("增量🙂");
+            agent.trim();
+        }
+        assert_eq!(agent.revision, revision);
+        agent.messages[response]
+            .text
+            .push_str(&"尾".repeat(TRANSCRIPT_LIMIT / 3));
+        agent.trim();
+        assert!(agent.messages.iter().map(|m| m.text.len()).sum::<usize>() <= TRANSCRIPT_LIMIT);
+        assert_eq!(agent.messages[0].text, "inspect the debugger");
+        assert_eq!(agent.response, Some(response));
     }
 
     #[test]
@@ -1044,10 +1312,19 @@ mod tests {
             ("keep 中文", "Set model"),
         ] {
             let mut agent = Agent::default();
+            let mut draft = input.to_owned();
             let error = agent
-                .send(input, input.into(), &config, 1, serde_json::Value::Null, 0)
+                .send(
+                    &mut draft,
+                    input.into(),
+                    &config,
+                    1,
+                    serde_json::Value::Null,
+                    0,
+                )
                 .unwrap_err();
             assert!(error.to_string().contains(diagnostic));
+            assert_eq!(draft, input);
             assert!(agent.messages.is_empty());
             assert!(agent.runtime.is_none());
             assert!(!agent.busy);

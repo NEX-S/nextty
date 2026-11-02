@@ -43,9 +43,8 @@ pub(crate) struct Text {
     pub width: u16,
     pub text: String,
     pub color: u32,
-    pub selected: bool,
+    emphasis: Emphasis,
     pub focused: bool,
-    pub highlighted: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -57,12 +56,9 @@ pub(crate) enum Emphasis {
 
 impl Text {
     pub fn emphasis(&self, monitor_focused: bool) -> Emphasis {
-        if self.selected {
-            Emphasis::Selected
-        } else if self.highlighted || self.focused && monitor_focused {
-            Emphasis::Highlighted
-        } else {
-            Emphasis::None
+        match self.emphasis {
+            Emphasis::None if self.focused && monitor_focused => Emphasis::Highlighted,
+            emphasis => emphasis,
         }
     }
 }
@@ -88,17 +84,23 @@ pub(crate) struct View {
     pub body_x: u16,
 }
 impl View {
-    fn text(&mut self, x: u16, y: i32, width: u16, text: impl Into<String>, color: u32) {
-        self.texts.push(Text {
+    fn text(
+        &mut self,
+        x: u16,
+        y: i32,
+        width: u16,
+        text: impl Into<String>,
+        color: u32,
+    ) -> &mut Text {
+        self.texts.push_mut(Text {
             x,
             y,
             width,
             text: text.into(),
             color,
-            selected: false,
+            emphasis: Emphasis::None,
             focused: false,
-            highlighted: false,
-        });
+        })
     }
     fn button(&mut self, x: u16, y: i32, width: u16, text: &str, action: Action, selected: bool) {
         let width = if matches!(action, Action::Process(_) | Action::Search | Action::Tab(_)) {
@@ -107,8 +109,10 @@ impl View {
             width.min(text_width(text) as u16 + 2)
         };
         let label = format!(" {} ", fit_label(text, width.saturating_sub(2)));
-        self.text(x, y, width, label, if selected { GREEN } else { MUTED });
-        self.texts.last_mut().unwrap().highlighted = selected;
+        let text = self.text(x, y, width, label, if selected { GREEN } else { MUTED });
+        if selected {
+            text.emphasis = Emphasis::Highlighted;
+        }
         self.hits.push(Hit {
             x,
             y,
@@ -149,24 +153,19 @@ impl View {
         x: u16,
         mut y: i32,
         width: u16,
-        rows: impl IntoIterator<Item = (String, String)>,
+        rows: impl IntoIterator<Item = (&'static str, String)>,
     ) -> i32 {
         let key_width = (width / 2).min(24);
+        let value_width = width.saturating_sub(key_width);
         for (key, value) in rows {
-            if text_width(&value) > usize::from(width.saturating_sub(key_width))
-                || text_width(&key) >= usize::from(key_width)
+            if text_width(&value) > usize::from(value_width)
+                || text_width(key) >= usize::from(key_width)
             {
-                y = self.lines(x, y, width, &key, MUTED);
+                y = self.lines(x, y, width, key, MUTED);
                 y = self.lines(x, y, width, &value, INK);
             } else {
                 self.text(x, y, key_width.saturating_sub(1), key, MUTED);
-                self.text(
-                    x + key_width,
-                    y,
-                    width.saturating_sub(key_width),
-                    value,
-                    INK,
-                );
+                self.text(x + key_width, y, value_width, value, INK);
                 y += 1;
             }
         }
@@ -237,14 +236,14 @@ impl Monitor {
             false,
         );
         if self.open {
-            let start = width.saturating_sub(25);
-            for (offset, seconds, label) in [
-                (0, 60, "60s"),
-                (6, 300, "5m"),
-                (11, 900, "15m"),
-                (17, 3600, "1h"),
-            ] {
-                if width >= 25 {
+            if width >= 25 {
+                let start = width - 25;
+                for (offset, seconds, label) in [
+                    (0, 60, "60s"),
+                    (6, 300, "5m"),
+                    (11, 900, "15m"),
+                    (17, 3600, "1h"),
+                ] {
                     view.button(
                         start + offset,
                         0,
@@ -377,18 +376,12 @@ impl Monitor {
         if self.process_revision == Some(revision) {
             return;
         }
-        if let Some((pid, start)) = self.selected
-            && !self
-                .stats
-                .processes()
-                .iter()
-                .any(|p| p.pid == pid && p.start == start)
-        {
-            self.selected = None;
-        }
+        let processes = self.stats.processes();
+        self.selected = self
+            .selected
+            .filter(|identity| processes.iter().any(|p| (p.pid, p.start) == *identity));
         let query = self.query.to_lowercase();
         let numeric = query.bytes().all(|byte| byte.is_ascii_digit());
-        let processes = self.stats.processes();
         self.process_order.clear();
         self.process_order.extend(
             processes
@@ -528,32 +521,25 @@ impl Monitor {
         if self.searching {
             match symbol {
                 keysym::LEFT => {
-                    self.cursor = self.query[..self.cursor]
-                        .char_indices()
-                        .next_back()
-                        .map_or(0, |(i, _)| i)
+                    self.cursor = self
+                        .query
+                        .floor_char_boundary(self.cursor.saturating_sub(1))
                 }
-                keysym::RIGHT => {
-                    self.cursor = self.query[self.cursor..]
-                        .char_indices()
-                        .nth(1)
-                        .map_or(self.query.len(), |(i, _)| self.cursor + i)
-                }
+                keysym::RIGHT => self.cursor = self.query.ceil_char_boundary(self.cursor + 1),
                 keysym::HOME => self.cursor = 0,
                 keysym::END => self.cursor = self.query.len(),
-                keysym::BACKSPACE => {
-                    if let Some((i, _)) = self.query[..self.cursor].char_indices().next_back() {
+                keysym::BACKSPACE | keysym::DELETE => {
+                    let range = if symbol == keysym::BACKSPACE {
+                        self.query
+                            .floor_char_boundary(self.cursor.saturating_sub(1))
+                            ..self.cursor
+                    } else {
+                        self.cursor..self.query.ceil_char_boundary(self.cursor + 1)
+                    };
+                    if !range.is_empty() {
                         self.process_revision = None;
-                        self.query.drain(i..self.cursor);
-                        self.cursor = i;
-                    }
-                    self.scroll = 0;
-                    self.anchor = None;
-                }
-                keysym::DELETE => {
-                    if let Some(ch) = self.query[self.cursor..].chars().next() {
-                        self.process_revision = None;
-                        self.query.drain(self.cursor..self.cursor + ch.len_utf8());
+                        self.cursor = range.start;
+                        self.query.drain(range);
                     }
                     self.scroll = 0;
                     self.anchor = None;
@@ -583,27 +569,26 @@ impl Monitor {
             }
             return;
         }
-        let ch = char::from_u32(symbol);
         match symbol {
-            keysym::RETURN | 0x20 => {
-                let action = self.focus;
-                self.action(action);
-            }
-            keysym::UP | keysym::DOWN | 0x6a | 0x6b => {
-                let down = matches!(symbol, keysym::DOWN | 0x6a);
+            keysym::RETURN | 0x20 => self.action(self.focus),
+            keysym::UP | keysym::DOWN | keysym::PAGE_UP | keysym::PAGE_DOWN | 0x6a | 0x6b => {
+                let delta: isize = match symbol {
+                    keysym::UP | 0x6b => -1,
+                    keysym::DOWN | 0x6a => 1,
+                    keysym::PAGE_UP => -6,
+                    _ => 6,
+                };
                 match self.focus {
-                    Action::Tab(tab) => {
-                        let tab = if down { (tab + 1) % 7 } else { (tab + 6) % 7 };
+                    Action::Tab(tab) if delta.abs() == 1 => {
+                        let tab = if delta > 0 {
+                            (tab + 1) % 7
+                        } else {
+                            (tab + 6) % 7
+                        };
                         self.action(Action::Tab(tab));
                     }
-                    Action::Process(_) => self.move_process(if down { 1 } else { -1 }),
-                    _ => {
-                        self.scroll = if down {
-                            self.scroll.saturating_add(1)
-                        } else {
-                            self.scroll.saturating_sub(1)
-                        }
-                    }
+                    Action::Process(_) => self.move_process(delta),
+                    _ => self.scroll = self.scroll.saturating_add_signed(delta),
                 }
             }
             keysym::LEFT | keysym::RIGHT | 0x68 | 0x6c => {
@@ -621,19 +606,7 @@ impl Monitor {
                     self.cycle(false);
                 }
             }
-            keysym::PAGE_UP | keysym::PAGE_DOWN => {
-                let down = symbol == keysym::PAGE_DOWN;
-                if matches!(self.focus, Action::Process(_)) {
-                    self.move_process(if down { 6 } else { -6 });
-                } else {
-                    self.scroll = if down {
-                        self.scroll.saturating_add(6)
-                    } else {
-                        self.scroll.saturating_sub(6)
-                    };
-                }
-            }
-            _ if ch == Some('/') && self.tab == 6 => self.action(Action::Search),
+            0x2f if self.tab == 6 => self.action(Action::Search),
             _ => (),
         }
     }
@@ -658,15 +631,16 @@ impl Monitor {
         if width < 10 || series.is_empty() {
             return;
         }
+        let first = &series[0];
         let maximum = series.iter().map(|s| s.maximum).fold(0., f32::max);
-        let title = match (series.len(), series[0].name) {
-            (2, "RX") => series[0].summary.split('·').next().unwrap().trim(),
+        let title = match (series.len(), first.name) {
+            (2, "RX") => first.summary.split('·').next().unwrap().trim(),
             (2, "READ") => "DISK I/O",
             (2, "IN") => "SWAP I/O",
-            _ => series[0].name,
+            _ => first.name,
         };
         if series.len() == 1 {
-            let value = trend_value(series[0].value, series[0].unit);
+            let value = trend_value(first.value, first.unit);
             let value_width = (text_width(&value) as u16).min(width.saturating_sub(5));
             view.text(x, y, width.saturating_sub(value_width + 1), title, INK);
             view.text(
@@ -674,9 +648,9 @@ impl Monitor {
                 y,
                 value_width,
                 value,
-                series_color(series[0].name),
+                series_color(first.name),
             );
-            view.text(x, y + 1, width, &series[0].summary, MUTED);
+            view.text(x, y + 1, width, &first.summary, MUTED);
         } else {
             view.text(x, y, width, title, INK);
             let columns = width / series.len() as u16;
@@ -690,7 +664,7 @@ impl Monitor {
                 );
             }
         }
-        let scale = if series[0].unit == "%" {
+        let scale = if first.unit == "%" {
             format!("{maximum:.0}%")
         } else if maximum < 1. {
             format!("{:.0}K", maximum * 1024.)
@@ -953,15 +927,15 @@ impl Monitor {
                         dw,
                         [
                             (
-                                "Read".into(),
+                                "Read",
                                 trend_value(disk.rates[0].map(|v| (v / 1048576.) as f32), "MiB/s"),
                             ),
                             (
-                                "Write".into(),
+                                "Write",
                                 trend_value(disk.rates[1].map(|v| (v / 1048576.) as f32), "MiB/s"),
                             ),
                             (
-                                "Busy".into(),
+                                "Busy",
                                 disk.utilization
                                     .map_or_else(|| "—".into(), |v| format!("{v:.0}%")),
                             ),
@@ -1118,9 +1092,12 @@ impl Monitor {
                         width: hit.width,
                         text: process_row(process, w, columns),
                         color: if selected { GREEN } else { INK },
-                        selected,
+                        emphasis: if selected {
+                            Emphasis::Selected
+                        } else {
+                            Emphasis::None
+                        },
                         focused: false,
-                        highlighted: false,
                     });
                 }
             }
@@ -1137,21 +1114,20 @@ impl Monitor {
             && let Some(hit) = view
                 .hits
                 .iter()
-                .rev()
-                .find(|hit| hit.y == y && (hit.x..hit.x + hit.width).contains(&x))
+                .rfind(|hit| hit.y == y && (hit.x..hit.x + hit.width).contains(&x))
             && let Some(text) = view
                 .texts
                 .iter_mut()
                 .find(|text| text.x == hit.x && text.y == hit.y && text.width == hit.width)
         {
-            if !text.selected {
+            if text.emphasis != Emphasis::Selected {
                 text.color = INK;
             }
-            if matches!(hit.action, Action::Process(_)) {
-                text.selected = true;
+            text.emphasis = if matches!(hit.action, Action::Process(_)) {
+                Emphasis::Selected
             } else {
-                text.highlighted = true;
-            }
+                Emphasis::Highlighted
+            };
         }
         view
     }
@@ -1254,9 +1230,10 @@ impl Monitor {
                     width.saturating_sub(2),
                     &format!(
                         "cwd {}",
-                        p.directory
-                            .as_ref()
-                            .map_or_else(|| "unavailable".into(), |d| d.display().to_string())
+                        p.directory.as_deref().map_or(
+                            Cow::Borrowed("unavailable"),
+                            std::path::Path::to_string_lossy
+                        )
                     ),
                     MUTED,
                 );
@@ -1389,7 +1366,7 @@ mod tests {
             .unwrap();
         assert_eq!(label.text, " Network ");
         assert_eq!(hit.width, 12);
-        assert!(!label.selected);
+        assert!(label.emphasis(false) == Emphasis::None);
         monitor.pointer = Some((hit.x, hit.y));
         let view = monitor.view(120, 18);
         let label = view
@@ -1397,17 +1374,17 @@ mod tests {
             .iter()
             .find(|text| text.text == " Network ")
             .unwrap();
-        assert!(!label.selected);
-        assert!(label.highlighted);
+        assert!(label.emphasis(false) == Emphasis::Highlighted);
         monitor.pointer = None;
         assert!(
-            !monitor
+            monitor
                 .view(120, 18)
                 .texts
                 .iter()
                 .find(|text| text.text == " Network ")
                 .unwrap()
-                .highlighted
+                .emphasis(false)
+                == Emphasis::None
         );
     }
     #[test]

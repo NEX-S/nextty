@@ -45,6 +45,7 @@ fn shortening_selection_preserves_text_and_clears_unselected_padding() {
     let pane = PaneView {
         process: Default::default(),
         id: 1,
+        tab: 1,
         rect: Rect {
             x: 0,
             y: 0,
@@ -169,8 +170,8 @@ fn stdout_hangup_detaches_even_while_stdin_remains_open() {
     let mut child = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "tui::tests::stdout_hangup_child", "--nocapture"])
         .env("NEXTTY_TEST_OUTPUT_HANGUP_SOCKET", &socket)
-        .stdin(Stdio::from(input_slave))
-        .stdout(Stdio::from(output_slave))
+        .stdin(input_slave)
+        .stdout(output_slave)
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
@@ -267,6 +268,7 @@ fn metadata_updates_remove_hover_from_unchanged_output_rows() {
         panes: vec![PaneView {
             process: Default::default(),
             id: 1,
+            tab: 1,
             rect: Rect {
                 x: 0,
                 y: 1,
@@ -522,6 +524,7 @@ fn file_paste_edits_only_local_query_and_enter_copies_the_path() {
                 panes: vec![PaneView {
                     process: Default::default(),
                     id: 1,
+                    tab: 1,
                     rect: Rect {
                         x: 0,
                         y: 1,
@@ -633,6 +636,7 @@ fn result_rows_keep_full_width_and_hover_preserves_selection() {
     let pane = PaneView {
         process: Default::default(),
         id: 1,
+        tab: 1,
         rect: Rect {
             x: 0,
             y: 0,
@@ -718,6 +722,7 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
         let pane = PaneView {
             process: Default::default(),
             id: 1,
+            tab: 1,
             rect: Rect {
                 x: 2,
                 y: 1,
@@ -795,6 +800,7 @@ fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
     let pane = PaneView {
         process: Default::default(),
         id: 1,
+        tab: 1,
         rect: Rect {
             x: 0,
             y: 0,
@@ -871,16 +877,7 @@ fn tab_dots_follow_active_color_with_spaces_inside_both_edges() {
     for active in [1, 2] {
         snapshot.active_tab = active;
         let mut output = Vec::new();
-        draw_tabs(
-            &mut output,
-            &snapshot,
-            80,
-            "",
-            None,
-            &Ui::new().unwrap(),
-            &Config::default(),
-        )
-        .unwrap();
+        draw_tabs(&mut output, &snapshot, 80, "", None, &Config::default()).unwrap();
         parser.advance(&mut host, &output);
         for (index, x, width) in tab_chrome(&snapshot, 80, "").0 {
             let row = &host.row(0).cells;
@@ -891,9 +888,9 @@ fn tab_dots_follow_active_color_with_spaces_inside_both_edges() {
             assert_eq!(
                 row[x + 2].fg,
                 Color::Spec(Rgb {
-                    r: 75,
-                    g: 75,
-                    b: 75
+                    r: 181,
+                    g: 210,
+                    b: 162
                 })
             );
             assert_eq!(row[x + 3].c, ' ');
@@ -948,7 +945,6 @@ fn tab_dots_follow_active_color_with_spaces_inside_both_edges() {
                 80,
                 "",
                 hovered.then_some(pointer),
-                &Ui::new().unwrap(),
                 &Config::default(),
             )
             .unwrap();
@@ -973,9 +969,9 @@ fn tab_dots_follow_active_color_with_spaces_inside_both_edges() {
                         .extra(usize::from(column))
                         .and_then(|extra| extra.underline_color),
                     Some(Color::Spec(Rgb {
-                        r: 148,
-                        g: 148,
-                        b: 148
+                        r: 232,
+                        g: 117,
+                        b: 117
                     }))
                 );
             }
@@ -1215,7 +1211,6 @@ fn both_tab_styles_share_status_colors_and_gray_close_buttons() {
             100,
             "",
             None,
-            &Ui::new().unwrap(),
             &Config {
                 tab_style: style,
                 ..Config::default()
@@ -1236,7 +1231,7 @@ fn both_tab_styles_share_status_colors_and_gray_close_buttons() {
         for ((index, x, width), color) in tab_chrome(&snapshot, 100, "")
             .0
             .into_iter()
-            .zip([0xfe9b30, 0xb5d2a2, 0xe87575, 0x4b4b4b])
+            .zip([0xfe9b30, 0xb5d2a2, 0xef5350, 0xb5d2a2])
         {
             let cells = &host.row(0).cells;
             assert_eq!(
@@ -1550,7 +1545,8 @@ mod agent {
             for y in panel.y..panel.y + panel.rows {
                 for x in panel.x..panel.x + panel.cols {
                     let cell = &host.row(usize::from(y)).cells[usize::from(x)];
-                    if !cell.c.is_whitespace() && cell.c != '│' {
+                    if !cell.c.is_whitespace() && !matches!(cell.c, '│' | '─' | '├' | '•' | '╱')
+                    {
                         let fg = luminance(host.color(cell.fg));
                         let bg = luminance(host.color(cell.bg));
                         let contrast = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
@@ -1596,7 +1592,7 @@ mod agent {
             .max()
             .unwrap();
         assert_eq!(plus.x, tabs_end);
-        assert_eq!(plus.cols, 3);
+        assert_eq!(plus.cols, 2);
         assert_eq!(panel_close.cols, 3);
         assert_eq!(panel_close.x + panel_close.cols, frontend.size.num_cols);
         assert!(plus.x + plus.cols <= panel_close.x);
@@ -1653,41 +1649,31 @@ mod agent {
                 frontend.draw_agent(&mut bytes).unwrap();
                 parser.advance(&mut host, &bytes);
                 let cell = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 1)];
-                let active = matches!(
-                    action,
-                    AgentAction::Session(0) | AgentAction::CloseSession(0)
-                );
-                assert_eq!(
-                    cell.flags.contains(Flags::UNDERLINE),
-                    active || hovered && !matches!(action, AgentAction::Session(_))
-                );
-                if hovered && !matches!(action, AgentAction::Session(_)) {
-                    let rgb = crate::vt::Rgb {
-                        r: 204,
-                        g: 204,
-                        b: 204,
-                    };
-                    assert_eq!(cell.fg, Color::Spec(rgb));
+                if action == AgentAction::ClosePanel {
+                    assert_eq!(cell.c, '›');
                     assert_eq!(
-                        host.row(usize::from(rect.y))
-                            .extra(usize::from(rect.x + 1))
-                            .and_then(|extra| extra.underline_color),
-                        Some(Color::Spec(if active {
-                            crate::vt::Rgb {
-                                r: 181,
-                                g: 210,
-                                b: 162,
-                            }
-                        } else {
-                            rgb
-                        }))
+                        host.row(usize::from(rect.y)).cells[usize::from(rect.x + 2)].c,
+                        ' '
                     );
                 }
-                let bg = match action {
-                    AgentAction::Session(_) | AgentAction::CloseSession(_) if active => 32,
-                    AgentAction::Session(_) | AgentAction::CloseSession(_) => 28,
-                    _ => 25,
-                };
+                if action == AgentAction::NewSession {
+                    let cells = &host.row(usize::from(rect.y)).cells;
+                    assert_eq!(cells[usize::from(rect.x)].c, '+');
+                    assert_eq!(cells[usize::from(rect.x - 1)].c, ' ');
+                    assert_eq!(cells[usize::from(rect.x - 2)].c, '╱');
+                }
+                assert!(!cell.flags.contains(Flags::UNDERLINE));
+                if let AgentAction::Session(index) = action {
+                    let title = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 2)];
+                    assert_eq!(title.flags.contains(Flags::BOLD), index == 0);
+                    if index == 0 {
+                        assert_eq!(title.fg, crate::panel::rgb(0xffffff));
+                    }
+                }
+                if hovered && matches!(action, AgentAction::CloseSession(_)) {
+                    assert_eq!(cell.fg, crate::panel::rgb(0xef5350));
+                }
+                let bg = 25;
                 assert_eq!(
                     cell.bg,
                     Color::Spec(crate::vt::Rgb {
@@ -1705,7 +1691,7 @@ mod agent {
         frontend.draw_agent(&mut bytes).unwrap();
         parser.advance(&mut host, &bytes);
         let focused_plus = host.row(usize::from(plus.y)).cells[usize::from(plus.x + 1)];
-        assert!(focused_plus.flags.contains(Flags::UNDERLINE));
+        assert!(!focused_plus.flags.contains(Flags::UNDERLINE));
         assert_eq!(
             focused_plus.bg,
             Color::Spec(crate::vt::Rgb {
@@ -2036,6 +2022,7 @@ mod agent {
             panes: vec![PaneView {
                 process: Default::default(),
                 id: 1,
+                tab: 1,
                 rect: Rect {
                     x: 0,
                     y: 1,
@@ -2244,6 +2231,29 @@ mod agent {
             &frontend.ui.agent.active().model.input[selection],
             "draft line"
         );
+        frontend.ui.agent.active_mut().editor_scroll = Some(1);
+        frontend.draw_agent(&mut Vec::new()).unwrap();
+        let rect = editor(&frontend.ui, frontend.agent_rect()).0;
+        for (code, row, release) in [
+            (0, rect.y + rect.rows - 1, false),
+            (32, rect.y + rect.rows, false),
+            (0, rect.y + rect.rows, true),
+        ] {
+            frontend
+                .input(Input::Mouse(Mouse {
+                    code,
+                    column: rect.x,
+                    row,
+                    release,
+                }))
+                .unwrap();
+        }
+        let selection = frontend.ui.agent.active().model.selection().unwrap();
+        assert_eq!(
+            &frontend.ui.agent.active().model.input[selection],
+            "draft line 08\n"
+        );
+        assert!(!frontend.agent.selecting_editor);
         frontend.ui.agent.active_mut().context.preview =
             Some(crate::agent::panel::ContextPreview::new(
                 crate::agent::panel::ContextItem {
@@ -2630,6 +2640,7 @@ mod agent {
                     }],
                     panes: vec![PaneView {
                         id: 1,
+                        tab: 1,
                         rect: Rect {
                             x: 0,
                             y: 1,

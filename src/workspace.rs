@@ -1,6 +1,7 @@
 //! A workspace owns its PTYs independently of any particular frontend.
+pub use crate::agent_files::{FileMatch, FileOperation, FileResult};
 pub use crate::core::{BlockMarker, CommandBlock};
-use crate::core::{Mode, Point, Scroll, SelectionType, Side, WindowSize};
+use crate::core::{Core, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryConfig, HistoryCopy};
 pub use crate::history::{HistoryCursor, HistoryPage};
 use crate::screen::{Screen, Update};
@@ -13,29 +14,37 @@ use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, OwnedFd, RawFd};
-use std::os::unix::fs::{FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 pub type PaneId = u64;
 pub type TabId = u64;
+// Requests can outlive their workspace, so a new pane must not reuse its identity.
+static NEXT_PANE: AtomicU64 = AtomicU64::new(1);
+pub(crate) const MAX_COLUMNS: usize = 4096;
+pub(crate) const MAX_LINES: usize = 2048;
+pub(crate) const MAX_CELLS: usize = 1_048_576;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Axis {
-    LeftRight,
-    TopBottom,
+    LeftRight = 0,
+    TopBottom = 1,
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u8)]
 pub enum Direction {
-    Left,
-    Down,
-    Up,
-    Right,
+    Left = 0,
+    Down = 1,
+    Up = 2,
+    Right = 3,
 }
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Rect {
@@ -113,24 +122,23 @@ impl AgentModelPatch {
                 "invalid Agent message patch",
             ));
         }
-        if prefix == 0 {
-            messages.truncate(start);
-            messages.extend_from_slice(&self.messages);
-        } else {
+        if prefix != 0 {
+            let update = &self.messages[0];
             let message = &mut messages[start];
             message.text.truncate(prefix);
-            message.text.push_str(&self.messages[0].text);
-            message.role.clone_from(&self.messages[0].role);
-            message.id.clone_from(&self.messages[0].id);
-            message.turn = self.messages[0].turn;
-            messages.truncate(start + 1);
-            messages.extend_from_slice(&self.messages[1..]);
+            message.text.push_str(&update.text);
+            message.role.clone_from(&update.role);
+            message.id.clone_from(&update.id);
+            message.turn = update.turn;
         }
+        let skip = usize::from(prefix != 0);
+        messages.truncate(start + skip);
+        messages.extend_from_slice(&self.messages[skip..]);
         Ok(())
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) enum AgentEvent {
     Draft(Vec<u8>),
     Model(AgentModelPatch),
@@ -175,6 +183,19 @@ pub enum Action {
         generation: u64,
         prompt: Option<u64>,
         data: Vec<u8>,
+    },
+    AgentFile {
+        pane: PaneId,
+        request: u64,
+        path: PathBuf,
+        operation: FileOperation,
+    },
+    CancelAgentFile {
+        request: u64,
+    },
+    AgentNewTab {
+        pane: PaneId,
+        request: u64,
     },
     Resize(WindowSize),
     Split {
@@ -281,6 +302,7 @@ pub struct TabView {
 #[derive(Clone, Debug)]
 pub struct PaneView {
     pub id: PaneId,
+    pub tab: TabId,
     pub rect: Rect,
     pub title: String,
     pub cwd: Option<PathBuf>,
@@ -319,6 +341,20 @@ impl SplitDrag {
     }
 }
 impl Snapshot {
+    pub(crate) fn pane(&self, id: PaneId) -> Option<&PaneView> {
+        self.panes.iter().find(|pane| pane.id == id)
+    }
+
+    pub(crate) fn pane_at(&self, column: u16, row: u16) -> Option<&PaneView> {
+        self.panes
+            .iter()
+            .find(|pane| pane.rect.contains(column, row))
+    }
+
+    pub(crate) fn focused_pane(&self) -> Option<&PaneView> {
+        self.pane(self.focused)
+    }
+
     pub fn divider_at(&self, column: u16, row: u16) -> Option<SplitDrag> {
         for first in &self.panes {
             for second in &self.panes {
@@ -372,19 +408,16 @@ pub fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLa
     let active_width = snapshot
         .tabs
         .get(active)
-        .map_or(9, |tab| text_width(&tab.title, 22) + 8);
+        .map(|tab| text_width(&tab.title, 22) + 8);
     let minimum = if snapshot.controller { 0 } else { 12 };
     let reserve = text_width(right_label, columns)
         .saturating_add(3)
-        .min(columns.saturating_sub(5 + active_width))
+        .min(columns.saturating_sub(5 + active_width.unwrap_or(9)))
         .max(minimum.min(columns.saturating_sub(5 + 9)));
     let available = columns.saturating_sub(5 + reserve);
     let tab_width = |title: &str, available| (text_width(title, 22) + 8).min(available);
     let mut start = active;
-    let mut used = snapshot
-        .tabs
-        .get(active)
-        .map_or(0, |tab| tab_width(&tab.title, available));
+    let mut used = active_width.unwrap_or(0).min(available);
     while start > 0 {
         let width = tab_width(&snapshot.tabs[start - 1].title, available);
         if used.saturating_add(width + 1) > available {
@@ -446,6 +479,14 @@ pub enum ClientEvent {
         request: u64,
         result: Result<Option<u64>, String>,
     },
+    AgentFile {
+        request: u64,
+        result: Result<FileResult, String>,
+    },
+    AgentNewTab {
+        request: u64,
+        result: Result<PaneId, String>,
+    },
     List(Vec<WorkspaceInfo>),
     Clipboard {
         request: u64,
@@ -474,7 +515,6 @@ pub enum ClientEvent {
     Detached,
 }
 #[cfg(feature = "agent")]
-#[derive(Clone, Debug)]
 pub(crate) enum ClientEndpoint {
     Local(PathBuf),
     Remote {
@@ -482,7 +522,6 @@ pub(crate) enum ClientEndpoint {
         args: Vec<OsString>,
         env: Vec<(OsString, Option<OsString>)>,
         directory: Option<PathBuf>,
-        target: String,
     },
 }
 pub struct Client {
@@ -541,12 +580,11 @@ impl Client {
                 .map(|(key, value)| (key.to_owned(), value.map(ToOwned::to_owned)))
                 .collect(),
             directory: command.get_current_dir().map(Path::to_path_buf),
-            target: target.clone(),
         };
         let (local, ssh) = UnixStream::pair()?;
         let peer = Peer::remote(local)?;
-        command.stdin(Stdio::from(OwnedFd::from(ssh.try_clone()?)));
-        command.stdout(Stdio::from(OwnedFd::from(ssh)));
+        command.stdin(OwnedFd::from(ssh.try_clone()?));
+        command.stdout(OwnedFd::from(ssh));
         let child = command.spawn()?;
         drop(command);
         let mut client = Self::new(
@@ -609,6 +647,8 @@ impl Client {
                 | Action::AgentRemove(_)
                 | Action::ReadHistory { .. }
                 | Action::CancelHistory { .. }
+                | Action::AgentFile { .. }
+                | Action::CancelAgentFile { .. }
                 | Action::List
                 | Action::CopyBlock { .. }
                 | Action::CopySelection { .. }
@@ -617,12 +657,7 @@ impl Client {
             Action::Input { pane, data } => {
                 // An older response may already be in flight; keep a fresh request
                 // ahead of input, including chunks that PTY backpressure may block.
-                self.screen_wait = Some(true);
-                self.screen_request += 1;
-                self.peer.send_action(&Action::ScreenRequest {
-                    request: self.screen_request,
-                    wait: true,
-                })?;
+                self.send_screen_request(true)?;
                 self.peer.send_input(pane, &data)?;
             }
             action => self.peer.send_action(&action)?,
@@ -632,28 +667,23 @@ impl Client {
         }
         Ok(())
     }
+    fn send_screen_request(&mut self, wait: bool) -> io::Result<()> {
+        self.screen_wait = Some(wait);
+        self.screen_request += 1;
+        self.peer.send_action(&Action::ScreenRequest {
+            request: self.screen_request,
+            wait,
+        })
+    }
     pub fn request_screen(&mut self) -> io::Result<()> {
         if self.screen_wait.is_none() {
-            self.screen_wait = Some(true);
-            self.screen_request += 1;
-            self.peer.send_action(&Action::ScreenRequest {
-                request: self.screen_request,
-                wait: true,
-            })?;
+            self.send_screen_request(true)?;
         }
         Ok(())
     }
     pub fn refresh_screen(&mut self) -> io::Result<()> {
-        if self.screen_wait != Some(false) {
-            self.screen_wait = Some(false);
-            self.screen_dirty = true;
-            self.screen_request += 1;
-            self.peer.send_action(&Action::ScreenRequest {
-                request: self.screen_request,
-                wait: false,
-            })?;
-        }
-        Ok(())
+        self.screen_dirty = true;
+        self.send_screen_request(false)
     }
 
     pub fn scroll_to(&mut self, pane: PaneId, mut offset: usize) -> io::Result<()> {
@@ -693,13 +723,22 @@ impl Client {
     pub fn receiver_fd(&self) -> RawFd {
         self.peer.receiver_fd()
     }
-    pub fn wants_read(&self) -> bool {
-        self.peer.wants_read()
+    pub fn pollfd(&self) -> libc::pollfd {
+        let events = if self.peer.wants_read() {
+            libc::POLLIN
+        } else {
+            0
+        } | if self.wants_write() { libc::POLLOUT } else { 0 };
+        libc::pollfd {
+            fd: if events == 0 { -1 } else { self.fd() },
+            events,
+            revents: 0,
+        }
     }
     pub fn needs_poll(&self) -> bool {
         self.peer.needs_poll()
     }
-    pub fn wants_write(&self) -> bool {
+    fn wants_write(&self) -> bool {
         self.write_error.is_none() && self.peer.pending()
     }
     pub fn snapshot(&self) -> Option<&Snapshot> {
@@ -707,6 +746,11 @@ impl Client {
     }
     pub fn screens(&self) -> &HashMap<PaneId, Screen> {
         &self.screens
+    }
+    pub(crate) fn selected_pane(&self) -> Option<PaneId> {
+        self.screens
+            .iter()
+            .find_map(|(&id, screen)| screen.selection_range().is_some().then_some(id))
     }
     pub fn snapshot_and_screens_mut(
         &mut self,
@@ -730,19 +774,20 @@ impl Client {
         for response in responses {
             let event = match response {
                 Response::State(snapshot, updates, request) => {
-                    self.screens
-                        .retain(|id, _| snapshot.panes.iter().any(|pane| pane.id == *id));
+                    self.screens.retain(|id, _| snapshot.pane(*id).is_some());
                     for (id, update) in updates {
                         let screen = self.screens.entry(id).or_default();
                         if self.agent_delegate && screen.changes_activity(&update) {
                             screen.activity += 1;
+                            screen.output_activity += 1;
                         }
                         screen.apply(update)?;
                     }
                     for pane in &snapshot.panes {
-                        let previous = self.snapshot.as_ref().and_then(|snapshot| {
-                            snapshot.panes.iter().find(|old| old.id == pane.id)
-                        });
+                        let previous = self
+                            .snapshot
+                            .as_ref()
+                            .and_then(|snapshot| snapshot.pane(pane.id));
                         let Some(screen) = self.screens.get_mut(&pane.id) else {
                             continue;
                         };
@@ -786,6 +831,12 @@ impl Client {
                 Response::List(list) => ClientEvent::List(list),
                 Response::AgentInput { request, result } => {
                     ClientEvent::AgentInput { request, result }
+                }
+                Response::AgentFile { request, result } => {
+                    ClientEvent::AgentFile { request, result }
+                }
+                Response::AgentNewTab { request, result } => {
+                    ClientEvent::AgentNewTab { request, result }
                 }
                 Response::Clipboard {
                     request,
@@ -849,22 +900,6 @@ impl Drop for Client {
 
 pub use crate::bridge::{BRIDGE_VERSION, run_bridge};
 
-pub struct ServerOptions {
-    pub history_directory: PathBuf,
-}
-impl Default for ServerOptions {
-    fn default() -> Self {
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache")))
-            .unwrap_or_else(|| PathBuf::from(".cache"));
-        Self {
-            history_directory: root.join("nextty/history"),
-        }
-    }
-}
-
 pub fn socket_path() -> io::Result<PathBuf> {
     let root = std::env::var_os("XDG_RUNTIME_DIR")
         .filter(|p| !p.is_empty())
@@ -882,12 +917,11 @@ pub fn socket_path() -> io::Result<PathBuf> {
     Ok(directory.join(format!("server-v{}.sock", crate::wire::VERSION)))
 }
 fn private_directory(path: &Path, create: bool) -> io::Result<()> {
-    if create {
-        match fs::create_dir(path) {
-            Ok(()) => fs::set_permissions(path, fs::Permissions::from_mode(0o700))?,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => (),
-            Err(error) => return Err(error),
-        }
+    if create
+        && let Err(error) = fs::DirBuilder::new().mode(0o700).create(path)
+        && error.kind() != io::ErrorKind::AlreadyExists
+    {
+        return Err(error);
     }
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_dir()
@@ -959,7 +993,7 @@ pub fn ensure_server(executable: &Path, socket: &Path) -> io::Result<()> {
         .arg(socket)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(log));
+        .stderr(log);
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -991,7 +1025,6 @@ pub fn ensure_server(executable: &Path, socket: &Path) -> io::Result<()> {
     }
 }
 
-#[derive(Clone, Debug)]
 enum Node {
     Pane(PaneId),
     Split {
@@ -1148,8 +1181,8 @@ impl Node {
                 let a = first.minimum();
                 let b = second.minimum();
                 match axis {
-                    Axis::LeftRight => (a.0.saturating_add(b.0).saturating_add(1), a.1.max(b.1)),
-                    Axis::TopBottom => (a.0.max(b.0), a.1.saturating_add(b.1).saturating_add(1)),
+                    Axis::LeftRight => (a.0 + b.0 + 1, a.1.max(b.1)),
+                    Axis::TopBottom => (a.0.max(b.0), a.1 + b.1 + 1),
                 }
             }
         }
@@ -1182,7 +1215,6 @@ struct Workspace {
     active: usize,
     panes: HashMap<PaneId, Pane>,
     controller: Option<u64>,
-    next_id: u64,
     budget: Arc<HistoryBudget>,
 }
 impl Workspace {
@@ -1243,8 +1275,7 @@ impl Workspace {
                 "workspace has reached its 1024-pane limit",
             ));
         }
-        let id = self.next_id;
-        self.next_id += 1;
+        let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
         let terminal = Terminal::new_with_history(
             program,
             directory,
@@ -1268,9 +1299,9 @@ impl Workspace {
         Ok(id)
     }
     fn remove_pane(&mut self, id: PaneId) -> Option<Terminal> {
+        let active_tab = self.tabs[self.active].id;
         let terminal = self.panes.remove(&id).map(|pane| pane.terminal);
-        let old = std::mem::take(&mut self.tabs);
-        self.tabs = old
+        self.tabs = std::mem::take(&mut self.tabs)
             .into_iter()
             .filter_map(|tab| {
                 tab.root.remove(id).map(|root| Tab {
@@ -1284,7 +1315,12 @@ impl Workspace {
                 })
             })
             .collect();
-        self.active = self.active.min(self.tabs.len().saturating_sub(1));
+        self.active = self
+            .tabs
+            .iter()
+            .position(|tab| tab.id == active_tab)
+            .unwrap_or(self.active)
+            .min(self.tabs.len().saturating_sub(1));
         terminal
     }
     fn snapshot(&self, panes: Vec<PaneView>) -> io::Result<Snapshot> {
@@ -1307,20 +1343,7 @@ impl Workspace {
                     };
                     let title = match panes.iter().find(|pane| pane.id == tab.focused) {
                         Some(pane) => pane.cwd.as_deref().map(title),
-                        None => {
-                            let core = pane
-                                .terminal
-                                .core
-                                .lock()
-                                .map_err(|error| io::Error::other(error.to_string()))?;
-                            match core.current_directory() {
-                                Some(directory) => Some(title(directory)),
-                                None => {
-                                    drop(core);
-                                    pane_directory(&pane.terminal)?.as_deref().map(title)
-                                }
-                            }
-                        }
+                        None => pane_directory(&pane.terminal)?.as_deref().map(title),
                     }
                     .unwrap_or_else(|| pane.title.clone());
                     Ok(TabView {
@@ -1346,18 +1369,18 @@ impl Workspace {
             let state = if process
                 .foreground_pgid
                 .is_some_and(|pgid| pgid != process.child_pid)
-                || process.has_children == Some(true)
+                || latest.is_none() && process.has_children == Some(true)
                 || latest == Some(None)
             {
                 TabActivity::Running
-            } else if process.has_children.is_none()
-                || core.shell_prompt().is_none() && !core.shell_editing()
-            {
-                TabActivity::Unknown
             } else if matches!(latest, Some(Some(status)) if status != 0) {
                 TabActivity::Failed
             } else if latest.is_some() {
                 TabActivity::Finished
+            } else if process.has_children.is_none()
+                || core.shell_prompt().is_none() && !core.shell_editing()
+            {
+                TabActivity::Unknown
             } else {
                 TabActivity::Idle
             };
@@ -1377,11 +1400,8 @@ impl Workspace {
     }
     fn navigate(&mut self, direction: Direction) {
         let layout = self.layout();
-        let current = layout
-            .iter()
-            .find(|(id, _)| *id == self.focused())
-            .unwrap()
-            .1;
+        let focused = self.focused();
+        let current = layout.iter().find(|(id, _)| *id == focused).unwrap().1;
         let center = |r: Rect| {
             (
                 i32::from(r.x) * 2 + i32::from(r.cols),
@@ -1391,16 +1411,11 @@ impl Workspace {
         let (cx, cy) = center(current);
         if let Some((id, _)) = layout
             .iter()
-            .filter(|(id, rect)| {
-                if *id == self.focused() {
-                    return false;
-                }
-                match direction {
-                    Direction::Left => rect.x + rect.cols <= current.x,
-                    Direction::Right => rect.x >= current.x + current.cols,
-                    Direction::Up => rect.y + rect.rows <= current.y,
-                    Direction::Down => rect.y >= current.y + current.rows,
-                }
+            .filter(|(_, rect)| match direction {
+                Direction::Left => rect.x + rect.cols <= current.x,
+                Direction::Right => rect.x >= current.x + current.cols,
+                Direction::Up => rect.y + rect.rows <= current.y,
+                Direction::Down => rect.y >= current.y + current.rows,
             })
             .min_by_key(|(_, rect)| {
                 let (x, y) = center(*rect);
@@ -1415,17 +1430,19 @@ impl Workspace {
     }
 }
 fn validate_size(size: WindowSize) -> io::Result<()> {
-    if size.num_cols < 2
-        || size.num_lines < 2
-        || size.num_cols > 4096
-        || size.num_lines > 2048
-        || usize::from(size.num_cols) * usize::from(size.num_lines) > 1_048_576
+    let columns = usize::from(size.num_cols);
+    let lines = usize::from(size.num_lines);
+    if !(2..=MAX_COLUMNS).contains(&columns)
+        || !(2..=MAX_LINES).contains(&lines)
+        || columns * lines > MAX_CELLS
         || size.num_cols.checked_mul(size.cell_width).is_none()
         || size.num_lines.checked_mul(size.cell_height).is_none()
     {
         Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "workspace size must be 2..4096 columns, 2..2048 rows, at most 1048576 cells",
+            format!(
+                "workspace size must be 2..{MAX_COLUMNS} columns, 2..{MAX_LINES} rows, at most {MAX_CELLS} cells"
+            ),
         ))
     } else {
         Ok(())
@@ -1435,30 +1452,101 @@ struct PaneSearch {
     pane: PaneId,
     request: u64,
     query: String,
-    core: std::sync::Arc<std::sync::Mutex<crate::core::Core>>,
+    core: Arc<Mutex<Core>>,
     origin: Option<crate::core::SearchAnchor>,
-    cancelled: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    receiver: Option<std::sync::mpsc::Receiver<io::Result<crate::search::SearchResult>>>,
-    result: Option<crate::search::SearchResult>,
+    cancelled: Arc<AtomicBool>,
+    state: SearchState,
+}
+enum SearchState {
+    Queued,
+    Pending(mpsc::Receiver<io::Result<crate::search::SearchResult>>),
+    Ready(crate::search::SearchResult),
 }
 impl Drop for PaneSearch {
     fn drop(&mut self) {
-        self.cancelled
-            .store(true, std::sync::atomic::Ordering::Relaxed);
+        self.cancelled.store(true, Ordering::Relaxed);
         if let Some(origin) = self.origin {
             self.core.lock().unwrap().restore_search(origin);
         }
     }
 }
+struct CopyRequest {
+    pane: PaneId,
+    request: u64,
+    block: Option<u64>,
+}
+
+struct ReadRequest {
+    pane: PaneId,
+    request: u64,
+    block: Option<u64>,
+    cursor: Option<HistoryCursor>,
+    query: Option<String>,
+}
+
 struct PendingRead {
     request: u64,
+    workspace: String,
     pane: PaneId,
-    receiver: std::sync::mpsc::Receiver<io::Result<HistoryPage>>,
+    receiver: mpsc::Receiver<io::Result<HistoryPage>>,
     cancelled: Arc<AtomicBool>,
 }
 impl Drop for PendingRead {
     fn drop(&mut self) {
         self.cancelled.store(true, Ordering::Relaxed);
+    }
+}
+
+#[derive(Clone)]
+struct FileSource {
+    request: u64,
+    pane: PaneId,
+    cancelled: Arc<AtomicBool>,
+}
+struct FileJob {
+    source: FileSource,
+    path: PathBuf,
+    operation: FileOperation,
+}
+struct FileWorker {
+    worker: crate::worker::Worker<FileJob, io::Result<FileResult>>,
+    queued: VecDeque<FileJob>,
+    active: Option<FileSource>,
+}
+impl FileWorker {
+    fn new() -> io::Result<Self> {
+        Ok(Self {
+            worker: crate::worker::Worker::new(
+                "agent-files",
+                Arc::new(crate::eventfd::new()?),
+                |job: FileJob, publish| {
+                    publish(crate::agent_files::execute(
+                        job.path,
+                        job.operation,
+                        &job.source.cancelled,
+                    ));
+                },
+            )?,
+            queued: VecDeque::new(),
+            active: None,
+        })
+    }
+
+    fn cancel(&self, matches: impl Fn(&FileSource) -> bool) {
+        for source in self
+            .queued
+            .iter()
+            .map(|job| &job.source)
+            .chain(self.active.iter())
+            .filter(|source| matches(source))
+        {
+            source.cancelled.store(true, Ordering::Relaxed);
+        }
+    }
+}
+impl Drop for FileWorker {
+    fn drop(&mut self) {
+        self.cancel(|_| true);
     }
 }
 
@@ -1474,18 +1562,19 @@ struct Connection {
     full: bool,
     failed: bool,
     known: HashMap<PaneId, Arc<crate::terminal::ProcessMetadata>>,
-    copy: Option<(u64, std::sync::mpsc::Receiver<io::Result<HistoryCopy>>)>,
+    copy: Option<(u64, mpsc::Receiver<io::Result<HistoryCopy>>)>,
     deferred: Option<Action>,
     ending: bool,
-    copy_requests: VecDeque<(String, Action)>,
+    copy_requests: VecDeque<(String, CopyRequest)>,
     reads: Vec<PendingRead>,
-    read_requests: VecDeque<(String, Action)>,
+    read_requests: VecDeque<(String, ReadRequest)>,
     search: Option<PaneSearch>,
+    files: Option<FileWorker>,
 }
 
 impl Connection {
     fn screen_eligible(&self) -> bool {
-        self.screen_request.is_some() && self.screen_dirty
+        self.screen_request.is_some() && self.screen_dirty && !self.failed && !self.peer.pending()
     }
 
     fn new(id: u64, stream: UnixStream) -> io::Result<Self> {
@@ -1508,6 +1597,7 @@ impl Connection {
             reads: Vec::new(),
             read_requests: VecDeque::new(),
             search: None,
+            files: None,
         })
     }
 
@@ -1550,6 +1640,16 @@ impl Connection {
         self.reads.clear();
         self.copy = None;
         self.search = None;
+        if let Some(files) = &mut self.files
+            && let Some(result) = files.worker.take()
+        {
+            let request = files.active.take().unwrap().request;
+            self.respond(Response::AgentFile {
+                request,
+                result: result.map_err(|error| error.to_string()),
+            });
+        }
+        self.files = None;
         self.respond(Response::Detached);
     }
 
@@ -1562,7 +1662,13 @@ impl Connection {
 }
 
 /// Run in the hidden server process. No GUI or font libraries are needed here.
-pub fn run_server(socket: &Path, options: ServerOptions) -> io::Result<()> {
+pub fn run_server(socket: &Path) -> io::Result<()> {
+    let history_directory = std::env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache")))
+        .unwrap_or_else(|| PathBuf::from(".cache"))
+        .join("nextty/history");
     let parent = socket
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no directory"))?;
@@ -1590,21 +1696,18 @@ pub fn run_server(socket: &Path, options: ServerOptions) -> io::Result<()> {
     let listener = UnixListener::bind(socket)?;
     fs::set_permissions(socket, fs::Permissions::from_mode(0o600))?;
     listener.set_nonblocking(true)?;
-    fs::create_dir_all(&options.history_directory)?;
-    fs::set_permissions(
-        &options.history_directory,
-        fs::Permissions::from_mode(0o700),
-    )?;
-    private_directory(&options.history_directory, false)?;
-    let result = server_loop(listener, options);
+    fs::create_dir_all(&history_directory)?;
+    fs::set_permissions(&history_directory, fs::Permissions::from_mode(0o700))?;
+    private_directory(&history_directory, false)?;
+    let result = server_loop(listener, &history_directory);
     let cleanup = fs::remove_file(socket);
     result.and(cleanup)
 }
 #[derive(Default)]
 struct ClosingTerminals(Vec<JoinHandle<()>>);
 impl ClosingTerminals {
-    fn reap(&mut self) {
-        for thread in self.0.extract_if(.., |thread| thread.is_finished()) {
+    fn reap(&mut self, wait: bool) {
+        for thread in self.0.extract_if(.., |thread| wait || thread.is_finished()) {
             if thread.join().is_err() {
                 eprintln!("terminal IO thread panicked");
             }
@@ -1613,15 +1716,29 @@ impl ClosingTerminals {
 }
 impl Drop for ClosingTerminals {
     fn drop(&mut self) {
-        for thread in self.0.drain(..) {
-            if thread.join().is_err() {
-                eprintln!("terminal IO thread panicked");
-            }
+        self.reap(true);
+    }
+}
+
+fn terminate_workspace(
+    workspace: Workspace,
+    clients: &mut [Connection],
+    closing: &mut ClosingTerminals,
+) {
+    closing.0.extend(
+        workspace
+            .panes
+            .into_values()
+            .map(|pane| pane.terminal.shutdown()),
+    );
+    for client in clients {
+        if client.workspace.as_deref() == Some(&workspace.name) {
+            client.finish();
         }
     }
 }
 
-fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()> {
+fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<()> {
     let mut closing = ClosingTerminals::default();
     let mut workspaces: HashMap<String, Workspace> = HashMap::new();
     let mut clients: Vec<Connection> = Vec::new();
@@ -1631,12 +1748,12 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
     let mut terminals: Vec<(String, PaneId)> = Vec::new();
     let mut dirty = HashSet::new();
     loop {
-        closing.reap();
+        closing.reap(false);
         had_workspace |= !workspaces.is_empty();
         clients.retain(|client| !client.failed);
         let requested: HashSet<_> = clients
             .iter()
-            .filter(|client| client.screen_eligible() && !client.peer.pending())
+            .filter(|client| client.screen_eligible())
             .filter_map(|client| client.workspace.clone())
             .collect();
         for name in requested {
@@ -1713,6 +1830,13 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
         }
         terminals.truncate(terminal_count);
+        for files in clients.iter().filter_map(|client| client.files.as_ref()) {
+            fds.push(libc::pollfd {
+                fd: files.worker.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            });
+        }
         // Failures and completed resizes may have no further socket or terminal wakeup.
         let timeout = if clients.iter().any(|client| {
             client.failed
@@ -1790,7 +1914,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
                             &mut clients,
                             &mut workspaces,
                             &mut dirty,
-                            &options.history_directory,
+                            history_directory,
                             &mut closing,
                         ),
                         Err(error) => Err(error),
@@ -1855,6 +1979,7 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
             pane.terminal.acknowledge_wakeup();
             if exit {
+                cancel_pane_files(&clients, *id);
                 closing
                     .0
                     .extend(workspace.remove_pane(*id).map(Terminal::shutdown));
@@ -1864,13 +1989,8 @@ fn server_loop(listener: UnixListener, options: ServerOptions) -> io::Result<()>
             }
             dirty.insert(name.clone());
         }
-        for (name, workspace) in workspaces.extract_if(|_, workspace| workspace.tabs.is_empty()) {
-            drop(workspace);
-            for client in &mut clients {
-                if client.workspace.as_ref() == Some(&name) {
-                    client.finish();
-                }
-            }
+        for (_, workspace) in workspaces.extract_if(|_, workspace| workspace.tabs.is_empty()) {
+            terminate_workspace(workspace, &mut clients, &mut closing);
         }
         for name in dirty.drain() {
             if let Some(workspace) = workspaces.get_mut(&name) {
@@ -1919,11 +2039,41 @@ fn complete_requests(
     dirty: &mut HashSet<String>,
 ) {
     for client in clients.iter_mut() {
-        let ready = client
+        if client.failed {
+            client.files = None;
+        }
+        let file_result = client.files.as_mut().and_then(|files| {
+            if let Err(error) = crate::eventfd::consume_notification(files.worker.fd()) {
+                eprintln!("agent file worker: {error}");
+                client.failed = true;
+            }
+            files.worker.take().map(|result| {
+                let source = files.active.take().unwrap();
+                (source.request, result.map_err(|error| error.to_string()))
+            })
+        });
+        if let Some((request, result)) = file_result {
+            client.respond(Response::AgentFile { request, result });
+        }
+        if client.failed {
+            client.files = None;
+        } else if let Some(files) = &mut client.files
+            && files.active.is_none()
+            && let Some(job) = files.queued.pop_front()
+        {
+            // Worker replaces pending work and results, so submit only after taking the result.
+            files.active = Some(job.source.clone());
+            files.worker.submit(job);
+        }
+        let workspace = client
+            .workspace
+            .as_ref()
+            .and_then(|name| workspaces.get(name));
+        if let Some(result) = client
             .copy
             .as_ref()
-            .and_then(|(_, receiver)| worker_result(receiver, "history copy worker disconnected"));
-        if let Some(result) = ready {
+            .and_then(|(_, receiver)| worker_result(receiver, "history copy worker disconnected"))
+        {
             let (request, _) = client.copy.take().unwrap();
             match result {
                 Ok(copy) => client.respond(Response::Clipboard {
@@ -1938,80 +2088,58 @@ fn complete_requests(
             }
         }
         while client.copy.is_none()
-            && let Some((name, action)) = client.copy_requests.pop_front()
+            && let Some((name, copy)) = client.copy_requests.pop_front()
         {
-            let request = copy_request(&action);
-            let pane = match action {
-                Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. } => pane,
-                _ => unreachable!(),
-            };
-            let result = workspaces
+            let Some(pane) = workspaces
                 .get(&name)
-                .and_then(|workspace| workspace.panes.get(&pane))
-                .ok_or_else(|| {
-                    io::Error::new(io::ErrorKind::NotFound, "copy source pane no longer exists")
-                })
-                .map(|pane| queue_copy(client, Cow::Owned(name), &pane.terminal, action));
-            match result {
-                Ok(true) => (),
-                Ok(false) => break,
-                Err(error) => client.respond(Response::CopyError {
-                    request,
-                    error: error.to_string(),
-                }),
-            }
-        }
-    }
-    for client in clients.iter_mut() {
-        for index in (0..client.reads.len()).rev() {
-            if client
-                .workspace
-                .as_ref()
-                .and_then(|name| workspaces.get(name))
-                .is_none_or(|workspace| !workspace.panes.contains_key(&client.reads[index].pane))
-            {
-                let read = client.reads.swap_remove(index);
-                client.respond(Response::History {
-                    request: read.request,
-                    result: Err("history source pane no longer exists".into()),
+                .and_then(|workspace| workspace.panes.get(&copy.pane))
+            else {
+                client.respond(Response::CopyError {
+                    request: copy.request,
+                    error: "copy source pane no longer exists".into(),
                 });
                 continue;
+            };
+            if !queue_copy(client, Cow::Owned(name), &pane.terminal, copy) {
+                break;
             }
-            let ready = worker_result(&client.reads[index].receiver, "history reader disconnected");
+        }
+        for index in (0..client.reads.len()).rev() {
+            let read = &client.reads[index];
+            let ready = if workspaces
+                .get(&read.workspace)
+                .is_none_or(|workspace| !workspace.panes.contains_key(&read.pane))
+            {
+                Some(Err("history source pane no longer exists".into()))
+            } else {
+                worker_result(&read.receiver, "history reader disconnected")
+                    .map(|result| result.map_err(|error| error.to_string()))
+            };
             if let Some(result) = ready {
                 let read = client.reads.swap_remove(index);
                 client.respond(Response::History {
                     request: read.request,
-                    result: result.map_err(|error| error.to_string()),
+                    result,
                 });
             }
         }
         for _ in 0..client.read_requests.len() {
-            let (name, action) = client.read_requests.pop_front().unwrap();
-            let (pane, request) = match &action {
-                Action::ReadHistory { pane, request, .. } => (*pane, *request),
-                _ => unreachable!(),
-            };
+            let (name, read) = client.read_requests.pop_front().unwrap();
             match workspaces
                 .get(&name)
-                .and_then(|workspace| workspace.panes.get(&pane))
+                .and_then(|workspace| workspace.panes.get(&read.pane))
             {
-                Some(pane) => queue_read(client, Cow::Owned(name), &pane.terminal, action),
+                Some(pane) => queue_read(client, Cow::Owned(name), &pane.terminal, read),
                 None => client.respond(Response::History {
-                    request,
+                    request: read.request,
                     result: Err("history source pane no longer exists".into()),
                 }),
             }
         }
-    }
-    for client in clients.iter_mut() {
         let Some(search) = client.search.as_mut() else {
             continue;
         };
-        let Some(terminal) = client
-            .workspace
-            .as_ref()
-            .and_then(|name| workspaces.get(name))
+        let Some(terminal) = workspace
             .and_then(|workspace| workspace.panes.get(&search.pane))
             .map(|pane| &pane.terminal)
         else {
@@ -2021,32 +2149,27 @@ fn complete_requests(
             }
             continue;
         };
-        let submission_error =
-            if search.receiver.is_none() && search.result.is_none() && !search.query.is_empty() {
-                try_search(search, terminal).err()
-            } else {
-                None
-            };
-        let ready = if let Some(error) = submission_error {
-            Some(Err(error))
+        let submission_error = if matches!(search.state, SearchState::Queued) {
+            try_search(search, terminal).err()
         } else {
-            search
-                .receiver
-                .as_ref()
-                .and_then(|receiver| worker_result(receiver, "pane search worker stopped"))
+            None
         };
+        let ready = submission_error.map(Err).or_else(|| match &search.state {
+            SearchState::Pending(receiver) => worker_result(receiver, "pane search worker stopped"),
+            _ => None,
+        });
         if let Some(result) = ready {
-            search.receiver = None;
             let (pane, request) = (search.pane, search.request);
             match result {
                 Ok(result) => {
-                    client.respond(Response::Search {
+                    let response = Response::Search {
                         pane,
                         request,
                         count: result.matches.len() as u32,
                         truncated: result.truncated,
-                    });
-                    client.search.as_mut().unwrap().result = Some(result);
+                    };
+                    search.state = SearchState::Ready(result);
+                    client.respond(response);
                 }
                 Err(error) => {
                     client.respond(Response::Search {
@@ -2067,15 +2190,21 @@ fn complete_requests(
 }
 
 fn worker_result<T>(
-    receiver: &std::sync::mpsc::Receiver<io::Result<T>>,
+    receiver: &mpsc::Receiver<io::Result<T>>,
     disconnected: &'static str,
 ) -> Option<io::Result<T>> {
     match receiver.try_recv() {
         Ok(result) => Some(result),
-        Err(std::sync::mpsc::TryRecvError::Empty) => None,
-        Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+        Err(mpsc::TryRecvError::Empty) => None,
+        Err(mpsc::TryRecvError::Disconnected) => {
             Some(Err(io::Error::new(io::ErrorKind::BrokenPipe, disconnected)))
         }
+    }
+}
+
+fn cancel_pane_files(clients: &[Connection], pane: PaneId) {
+    for files in clients.iter().filter_map(|client| client.files.as_ref()) {
+        files.cancel(|source| source.pane == pane);
     }
 }
 
@@ -2096,31 +2225,25 @@ fn broadcast(
         }
     }
     if !clients.iter().any(|client| {
-        client.workspace.as_deref() == Some(&workspace.name)
-            && client.screen_eligible()
-            && !client.peer.pending()
-            && !client.failed
+        client.workspace.as_deref() == Some(&workspace.name) && client.screen_eligible()
     }) {
         return Ok(());
     }
-    let active = workspace.layout();
     let has_agent = clients.iter().any(|client| {
         client.agent
             && client.screen_eligible()
-            && !client.peer.pending()
             && client.workspace.as_deref() == Some(&workspace.name)
-            && !client.failed
     });
-    let all_layouts;
-    let visible = if has_agent {
-        all_layouts = workspace.all_layouts();
-        &all_layouts
+    let all_tabs = has_agent && workspace.tabs.len() > 1;
+    let visible = if all_tabs {
+        workspace.all_layouts()
     } else {
-        &active
+        workspace.layout()
     };
+    let active = &workspace.tabs[workspace.active].root;
     let mut frames = Vec::with_capacity(visible.len());
     let mut panes = Vec::with_capacity(visible.len());
-    for &(id, rect) in visible {
+    for &(id, rect) in &visible {
         let pane = &workspace.panes[&id];
         let process = pane.terminal.process_metadata();
         let mut core = pane
@@ -2141,16 +2264,12 @@ fn broadcast(
             for client in clients.iter().filter(|client| {
                 client.workspace.as_deref() == Some(&workspace.name)
                     && client.screen_eligible()
-                    && !client.peer.pending()
-                    && !client.failed
-                    && (client.agent || active.iter().any(|(pane, _)| *pane == id))
+                    && (client.agent || !all_tabs || active.contains(id))
                     && (!client.agent || offset == 0)
             }) {
-                if client.full || !client.known.contains_key(&id) {
-                    needs_full = true;
-                } else {
-                    needs_delta = true;
-                }
+                let full = client.full || !client.known.contains_key(&id);
+                needs_full |= full;
+                needs_delta |= !full;
                 if needs_full && needs_delta {
                     break;
                 }
@@ -2168,6 +2287,12 @@ fn broadcast(
         drop(core);
         panes.push(PaneView {
             id,
+            tab: workspace
+                .tabs
+                .iter()
+                .find(|tab| tab.root.contains(id))
+                .unwrap()
+                .id,
             rect,
             title: pane.title.clone(),
             cwd: match cwd {
@@ -2188,19 +2313,25 @@ fn broadcast(
         if client.workspace.as_deref() != Some(&workspace.name) || client.failed {
             continue;
         }
-        if !client.screen_eligible() || client.peer.pending() {
+        if !client.screen_eligible() {
             client.full = true;
             continue;
         }
-        let snapshot = if client.agent || visible.len() == active.len() {
+        let snapshot = if client.agent || !all_tabs {
             &mut all_snapshot
         } else {
-            active_snapshot.get_or_insert_with(|| {
-                let mut snapshot = all_snapshot.clone();
-                snapshot
+            active_snapshot.get_or_insert_with(|| Snapshot {
+                name: all_snapshot.name.clone(),
+                controller: all_snapshot.controller,
+                focused: all_snapshot.focused,
+                active_tab: all_snapshot.active_tab,
+                tabs: all_snapshot.tabs.clone(),
+                panes: all_snapshot
                     .panes
-                    .retain(|pane| active.iter().any(|(id, _)| *id == pane.id));
-                snapshot
+                    .iter()
+                    .filter(|pane| active.contains(pane.id))
+                    .cloned()
+                    .collect(),
             })
         };
         updates.clear();
@@ -2208,9 +2339,7 @@ fn broadcast(
             frames
                 .iter()
                 .filter_map(|(id, full, delta, live, synchronized)| {
-                    if !client.agent
-                        && (*synchronized || !active.iter().any(|(pane, _)| pane == id))
-                    {
+                    if !client.agent && (*synchronized || all_tabs && !active.contains(*id)) {
                         return None;
                     }
                     let update = if client.agent
@@ -2235,9 +2364,7 @@ fn broadcast(
             eprintln!("workspace client {}: {error}", client.id);
             client.failed = true;
         } else {
-            client
-                .known
-                .retain(|id, _| snapshot.panes.iter().any(|pane| *id == pane.id));
+            client.known.retain(|id, _| snapshot.pane(*id).is_some());
             client.known.extend(
                 snapshot
                     .panes
@@ -2262,19 +2389,21 @@ fn apply_action(
     closing: &mut ClosingTerminals,
 ) -> io::Result<()> {
     let client_id = clients[index].id;
-    if clients[index].agent
-        && !matches!(
-            action,
-            Action::AgentInput { .. }
-                | Action::CopyBlock { .. }
-                | Action::ReadHistory { .. }
-                | Action::CancelHistory { .. }
-                | Action::AgentUpdate(_)
-                | Action::AgentRemove(_)
-                | Action::Detach
-                | Action::ScreenRequest { .. }
-        )
-    {
+    let authorized = match action {
+        Action::AgentFile { .. } | Action::CancelAgentFile { .. } | Action::AgentNewTab { .. } => {
+            clients[index].agent
+        }
+        Action::AgentInput { .. }
+        | Action::CopyBlock { .. }
+        | Action::ReadHistory { .. }
+        | Action::CancelHistory { .. }
+        | Action::AgentUpdate(_)
+        | Action::AgentRemove(_)
+        | Action::Detach
+        | Action::ScreenRequest { .. } => true,
+        _ => !clients[index].agent,
+    };
+    if !authorized {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "agent owner action is not authorized",
@@ -2316,7 +2445,11 @@ fn apply_action(
         }
     }
     if workspace.controller != Some(client_id)
-        && !(clients[index].agent && matches!(action, Action::AgentInput { .. }))
+        && !(clients[index].agent
+            && matches!(
+                action,
+                Action::AgentInput { .. } | Action::AgentFile { .. } | Action::AgentNewTab { .. }
+            ))
         && !matches!(
             action,
             Action::CopySelection { .. }
@@ -2339,6 +2472,62 @@ fn apply_action(
             .get(&id)
             .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "pane does not exist"))
     };
+    if let Action::AgentFile {
+        pane,
+        request,
+        path,
+        operation,
+    } = action
+    {
+        let result: io::Result<()> = (|| {
+            let terminal = &pane_ref(pane)?.terminal;
+            let path = if path.is_absolute() {
+                path
+            } else {
+                terminal.current_directory()?.join(path)
+            };
+            let client = &mut clients[index];
+            if client.files.is_none() {
+                client.files = Some(FileWorker::new()?);
+            }
+            client.files.as_mut().unwrap().queued.push_back(FileJob {
+                source: FileSource {
+                    request,
+                    pane,
+                    cancelled: Arc::new(AtomicBool::new(false)),
+                },
+                path,
+                operation,
+            });
+            Ok(())
+        })();
+        if let Err(error) = result {
+            clients[index].respond(Response::AgentFile {
+                request,
+                result: Err(error.to_string()),
+            });
+        }
+        return Ok(());
+    }
+    if let Action::AgentNewTab { pane, request } = action {
+        let result = pane_ref(pane)
+            .and_then(|pane| pane.terminal.current_directory())
+            .and_then(|directory| {
+                let new = workspace.new_pane(Some(directory), None)?;
+                workspace.tabs.push(Tab {
+                    id: new,
+                    root: Node::Pane(new),
+                    focused: new,
+                });
+                Ok(new)
+            })
+            .map_err(|error| error.to_string());
+        if result.is_ok() {
+            dirty.insert(workspace.name.clone());
+        }
+        clients[index].respond(Response::AgentNewTab { request, result });
+        return Ok(());
+    }
     if let Action::AgentInput {
         pane,
         request,
@@ -2387,12 +2576,7 @@ fn apply_action(
             second,
             position,
         } => {
-            let rect = Rect {
-                x: 0,
-                y: 1,
-                cols: workspace.size.num_cols,
-                rows: workspace.size.num_lines - 1,
-            };
+            let rect = workspace.area();
             if !workspace.tabs[workspace.active]
                 .root
                 .resize_split(rect, first, second, position)
@@ -2467,6 +2651,7 @@ fn apply_action(
         }
         Action::ClosePane(pane) => {
             pane_ref(pane)?;
+            cancel_pane_files(clients, pane);
             closing
                 .0
                 .extend(workspace.remove_pane(pane).map(Terminal::shutdown));
@@ -2482,6 +2667,7 @@ fn apply_action(
                 .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "tab no longer exists"))?;
             let tab = workspace.tabs.remove(index);
             tab.root.for_each_pane(&mut |pane| {
+                cancel_pane_files(clients, pane);
                 closing
                     .0
                     .push(workspace.panes.remove(&pane).unwrap().terminal.shutdown());
@@ -2497,17 +2683,7 @@ fn apply_action(
         }
         Action::Terminate => {
             let workspace = workspaces.remove(&name).unwrap();
-            closing.0.extend(
-                workspace
-                    .panes
-                    .into_values()
-                    .map(|pane| pane.terminal.shutdown()),
-            );
-            for client in clients {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.finish();
-                }
-            }
+            terminate_workspace(workspace, clients, closing);
             return Ok(());
         }
         action => {
@@ -2662,14 +2838,24 @@ fn apply_pane_action(
                 return Ok(false);
             }
         }
-        action @ (Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. }) => {
-            let request = copy_request(&action);
+        action @ (Action::CopySelection { pane, request }
+        | Action::CopyBlock { pane, request, .. }) => {
+            let block = if let Action::CopyBlock { block, .. } = action {
+                Some(block)
+            } else {
+                None
+            };
+            let copy = CopyRequest {
+                pane,
+                request,
+                block,
+            };
             if let Err(error) = pane_ref(pane).map(|pane| {
                 queue_copy(
                     &mut clients[index],
                     Cow::Borrowed(name),
                     &pane.terminal,
-                    action,
+                    copy,
                 )
             }) {
                 clients[index].respond(Response::CopyError {
@@ -2678,12 +2864,24 @@ fn apply_pane_action(
                 });
             }
         }
-        action @ Action::ReadHistory { pane, request, .. } => match pane_ref(pane) {
-            Ok(pane) => queue_read(
+        Action::ReadHistory {
+            pane,
+            request,
+            block,
+            cursor,
+            query,
+        } => match pane_ref(pane) {
+            Ok(source) => queue_read(
                 &mut clients[index],
                 Cow::Borrowed(name),
-                &pane.terminal,
-                action,
+                &source.terminal,
+                ReadRequest {
+                    pane,
+                    request,
+                    block,
+                    cursor,
+                    query,
+                },
             ),
             Err(error) => clients[index].respond(Response::History {
                 request,
@@ -2696,40 +2894,29 @@ fn apply_pane_action(
             query,
         } => {
             let terminal = &pane_ref(pane)?.terminal;
-            if clients[index]
-                .search
-                .as_ref()
-                .is_some_and(|search| search.pane != pane)
-            {
-                clients[index].search = None;
-            }
-            if clients[index].search.is_none() {
+            clients[index].search.take_if(|search| search.pane != pane);
+            let search = clients[index].search.get_or_insert_with(|| {
                 let origin = (workspace.controller == Some(client_id))
                     .then(|| terminal.core.lock().unwrap().search_anchor());
-                clients[index].search = Some(PaneSearch {
+                PaneSearch {
                     pane,
                     request,
                     query: String::new(),
-                    core: std::sync::Arc::clone(&terminal.core),
+                    core: Arc::clone(&terminal.core),
                     origin,
                     cancelled: Default::default(),
-                    receiver: None,
-                    result: None,
-                });
-            }
-            let search = clients[index].search.as_mut().unwrap();
-            search
-                .cancelled
-                .store(true, std::sync::atomic::Ordering::Relaxed);
+                    state: SearchState::Queued,
+                }
+            });
+            search.cancelled.store(true, Ordering::Relaxed);
             search.request = request;
             search.query = query;
-            search.receiver = None;
-            search.result = None;
+            search.state = SearchState::Queued;
             if search.query.is_empty() {
                 if let Some(origin) = search.origin {
                     search.core.lock().unwrap().restore_search(origin);
                 }
-                search.result = Some(crate::search::SearchResult {
+                search.state = SearchState::Ready(crate::search::SearchResult {
                     matches: Box::new([]),
                     truncated: false,
                     columns: 0,
@@ -2755,7 +2942,7 @@ fn apply_pane_action(
                 .search
                 .as_mut()
                 .filter(|search| search.pane == pane && search.request == request)
-                && let Some(result) = &search.result
+                && let SearchState::Ready(result) = &search.state
             {
                 search
                     .core
@@ -2765,13 +2952,9 @@ fn apply_pane_action(
             }
         }
         Action::SearchCancel { pane, request } => {
-            if clients[index]
+            clients[index]
                 .search
-                .as_ref()
-                .is_some_and(|search| search.pane == pane && search.request == request)
-            {
-                clients[index].search = None;
-            }
+                .take_if(|search| search.pane == pane && search.request == request);
         }
         _ => unreachable!(),
     }
@@ -2790,22 +2973,26 @@ fn apply_session_action(
 ) -> io::Result<Option<Action>> {
     let client_id = clients[index].id;
     match action {
+        Action::CancelAgentFile { request } => {
+            if let Some(files) = &clients[index].files {
+                files.cancel(|source| source.request == request);
+            }
+            Ok(None)
+        }
         Action::CancelHistory { request } => {
-            clients[index].read_requests.retain(
-                |(_, action)| !matches!(action,Action::ReadHistory {request:id,..} if *id==request),
-            );
-            if let Some(position) = clients[index]
-                .reads
-                .iter()
-                .position(|read| read.request == request)
-            {
-                clients[index].reads.swap_remove(position);
+            let client = &mut clients[index];
+            client
+                .read_requests
+                .retain(|(_, read)| read.request != request);
+            if let Some(position) = client.reads.iter().position(|read| read.request == request) {
+                client.reads.swap_remove(position);
             }
             Ok(None)
         }
         Action::ScreenRequest { request, wait } => {
-            clients[index].screen_request = Some(request);
-            clients[index].screen_dirty |= !wait;
+            let client = &mut clients[index];
+            client.screen_request = Some(request);
+            client.screen_dirty |= !wait;
             Ok(None)
         }
         Action::AgentAttach { name, token } => {
@@ -2899,7 +3086,6 @@ fn apply_session_action(
                 active: 0,
                 panes: HashMap::new(),
                 controller: Some(client_id),
-                next_id: 1,
                 budget,
             };
             let pane = workspace.new_pane(options.directory, options.program)?;
@@ -2946,17 +3132,7 @@ fn apply_session_action(
             let workspace = workspaces.remove(&name).ok_or_else(|| {
                 io::Error::new(io::ErrorKind::NotFound, "workspace does not exist")
             })?;
-            closing.0.extend(
-                workspace
-                    .panes
-                    .into_values()
-                    .map(|pane| pane.terminal.shutdown()),
-            );
-            for client in clients.iter_mut() {
-                if client.workspace.as_deref() == Some(&name) {
-                    client.finish();
-                }
-            }
+            terminate_workspace(workspace, clients, closing);
             if notify_requester {
                 clients[index].respond(Response::Detached);
             }
@@ -3066,7 +3242,7 @@ fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
         .map_err(|e| io::Error::other(e.to_string()))?
         .search(&search.query, &search.cancelled, wake)
     {
-        Ok(receiver) => search.receiver = Some(receiver),
+        Ok(receiver) => search.state = SearchState::Pending(receiver),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
         Err(error) => return Err(error),
     }
@@ -3076,80 +3252,60 @@ fn queue_copy(
     client: &mut Connection,
     name: Cow<'_, str>,
     terminal: &Terminal,
-    action: Action,
+    copy: CopyRequest,
 ) -> bool {
-    if client.copy.is_some() {
-        client.copy_requests.push_back((name.into_owned(), action));
-        return false;
-    }
-    let request = copy_request(&action);
-    let result = terminal
-        .core
-        .lock()
-        .map_err(|error| io::Error::other(error.to_string()))
-        .and_then(|mut core| match action {
-            Action::CopySelection { .. } => core.copy_selection(),
-            Action::CopyBlock { block, .. } => core.copy_block(block),
-            _ => unreachable!(),
-        });
-    match result {
-        Ok(receiver) => {
-            client.copy = Some((request, receiver));
-            true
-        }
-        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            client.copy_requests.push_back((name.into_owned(), action));
-            false
-        }
-        Err(error) => {
-            client.respond(Response::CopyError {
-                request,
-                error: error.to_string(),
+    if client.copy.is_none() {
+        let request = copy.request;
+        let result = terminal
+            .core
+            .lock()
+            .map_err(|error| io::Error::other(error.to_string()))
+            .and_then(|mut core| match copy.block {
+                None => core.copy_selection(),
+                Some(block) => core.copy_block(block),
             });
-            true
+        match result {
+            Ok(receiver) => {
+                client.copy = Some((request, receiver));
+                return true;
+            }
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+            Err(error) => {
+                client.respond(Response::CopyError {
+                    request,
+                    error: error.to_string(),
+                });
+                return true;
+            }
         }
     }
+    client.copy_requests.push_back((name.into_owned(), copy));
+    false
 }
-fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, action: Action) {
-    let Action::ReadHistory {
-        pane,
-        request,
-        block,
-        cursor,
-        ref query,
-        ..
-    } = action
-    else {
-        unreachable!()
-    };
+fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, read: ReadRequest) {
     let result = terminal
         .core
         .lock()
         .map_err(|error| io::Error::other(error.to_string()))
-        .and_then(|mut core| core.read_history(block, cursor, query.as_deref()));
+        .and_then(|mut core| core.read_history(read.block, read.cursor, read.query.as_deref()));
     match result {
         Ok((receiver, cancelled)) => client.reads.push(PendingRead {
-            request,
-            pane,
+            request: read.request,
+            workspace: name.into_owned(),
+            pane: read.pane,
             receiver,
             cancelled,
         }),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-            client.read_requests.push_back((name.into_owned(), action))
+            client.read_requests.push_back((name.into_owned(), read))
         }
         Err(error) => client.respond(Response::History {
-            request,
+            request: read.request,
             result: Err(error.to_string()),
         }),
     }
 }
-fn copy_request(action: &Action) -> u64 {
-    match action {
-        Action::CopySelection { request, .. } | Action::CopyBlock { request, .. } => *request,
-        _ => unreachable!(),
-    }
-}
-fn validate_point(core: &crate::core::Core, point: Point) -> io::Result<()> {
+fn validate_point(core: &Core, point: Point) -> io::Result<()> {
     if point.column >= core.columns()
         || i64::from(point.line) < -(core.history_size() as i64)
         || point.line >= core.screen_lines() as i32
@@ -3216,6 +3372,14 @@ impl Client {
         self.screens
             .get(&pane)
             .map(|screen| screen.activity)
+            .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
+    }
+
+    #[cfg(feature = "agent")]
+    pub(crate) fn screen_revision(&self, pane: PaneId) -> io::Result<u64> {
+        self.screens
+            .get(&pane)
+            .map(|screen| screen.output_activity)
             .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
     }
 }
