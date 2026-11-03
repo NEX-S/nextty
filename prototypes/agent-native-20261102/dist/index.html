@@ -1,0 +1,273 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#181a1c">
+  <title>nextty — 终端与助手</title>
+  <meta name="description" content="终端保持完整，nextty agent 安静地留在右侧。可交互的界面原型。">
+  <style>
+    :root{color-scheme:dark;--bg:#181a1c;--panel:#1c1e20;--line:#303335;--text:#d4d7d6;--muted:#858c89;--faint:#606866;--mint:#a4c6b6;--red:#d59b98;--panel-width:340px;font-family:ui-monospace,"SFMono-Regular",Consolas,"Liberation Mono",monospace;font-synthesis:none;background:var(--bg);color:var(--text)}
+    *{box-sizing:border-box}html,body{margin:0;width:100%;height:100%;overflow:hidden}button,input,textarea{font:inherit}button{cursor:pointer}button,input,textarea{border-radius:0}button{color:inherit}button:focus-visible,input:focus-visible,textarea:focus-visible,summary:focus-visible{outline:1px solid var(--mint);outline-offset:3px}button:disabled{cursor:default;opacity:.45}[hidden]{display:none!important}
+    .app{height:100dvh;display:flex;flex-direction:column}.workspace{display:flex;flex:1;min-height:0;position:relative}.terminal{flex:1;min-width:0;display:flex;flex-direction:column}.terminal-header{height:46px;flex:none;display:flex;align-items:stretch;border-bottom:1px solid var(--line);padding:0 18px;gap:24px}.terminal-tabs{display:flex;gap:6px}.terminal-tab{background:none;border:0;position:relative;padding:0 14px;color:var(--muted);font-size:12px;white-space:nowrap}.terminal-tab .number{color:var(--faint);margin-right:9px;font-size:10px}.terminal-tab[aria-selected="true"]{color:#e2e6e3}.terminal-tab[aria-selected="true"]:after{content:"";position:absolute;bottom:-1px;left:14px;right:14px;height:1px;background:var(--mint)}.terminal-tab[aria-selected="true"] .number{color:var(--mint)}.terminal-context{margin-left:auto;display:flex;align-items:center;gap:20px;color:var(--faint);font-size:10px;white-space:nowrap}.branch{color:#8d9791}.agent-toggle{align-self:center;display:flex;align-items:center;gap:8px;padding:6px 0 6px 12px;margin-left:auto;border:0;background:none;color:var(--muted);font-size:11px;white-space:nowrap}.agent-toggle svg{width:14px;height:14px;stroke:var(--mint);fill:none;stroke-width:1.2}.agent-toggle:hover,.terminal-tab:hover{color:#e0e5e2}.terminal-pane{min-height:0;flex:1;overflow:auto;padding:30px 34px 80px;scrollbar-width:thin;scrollbar-color:#393e3b transparent}.terminal-log pre{font:inherit;font-size:14px;line-height:1.7;white-space:pre-wrap;overflow-wrap:anywhere;margin:0 0 22px;tab-size:2}.dim{color:var(--muted)}.faint{color:var(--faint)}.mint{color:var(--mint)}.red{color:var(--red)}.terminal-prompt{display:flex;align-items:center;gap:12px;font-size:14px;line-height:1.7}.prompt-mark{color:var(--mint);flex:none}.terminal-prompt input{display:block;min-width:0;flex:1;border:0;background:none;outline:none;color:var(--text);padding:0;caret-color:var(--mint)}.terminal-prompt input:focus-visible{outline:none}
+    .agent-panel{width:var(--panel-width);flex:none;min-width:0;display:flex;flex-direction:column;background:var(--panel);border-left:1px solid var(--line);font-size:13px;line-height:1.8}.agent-header{height:46px;flex:none;display:flex;align-items:center;padding:0 20px;gap:10px;border-bottom:1px solid var(--line)}.agent-name{font-size:12px;font-weight:500;letter-spacing:-.2px}.agent-name span{color:var(--muted);font-weight:400;margin-left:6px}.header-actions{display:flex;gap:10px;align-items:center;margin-left:auto}.icon-button{border:0;background:none;color:var(--muted);padding:4px;font-size:17px;line-height:1}.icon-button:hover{color:var(--text)}.agent-thread{flex:1;min-height:0;overflow:auto;padding:26px 22px 24px;scrollbar-width:thin;scrollbar-color:#414743 transparent}.intro{color:var(--muted);margin:0;line-height:1.9}.suggestion{background:none;border:0;padding:0;margin-top:15px;font-size:12px;color:var(--mint);text-align:left;line-height:1.8}.suggestion span{margin-left:8px;color:var(--faint)}.message{margin:0 0 27px;overflow-wrap:anywhere}.message-label{color:var(--faint);font-size:10px;margin-bottom:8px;letter-spacing:.02em}.message.agent .message-label{color:var(--mint)}.message p{margin:0 0 12px}.message p:last-child{margin-bottom:0}.message.user{padding-bottom:1px}.message.user p{color:#e1e5e2}.tool-call{margin:0 0 15px;color:var(--muted);font-size:10px;line-height:1.7}.tool-call summary{cursor:pointer;list-style:none;display:flex;gap:7px;align-items:center}.tool-call summary::-webkit-details-marker{display:none}.tool-call summary:before{content:"›";color:var(--faint);width:8px;font-size:14px}.tool-call[open] summary:before{content:"⌄"}.tool-call pre{white-space:pre-wrap;overflow-wrap:anywhere;font:inherit;margin:9px 0 0 15px;color:var(--muted);padding-left:10px;border-left:1px solid #414743}.inline-action{border:0;border-bottom:1px solid #557065;background:none;padding:2px 0;color:var(--mint);font-size:12px;line-height:1.7}.inline-action:hover{color:#d4e5dc;border-color:var(--mint)}.diff{margin:16px 0;color:var(--muted);font-size:11px}.diff summary{cursor:pointer;line-height:1.7}.diff pre{font:inherit;line-height:1.8;white-space:pre-wrap;overflow-wrap:anywhere;padding:12px 0 0;margin:0}.thinking{color:var(--muted)}
+    .composer{padding:0 22px 20px;flex:none}.composer textarea{display:block;width:100%;resize:none;height:76px;border:0;border-top:1px solid #3b403d;background:transparent;padding:15px 0 8px;color:var(--text);font-size:13px;line-height:1.7;caret-color:var(--mint);outline:none}.composer textarea::placeholder{color:var(--faint)}.composer textarea:focus-visible{outline:none;border-top-color:#728d7f}.composer-tools{display:flex;align-items:center;gap:12px}.attach-button{background:none;border:0;padding:4px 0;color:var(--muted);font-size:10px;display:flex;align-items:center;gap:6px}.attach-button svg{width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:1.2}.attach-button:hover{color:var(--text)}.send-button{margin-left:auto;border:1px solid #46594f;background:#2b3831;color:#c9dcd1;width:29px;height:27px;display:grid;place-items:center;font-size:17px;line-height:1}.send-button:hover:enabled{background:#35483d}.composer-hint{color:var(--faint);font-size:9px}.context-chip{display:flex;align-items:center;width:max-content;max-width:100%;gap:7px;border:1px solid #3a443e;color:#a5b4ab;padding:3px 7px;margin:0 0 10px;font-size:10px;line-height:1.5}.context-chip button{background:none;border:0;padding:0 0 0 4px;line-height:1;color:var(--muted);font-size:14px}.context-chip span{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+    .statusbar{height:27px;flex:none;border-top:1px solid var(--line);display:flex;align-items:center;gap:18px;padding:0 22px;color:var(--faint);font-size:9px;line-height:1;white-space:nowrap}.status-shell{display:flex;gap:8px;align-items:center}.status-dot{width:4px;height:4px;background:#7d9c8b}.status-shortcut{color:var(--faint)}.density-control{margin-left:auto;display:flex;align-items:center;gap:14px}.density-control button{padding:4px 0;border:0;background:none;color:var(--faint);font-size:9px}.density-control button[aria-pressed="true"]{color:var(--mint)}.prototype-label{padding-left:4px;color:#6d7570;font-size:9px}body[data-density="roomy"]{--panel-width:420px}body[data-density="roomy"] .agent-thread{padding:34px 30px 30px}body[data-density="roomy"] .composer{padding:0 30px 26px}body[data-density="roomy"] .agent-panel{line-height:1.95}body[data-density="roomy"] .terminal-pane{padding:36px 40px 80px}
+    @media(max-width:1100px){.terminal-context .path{display:none}.terminal-header{gap:12px}.terminal-context{gap:0}.terminal-pane{padding-left:25px;padding-right:25px}.agent-toggle{padding-left:8px}}@media(max-width:760px){.agent-panel{position:absolute;inset:0 0 0 auto;width:min(var(--panel-width),100%);z-index:2}.terminal-header{padding:0 10px;gap:6px}.terminal-tab{padding:0 10px}.terminal-tab[aria-selected="true"]:after{left:10px;right:10px}.terminal-context{display:none}.terminal-pane,body[data-density="roomy"] .terminal-pane{padding:25px 20px 60px}.terminal-log pre{font-size:12px;line-height:1.75}.terminal-prompt{font-size:12px}.statusbar{padding:0 14px;gap:12px}.status-shortcut{display:none}}@media(max-width:400px){.agent-panel{width:100%}.terminal-tab{font-size:11px}.agent-toggle{font-size:10px}.status-shell .encoding{display:none}.composer-hint{display:none}}
+  </style>
+</head>
+<body data-density="quiet">
+  <main class="app">
+    <div class="workspace">
+      <section class="terminal" aria-label="终端">
+        <header class="terminal-header">
+          <nav class="terminal-tabs" role="tablist" aria-label="终端会话">
+            <button id="shell-tab" class="terminal-tab" role="tab" aria-selected="true" aria-controls="shell-pane"><span class="number">1</span>shell</button>
+            <button id="codex-tab" class="terminal-tab" role="tab" aria-selected="false" aria-controls="codex-pane"><span class="number">2</span>codex</button>
+          </nav>
+          <div class="terminal-context"><span class="path">~/work/atlas-api</span><span class="branch">⎇ fix/session-refresh</span></div>
+          <button id="agent-toggle" class="agent-toggle" aria-expanded="true" aria-controls="agent-panel" title="显示或隐藏 nextty agent · Alt+A"><svg viewBox="0 0 16 16" aria-hidden="true"><rect x="2" y="2.5" width="12" height="11"/><path d="M10 3v10"/></svg>nextty agent</button>
+        </header>
+        <section id="shell-pane" class="terminal-pane" role="tabpanel" aria-labelledby="shell-tab">
+          <div id="shell-output" class="terminal-log"><pre><span class="mint">❯</span> pnpm test
+
+<span class="dim">&gt; atlas-api@0.8.4 test /workspace/atlas-api
+&gt; vitest run</span>
+
+<span class="mint"> RUN </span> v3.2.4 <span class="dim">/workspace/atlas-api</span>
+
+<span class="mint"> ✓</span> tests/health.test.ts <span class="dim">(6 tests) 18ms</span>
+<span class="mint"> ✓</span> tests/auth.test.ts <span class="dim">(14 tests) 64ms</span>
+<span class="red"> ❯</span> tests/session.test.ts <span class="dim">(22 tests | <span class="red">1 failed</span>) 93ms</span>
+
+<span class="red"> FAIL </span> tests/session.test.ts <span class="dim">&gt; session &gt; refreshes an expired access token</span>
+<span class="red">AssertionError:</span> expected 401 to be 200 <span class="faint">// Object.is equality</span>
+
+  <span class="mint">Expected: 200</span>
+  <span class="red">Received: 401</span>
+
+<span class="dim"> ❯ tests/session.test.ts:84:29</span>
+<span class="faint">     82|</span> const response = await request(app)
+<span class="faint">     83|</span>   .post('/api/session/refresh').send({ refreshToken })
+<span class="red">     84|</span> expect(response.status).toBe(200)
+<span class="faint">       |                         ^</span>
+
+<span class="dim"> Test Files </span> <span class="red">1 failed</span> <span class="faint">|</span> <span class="mint">2 passed</span> <span class="faint">(3)</span>
+<span class="dim">      Tests </span> <span class="red">1 failed</span> <span class="faint">|</span> <span class="mint">41 passed</span> <span class="faint">(42)</span>
+<span class="dim">   Duration </span> 612ms</pre></div>
+          <form id="shell-command" class="terminal-prompt"><label class="prompt-mark" for="shell-input">❯</label><input id="shell-input" aria-label="Shell 命令，支持 pwd、pnpm test 和 clear" autocomplete="off" spellcheck="false"></form>
+        </section>
+        <section id="codex-pane" class="terminal-pane" role="tabpanel" aria-labelledby="codex-tab" hidden>
+          <div id="codex-output" class="terminal-log"><pre><span class="mint">❯</span> codex
+
+<span style="color:#e3e6e4">&gt;_ OpenAI Codex</span> <span class="faint">(v0.59.0)</span>
+
+<span class="dim">model:</span>     gpt-5.3-codex
+<span class="dim">directory:</span> ~/work/atlas-api
+
+<span style="color:#e3e6e4">› 看一下 session refresh 的实现，先不要修改。</span>
+
+<span class="dim">• Explored</span>
+  <span class="faint">Read</span> src/routes/session.ts, tests/session.test.ts
+
+• 刷新路由在 src/routes/session.ts:27。
+  它先经过 requireAuth，再进入 refreshSession。
+
+  这意味着 access token 过期时，请求会在刷新前返回 401。
+  refreshSession 本身已有 refresh token 校验。
+
+  <span class="dim">尚未修改文件。</span></pre></div>
+          <form id="codex-command" class="terminal-prompt"><label class="prompt-mark" for="codex-input">›</label><input id="codex-input" aria-label="Codex CLI 输入" autocomplete="off" spellcheck="false" placeholder="Ask Codex to do anything"></form>
+        </section>
+      </section>
+      <aside id="agent-panel" class="agent-panel" aria-label="nextty agent 助手">
+        <header class="agent-header"><div class="agent-name">nextty<span>agent</span></div><div class="header-actions"><button id="new-conversation" class="icon-button" aria-label="新对话" title="新对话">+</button><button id="agent-close" class="icon-button" aria-label="关闭助手" title="关闭助手">×</button></div></header>
+        <div id="agent-thread" class="agent-thread" role="log" aria-label="助手对话" aria-live="polite"></div>
+        <form id="agent-composer" class="composer">
+          <div id="context-chip" class="context-chip" hidden><span id="context-label">shell · pnpm test</span><button id="remove-context" type="button" aria-label="移除附加的输出">×</button></div>
+          <textarea id="agent-input" aria-label="给 nextty agent 的消息" placeholder="问问当前终端…" rows="3"></textarea>
+          <div class="composer-tools"><button id="attach-output" type="button" class="attach-button"><svg viewBox="0 0 14 14" aria-hidden="true"><path d="M5 4v5a2 2 0 0 0 4 0V3.5a1.5 1.5 0 0 0-3 0V9a.5.5 0 0 0 1 0V4"/></svg>附上当前输出</button><span class="composer-hint">Enter 发送</span><button id="send-message" class="send-button" aria-label="发送消息" title="发送 · Enter" disabled>↑</button></div>
+        </form>
+      </aside>
+    </div>
+    <footer class="statusbar"><span class="status-shell"><span class="status-dot"></span>zsh<span class="encoding">· UTF-8</span></span><span class="status-shortcut">Alt+A 助手</span><div class="density-control" aria-label="界面密度"><button id="density-quiet" aria-pressed="true">紧凑</button><button id="density-roomy" aria-pressed="false">舒展</button></div><span class="prototype-label">交互原型</span></footer>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const thread = $('agent-thread');
+    const agentInput = $('agent-input');
+    let activeTab = 'shell';
+    let busy = false;
+    let pendingTimer;
+    let attachedOutput = null;
+    let fixed = false;
+    const initialOutput = $('shell-output').innerHTML;
+    const passingOutput = '<pre><span class="mint">❯</span> pnpm test\n\n<span class="dim">&gt; atlas-api@0.8.4 test /workspace/atlas-api\n&gt; vitest run</span>\n\n<span class="mint"> RUN </span> v3.2.4 <span class="dim">/workspace/atlas-api</span>\n\n<span class="mint"> ✓</span> tests/health.test.ts <span class="dim">(6 tests) 17ms</span>\n<span class="mint"> ✓</span> tests/auth.test.ts <span class="dim">(14 tests) 61ms</span>\n<span class="mint"> ✓</span> tests/session.test.ts <span class="dim">(22 tests) 82ms</span>\n\n<span class="dim"> Test Files </span> <span class="mint">3 passed</span> <span class="faint">(3)</span>\n<span class="dim">      Tests </span> <span class="mint">42 passed</span> <span class="faint">(42)</span>\n<span class="dim">   Duration </span> 584ms</pre>';
+    function setBusy(value) { busy = value; $('send-message').disabled = busy || !agentInput.value.trim(); }
+    function scrollThread() { thread.scrollTop = thread.scrollHeight; }
+    function message(role, text) {
+      const item = document.createElement('section');
+      item.className = 'message ' + role;
+      const label = document.createElement('div');
+      label.className = 'message-label';
+      label.textContent = role === 'user' ? '你' : 'nextty';
+      item.append(label);
+      if (text) { const paragraph = document.createElement('p'); paragraph.textContent = text; item.append(paragraph); }
+      thread.append(item);
+      scrollThread();
+      return item;
+    }
+    function tool(parent, label, output) {
+      const details = document.createElement('details');
+      details.className = 'tool-call';
+      const summary = document.createElement('summary');
+      summary.textContent = label;
+      const pre = document.createElement('pre');
+      pre.textContent = output;
+      details.append(summary, pre);
+      parent.append(details);
+    }
+    function newConversation() {
+      clearTimeout(pendingTimer);
+      thread.innerHTML = '<p class="intro">需要时，在这里问我。</p><button id="suggest-failure" class="suggestion" type="button">解释这次测试失败<span>↗</span></button>';
+      $('suggest-failure').addEventListener('click', () => { agentInput.value = fixed ? '解释当前测试结果' : '解释这次测试失败'; setBusy(false); agentInput.focus(); });
+      agentInput.value = '';
+      attachedOutput = null;
+      $('context-chip').hidden = true;
+      setBusy(false);
+      thread.scrollTop = 0;
+    }
+    function setPanel(open) {
+      $('agent-panel').hidden = !open;
+      $('agent-toggle').setAttribute('aria-expanded', String(open));
+    }
+    function setDensity(density) {
+      const value = density === 'roomy' ? 'roomy' : 'quiet';
+      document.body.dataset.density = value;
+      $('density-quiet').setAttribute('aria-pressed', String(value === 'quiet'));
+      $('density-roomy').setAttribute('aria-pressed', String(value === 'roomy'));
+      if (location.hash !== '#' + value) history.replaceState(null, '', '#' + value);
+    }
+    function selectTab(tab) {
+      activeTab = tab;
+      ['shell', 'codex'].forEach(name => {
+        $(name + '-pane').hidden = name !== tab;
+        $(name + '-tab').setAttribute('aria-selected', String(name === tab));
+      });
+    }
+    function prepareFix(button) {
+      if (busy) return;
+      button.disabled = true;
+      setBusy(true);
+      const reply = message('agent', '正在检查刷新路由和对应测试…');
+      pendingTimer = setTimeout(() => {
+        reply.lastElementChild.remove();
+        tool(reply, '读取 2 个文件', 'src/routes/session.ts:27\nrouter.post(\'/refresh\', requireAuth, refreshSession);\n\nrefreshSession 内部调用 verifyRefreshToken(refreshToken)。\n\ntests/session.test.ts:84\nexpect(response.status).toBe(200)');
+        const explanation = document.createElement('p');
+        explanation.textContent = '原因确认了：requireAuth 在进入刷新逻辑前就拒绝了过期的 access token。移除这条路由前的访问令牌校验，保留 refreshSession 内的 refresh token 校验。';
+        reply.append(explanation);
+        const diff = document.createElement('details');
+        diff.className = 'diff';
+        diff.innerHTML = '<summary>查看改动 · session.ts <span class="mint">+1</span> <span class="red">−1</span></summary><pre><span class="dim">src/routes/session.ts:27</span>\n<span class="red">− router.post(\'/refresh\', requireAuth, refreshSession);</span>\n<span class="mint">+ router.post(\'/refresh\', refreshSession);</span></pre>';
+        reply.append(diff);
+        const apply = document.createElement('button');
+        apply.type = 'button'; apply.id = 'apply-fix'; apply.className = 'inline-action'; apply.textContent = '应用并验证';
+        apply.addEventListener('click', () => applyFix(apply));
+        reply.append(apply);
+        setBusy(false); scrollThread();
+      }, 450);
+    }
+    function applyFix(button) {
+      if (busy) return;
+      button.disabled = true;
+      setBusy(true);
+      const reply = message('agent', '正在应用改动并运行 pnpm test…');
+      pendingTimer = setTimeout(() => {
+        fixed = true;
+        $('shell-output').insertAdjacentHTML('beforeend', passingOutput);
+        selectTab('shell');
+        $('shell-pane').scrollTop = $('shell-pane').scrollHeight;
+        reply.lastElementChild.remove();
+        tool(reply, '修改 1 个文件 · pnpm test · exit 0', 'src/routes/session.ts  +1 −1\nTest Files  3 passed (3)\n     Tests  42 passed (42)\n  Duration  584ms\nexit 0');
+        const done = document.createElement('p');
+        done.textContent = '已移除刷新路由上的 requireAuth。42 项测试全部通过，包括刚才失败的会话刷新测试。';
+        reply.append(done);
+        setBusy(false); scrollThread();
+      }, 650);
+    }
+    function sendMessage(event) {
+      event.preventDefault();
+      const text = agentInput.value.trim();
+      if (!text || busy) return;
+      const context = attachedOutput || {source: activeTab, text: $(activeTab + '-output').textContent};
+      thread.querySelector('.intro')?.remove();
+      $('suggest-failure')?.remove();
+      message('user', text);
+      agentInput.value = '';
+      attachedOutput = null;
+      $('context-chip').hidden = true;
+      setBusy(true);
+      const reply = message('agent', '正在查看终端输出…');
+      pendingTimer = setTimeout(() => {
+        reply.lastElementChild.remove();
+        tool(reply, '读取终端输出 · ' + context.source, context.text.trim());
+        if (fixed) {
+          const paragraph = document.createElement('p');
+          paragraph.textContent = '当前这次运行已通过：3 个测试文件、42 项测试全部通过。之前返回 401 的会话刷新测试也已通过。';
+          reply.append(paragraph);
+        } else {
+          const diagnosis = document.createElement('p');
+          diagnosis.textContent = '失败的是会话刷新测试。tests/session.test.ts:84 期望返回 200，实际收到 401。';
+          const reason = document.createElement('p');
+          reason.textContent = '从结果看，刷新请求可能在进入处理函数前被身份校验拦住了。有效的 refresh token 应该允许过期的 access token 换取新令牌。';
+          const action = document.createElement('button');
+          action.type = 'button'; action.id = 'prepare-fix'; action.className = 'inline-action'; action.textContent = '准备修复 →';
+          action.addEventListener('click', () => prepareFix(action));
+          reply.append(diagnosis, reason, action);
+        }
+        setBusy(false); scrollThread();
+      }, 450);
+    }
+    ['shell', 'codex'].forEach(name => {
+      $(name + '-tab').addEventListener('click', () => selectTab(name));
+      $(name + '-command').addEventListener('submit', event => {
+        event.preventDefault();
+        const input = $(name + '-input');
+        const command = input.value.trim();
+        if (!command) return;
+        input.value = '';
+        const log = $(name + '-output');
+        if (command === 'clear') { log.replaceChildren(); return; }
+        if (command === 'pnpm test') log.insertAdjacentHTML('beforeend', fixed ? passingOutput : initialOutput);
+        else {
+          const pre = document.createElement('pre');
+          const result = command === 'pwd' ? '/workspace/atlas-api' : name === 'codex' ? '• 此处演示 Codex CLI 会话。你可以在右侧让 nextty 解释当前测试。' : 'zsh: command not found: ' + command;
+          pre.textContent = (name === 'shell' ? '❯ ' : '› ') + command + '\n' + result;
+          log.append(pre);
+        }
+        $(name + '-pane').scrollTop = $(name + '-pane').scrollHeight;
+      });
+    });
+    $('agent-toggle').addEventListener('click', () => setPanel($('agent-panel').hidden));
+    $('agent-close').addEventListener('click', () => setPanel(false));
+    $('new-conversation').addEventListener('click', newConversation);
+    $('density-quiet').addEventListener('click', () => setDensity('quiet'));
+    $('density-roomy').addEventListener('click', () => setDensity('roomy'));
+    window.addEventListener('hashchange', () => setDensity(location.hash.slice(1)));
+    document.addEventListener('keydown', event => { if (event.altKey && event.key.toLowerCase() === 'a') { event.preventDefault(); setPanel($('agent-panel').hidden); } });
+    $('attach-output').addEventListener('click', () => {
+      attachedOutput = {source: activeTab, text: $(activeTab + '-output').textContent};
+      $('context-label').textContent = activeTab === 'shell' ? 'shell · pnpm test · 当前输出' : 'codex · 当前输出';
+      $('context-chip').hidden = false;
+      agentInput.focus();
+    });
+    $('remove-context').addEventListener('click', () => { attachedOutput = null; $('context-chip').hidden = true; });
+    agentInput.addEventListener('input', () => setBusy(busy));
+    agentInput.addEventListener('keydown', event => { if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) sendMessage(event); });
+    $('agent-composer').addEventListener('submit', sendMessage);
+    setDensity(location.hash.slice(1));
+    setPanel(window.innerWidth > 760);
+    newConversation();
+  </script>
+</body>
+</html>
