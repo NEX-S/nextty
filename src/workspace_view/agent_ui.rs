@@ -87,18 +87,6 @@ impl WorkspaceView {
         self.dirty = true;
     }
 
-    pub(super) fn open_object(&mut self, pane: PaneId, object: Object) -> Result<()> {
-        if !self.composition_finished() {
-            return Ok(());
-        }
-        if self.ui.attach_object(&self.client, pane, object) {
-            self.resize()?;
-        }
-        self.selecting = None;
-        self.dirty = true;
-        Ok(())
-    }
-
     /// Clicks while a context preview covers the window.
     pub(super) fn preview_button(&mut self, button: u32) -> Result<()> {
         if button == 1

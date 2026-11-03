@@ -2,7 +2,7 @@ use crate::eventfd::{consume_notification, notify};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::ffi::{CStr, OsString};
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::process::CommandExt;
@@ -209,7 +209,8 @@ impl Terminal {
             ),
         };
         if let Some(directory) = &working_directory {
-            command.current_dir(directory);
+            let directory = std::path::absolute(directory)?;
+            command.current_dir(&directory).env("PWD", &directory);
         }
 
         let integration = if integrate {
@@ -559,8 +560,14 @@ impl PtyLoop {
                     .push(format!("foreground cwd: {error}")),
             }
         }
-        match std::fs::read_to_string(format!("/proc/{0}/task/{0}/children", metadata.child_pid)) {
-            Ok(children) => metadata.has_children = Some(!children.trim().is_empty()),
+        // A nonempty procfs children list starts with a PID.
+        match std::fs::File::open(format!("/proc/{0}/task/{0}/children", metadata.child_pid))
+            .and_then(|mut file| file.read_exact(&mut [0]))
+        {
+            Ok(()) => metadata.has_children = Some(true),
+            Err(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
+                metadata.has_children = Some(false)
+            }
             Err(error) => metadata
                 .unavailable
                 .push(format!("child processes: {error}")),
@@ -1056,6 +1063,30 @@ mod tests {
     }
 
     #[test]
+    fn explicit_working_directory_sets_pwd_before_shell_startup() {
+        for directory in [
+            PathBuf::from("target"),
+            std::env::current_dir().unwrap().join("target"),
+        ] {
+            let terminal = Terminal::new(
+                Some(Shell::new(
+                    "/usr/bin/python3".into(),
+                    vec![
+                        "-c".into(),
+                        "import os; assert os.environ['PWD'] == os.getcwd()".into(),
+                    ],
+                )),
+                Some(directory),
+                size(24, 80),
+                0xd8dee9,
+                0x14161b,
+            )
+            .unwrap();
+            assert!(exit_status(&terminal).success(), "{}", content(&terminal));
+        }
+    }
+
+    #[test]
     fn wakeups_are_merged_without_dropping_other_events() {
         let (sender, receiver) = mpsc::channel();
         let proxy = EventProxy {
@@ -1114,7 +1145,11 @@ mod tests {
                 std::thread::sleep(Duration::from_millis(10));
             }
         };
-        let initial = wait(&|m| m.foreground_pid == Some(m.child_pid) && m.unavailable.is_empty());
+        let initial = wait(&|m| {
+            m.foreground_pid == Some(m.child_pid)
+                && m.has_children == Some(false)
+                && m.unavailable.is_empty()
+        });
         assert_eq!(initial.launch_argv, ["/bin/sh", "-i"]);
         assert_eq!(initial.foreground_cwd, Some(std::env::temp_dir()));
         terminal.write(b"/bin/sleep 30\n".as_slice()).unwrap();
@@ -1124,6 +1159,7 @@ mod tests {
                 .is_some_and(|p| p.file_name().is_some_and(|n| n == "sleep"))
         });
         assert_ne!(job.foreground_pid, Some(job.child_pid));
+        assert_eq!(job.has_children, Some(true));
         assert_eq!(job.foreground_pid, job.foreground_pgid);
         assert_eq!(job.foreground_argv.as_ref().unwrap(), &["/bin/sleep", "30"]);
         assert_eq!(job.foreground_cwd, Some(std::env::temp_dir()));

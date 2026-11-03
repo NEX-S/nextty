@@ -10,6 +10,37 @@ fn horizontal(character: char) -> bool {
     )
 }
 
+// Keep query search state off the common unfiltered snapshot path.
+#[inline(never)]
+fn matching_rows(text: &str, query: &str, row_ranges: &[std::ops::Range<usize>]) -> Vec<bool> {
+    let finder = memchr::memmem::Finder::new(query.as_bytes());
+    let mut matches = vec![false; row_ranges.len()];
+    let mut offset = 0;
+    let mut first = 0;
+    let mut last = 0;
+    while let Some(found) = finder.find(&text.as_bytes()[offset..]) {
+        let start = offset + found;
+        let end = start + query.len();
+        while first + 1 < row_ranges.len() && row_ranges[first + 1].start <= start {
+            first += 1;
+        }
+        last = last.max(first);
+        while last + 1 < row_ranges.len()
+            && (row_ranges[last + 1].start < end
+                || query.ends_with('\n') && row_ranges[last + 1].start == end)
+        {
+            last += 1;
+        }
+        matches[first..=last].fill(true);
+        let Some(next) = text[start..].chars().next() else {
+            break;
+        };
+        // Keep the suffix where a match could still reach another row.
+        offset = (start + next.len_utf8()).max(row_ranges[last].end.saturating_sub(query.len()));
+    }
+    matches
+}
+
 pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     let mut text = String::with_capacity(
         screen
@@ -35,32 +66,7 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
             text.push('\n');
         }
     }
-    let mut matches = Vec::new();
-    if let Some(query) = query {
-        matches.resize(row_ranges.len(), false);
-        let mut offset = 0;
-        let mut first = 0;
-        let mut last = 0;
-        while let Some(found) = text[offset..].find(query) {
-            let start = offset + found;
-            let end = start + query.len();
-            while first + 1 < row_ranges.len() && row_ranges[first + 1].start <= start {
-                first += 1;
-            }
-            last = last.max(first);
-            while last + 1 < row_ranges.len()
-                && (row_ranges[last + 1].start < end
-                    || query.ends_with('\n') && row_ranges[last + 1].start == end)
-            {
-                last += 1;
-            }
-            matches[first..=last].fill(true);
-            let Some(next) = text[start..].chars().next() else {
-                break;
-            };
-            offset = start + next.len_utf8();
-        }
-    }
+    let matches = query.map_or_else(Vec::new, |query| matching_rows(&text, query, &row_ranges));
     let mut rows = Vec::new();
     let mut omitted = Vec::<Value>::new();
     let mut omission: Option<(&str, usize)> = None;

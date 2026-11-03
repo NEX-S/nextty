@@ -1,13 +1,13 @@
 use crate::agent::AgentView;
 use crate::config::Config;
-use crate::context::{self, Object, Snapshot as ContextSnapshot};
+use crate::context::{self, Snapshot as ContextSnapshot};
 use crate::core::Mode;
 use crate::core::{Flags, WindowSize};
 use crate::input::keysym;
 use crate::panel::{Grid, mix_color, rgb};
 use crate::ui::{Focus, Ui};
 use crate::width::scalar_width;
-use crate::width::{fit_label, text_width};
+use crate::width::text_width;
 use crate::worker::Worker;
 use crate::workspace::Rect;
 use crate::workspace::{AgentEvent, AgentModelPatch, Client, PaneId};
@@ -420,13 +420,16 @@ impl AgentPainter<'_> {
                         message_bg,
                     );
                     let text = self.ui.agent.active().message_text(*index as usize);
-                    let color = if message.role == "Error" {
-                        error
-                    } else if message.id.is_some() {
-                        muted
-                    } else {
-                        foreground
-                    };
+                    let color =
+                        if user && self.ui.agent.active().rewind_target == Some(message.turn) {
+                            crate::panel::ACCENT
+                        } else if message.role == "Error" {
+                            error
+                        } else if message.id.is_some() {
+                            muted
+                        } else {
+                            foreground
+                        };
                     let from = range.start as usize;
                     let to = range.end as usize;
                     if let Some(document) = self.ui.agent.active().markdown(*index as usize) {
@@ -520,7 +523,7 @@ impl AgentPainter<'_> {
             editor.x,
             editor.y.saturating_sub(3),
             editor.cols,
-            "Esc older · Enter confirm · type cancels",
+            "j/k select · Enter confirm · Esc exits",
             muted,
             bg,
         );
@@ -876,10 +879,7 @@ impl AgentPainter<'_> {
                 x + 2,
                 side.y,
                 width.saturating_sub(7),
-                &fit_label(
-                    self.ui.agent.sessions[index].title(),
-                    width.saturating_sub(7),
-                ),
+                self.ui.agent.sessions[index].title(),
                 if active {
                     active_fg
                 } else if hovered {
@@ -1588,6 +1588,7 @@ impl AgentPanel {
     pub fn clear_input(&mut self) {
         self.view_dirty |= !self.active().model.input.is_empty();
         self.active_mut().model.clear_input();
+        self.active_mut().prompt_index = None;
     }
 
     pub fn controls(&self) -> Vec<AgentAction> {
@@ -1769,6 +1770,9 @@ pub(crate) struct AgentSession {
     render_request: Option<u64>,
     pub editor_scroll: Option<usize>,
     pub rewind_target: Option<u64>,
+    escape_pending: bool,
+    prompt_index: Option<usize>,
+    prompt_draft: String,
     selection: Option<ChatSelection>,
     rewind_applied: Option<u64>,
     failed_send_applied: Option<u64>,
@@ -1947,13 +1951,15 @@ impl AgentSession {
         Some([checkpoint(selection.anchor)?, checkpoint(selection.head)?])
     }
 
-    fn selected_range(&self, line: usize) -> Option<Range<usize>> {
-        let selection = self.selection.as_ref()?;
+    fn selected_range(
+        selection: &ChatSelection,
+        mut first: TranscriptPoint,
+        range: Range<usize>,
+    ) -> Option<Range<usize>> {
         let (start, end) = (
             selection.anchor.min(selection.head),
             selection.anchor.max(selection.head),
         );
-        let (mut first, range, _) = self.line_text(line)?;
         first.offset = range.start;
         let mut last = first;
         last.offset = range.end;
@@ -1974,22 +1980,24 @@ impl AgentSession {
     }
 
     pub fn selection_columns(&self, line: usize) -> Option<Range<usize>> {
-        let selected = self.selected_range(line)?;
-        let (_, range, text) = self.line_text(line)?;
-        Some(
-            crate::width::text_width(&text[range.start..selected.start])
-                ..crate::width::text_width(&text[range.start..selected.end]),
-        )
+        let selection = self.selection.as_ref()?;
+        let (point, range, text) = self.line_text(line)?;
+        let selected = Self::selected_range(selection, point, range.clone())?;
+        let start = crate::width::text_width(&text[range.start..selected.start]);
+        Some(start..start + crate::width::text_width(&text[selected]))
     }
 
     pub fn selected_text(&self) -> Option<String> {
+        let selection = self.selection.as_ref()?;
         let mut output = String::new();
         let mut previous: Option<TranscriptPoint> = None;
         for index in 0..self.lines.len() {
-            let Some(range) = self.selected_range(index) else {
+            let Some((mut point, range, text)) = self.line_text(index) else {
                 continue;
             };
-            let (mut point, _, text) = self.line_text(index).unwrap();
+            let Some(range) = Self::selected_range(selection, point, range) else {
+                continue;
+            };
             if let Some(last) = previous {
                 if (last.message, last.part) == (point.message, point.part) {
                     output.push_str(&text[last.offset..range.start]);
@@ -2016,12 +2024,19 @@ impl AgentSession {
         let (caret_lines, caret_range) = if self.model.cursor == self.model.input.len() {
             (lines.len(), lines.last().cloned().unwrap_or(0..0))
         } else {
+            let row = lines.partition_point(|range| range.end < self.model.cursor);
+            // A caret inside CRLF falls between adjacent displayed ranges.
+            let row = row.saturating_sub(usize::from(lines[row].start > self.model.cursor));
+            let offset = lines[row].start;
             let mut caret = (0usize, 0..0);
-            wrap_context_into(prefix, columns, |range| {
+            wrap_context_into(&prefix[offset..], columns, |range| {
                 caret.0 += 1;
                 caret.1 = range;
             });
-            caret
+            (
+                row + caret.0.max(1),
+                offset + caret.1.start..offset + caret.1.end,
+            )
         };
         let text = &prefix[caret_range];
         let width = if text.is_ascii() {
@@ -2165,21 +2180,6 @@ impl AgentSession {
         Ok(true)
     }
 
-    pub fn attach_object(
-        &mut self,
-        client: &Client,
-        pane: PaneId,
-        object: Object,
-    ) -> Result<(), &'static str> {
-        let screen = client.screens().get(&pane).ok_or("No active pane")?;
-        self.add_context(ContextItem {
-            label: object.text,
-            source: context_source(client, pane),
-            kind: object.kind.into(),
-            snapshot: context::region_context(screen, object.range.start.line)
-                .unwrap_or_else(|| context::object_context(screen, object.range)),
-        })
-    }
     pub fn attach_screen(
         &mut self,
         client: &Client,
@@ -2349,8 +2349,8 @@ impl Ui {
                 .saturating_sub(line + 1);
         }
         let hint = match self.agent.keyboard {
-            AgentAction::Editor => "Agent input · Enter sends · Ctrl+J newline",
-            AgentAction::Output => "Agent output · Ctrl+C copies selection / stops",
+            AgentAction::Editor => "Agent input · Enter sends · Shift+Enter newline",
+            AgentAction::Output => "Agent output · Ctrl+C clears input / stops",
             AgentAction::Stop => "Stop generation · Enter",
             AgentAction::ContextMenu => "Attach terminal context · Enter",
             AgentAction::Selection => "Attach visible selection · Enter",
@@ -2365,7 +2365,7 @@ impl Ui {
             AgentAction::Session(_) => "Switch conversation · Enter",
             AgentAction::CloseSession(_) => "Close conversation · Enter",
             AgentAction::ClosePanel => "Collapse Agent panel · Enter",
-            AgentAction::Rewind(_) => "Selected rewind target · Esc older · Enter confirms",
+            AgentAction::Rewind(_) => "History · j/k selects · Esc exits · Enter confirms",
         };
         self.message(hint);
     }
@@ -2575,6 +2575,7 @@ impl Ui {
     }
 
     pub fn cancel_rewind(&mut self) {
+        self.agent.active_mut().escape_pending = false;
         if self.agent.active_mut().rewind_target.take().is_some() {
             self.agent.keyboard = AgentAction::Editor;
             if self.focus.is_agent() {
@@ -2607,31 +2608,37 @@ impl Ui {
         {
             return false;
         }
-        if symbol == keysym::ESCAPE
-            && (self.focus == Focus::Editor || self.agent.active().rewind_target.is_some())
-        {
-            self.previous_agent_rewind();
+        if self.agent.active().rewind_target.is_some() {
+            match symbol {
+                keysym::ESCAPE => self.cancel_rewind(),
+                keysym::RETURN | keysym::KP_ENTER => self.confirm_agent_rewind(),
+                0x6b => self.previous_agent_rewind(),
+                0x6a => {
+                    let session = self.agent.active();
+                    if let Some(index) = session.rewind_index().and_then(|index| {
+                        session.model.messages[index + 1..]
+                            .iter()
+                            .position(|message| message.role == "You")
+                            .map(|offset| index + 1 + offset)
+                    }) {
+                        self.select_agent_rewind(index);
+                    }
+                }
+                _ => (),
+            }
             return true;
         }
-        if self.agent.active().rewind_target.is_some() {
-            if matches!(symbol, keysym::RETURN | keysym::KP_ENTER) {
-                self.confirm_agent_rewind();
-                return true;
+        if symbol == keysym::ESCAPE {
+            if self.agent.active().escape_pending {
+                self.agent.active_mut().escape_pending = false;
+                self.previous_agent_rewind();
+            } else {
+                self.agent.active_mut().escape_pending = true;
             }
-            self.cancel_rewind();
+            return true;
         }
+        self.agent.active_mut().escape_pending = false;
         false
-    }
-
-    /// Returns whether the Agent panel was opened by this attachment.
-    pub fn attach_object(&mut self, client: &Client, pane: PaneId, object: Object) -> bool {
-        let count = self.agent.active().context.basket.len();
-        if let Err(error) = self.agent.active_mut().attach_object(client, pane, object) {
-            self.message(error);
-        }
-        self.agent.view_dirty |= count != self.agent.active().context.basket.len();
-        self.focus = Focus::Editor;
-        !std::mem::replace(&mut self.agent.open, true)
     }
 
     /// Handles a key aimed at the Agent panel; `None` passes it to the next region.
@@ -2644,13 +2651,18 @@ impl Ui {
         use crate::input::KeyResult;
         let (control, shift, letter, paste) =
             (key.control(), key.shift(), key.letter(), key.paste());
-        if let Some(preview) = &self.agent.active().context.preview {
-            if control && letter == Some('c') {
-                return Ok(Some(KeyResult::Copy(
-                    preview.item.snapshot.text.clone(),
-                    false,
-                )));
+        if control && letter == Some('c') && self.agent.open && self.focus.is_agent() {
+            self.agent.active_mut().escape_pending = false;
+            if self.agent.active().model.input.is_empty() {
+                if self.agent.active().model.busy {
+                    self.activate_agent(AgentAction::Stop, client)?;
+                }
+            } else {
+                self.agent.clear_input();
             }
+            return Ok(Some(KeyResult::Handled));
+        }
+        if self.agent.active().context.preview.is_some() {
             if matches!(key.symbol, keysym::TAB | keysym::LEFT_TAB)
                 || self.focus == Focus::Controls
                     && matches!(key.symbol, keysym::RETURN | keysym::KP_ENTER | 32)
@@ -2727,17 +2739,12 @@ impl Ui {
                                     1
                                 })
                     }
-                    _ if control && letter == Some('c') => {
-                        if let Some(text) = self.agent.active().selected_text() {
-                            return Ok(Some(KeyResult::Copy(text, false)));
-                        }
-                        if self.agent.active().model.busy {
-                            self.activate_agent(AgentAction::Stop, client)?;
-                        }
-                    }
                     _ => (),
                 }
                 return Ok(Some(KeyResult::Handled));
+            }
+            if !(control && matches!(letter, Some('h' | 'j' | 'k' | 'l'))) {
+                self.agent.active_mut().prompt_index = None;
             }
             if paste {
                 return Ok(Some(KeyResult::Paste));
@@ -2745,25 +2752,60 @@ impl Ui {
             if control {
                 match letter {
                     Some('a') => self.agent.active_mut().model.select_all(),
-                    Some('c' | 'x') => {
+                    Some('x') => {
                         if let Some(range) = self.agent.active().model.selection() {
                             return Ok(Some(KeyResult::Copy(
                                 self.agent.active().model.input[range].to_owned(),
-                                letter == Some('x'),
+                                true,
                             )));
-                        }
-                        if letter == Some('c') {
-                            if self.agent.active().model.busy {
-                                self.activate_agent(AgentAction::Stop, client)?;
-                            } else {
-                                self.agent.clear_input();
-                            }
                         }
                     }
                     Some('u') => self.agent.clear_input(),
-                    Some('j') => {
-                        if let Err(error) = self.agent.insert(self.agent.active().id, "\n") {
-                            self.message(error);
+                    Some('h' | 'l') => self.agent.active_mut().model.key(
+                        if letter == Some('h') {
+                            keysym::LEFT
+                        } else {
+                            keysym::RIGHT
+                        },
+                        false,
+                    ),
+                    Some('j' | 'k') => {
+                        let up = letter == Some('k');
+                        let layout = self
+                            .agent
+                            .active()
+                            .editor_layout(viewport.0.max(1), viewport.1.max(1));
+                        if (up && layout.caret_row == 0)
+                            || (!up && layout.caret_row + 1 == layout.lines.len())
+                        {
+                            let session = self.agent.active_mut();
+                            let prompts: Vec<_> = session
+                                .model
+                                .messages
+                                .iter()
+                                .filter(|message| message.role == "You")
+                                .map(|message| message.text.clone())
+                                .collect();
+                            let current = session.prompt_index.unwrap_or(prompts.len());
+                            if session.prompt_index.is_none() {
+                                session.prompt_draft = session.model.input.clone();
+                            }
+                            let index = if up {
+                                current.saturating_sub(1)
+                            } else {
+                                (current + 1).min(prompts.len())
+                            };
+                            session.model.input = prompts
+                                .get(index)
+                                .cloned()
+                                .unwrap_or_else(|| session.prompt_draft.clone());
+                            session.prompt_index = (index < prompts.len()).then_some(index);
+                            session
+                                .model
+                                .set_cursor(if up { 0 } else { session.model.input.len() }, false);
+                            self.agent.view_dirty = true;
+                        } else {
+                            self.agent.active_mut().move_vertical(layout, up, false);
                         }
                     }
                     _ => (),
@@ -2818,7 +2860,7 @@ impl Ui {
     }
 
     pub fn toggle_agent(&mut self) {
-        self.agent.active_mut().rewind_target = None;
+        self.cancel_rewind();
         self.agent.open = !self.agent.open;
         self.agent.sessions[self.agent.current].context.menu = false;
         self.agent.sessions[self.agent.current].context.preview = None;
@@ -3208,7 +3250,62 @@ mod tests {
     }
 
     #[test]
-    fn escape_selects_older_messages_without_changing_the_draft_or_history() {
+    fn editor_control_navigation_recalls_prompts_and_clear_precedes_stop() {
+        let path = std::env::temp_dir().join(format!("nextty-editor-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let mut client = Client::connect(&path).unwrap();
+        let (_stream, _) = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut ui = Ui::new().unwrap();
+        ui.agent.open = true;
+        ui.focus = Focus::Editor;
+        ui.agent
+            .active_mut()
+            .model
+            .messages
+            .push(crate::workspace::AgentMessage {
+                turn: 1,
+                role: "You".into(),
+                text: "previous".into(),
+                id: None,
+            });
+        ui.agent.active_mut().model.insert("draft").unwrap();
+        let mut press = |ui: &mut Ui, symbol, modifiers| {
+            ui.agent_key_input(
+                &mut client,
+                &crate::input::Key {
+                    symbol,
+                    modifiers,
+                    text: "",
+                },
+                (40, 8),
+            )
+            .unwrap();
+        };
+        press(&mut ui, 'h' as u32, crate::input::CONTROL);
+        assert_eq!(ui.agent.active().model.cursor, 4);
+        press(&mut ui, 'l' as u32, crate::input::CONTROL);
+        assert_eq!(ui.agent.active().model.cursor, 5);
+        press(&mut ui, 'k' as u32, crate::input::CONTROL);
+        assert_eq!(ui.agent.active().model.input, "previous");
+        press(&mut ui, 'j' as u32, crate::input::CONTROL);
+        assert_eq!(ui.agent.active().model.input, "draft");
+        press(&mut ui, keysym::RETURN, crate::input::SHIFT);
+        assert_eq!(ui.agent.active().model.input, "draft\n");
+        ui.agent.active_mut().model.busy = true;
+        press(&mut ui, 'c' as u32, crate::input::CONTROL);
+        assert!(ui.agent.active().model.input.is_empty());
+        assert!(ui.agent.active().model.busy);
+        assert!(ui.agent.active().model.pending.is_empty());
+        press(&mut ui, 'c' as u32, crate::input::CONTROL);
+        assert_eq!(
+            ui.agent.active().model.pending.last().unwrap()["action"],
+            "abort"
+        );
+    }
+
+    #[test]
+    fn double_escape_selects_history_and_jk_navigate_without_changing_draft() {
         let mut ui = Ui::new().unwrap();
         ui.agent.open = true;
         ui.focus = Focus::Editor;
@@ -3226,17 +3323,21 @@ mod tests {
                 });
         }
         assert!(ui.agent_rewind_key(keysym::ESCAPE));
+        assert_eq!(ui.agent.active().rewind_target, None);
+        assert!(ui.agent_rewind_key(keysym::ESCAPE));
         assert_eq!(ui.agent.active().rewind_target, Some(3));
-        assert!(ui.agent_rewind_key(keysym::ESCAPE));
+        assert!(ui.agent_rewind_key('k' as u32));
         assert_eq!(ui.agent.active().rewind_target, Some(2));
-        assert!(ui.agent_rewind_key(keysym::ESCAPE));
+        assert!(ui.agent_rewind_key('k' as u32));
         assert_eq!(ui.agent.active().rewind_target, Some(1));
-        assert!(ui.agent_rewind_key(keysym::ESCAPE));
+        assert!(ui.agent_rewind_key('k' as u32));
         assert_eq!(ui.agent.active().rewind_target, Some(1));
         assert_eq!(ui.agent.active().model.input, "untouched draft");
         assert_eq!(ui.agent.active().model.messages.len(), 3);
         assert!(!ui.agent.active().model.busy);
-        assert!(!ui.agent_rewind_key('x' as u32));
+        assert!(ui.agent_rewind_key('j' as u32));
+        assert_eq!(ui.agent.active().rewind_target, Some(2));
+        assert!(ui.agent_rewind_key(keysym::ESCAPE));
         assert_eq!(ui.agent.active().rewind_target, None);
         assert!(ui.focus == Focus::Editor);
     }
@@ -3403,10 +3504,24 @@ mod tests {
                 })
                 .collect::<Vec<_>>()
         };
-        for delta in ["追加", "e\u{301}🙂", "\n\n**bold", "**\n\nlast"] {
+        for delta in [
+            "追加",
+            "e\u{301}🙂",
+            "\n\n**bold",
+            "**\n\nlast",
+            "\r\r*",
+            "*",
+            "\n\n- a\n*",
+            "*",
+            "\n\n`a\n****",
+            "`",
+        ] {
             panel.active_mut().model.messages[1].text.push_str(delta);
             panel.wait_layout(12);
             let session = panel.active_mut();
+            let full =
+                crate::agent::markdown::Markdown::render(&session.model.messages[1].text, None);
+            assert_eq!(session.message_text(1), full.text);
             let streamed = rows(session);
             let scroll = session.model.scroll;
             session.columns = 0;
@@ -3973,6 +4088,17 @@ mod tests {
         assert_eq!(panel.model.cursor, 2);
         panel.move_vertical(panel.editor_layout(3, 3), false, true);
         assert_eq!(panel.model.selection(), Some(2..5));
+    }
+
+    #[test]
+    fn editor_caret_preserves_positions_inside_crlf() {
+        let mut session = AgentSession::default();
+        session.model.insert("ab\r\n中").unwrap();
+        for (cursor, expected) in [(2, (1, 0)), (3, (1, 1)), (4, (1, 0))] {
+            session.model.set_cursor(cursor, false);
+            let layout = session.editor_layout(2, 3);
+            assert_eq!((layout.caret_row, layout.caret_column), expected);
+        }
     }
 
     #[test]

@@ -1,13 +1,13 @@
 use crate::input::PasteTarget;
 use crate::input::keysym;
 use crate::panel::mix_color;
-#[cfg(feature = "agent")]
+
 mod agent_ui;
 mod render;
 
 use crate::files::FileFocus;
-#[cfg(feature = "agent")]
-use crate::{agent::panel::AgentAction, context::Object, workspace_view::agent_ui::AgentScroll};
+
+use crate::{agent::panel::AgentAction, workspace_view::agent_ui::AgentScroll};
 use crate::{
     config::Config,
     context,
@@ -162,7 +162,7 @@ impl GuiLayout {
             cell_height: cell.1.round() as u16,
         }
     }
-    #[cfg(any(feature = "agent", test))]
+
     fn divider_contains(self, point: (f32, f32)) -> bool {
         self.side < self.width
             && point.0 >= self.side
@@ -188,7 +188,7 @@ impl GuiLayout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScrollTarget {
     Pane(PaneId),
-    #[cfg(feature = "agent")]
+
     Agent(AgentScroll),
 }
 
@@ -258,11 +258,10 @@ enum GuiAction {
     CloseTab(TabId),
     Tab(i32),
     SelectTab(usize),
-    DismissHelp,
     Minimize,
     Maximize,
     Close,
-    #[cfg(feature = "agent")]
+
     Agent(crate::agent::panel::AgentAction),
 }
 
@@ -322,7 +321,7 @@ pub struct WorkspaceView {
 
     suppressed_text: Option<String>,
     trace: Option<Trace>,
-    #[cfg(feature = "agent")]
+
     agent: agent_ui::AgentState,
 }
 
@@ -359,7 +358,7 @@ impl WorkspaceView {
             preedit: String::new(),
             paste: None,
             deferred: VecDeque::new(),
-            #[cfg(feature = "agent")]
+
             agent: agent_ui::AgentState::default(),
             scrollbars: Vec::new(),
             scrollbar_drag: None,
@@ -440,7 +439,6 @@ impl WorkspaceView {
             };
             for event in responses {
                 match event {
-                    ClientEvent::AgentUpdated => {}
                     ClientEvent::Updated => {
                         self.dirty = true;
                         if self.ui.search.open {
@@ -512,7 +510,7 @@ impl WorkspaceView {
                     }
                 }
             }
-            #[cfg(feature = "agent")]
+
             self.poll_agent_events(&pollfds)?;
             self.refresh_hover();
 
@@ -527,7 +525,7 @@ impl WorkspaceView {
                 self.client.request_screen()?;
             }
         }
-        #[cfg(feature = "agent")]
+
         if self.client.snapshot().is_some() {
             self.ui.poll_agent(&mut self.client, &self.config)?;
         }
@@ -560,7 +558,7 @@ impl WorkspaceView {
         ) {
             self.ui.search.close(&mut self.client)?;
             self.ui.focus = Focus::Terminal;
-            #[cfg(feature = "agent")]
+
             {
                 self.ui.cancel_rewind();
             }
@@ -619,7 +617,7 @@ impl WorkspaceView {
         if let Some(trace) = &mut self.trace {
             trace.event(&event)?;
         }
-        #[cfg(feature = "agent")]
+
         if self.agent_event(&event) {
             return Ok(());
         }
@@ -630,7 +628,7 @@ impl WorkspaceView {
             }
             native::KEY => self.key(event.code, event.modifiers, &event.text)?,
             native::TEXT => {
-                if self.ui.help || self.ui.close_prompt.is_some() || self.preview_open() {
+                if self.ui.close_prompt.is_some() || self.preview_open() {
                     return Ok(());
                 }
                 let marked = !self.preedit.is_empty();
@@ -667,7 +665,7 @@ impl WorkspaceView {
                     self.preedit.clear();
                     return Ok(());
                 }
-                if self.ui.help || self.ui.close_prompt.is_some() || self.preview_open() {
+                if self.ui.close_prompt.is_some() || self.preview_open() {
                     return Ok(());
                 }
                 let start = if event.start < 0 {
@@ -756,18 +754,6 @@ impl WorkspaceView {
             _ => symbol_char(symbol).map(|c| c.to_ascii_lowercase()),
         };
         match key {
-            Some('?') => {
-                self.ui.help = true;
-                self.ui.help_scroll = 0;
-                self.dirty = true;
-                return Ok(true);
-            }
-            Some('o') => {
-                self.ui.cycle_focus(modifiers & native::SHIFT != 0);
-                self.resize()?;
-                return Ok(true);
-            }
-
             Some('m') => {
                 self.ui.search.close(&mut self.client)?;
                 self.gui_action(GuiAction::Resources)?;
@@ -838,22 +824,6 @@ impl WorkspaceView {
             self.running = false;
             return Ok(());
         }
-        if self.ui.help {
-            match symbol {
-                keysym::ESCAPE => self.ui.help = false,
-                keysym::UP => self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1),
-                keysym::DOWN => self.ui.help_scroll = self.ui.help_scroll.saturating_add(1),
-                keysym::PAGE_UP => self.ui.help_scroll = self.ui.help_scroll.saturating_sub(8),
-                keysym::PAGE_DOWN => self.ui.help_scroll = self.ui.help_scroll.saturating_add(8),
-                _ if modifiers & native::ALT != 0 && symbol_char(symbol) == Some('?') => {
-                    self.ui.help = false
-                }
-                _ => (),
-            }
-            self.dirty = true;
-            return Ok(());
-        }
-        #[cfg(feature = "agent")]
         if modifiers == native::ALT && symbol_char(symbol) == Some('a') {
             if !self.composition_finished() {
                 return Ok(());
@@ -867,7 +837,7 @@ impl WorkspaceView {
         if self.workspace_key(pane, symbol, modifiers)? {
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.open
             && self.ui.focus == Focus::Editor
             && (!self.preedit.is_empty() || self.paste.is_some())
@@ -892,14 +862,7 @@ impl WorkspaceView {
         }
 
         if modifiers & (native::SHIFT | native::CONTROL | native::ALT) == native::SHIFT {
-            let lines = self
-                .client
-                .screens()
-                .get(&pane)
-                .map_or(24, |s| s.screen_lines()) as i32;
             let scroll = match symbol {
-                keysym::PAGE_UP => Some(Scroll::Delta(lines - 1)),
-                keysym::PAGE_DOWN => Some(Scroll::Delta(1 - lines)),
                 keysym::HOME => Some(Scroll::Top),
                 keysym::END => Some(Scroll::Bottom),
                 keysym::INSERT => {
@@ -939,7 +902,6 @@ impl WorkspaceView {
                 usize::from(rect.rows.saturating_sub(2)),
             );
         } else {
-            #[cfg(feature = "agent")]
             if let Some(layout) = self.editor_viewport() {
                 viewport = (layout.columns, layout.rows);
             }
@@ -960,7 +922,7 @@ impl WorkspaceView {
             KeyResult::Unhandled => return Ok(false),
             KeyResult::Copy(text, _cut) => {
                 self.window.selection(false, &text);
-                #[cfg(feature = "agent")]
+
                 if _cut {
                     self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
                 }
@@ -1074,15 +1036,13 @@ impl WorkspaceView {
     }
     fn layout(&self) -> GuiLayout {
         let (width, height, _) = self.window.size();
-        #[cfg(feature = "agent")]
+
         let agent_width = self.ui.agent.open.then(|| {
             self.ui
                 .agent
                 .width
                 .unwrap_or(self.cell.0 * 36. + PADDING * 2.)
         });
-        #[cfg(not(feature = "agent"))]
-        let agent_width = None;
         let mut layout = GuiLayout::new(width as f32, height as f32, self.cell, agent_width);
 
         if self.ui.files_open {
@@ -1095,25 +1055,10 @@ impl WorkspaceView {
         layout
     }
     fn preview_open(&self) -> bool {
-        #[cfg(feature = "agent")]
-        {
-            self.ui.agent.active().context.preview.is_some()
-        }
-        #[cfg(not(feature = "agent"))]
-        {
-            false
-        }
+        self.ui.agent.active().context.preview.is_some()
     }
     fn scrollbar_visible(&self, target: ScrollTarget) -> bool {
-        #[cfg(feature = "agent")]
-        {
-            self.preview_open() == (target == ScrollTarget::Agent(AgentScroll::Preview))
-        }
-        #[cfg(not(feature = "agent"))]
-        {
-            let _ = target;
-            true
-        }
+        self.preview_open() == (target == ScrollTarget::Agent(AgentScroll::Preview))
     }
     fn hit(&self, captured: Option<PaneId>) -> Option<(PaneId, Point, Side)> {
         let layout = self.layout();
@@ -1176,7 +1121,6 @@ impl WorkspaceView {
             && !self.preview_open()
             && (self.ui.resources.dragging || (self.pointer.1 - layout.footer).abs() <= 5.);
         let horizontal = {
-            #[cfg(feature = "agent")]
             {
                 let divider = !self.ui.files_open
                     && (self.agent.drag.is_some()
@@ -1188,10 +1132,6 @@ impl WorkspaceView {
                     self.dirty = true;
                 }
                 divider
-            }
-            #[cfg(not(feature = "agent"))]
-            {
-                false
             }
         };
         self.window.resize_cursor(horizontal, monitor_divider);
@@ -1241,7 +1181,6 @@ impl WorkspaceView {
         }
     }
     fn gui_action(&mut self, action: GuiAction) -> Result<()> {
-        #[cfg(feature = "agent")]
         if !matches!(action, GuiAction::Agent(_)) {
             self.ui.agent.active_mut().context.menu = false;
         }
@@ -1294,7 +1233,6 @@ impl WorkspaceView {
                     self.action(Action::Tab(index as i32 - active as i32))?;
                 }
             }
-            GuiAction::DismissHelp => self.ui.help = false,
             GuiAction::NewTab => {
                 if self.composition_finished()
                     && self.controller()
@@ -1306,7 +1244,7 @@ impl WorkspaceView {
             GuiAction::Minimize => self.window.minimize(),
             GuiAction::Maximize => self.window.maximize(!self.maximized),
             GuiAction::Close => self.open_close(),
-            #[cfg(feature = "agent")]
+
             GuiAction::Agent(action) => {
                 if !self.agent_action(action)? {
                     return Ok(());
@@ -1354,20 +1292,6 @@ impl WorkspaceView {
         Ok(())
     }
     fn button(&mut self, button: u32, pressed: bool, modifiers: u32) -> Result<()> {
-        if self.ui.help {
-            if button == 1
-                && pressed
-                && self
-                    .control_hits
-                    .iter()
-                    .any(|hit| hit.action == GuiAction::DismissHelp && hit.contains(self.pointer))
-            {
-                self.ui.help = false;
-                self.dirty = true;
-            }
-            return Ok(());
-        }
-
         if !pressed {
             return self.button_release(button, modifiers);
         }
@@ -1428,7 +1352,7 @@ impl WorkspaceView {
             self.drag_scrollbar(self.pointer.1)?;
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.active().context.preview.is_some() {
             return self.preview_button(button);
         }
@@ -1436,7 +1360,7 @@ impl WorkspaceView {
         if self.footer_button(button)? {
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if button == 1 && layout.divider_contains(self.pointer) {
             if self.composition_finished() {
                 self.agent.drag = Some(self.pointer.0 - layout.side);
@@ -1474,7 +1398,6 @@ impl WorkspaceView {
             .rfind(|hit| hit.contains(self.pointer))
             .map(|hit| hit.action)
         {
-            #[cfg(feature = "agent")]
             if self.agent_control_button(button, action, modifiers)? {
                 return Ok(());
             }
@@ -1483,7 +1406,7 @@ impl WorkspaceView {
             }
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if !self.agent_button(button, layout) {
             return Ok(());
         }
@@ -1509,32 +1432,24 @@ impl WorkspaceView {
             }
         }
         if button == 3
-            && (modifiers & native::SHIFT != 0
+            && (modifiers & native::ALT != 0
                 || self
                     .hit(None)
                     .is_some_and(|(pane, _, _)| !self.mode(pane).intersects(Mode::MOUSE_MODE)))
         {
-            if let Some(pane) = self.client.selected_pane() {
-                return self.copy(pane, false);
-            }
             if let Some((_, object)) = &self.hovered {
                 self.window.selection(false, &object.text);
-                self.message("Object copied");
                 return Ok(());
             }
-
-            if let Some((pane, block)) = self
-                .hit(None)
-                .and_then(|(pane, point, _)| self.block_at(pane, point))
-            {
-                return self.copy_block(pane, Some(block));
+            if let Some((pane, _, _)) = self.hit(None) {
+                self.paste(pane, false);
             }
+            return Ok(());
         }
         self.terminal_button(button, modifiers)
     }
 
     fn button_release(&mut self, button: u32, modifiers: u32) -> Result<()> {
-        #[cfg(feature = "agent")]
         if self.agent_button_release(button)? {
             return Ok(());
         }
@@ -1635,7 +1550,7 @@ impl WorkspaceView {
         }
         let mode = self.mode(pane);
         if mode.intersects(Mode::MOUSE_MODE)
-            && modifiers & native::SHIFT == 0
+            && modifiers & native::ALT == 0
             && (1..=3).contains(&button)
         {
             let code = (button - 1) as u8;
@@ -1655,15 +1570,27 @@ impl WorkspaceView {
                 })
                 .map_or(1, |(_, _, _, n)| n % 3 + 1);
             self.last_click = Some((now, pane, point, count));
-            #[cfg(feature = "agent")]
+
             if count == 2
-                && modifiers & native::CONTROL == 0
-                && let Some(object) = context::object_at(&self.client.screens()[&pane], point)
+                && let Some((id, object)) = &self.hovered
+                && *id == pane
             {
-                return self.open_object(pane, object);
+                let mut command = std::process::Command::new("xdg-open");
+                command.arg(&object.text);
+                if !self.client.is_remote()
+                    && let Some(cwd) = self
+                        .client
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.pane(pane))
+                        .and_then(|pane| pane.cwd.as_ref())
+                {
+                    command.current_dir(cwd);
+                }
+                let mut child = command.spawn()?;
+                std::thread::spawn(move || child.wait());
+                return Ok(());
             }
             let kind = match count {
-                2 if modifiers & native::CONTROL != 0 => SelectionType::Object,
                 2 => SelectionType::Semantic,
                 3 => SelectionType::Lines,
                 _ => SelectionType::Simple,
@@ -1694,7 +1621,7 @@ impl WorkspaceView {
             self.dirty |= previous != pointer;
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if self.agent_motion(previous, layout)? {
             return Ok(());
         }
@@ -1752,7 +1679,7 @@ impl WorkspaceView {
                 self.action(Action::SelectionUpdate { pane, point, side })?;
             } else {
                 let mode = self.mode(pane);
-                if modifiers & native::SHIFT == 0
+                if modifiers & native::ALT == 0
                     && (mode.contains(Mode::MOUSE_MOTION)
                         || mode.contains(Mode::MOUSE_DRAG) && self.reported_buttons != 0)
                 {
@@ -1795,7 +1722,7 @@ impl WorkspaceView {
                 }
             }
             ScrollTarget::Pane(_) => return Ok(()),
-            #[cfg(feature = "agent")]
+
             ScrollTarget::Agent(target) => match target {
                 AgentScroll::Transcript => self.ui.agent.active_mut().model.scroll = offset,
                 AgentScroll::Editor => {
@@ -1814,20 +1741,10 @@ impl WorkspaceView {
         Ok(())
     }
     fn scroll(&mut self, amount: f32, modifiers: u32) -> Result<()> {
-        if self.ui.help {
-            self.ui.help_scroll = if amount > 0. {
-                self.ui.help_scroll.saturating_sub(3)
-            } else {
-                self.ui.help_scroll.saturating_add(3)
-            };
-            self.dirty = true;
-            return Ok(());
-        }
-
         if self.scrollbar_drag.is_some() {
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         if self.agent_scroll(amount) {
             return Ok(());
         }
@@ -1866,7 +1783,7 @@ impl WorkspaceView {
             return Ok(());
         }
         let mode = self.mode(pane);
-        if mode.intersects(Mode::MOUSE_MODE) && modifiers & native::SHIFT == 0 {
+        if mode.intersects(Mode::MOUSE_MODE) && modifiers & native::ALT == 0 {
             self.mouse(
                 pane,
                 point,
@@ -1877,7 +1794,7 @@ impl WorkspaceView {
             )?;
         } else if mode.contains(Mode::ALT_SCREEN)
             && mode.contains(Mode::ALTERNATE_SCROLL)
-            && modifiers & native::SHIFT == 0
+            && modifiers & native::ALT == 0
         {
             let bytes = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
             self.input(pane, bytes.repeat(lines.unsigned_abs() as usize * 3))?;
@@ -1911,7 +1828,6 @@ impl WorkspaceView {
         self.renderer.clear(background)?;
         self.renderer.clip(0., 0., 0., 0.)?;
         let terminal_input = self.ui.close_prompt.is_none()
-            && !self.ui.help
             && !self.ui.search.open
             && self.ui.focus == Focus::Terminal;
         if let Some((snapshot, screens)) = self.client.snapshot_and_screens_mut() {
@@ -2121,7 +2037,7 @@ impl WorkspaceView {
                 false,
             );
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.open {
             let x = ((layout.side / self.cell.0).floor() + 0.5) * self.cell.0;
             self.renderer.rect(
@@ -2135,7 +2051,6 @@ impl WorkspaceView {
         }
         self.renderer.clip(0., 0., 0., 0.)?;
 
-        #[cfg(feature = "agent")]
         self.draw_agent(layout)?;
         self.draw_scrollbars()?;
         if self.ui.files_open {
@@ -2143,9 +2058,6 @@ impl WorkspaceView {
         }
         if self.ui.search.open {
             self.draw_search(layout)?;
-        }
-        if self.ui.help {
-            self.draw_help(layout)?;
         }
         if self.ui.close_prompt.is_some() {
             self.draw_close(width as f32, height as f32)?;

@@ -298,7 +298,7 @@ impl Search {
         let status = fit_label(&status, (columns.saturating_sub(5).min(columns / 2)) as u16);
         let status_width = text_width(&status);
         let budget = columns.saturating_sub(status_width + 4);
-        let before = format!("{}{preedit}", &self.query[..self.cursor]);
+        let before = [&self.query[..self.cursor], preedit].concat();
         let mut width = 0;
         let start = before
             .char_indices()
@@ -320,7 +320,7 @@ impl Search {
             budget.saturating_sub(width + 1) as u16,
         );
         let caret = 2 + text_width(before);
-        let mut label = format!("⌕ {before}▏{after}");
+        let mut label = ["⌕ ", before, "▏", &after].concat();
         let padding = columns.saturating_sub(text_width(&label) + status_width);
         label.extend(std::iter::repeat_n(' ', padding));
         label.push_str(&status);

@@ -31,8 +31,12 @@ pub(crate) struct Markdown {
 impl Markdown {
     fn push(&mut self, text: &str, style: u8) {
         let start = self.text.len();
-        if text.chars().any(|ch| ch.is_control() && ch != '\n') {
-            self.text.extend(text.chars().map(|ch| {
+        let mut chars = text.chars();
+        if let Some(control) = chars.find(|ch| ch.is_control() && *ch != '\n') {
+            let prefix = text.len() - chars.as_str().len() - control.len_utf8();
+            self.text.push_str(&text[..prefix]);
+            self.text.push(' ');
+            self.text.extend(chars.map(|ch| {
                 if ch.is_control() && ch != '\n' {
                     ' '
                 } else {
@@ -53,7 +57,13 @@ impl Markdown {
 
     fn newline(&mut self, count: usize) {
         if !self.text.is_empty() {
-            let existing = self.text.bytes().rev().take_while(|b| *b == b'\n').count();
+            let existing = self
+                .text
+                .bytes()
+                .rev()
+                .take_while(|b| *b == b'\n')
+                .take(count)
+                .count();
             for _ in existing..count {
                 self.push("\n", 0);
             }
@@ -121,11 +131,20 @@ impl Markdown {
         let mut number_text = String::new();
         let mut links = Vec::new();
         let mut quote_depth = 0;
+        let mut pending_prefix = None;
         for (event, range) in Parser::new(&source[offset..]).into_offset_iter() {
             if reusable && styles.len() == 1 && !matches!(&event, Event::End(_)) {
                 let start = offset + range.start;
-                let start = source[..start].rfind('\n').map_or(0, |index| index + 1);
-                output.prefix = Some((start, output.text.len(), output.spans.len()));
+                let start = source[..start]
+                    .rfind(['\r', '\n'])
+                    .map_or(0, |index| index + 1);
+                pending_prefix = Some((start, output.text.len(), output.spans.len()));
+            }
+            // An unfinished block marker can still merge into the preceding paragraph.
+            if matches!(&event, Event::Text(_) | Event::Code(_))
+                && let Some(prefix) = pending_prefix.take()
+            {
+                output.prefix = Some(prefix);
             }
             let style = *styles.last().unwrap();
             match event {
@@ -228,6 +247,9 @@ mod tests {
     #[test]
     fn streaming_prefix_reuse_matches_full_rendering() {
         let sources = [
+            "- a\n**",
+            "`a\n****`",
+            "\n😀\r\r**",
             "first **bold**\n\nsecond *italic*\n\nlast `code` and 中\n",
             "- first\n\n- second\n  continued\n\noutside\n\nlast\n",
             "> quote\n>\n> next\n\nplain\n\nlast\n",
@@ -240,7 +262,13 @@ mod tests {
             "intro\n\n[old][ref]\n\n[ref]: https://example.com\n",
             "intro\n\n<div>\nhtml\n</div>\n\nlast\n",
         ];
-        for source in sources {
+        for source in sources.into_iter().flat_map(|source| {
+            [
+                source.to_owned(),
+                source.replace('\n', "\r"),
+                source.replace('\n', "\r\n"),
+            ]
+        }) {
             let mut previous = None;
             for end in source
                 .char_indices()
@@ -290,12 +318,20 @@ mod tests {
 
     #[test]
     fn code_controls_preserve_unicode_text_and_style_offsets() {
-        let document = Markdown::render("```text\n中\tA\u{85}B\ne\u{301}\x1bC\n```", None);
-        assert_eq!(document.text, "中 A B\ne\u{301} C");
-        assert_eq!(
-            document.spans(0..document.text.len()).collect::<Vec<_>>(),
-            vec![(0..document.text.len(), CODE)]
-        );
+        for (source, expected) in [
+            (
+                "```text\n中\tA\u{85}B\ne\u{301}\x1bC\n```",
+                "中 A B\ne\u{301} C",
+            ),
+            ("```text\n中e\u{301}\u{85}A\tB\n```", "中e\u{301} A B"),
+        ] {
+            let document = Markdown::render(source, None);
+            assert_eq!(document.text, expected);
+            assert_eq!(
+                document.spans(0..document.text.len()).collect::<Vec<_>>(),
+                vec![(0..document.text.len(), CODE)]
+            );
+        }
     }
 
     #[test]

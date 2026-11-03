@@ -4,7 +4,6 @@ fn test_client(stream: UnixStream) -> Client {
     Client::new(
         Peer::new(stream).unwrap(),
         None,
-        #[cfg(feature = "agent")]
         ClientEndpoint::Local(PathBuf::new()),
     )
 }
@@ -1520,7 +1519,6 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         .map(|row| row.cells.clone())
         .collect();
 
-    #[cfg(feature = "agent")]
     {
         let mut session = crate::agent::panel::AgentSession::default();
         session.model.input = "describe current screen".into();
@@ -1546,6 +1544,13 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         parser.advance(&mut core, b"\x1b[2;1Hhidden-update");
         assert_eq!(core.dirty_rows().count(), 0);
     }
+    let terminal = &workspace.panes[&pane].terminal;
+    let generation = terminal.core.lock().unwrap().input_generation();
+    agent_input(terminal, generation, None, b"x".to_vec()).unwrap();
+    assert_eq!(
+        terminal.core.lock().unwrap().input_generation(),
+        generation + 1
+    );
     for client in &mut clients {
         client.screen_request = Some(0);
     }
@@ -3224,7 +3229,6 @@ fn screen_pull_waits_for_changes_and_recovers_after_another_consumer() {
     assert!(grid_contains(&frontends[0], "second"));
 }
 
-#[cfg(feature = "agent")]
 #[test]
 fn forced_screen_read_waits_for_its_own_reply() {
     let server = TestServer::start();
@@ -4480,6 +4484,9 @@ fn agent_file_inflight_cancellation_and_lifecycle_preserve_received_commits() {
         }
     )));
     assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
+    // A wakeup may arrive after its result has already been consumed.
+    let fd = clients[1].files.as_ref().unwrap().worker.fd();
+    crate::eventfd::notify(fd).unwrap();
     apply(1, edit(3, "after close"), &mut clients, &mut workspaces);
     apply(
         1,

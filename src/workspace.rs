@@ -9,7 +9,7 @@ use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
 use crate::wire::{Peer, Response};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
-#[cfg(feature = "agent")]
+
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -429,7 +429,12 @@ pub fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLa
     let mut x = 3;
     let mut layout = Vec::new();
     for (index, tab) in snapshot.tabs.iter().enumerate().skip(start) {
-        let width = tab_width(&tab.title, (3 + available).saturating_sub(x));
+        let remaining = (3 + available).saturating_sub(x);
+        let width = if index == active {
+            active_width.unwrap_or(0).min(remaining)
+        } else {
+            tab_width(&tab.title, remaining)
+        };
         if width < 9 {
             break;
         }
@@ -474,7 +479,6 @@ pub fn tab_chrome<'a>(
 
 pub enum ClientEvent {
     Updated,
-    AgentUpdated,
     AgentInput {
         request: u64,
         result: Result<Option<u64>, String>,
@@ -514,7 +518,7 @@ pub enum ClientEvent {
     Error(String),
     Detached,
 }
-#[cfg(feature = "agent")]
+
 pub(crate) enum ClientEndpoint {
     Local(PathBuf),
     Remote {
@@ -528,7 +532,7 @@ pub struct Client {
     screen_wait: Option<bool>,
     screen_request: u64,
     screen_dirty: bool,
-    #[cfg(feature = "agent")]
+
     endpoint: ClientEndpoint,
     agent_events: Vec<AgentEvent>,
     agent_delegate: bool,
@@ -539,15 +543,11 @@ pub struct Client {
     ssh: Option<(Child, String)>,
 }
 impl Client {
-    fn new(
-        peer: Peer,
-        ssh: Option<(Child, String)>,
-        #[cfg(feature = "agent")] endpoint: ClientEndpoint,
-    ) -> Self {
+    fn new(peer: Peer, ssh: Option<(Child, String)>, endpoint: ClientEndpoint) -> Self {
         Self {
             peer,
             ssh,
-            #[cfg(feature = "agent")]
+
             endpoint,
             screen_wait: None,
             screen_request: 0,
@@ -566,12 +566,10 @@ impl Client {
         Ok(Self::new(
             Peer::new(stream)?,
             None,
-            #[cfg(feature = "agent")]
             ClientEndpoint::Local(path.to_path_buf()),
         ))
     }
     pub fn connect_remote(mut command: Command, target: String) -> io::Result<Self> {
-        #[cfg(feature = "agent")]
         let endpoint = ClientEndpoint::Remote {
             program: command.get_program().to_owned(),
             args: command.get_args().map(ToOwned::to_owned).collect(),
@@ -587,12 +585,7 @@ impl Client {
         command.stdout(OwnedFd::from(ssh));
         let child = command.spawn()?;
         drop(command);
-        let mut client = Self::new(
-            peer,
-            Some((child, target)),
-            #[cfg(feature = "agent")]
-            endpoint,
-        );
+        let mut client = Self::new(peer, Some((child, target)), endpoint);
         loop {
             match client.peer.hello() {
                 Ok(Some(BRIDGE_VERSION)) => return Ok(client),
@@ -747,11 +740,6 @@ impl Client {
     pub fn screens(&self) -> &HashMap<PaneId, Screen> {
         &self.screens
     }
-    pub(crate) fn selected_pane(&self) -> Option<PaneId> {
-        self.screens
-            .iter()
-            .find_map(|(&id, screen)| screen.selection_range().is_some().then_some(id))
-    }
     pub fn snapshot_and_screens_mut(
         &mut self,
     ) -> Option<(&Snapshot, &mut HashMap<PaneId, Screen>)> {
@@ -784,13 +772,13 @@ impl Client {
                         screen.apply(update)?;
                     }
                     for pane in &snapshot.panes {
+                        let Some(screen) = self.screens.get_mut(&pane.id) else {
+                            continue;
+                        };
                         let previous = self
                             .snapshot
                             .as_ref()
                             .and_then(|snapshot| snapshot.pane(pane.id));
-                        let Some(screen) = self.screens.get_mut(&pane.id) else {
-                            continue;
-                        };
                         if self.agent_delegate
                             && previous.is_none_or(|old| {
                                 old.input_generation != pane.input_generation
@@ -826,7 +814,7 @@ impl Client {
                         self.agent_delegate = true;
                     }
                     self.agent_events.push(event);
-                    ClientEvent::AgentUpdated
+                    continue;
                 }
                 Response::List(list) => ClientEvent::List(list),
                 Response::AgentInput { request, result } => {
@@ -1751,13 +1739,13 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
         closing.reap(false);
         had_workspace |= !workspaces.is_empty();
         clients.retain(|client| !client.failed);
-        let requested: HashSet<_> = clients
-            .iter()
-            .filter(|client| client.screen_eligible())
-            .filter_map(|client| client.workspace.clone())
-            .collect();
-        for name in requested {
-            if let Some(workspace) = workspaces.get_mut(&name) {
+        for index in 0..clients.len() {
+            if clients[index].screen_eligible()
+                && let Some(workspace) = clients[index]
+                    .workspace
+                    .as_ref()
+                    .and_then(|name| workspaces.get_mut(name))
+            {
                 broadcast(workspace, &mut clients, false)?;
             }
         }
@@ -1821,8 +1809,11 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
                     revents: 0,
                 });
                 if let Some((previous_name, previous_id)) = terminals.get_mut(terminal_count) {
-                    previous_name.clone_from(name);
-                    *previous_id = *id;
+                    // Pane IDs are global and never change workspace.
+                    if *previous_id != *id {
+                        previous_name.clone_from(name);
+                        *previous_id = *id;
+                    }
                 } else {
                     terminals.push((name.clone(), *id));
                 }
@@ -1830,7 +1821,12 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
             }
         }
         terminals.truncate(terminal_count);
-        for files in clients.iter().filter_map(|client| client.files.as_ref()) {
+        // A late notification may outlive the last result; idle workers need no polling.
+        for files in clients
+            .iter()
+            .filter_map(|client| client.files.as_ref())
+            .filter(|files| files.active.is_some())
+        {
             fds.push(libc::pollfd {
                 fd: files.worker.fd(),
                 events: libc::POLLIN,
@@ -2043,6 +2039,7 @@ fn complete_requests(
             client.files = None;
         }
         let file_result = client.files.as_mut().and_then(|files| {
+            files.active.as_ref()?;
             if let Err(error) = crate::eventfd::consume_notification(files.worker.fd()) {
                 eprintln!("agent file worker: {error}");
                 client.failed = true;
@@ -2287,12 +2284,16 @@ fn broadcast(
         drop(core);
         panes.push(PaneView {
             id,
-            tab: workspace
-                .tabs
-                .iter()
-                .find(|tab| tab.root.contains(id))
-                .unwrap()
-                .id,
+            tab: if all_tabs {
+                workspace
+                    .tabs
+                    .iter()
+                    .find(|tab| tab.root.contains(id))
+                    .unwrap()
+                    .id
+            } else {
+                workspace.tabs[workspace.active].id
+            },
             rect,
             title: pane.title.clone(),
             cwd: match cwd {
@@ -2306,9 +2307,10 @@ fn broadcast(
             shell_prompt,
         });
     }
+    let all_frames = frames.len() == visible.len();
     let mut all_snapshot = workspace.snapshot(panes)?;
     let mut active_snapshot = None;
-    let mut updates = Vec::new();
+    let mut updates = Vec::with_capacity(frames.len());
     for client in clients {
         if client.workspace.as_deref() != Some(&workspace.name) || client.failed {
             continue;
@@ -2364,12 +2366,18 @@ fn broadcast(
             eprintln!("workspace client {}: {error}", client.id);
             client.failed = true;
         } else {
-            client.known.retain(|id, _| snapshot.pane(*id).is_some());
+            if all_frames {
+                client.known.clear();
+            } else {
+                client.known.retain(|id, _| snapshot.pane(*id).is_some());
+            }
             client.known.extend(
                 snapshot
                     .panes
                     .iter()
-                    .filter(|pane| frames.iter().any(|(id, _, _, _, _)| *id == pane.id))
+                    .filter(|pane| {
+                        all_frames || frames.iter().any(|(id, _, _, _, _)| *id == pane.id)
+                    })
                     .map(|pane| (pane.id, Arc::clone(&pane.process))),
             );
         }
@@ -2747,8 +2755,6 @@ fn agent_input(
     }
     terminal.try_write(data)?;
     core.note_input();
-    core.clear_selection();
-    core.scroll_display(Scroll::Bottom);
     Ok(prompt)
 }
 
@@ -3212,10 +3218,14 @@ fn apply_agent_action(
             model.revision = patch.revision;
             model.turn = patch.turn;
             model.recovery.clone_from(&patch.recovery);
-            for client in clients.iter_mut().filter(|client| {
+            let mut subscribers = clients.iter_mut().filter(|client| {
                 client.agent_open && client.workspace.as_deref() == Some(&workspace.name)
-            }) {
-                client.respond(Response::Agent(AgentEvent::Model(patch.clone())));
+            });
+            if let Some(last) = subscribers.next_back() {
+                for client in subscribers {
+                    client.respond(Response::Agent(AgentEvent::Model(patch.clone())));
+                }
+                last.respond(Response::Agent(AgentEvent::Model(patch)));
             }
             Ok(())
         }
@@ -3343,7 +3353,6 @@ fn pane_directory(terminal: &Terminal) -> io::Result<Option<PathBuf>> {
     }
 }
 
-#[cfg(feature = "agent")]
 impl Client {
     pub(crate) fn screen_stale(&self) -> bool {
         self.screen_dirty
@@ -3354,7 +3363,6 @@ impl Client {
     }
 }
 
-#[cfg(any(test, feature = "agent"))]
 impl Client {
     pub(crate) fn take_agent_events(&mut self) -> Vec<AgentEvent> {
         std::mem::take(&mut self.agent_events)
@@ -3375,7 +3383,6 @@ impl Client {
             .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
     }
 
-    #[cfg(feature = "agent")]
     pub(crate) fn screen_revision(&self, pane: PaneId) -> io::Result<u64> {
         self.screens
             .get(&pane)

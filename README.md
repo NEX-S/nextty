@@ -31,7 +31,7 @@ The implementation uses a small Rust terminal core, a native desktop backend, an
 
 **Use libraries where the problem calls for them.** nextty implements its parser, screen, PTY backend, and workspace transport. It uses system libraries for fonts, shaping, rasterization, HTTP, and TLS. There is no embedded browser, JavaScript runtime, or external Agent executable.
 
-**Target one platform deliberately.** The desktop targets modern Linux and GNOME/Wayland. There is no X11 backend or platform compatibility layer. Cargo features remove optional components at build time. Data types and functions stay local until there is a concrete reason to share them.
+**Target one platform deliberately.** The desktop targets modern Linux and GNOME/Wayland. There is no X11 backend or platform compatibility layer. Cargo features select frontends at build time. Data types and functions stay local until there is a concrete reason to share them.
 
 **Measure performance changes.** Extra caches, threads, and batching rules need a benefit that pays for their complexity. Parser throughput, PTY round trips, and compositor presentation are different measurements; none alone describes keyboard-to-screen latency.
 
@@ -58,23 +58,28 @@ The default font is **CodeNewRoman Nerd Font Mono**, at 17 logical pixels. Insta
 font_family = "monospace"
 ```
 
-Shaders are compiled to SPIR-V by `glslangValidator` during the build. Wayland protocol stubs are committed, so normal builds do not require `wayland-scanner`. GUI builds link to system Fontconfig, HarfBuzz, FriBidi, Cairo/FreeType, utf8proc, Wayland, xkbcommon, and Vulkan. Agent builds also link to system libcurl.
+Shaders are compiled to SPIR-V by `glslangValidator` during the build. Wayland protocol stubs are committed, so normal builds do not require `wayland-scanner`. GUI builds link to system Fontconfig, HarfBuzz, FriBidi, Cairo/FreeType, utf8proc, Wayland, xkbcommon, and Vulkan. All builds also link to system libcurl.
 
 ### Build only what you use
 
-Default features are `gui,agent`. Workspace support, the ANSI frontend, monitor, and file browser are always included.
+Default features are `gui,tui`. Agent support, workspace services, monitor, and file browser are always included.
 
 - `gui`: Wayland window, input handling, font backend, and Vulkan renderer.
-- `agent`: Agent panel, model/tool loop, JSON, HTTP, and Markdown.
-
-All desktop windows use the workspace daemon. A workspace frontend and server without graphical or Agent dependencies:
+- `tui`: ANSI frontend inside an existing terminal.
 
 ```sh
-cargo build --release --locked --no-default-features --target-dir target/headless
+# Both frontends
+cargo build --release --locked
+# Desktop only (opens a GUI by default)
+cargo build --release --locked --no-default-features --features gui
+# ANSI frontend and remote workspace server, without graphical dependencies
+cargo build --release --locked --no-default-features --features tui --target-dir target/headless
 ./target/headless/release/nextty
+# Workspace server only
+cargo build --release --locked --no-default-features
 ```
 
-Add `--features agent` for the Agent panel. This build is also enough for a remote workspace server.
+All builds include the Agent and link to system libcurl. All desktop windows use the workspace daemon.
 
 ## Usage
 
@@ -92,7 +97,7 @@ nextty --working-directory /path/to/project
 nextty --gui -e /bin/bash --noprofile --norc
 ```
 
-`nextty` defaults to the ANSI frontend. `--gui` opens a desktop window; `--tui` selects the current terminal explicitly. Put nextty options before `-e`: everything after it belongs to the child command. Explicit `-e` commands run as supplied; automatic shell integration is installed only for default interactive Bash/Zsh sessions.
+`nextty` defaults to the ANSI frontend when compiled in, otherwise the GUI frontend. `--gui` opens a desktop window; `--tui` selects the current terminal explicitly. Put nextty options before `-e`: everything after it belongs to the child command. Explicit `-e` commands run as supplied; automatic shell integration is installed only for default interactive Bash/Zsh sessions.
 
 Set `tab_style = "angled"` (default) or `tab_style = "flat"` in the configuration. Tab dots show running programs in orange, successful completion in green, failure in red, and idle or unknown state in gray. Closing a tab with running programs or unknown state asks for confirmation.
 
@@ -122,19 +127,18 @@ Remote sessions support tabs, splits, history, selection, and clipboard transfer
 
 ### Everyday keys
 
+In the system monitor, j/k selects controls, l enters the selected control, and h returns to control selection.
+
 - `Alt+Enter`: new tab. `Alt+,` / `Alt+.`: previous/next tab.
 - `Alt+v` / `Alt+s`: split left/right or top/bottom. `Alt+h/j/k/l`: focus a pane.
-- `Alt+q`: detach. `Alt+?`: context help.
+- `Alt+q`: detach.
 - `Alt+/`: search the current pane's retained output. Enter / Shift+Enter: next/previous match. Esc: restore the previous selection and reading position.
 - `Alt+p` / `Alt+n`: previous/next prompt. `Alt+c`: copy command output.
-- `Alt+a`, `Alt+m`, `Alt+f`: Agent, monitor, and files. The Agent requires the `agent` feature.
-- `Alt+o`: cycle focus between the terminal and visible Agent/monitor regions.
+- `Alt+a`, `Alt+m`, `Alt+f`: Agent, monitor, and files.
 
-In the desktop frontend, `Ctrl+Shift+C/V` copies/pastes, middle-click pastes the primary selection, and `Shift+PageUp/Down` scrolls history. Hold Shift to select or scroll locally when an application captures the mouse. `Ctrl+double-click` selects a URL, path, or quoted object. Double-clicking a recognized address, register, path, symbol, or instruction captures its visible context for the Agent panel.
+In the desktop frontend, `Ctrl+Shift+C/V` copies/pastes and middle-click pastes the primary selection. Hold Alt to select or scroll locally when an application captures the mouse. Double-click a highlighted object to open it with `xdg-open`. Right-click copies the highlighted object; without a highlighted object it pastes. The ANSI frontend exports clipboard text using OSC 52 and uses the host terminal for paste.
 
-The ANSI frontend uses the host terminal for paste and OSC 52 for clipboard export. Both frontends support mouse selection and right-click copy; an existing selection takes precedence over command-output copying.
-
-`Alt+f` opens a tree selector in the left sidebar and leaves the terminal visible beside it. Use `j`/`k` or arrows to select, `l` to expand a directory or open a centered file preview, and `h` to collapse or move to the parent. Enter copies the selected absolute path to the clipboard without sending input to the shell. `/` searches beneath the root directory. Esc closes the preview first, then search, then the sidebar. Directory scans and on-demand file previews run asynchronously.
+`Alt+f` opens a tree selector in the left sidebar and leaves the terminal visible beside it. Use `j`/`k` or arrows to select, `l` to expand a directory or open a centered file preview, and `h` to collapse or move to the parent. Enter inserts the selected absolute path into the terminal without executing it. `/` searches beneath the root directory. Esc closes the preview first, then search, then the sidebar. Directory scans and on-demand file previews run asynchronously.
 
 ## Agent
 
@@ -149,7 +153,7 @@ model = "your-model"
 
 nextty appends `/v1/messages` to `base_url`; an empty URL uses `https://api.anthropic.com`. Agent turns enable automatic prompt caching with `cache_control`; custom endpoints must support this Messages API field. If the endpoint requires authentication, set `ANTHROPIC_AUTH_TOKEN` for Bearer authentication or `ANTHROPIC_API_KEY` for API-key authentication in the environment before starting nextty.
 
-Open the right-side panel with `Alt+a`. Enter sends, Ctrl+J inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C copies a selection; without a selection, it stops a running reply from the input or output area. Esc in the editor selects an earlier user message, and Enter confirms rewind.
+Open the right-side panel with `Alt+a`. Enter sends, Shift+Enter inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C clears input; when input is already empty it stops the running Agent. Ctrl+h/j/k/l navigates input; Ctrl+k at the top recalls the previous prompt and Ctrl+j at the bottom recalls the next. Press Esc twice to enter history selection, use j/k to select a highlighted earlier user message, Enter to confirm rewind, or Esc to exit.
 
 Each submission includes the focused pane's live screen and a workspace inventory: pane IDs, directories, foreground state, and recent commands. Selected text and screen attachments are historical snapshots. Reading terminal state does not move your viewport, change your selection, or issue commands to the foreground program.
 
@@ -171,7 +175,7 @@ For example, while a debugger occupies your current terminal, the Agent can insp
 
 `read.wait` observes for 0 through 1800 seconds; omission or 0 reads immediately. Command reads can wait for command completion without repeated model calls. Screen/history waits return on activity. Timeouts leave programs running, and screen activity alone does not establish readiness or success. Text reads provide continuation cursors and report missing evidence; overwritten TUI frames and evicted history cannot be recovered.
 
-Every submission is a goal by default. After a final response, the same model reviews the request and available evidence with tools disabled. It continues when concrete work remains, finishes when satisfied, or reports a blocker. Ordinary questions can finish with an answer. This review normally adds one model request and is not independent proof of correctness. There is no goal-wide token, iteration, or time budget; bounded reads, context compaction, per-request limits, and transport timeouts still apply. API errors remain visible without automatic retries.
+Every submission is a goal by default. After a final response, the same model reviews the request and available evidence with tools disabled. It continues when concrete work remains, finishes when satisfied, or reports a blocker. Ordinary questions can finish with an answer. This review normally adds one model request and is not independent proof of correctness. There is no goal-wide token, iteration, or time budget; bounded reads, context compaction, per-request limits, and transport timeouts still apply. Transient model connection failures and temporary API errors retry the same request up to three times with cancellable 1, 2 and 4 second waits. Incomplete response drafts are discarded; completed tool results remain, and terminal or file actions are never automatically replayed. Permanent errors and exhausted retries remain visible.
 
 Stopping cancels Agent requests and waits; it does not send Ctrl+C or kill programs already running in your terminals. An uncertain action may already have happened, so the Agent must inspect current state before repeating it. Rewind removes later conversation history and restores the draft and attachments; it does not undo commands or file changes.
 
@@ -324,11 +328,21 @@ python3 tools/remote_smoke.py --binary target/release/nextty
 
 # Agent streaming, tool round trips, history reads, and PTY input delivery
 python3 tools/agent_bench.py target/release/nextty
+
+# Real-model tasks in private workspaces (uses the configured API)
+python3 tools/agent_eval.py target/release/nextty --config ~/.config/nextty/config.toml
+
+# Multi-minute real-model task with an interrupted HTTP stream
+python3 tools/agent_soak.py target/release/nextty --config ~/.config/nextty/config.toml
 ```
 
 [wayland_input.py](tools/wayland_input.py) measures synthetic key input to presentation in an existing isolated Mutter session, including frontend and daemon CPU/PSS. See each tool's `--help`. Synthetic input excludes physical keyboard and panel scanout latency. Measurements need a recorded build, workload, and environment to be useful.
 
 [agent_bench.py](tools/agent_bench.py) uses a local SSE model and private workspaces to measure the real ANSI frontend, Agent owner, and daemon. Its input latency is PTY injection to the child application's read, with 80 probes across each four-second workload; it does not measure GUI presentation or an online model. The large-response stress case starts with 128 KiB of Markdown and adds 200 deltas per second. It verifies streamed conversation content, tool results, native workspace file repair in an unfocused terminal and default goal continuation after a premature final response, and reports process CPU, end-of-workload PSS, and tool round trips as JSON. Compare saved release binaries with the same script and repeat runs to account for scheduling noise.
+
+[agent_eval.py](tools/agent_eval.py) runs two real-model tasks through the same frontend, owner, and daemon: repairing a file while preserving an occupied terminal, and retrieving evidence from long command output to answer an interactive prompt. It independently checks the resulting files and foreground application, and reports tool calls, errors, request/result sizes, elapsed time, and provider token/cache usage per request. Only synthetic workspace content is submitted. Requests use the configured endpoint and normal API credentials and can incur charges. These tasks establish feasibility; comparing task quality or token savings requires paired runs with the same model and initial state.
+
+[agent_soak.py](tools/agent_soak.py) runs a 24-stage interactive task taking at least 192 seconds, truncating one model HTTP stream after stage four. It checks recovery with the same request, one program launch, every stage's live answer, final exit status, and input delivery to the original terminal during the task. It saves requests and terminal evidence in a private `/tmp` directory and prints the result as JSON.
 
 ## Scope and limits
 

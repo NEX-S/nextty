@@ -380,7 +380,7 @@ impl Row {
         Arc::make_mut(self.extras.get_or_insert_default())
     }
 
-    fn clear_all_extras(&mut self) {
+    pub(crate) fn clear_all_extras(&mut self) {
         if let Some(extras) = self.extras.as_mut().and_then(Arc::get_mut) {
             extras.clear();
         } else {
@@ -393,7 +393,11 @@ impl Row {
         range: std::ops::Range<usize>,
     ) -> impl Iterator<Item = (usize, &Cell, Option<&Extra>)> {
         let extras = self.extras();
-        let first = extras.partition_point(|(column, _)| *column < range.start);
+        let first = if range.start == 0 {
+            0
+        } else {
+            extras.partition_point(|(column, _)| *column < range.start)
+        };
         let mut extras = extras[first..].iter().peekable();
         let cells = &self.cells[range.start..];
         range.zip(cells).map(move |(column, cell)| {
@@ -461,7 +465,7 @@ impl Row {
         &mut extras[index].1
     }
 
-    fn clear_extras(&mut self, start: usize, end: usize) {
+    pub(crate) fn clear_extras(&mut self, start: usize, end: usize) {
         let extras = self.extras();
         if extras.last().is_none_or(|(column, _)| *column < start) {
             return;
@@ -1912,6 +1916,16 @@ impl Core {
             return length;
         }
         0
+    }
+
+    // Keep the REP buffer out of the shared CSI dispatch path.
+    #[inline(never)]
+    pub(crate) fn repeat_ascii(&mut self, byte: u8, count: usize) {
+        let bytes = [byte; 64];
+        let text = std::str::from_utf8(&bytes).unwrap();
+        for start in (0..count).step_by(text.len()) {
+            self.input_text(&text[..(count - start).min(text.len())]);
+        }
     }
 
     pub(crate) fn input(&mut self, c: char) {

@@ -100,7 +100,7 @@ pub fn fit_middle(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
         used += width;
         start = index;
     }
-    std::borrow::Cow::Owned(format!("{prefix}…{}", &clean[start..]))
+    std::borrow::Cow::Owned([prefix.as_ref(), "…", &clean[start..]].concat())
 }
 
 #[cfg(test)]

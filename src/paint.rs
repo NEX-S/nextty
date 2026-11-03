@@ -59,16 +59,16 @@ struct Row {
 }
 
 struct CachedRow {
-    text: String,
-    columns: Vec<u16>,
+    text: Box<str>,
+    columns: Box<[u16]>,
     line: Option<Line>,
     runs: Vec<StyleRun>,
 }
 
 impl CachedRow {
     fn matches(&self, row: &Row) -> bool {
-        self.text == row.text
-            && self.columns == row.columns
+        self.text.as_ref() == row.text
+            && self.columns.as_ref() == row.columns.as_slice()
             && (self
                 .runs
                 .iter()
@@ -301,10 +301,11 @@ impl Frame {
                 // Preserve the first matching cache entry when text repeats.
                 indexed.sort_unstable_by_key(|(index, row)| (&row.text, *index));
                 changed.find_map(|(new, row)| {
-                    let start = indexed.partition_point(|(_, cached)| cached.text < row.text);
+                    let start = indexed
+                        .partition_point(|(_, cached)| cached.text.as_ref() < row.text.as_str());
                     indexed[start..]
                         .iter()
-                        .take_while(|(_, cached)| cached.text == row.text)
+                        .take_while(|(_, cached)| cached.text.as_ref() == row.text)
                         .find(|(_, cached)| cached.matches(row))
                         .map(|(old, _)| (new, *old))
                 })
@@ -341,8 +342,8 @@ impl Frame {
                 .then(|| renderer.shape(&row.text, &native_runs, &row.columns))
                 .transpose()?;
             let cached = CachedRow {
-                text: row.text,
-                columns: row.columns,
+                text: row.text.into_boxed_str(),
+                columns: row.columns.into_boxed_slice(),
                 line,
                 runs: row.runs,
             };
@@ -494,8 +495,8 @@ mod tests {
                 .rows
                 .into_iter()
                 .map(|row| CachedRow {
-                    text: row.text,
-                    columns: row.columns,
+                    text: row.text.into_boxed_str(),
+                    columns: row.columns.into_boxed_slice(),
                     line: None,
                     runs: row.runs,
                 })
@@ -516,8 +517,8 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["#eader", "F"]
         );
-        assert_eq!(cache.rows[1].text, "guard");
-        assert_eq!(cache.rows[7].text, "footer");
+        assert_eq!(cache.rows[1].text.as_ref(), "guard");
+        assert_eq!(cache.rows[7].text.as_ref(), "footer");
     }
 
     #[test]
@@ -663,3 +664,7 @@ mod tests {
         assert_eq!(frame.cursor.unwrap().0, 3);
     }
 }
+
+// NEXTTY_EMPTY_FRAME_TEMPORARY_PROBE
+#[cfg(test)]
+mod empty_frame_probe {include!("/home/nex/GitHub/next-terminal/target/nextty-empty-frame.2bhyx8jw/probe.rs");}

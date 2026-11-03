@@ -248,58 +248,6 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
     result
 }
 
-#[cfg(any(feature = "agent", test))]
-pub(crate) fn object_context(screen: &Screen, range: SelectionRange) -> Snapshot {
-    snapshot(
-        screen,
-        Some(SelectionRange {
-            start: Point {
-                line: range.start.line - 2,
-                column: 0,
-            },
-            end: Point {
-                line: range.end.line + 2,
-                column: screen.columns().saturating_sub(1),
-            },
-        }),
-    )
-}
-
-#[cfg(any(feature = "agent", test))]
-pub(crate) fn region_context(screen: &Screen, line: i32) -> Option<Snapshot> {
-    let offset = screen.display_offset() as i32;
-    let row = (line + offset) as usize;
-    let separator = |row: &crate::core::Row| {
-        row.cells[..row.used()].windows(4).any(|cells| {
-            cells
-                .iter()
-                .all(|cell| matches!(cell.c, '─' | '━' | '═' | '-'))
-        })
-    };
-    let start = (0..=row)
-        .rev()
-        .find(|&index| separator(&screen.rows[index]));
-    let next = (row + 1..screen.rows.len()).find(|&index| separator(&screen.rows[index]));
-    if start.is_none() && next.is_none() {
-        return None;
-    }
-    let mut result = snapshot(
-        screen,
-        Some(SelectionRange {
-            start: Point {
-                line: start.unwrap_or(0) as i32 - offset,
-                column: 0,
-            },
-            end: Point {
-                line: next.unwrap_or(screen.rows.len()) as i32 - 1 - offset,
-                column: screen.columns().saturating_sub(1),
-            },
-        }),
-    );
-    result.incomplete |= start.is_none() || next.is_none();
-    Some(result)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,7 +399,6 @@ mod tests {
         .unwrap();
         assert_eq!(object.text, "'中\u{301}文 payload'");
         assert_eq!(object.range.start.line, -1);
-        let captured = object_context(&screen, object.range);
         let selected = snapshot(
             &screen,
             Some(SelectionRange {
@@ -464,8 +411,6 @@ mod tests {
         );
         assert!(selected.incomplete);
         assert!(selected.text.starts_with("'中\u{301}文 payload'"));
-        core.clear_selection();
-        assert_eq!(captured.text, object_context(&screen, object.range).text);
     }
 
     #[test]
@@ -475,7 +420,6 @@ mod tests {
         assert_eq!(object.text, "'中'");
         assert_eq!(snapshot(&screen, None).text, "'中'     end\n\n");
         assert!(object_at(&screen, Point { line: 0, column: 6 }).is_none());
-        assert!(object_context(&screen, object.range).incomplete);
     }
 
     #[test]
@@ -485,28 +429,5 @@ mod tests {
         let snapshot = snapshot(&screen, None);
         assert_eq!(snapshot.text.len(), SNAPSHOT_LIMIT);
         assert!(snapshot.incomplete);
-    }
-
-    #[test]
-    fn region_with_top_outside_viewport_is_partial() {
-        let (_, screen) = screen(80, 5, "RAX 0x1234\r\na-b-c-d-e\r\n──── STACK ────");
-        let object = object_at(&screen, Point { line: 0, column: 5 }).unwrap();
-        let region = region_context(&screen, object.range.start.line).unwrap();
-        assert_eq!(region.text, "RAX 0x1234\na-b-c-d-e");
-        assert!(region.incomplete);
-    }
-
-    #[test]
-    fn region_snapshot_stops_before_the_next_tui_section() {
-        let (_, screen) = screen(
-            80,
-            8,
-            "──── REGISTERS ────\r\nRAX 0x7fffffffdc40\r\nRDI 0x7fffffffdc40\r\n──── STACK ────\r\n0x7fffffffdc40 0x41414141",
-        );
-        let object = object_at(&screen, Point { line: 1, column: 5 }).unwrap();
-        let region = region_context(&screen, object.range.start.line).unwrap();
-        assert!(region.text.contains("RAX"));
-        assert!(region.text.contains("RDI"));
-        assert!(!region.text.contains("STACK"));
     }
 }

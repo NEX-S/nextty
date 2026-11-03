@@ -3,7 +3,13 @@ use super::*;
 #[test]
 fn resource_braille_keeps_missing_history_and_sampling_gaps_empty() {
     let graph = braille_trend(
-        &[(60., Some(50.)), (30., None), (0., Some(50.))],
+        &[
+            (60., Some(50.)),
+            (59.9, Some(50.)),
+            (30., None),
+            (0.1, Some(50.)),
+            (0., Some(50.)),
+        ],
         20,
         2,
         60.,
@@ -75,7 +81,7 @@ fn shortening_selection_preserves_text_and_clears_unselected_padding() {
         screen.apply(Update::capture(&core, false)).unwrap();
         let mut bytes = Vec::new();
         for row in screen.dirty_rows() {
-            draw_row(&mut bytes, &screen, &pane, row, 40, false, 0).unwrap();
+            draw_row(&mut bytes, &screen, &pane, row, 40, (false, None), 0).unwrap();
         }
         parser.advance(&mut host, &bytes);
         for row in 0..3 {
@@ -486,7 +492,7 @@ fn retained_header_updates_titles_status_control_and_full_redraws() {
 }
 
 #[test]
-fn file_paste_edits_only_local_query_and_enter_copies_the_path() {
+fn file_paste_edits_only_local_query_and_enter_inserts_the_path() {
     use crate::wire::{Peer, Response};
     use crate::workspace::TabView;
     use std::{fs, os::unix::net::UnixListener};
@@ -580,12 +586,16 @@ fn file_paste_edits_only_local_query_and_enter_copies_the_path() {
     );
     frontend.panel_bytes(b"\r", None).unwrap();
     assert!(frontend.ui.files_open);
-    assert!(matches!(
-        frontend.clipboard.as_ref().map(|transfer| &transfer.reader),
-        Some(ClipboardSource::Memory(bytes)) if bytes == file.to_string_lossy().as_bytes()
-    ));
+    assert!(frontend.clipboard.is_none());
     frontend.client.flush().unwrap();
-    assert!(server.next_action().unwrap().is_none());
+    let mut inserted = false;
+    while let Some(action) = server.next_action().unwrap() {
+        if let Action::Input { data, .. } = action {
+            assert_eq!(data, file.to_string_lossy().as_bytes());
+            inserted = true;
+        }
+    }
+    assert!(inserted);
     server
         .send_response(Response::State(
             frontend.client.snapshot().unwrap().clone(),
@@ -653,8 +663,8 @@ fn result_rows_keep_full_width_and_hover_preserves_selection() {
     let mut screen = Screen::default();
     screen.apply(Update::capture(&core, true)).unwrap();
     let mut bytes = Vec::new();
-    draw_row(&mut bytes, &screen, &pane, 0, 9, false, 0).unwrap();
-    draw_row(&mut bytes, &screen, &pane, 1, 9, true, 0).unwrap();
+    draw_row(&mut bytes, &screen, &pane, 0, 9, (false, None), 0).unwrap();
+    draw_row(&mut bytes, &screen, &pane, 1, 9, (true, None), 0).unwrap();
     let mut host = Core::new(
         WindowSize {
             num_cols: 9,
@@ -739,7 +749,7 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
         let mut screen = Screen::default();
         screen.apply(Update::capture(&core, true)).unwrap();
         let mut bytes = Vec::new();
-        draw_row(&mut bytes, &screen, &pane, 0, 28, false, 0).unwrap();
+        draw_row(&mut bytes, &screen, &pane, 0, 28, (false, None), 0).unwrap();
         let mut host = Core::new(
             WindowSize {
                 num_cols: 28,
@@ -773,7 +783,7 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
         parser.advance(&mut core, format!("\x1b[1;{}H\x1b[K", start + 1).as_bytes());
         screen.apply(Update::capture(&core, true)).unwrap();
         bytes.clear();
-        draw_row(&mut bytes, &screen, &pane, 0, 28, false, 0).unwrap();
+        draw_row(&mut bytes, &screen, &pane, 0, 28, (false, None), 0).unwrap();
         host_parser.advance(&mut host, &bytes);
         assert!(host.row(1).cells[19..23].iter().all(|cell| cell.c == ' '));
     }
@@ -815,7 +825,7 @@ fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
         shell_prompt: None,
     };
     let mut output = Vec::new();
-    draw_row(&mut output, &screen, &pane, 0, 40, false, 0).unwrap();
+    draw_row(&mut output, &screen, &pane, 0, 40, (false, None), 0).unwrap();
     let mut host = Core::new(size, 0xcccccc, 0x202020);
     let mut parser = crate::vt::Parser::new();
     parser.advance(&mut host, b"old contents must disappear");
@@ -829,7 +839,7 @@ fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
 
     screen.apply(Update::capture(&core, true)).unwrap();
     output.clear();
-    draw_row(&mut output, &screen, &pane, 0, 40, false, 0).unwrap();
+    draw_row(&mut output, &screen, &pane, 0, 40, (false, None), 0).unwrap();
     assert!(
         output.len() < 80,
         "empty rows should not emit a screenful of spaces"
@@ -1056,7 +1066,7 @@ fn tui_resize_uses_cells_and_zero_pixel_metrics() {
 
 #[test]
 fn clipboard_stream_crosses_chunk_boundaries_without_truncation() {
-    let plain = vec![b'x'; 3072 * 3 + 2];
+    let plain = vec![b'x'; OSC52_CHUNK_SIZE * 3 + 2];
     let mut transfer = ClipboardTransfer {
         reader: ClipboardSource::Memory(plain.clone()),
         target: b'c',
@@ -1071,7 +1081,7 @@ fn clipboard_stream_crosses_chunk_boundaries_without_truncation() {
             break message;
         }
     };
-    assert!(message.contains("9218 bytes"));
+    assert!(message.contains(&format!("{} bytes", plain.len())));
     assert!(message.contains("incomplete"));
     assert!(message.contains("host may reject"));
     assert!(output.starts_with(b"\x1b]52;c;"));
@@ -1266,7 +1276,6 @@ fn both_tab_styles_share_status_colors_and_gray_close_buttons() {
     }
 }
 
-#[cfg(feature = "agent")]
 mod agent {
     use super::*;
 
@@ -1381,6 +1390,8 @@ mod agent {
         server.flush().unwrap();
         frontend.poll().unwrap();
         assert!(sync(&mut frontend, &mut server).is_empty());
+        frontend.input(Input::Escape).unwrap();
+        assert!(frontend.ui.agent.active().rewind_target.is_none());
         frontend.input(Input::Escape).unwrap();
         assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
         assert!(sync(&mut frontend, &mut server).is_empty());
@@ -1839,7 +1850,7 @@ mod agent {
             .unwrap();
         assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
         assert_eq!(frontend.ui.agent.active().model.input, "first draft");
-        frontend.ui.agent_rewind_key(0);
+        frontend.input(Input::Escape).unwrap();
         frontend.input(Input::Escape).unwrap();
         frontend.input(Input::Escape).unwrap();
         assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
@@ -1850,6 +1861,7 @@ mod agent {
         let rewind = String::from_utf8(rewind).unwrap();
         assert!(rewind.contains("48;2;79;79;79m"));
         assert!(rewind.contains("Enter confirm"));
+        frontend.input(Input::Escape).unwrap();
         frontend.input(Input::Bytes(b"X".to_vec())).unwrap();
         assert!(frontend.ui.agent.active().rewind_target.is_none());
         assert_eq!(frontend.ui.agent.active().model.input, "first draftX");
@@ -1894,9 +1906,8 @@ mod agent {
                 .contains("48;2;79;79;79m中 world")
         );
         frontend.input(Input::Bytes(vec![3])).unwrap();
-        assert!(
-            matches!(frontend.clipboard.as_ref().map(|copy| &copy.reader), Some(ClipboardSource::Memory(bytes)) if bytes == "中 world\n\nagent".as_bytes())
-        );
+        assert!(frontend.clipboard.is_none());
+        assert!(frontend.ui.agent.active().model.input.is_empty());
         let editor = editor(&frontend.ui, frontend.agent_rect()).0;
         frontend
             .agent_mouse(Mouse {
@@ -1929,7 +1940,7 @@ mod agent {
         assert_eq!(frontend.ui.agent.current, 1);
         frontend.activate_agent(AgentAction::Session(0)).unwrap();
         assert_eq!(frontend.ui.agent.current, 0);
-        assert_eq!(frontend.ui.agent.active().model.input, "first draft");
+        assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.input(Input::Bytes(vec![23])).unwrap();
         assert_eq!(frontend.ui.agent.sessions.len(), 2);
         frontend
@@ -2140,12 +2151,8 @@ mod agent {
             .unwrap();
         frontend.input(Input::Bytes(vec![1])).unwrap();
         frontend.input(Input::Bytes(vec![3])).unwrap();
-        assert!(
-            matches!(frontend.clipboard.as_ref().map(|copy| &copy.reader), Some(ClipboardSource::Memory(bytes)) if bytes == "alpha 中".as_bytes())
-        );
-        frontend.input(Input::Bytes(vec![24])).unwrap();
-        assert_eq!(frontend.ui.agent.active().model.input, "alpha 中");
-        frontend.clipboard = None;
+        assert!(frontend.clipboard.is_none());
+        assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend
             .input(Input::Bytes(b"replacement".to_vec()))
             .unwrap();
@@ -2161,7 +2168,7 @@ mod agent {
         frontend.input(Input::PasteEnd).unwrap();
         frontend.input(Input::Bytes(b"ignored".to_vec())).unwrap();
         frontend.input(Input::Bytes(vec![3])).unwrap();
-        assert_eq!(frontend.ui.agent.active().model.input, "draft kept");
+        assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.client.flush().unwrap();
         assert!(peer.next_action().unwrap().is_none());
         frontend.ui.focus = Focus::Editor;
@@ -2170,7 +2177,7 @@ mod agent {
             .input(Input::Bytes(b"batch\t\x03".to_vec()))
             .unwrap();
         assert!(frontend.ui.focus == Focus::Output);
-        assert_eq!(frontend.ui.agent.active().model.input, "batch");
+        assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.ui.focus = Focus::Editor;
         frontend
             .input(Input::Bytes(b"\x01\x7fafter\r".to_vec()))
@@ -2695,12 +2702,6 @@ mod agent {
                 assert_eq!(&host.row(row).cells, cells, "row {row}");
             }
         };
-        frontend.input(Input::Alt(b'?')).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        assert_eq!(host.row(2).cells, baseline[2]);
-        frontend.input(Input::Escape).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        restored(&host);
         frontend.input(Input::Alt(b'/')).unwrap();
         paint(&mut frontend, &mut host, &mut parser);
         frontend.input(Input::Escape).unwrap();

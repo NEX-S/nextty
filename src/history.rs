@@ -132,9 +132,13 @@ impl HistoryBudget {
             }
         } else {
             // Batch clears avoid shifting the file table once per removed segment.
-            let paths: HashSet<_> = segments.iter().map(|segment| &segment.path).collect();
+            // Registered paths are shared verbatim with their segments.
+            let paths: HashSet<_> = segments
+                .iter()
+                .map(|segment| segment.path.as_os_str())
+                .collect();
             files.files.retain(|(path, bytes, _)| {
-                if paths.contains(path) {
+                if paths.contains(path.as_os_str()) {
                     removed += bytes;
                     false
                 } else {
@@ -264,6 +268,7 @@ impl SearchWorker {
                     state.active = Some(Arc::clone(job.cancelled()));
                     drop(state);
                     match job {
+                        job if job.cancelled().load(Ordering::Relaxed) => drop(job),
                         SearchWork::Find(job) => {
                             let result = search_archive(&job);
                             if !job.cancelled.load(Ordering::Relaxed) {
@@ -443,12 +448,16 @@ pub(crate) struct History {
 impl History {
     pub fn new(config: HistoryConfig) -> io::Result<Self> {
         let notification = Arc::new(crate::eventfd::new()?);
-        config
-            .budget
-            .notifications
-            .lock()
-            .map_err(|e| io::Error::other(e.to_string()))?
-            .push(Arc::downgrade(&notification));
+        {
+            let mut notifications = config
+                .budget
+                .notifications
+                .lock()
+                .map_err(|e| io::Error::other(e.to_string()))?;
+            // Quiet panes can close without ever triggering budget eviction.
+            notifications.retain(|weak| weak.strong_count() != 0);
+            notifications.push(Arc::downgrade(&notification));
+        }
         let budget = config.budget.clone();
         let generation = budget.generation.load(Ordering::Acquire);
         let wake = notification.clone();
@@ -727,13 +736,15 @@ impl Drop for History {
 pub(crate) const READ_LIMIT: usize = 16 * 1024;
 struct ReadLine {
     cursor: HistoryCursor,
-    text: String,
+    length: usize,
 }
 struct ReadText<'a> {
     read: &'a HistoryRead,
+    finder: Option<memchr::memmem::Finder<'a>>,
     cursor: HistoryCursor,
     text: String,
     pending: VecDeque<ReadLine>,
+    pending_text: String,
     found: bool,
     has_more: bool,
 }
@@ -757,15 +768,16 @@ impl ReadText<'_> {
     }
     fn skip_to(&mut self, row: u64) {
         self.pending.clear();
+        self.pending_text.clear();
         self.cursor.row = row.min(self.read.end.0);
         self.cursor.offset = 0;
         self.has_more = row <= self.read.end.0;
     }
-    fn row(&mut self, id: u64, row: &Row, bytes: &mut Vec<u8>) -> io::Result<bool> {
+    fn row(&mut self, id: u64, row: &Row, rendered: &mut String) -> io::Result<bool> {
         if self.read.cancelled.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        bytes.clear();
+        rendered.clear();
         let from = if id == self.read.start.0 {
             self.read.start.1
         } else {
@@ -776,12 +788,12 @@ impl ReadText<'_> {
         } else {
             row.used()
         };
-        write_text(bytes, row, from, to, false)?;
-        if id != self.read.end.0 && !row.wrapped {
-            bytes.push(b'\n');
+        if from < to {
+            rendered.extend(row.characters(from..to).map(|(_, ch)| ch));
         }
-        let rendered = std::str::from_utf8(bytes)
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        if id != self.read.end.0 && !row.wrapped {
+            rendered.push('\n');
+        }
         let offset = if id == self.cursor.row {
             self.cursor.offset as usize
         } else {
@@ -798,40 +810,43 @@ impl ReadText<'_> {
             offset: offset as u64,
             ..self.cursor
         };
-        let Some(query) = self.read.query.as_deref() else {
+        if self.finder.is_none() {
             return Ok(self.append(cursor, input));
-        };
+        }
         if self.found {
             self.append(cursor, input);
             return Ok(true);
         }
         self.advance(cursor, input.len(), input.len());
+        self.pending_text.push_str(input);
         self.pending.push_back(ReadLine {
             cursor,
-            text: input.to_owned(),
+            length: input.len(),
         });
-        let pending: String = self.pending.iter().map(|line| line.text.as_str()).collect();
-        if let Some(found) = pending.find(query) {
+        let finder = self.finder.as_ref().unwrap();
+        let query_length = finder.needle().len();
+        if let Some(found) = finder.find(self.pending_text.as_bytes()) {
+            let pending = std::mem::take(&mut self.pending_text);
             self.found = true;
             let mut row_start = 0;
             let mut previous_start = 0;
             let mut excerpt_start = 0;
             for line in &self.pending {
-                if found < row_start + line.text.len() {
+                if found < row_start + line.length {
                     excerpt_start = previous_start;
                     break;
                 }
                 previous_start = row_start;
-                row_start += line.text.len();
+                row_start += line.length;
             }
             // Preserve the match before spending the byte budget on preceding context.
             let excerpt_start = pending.ceil_char_boundary(
-                excerpt_start.max(found.saturating_sub(READ_LIMIT.saturating_sub(query.len()))),
+                excerpt_start.max(found.saturating_sub(READ_LIMIT.saturating_sub(query_length))),
             );
             let mut skipped = 0;
             while let Some(line) = self.pending.pop_front() {
-                if skipped + line.text.len() <= excerpt_start {
-                    skipped += line.text.len();
+                if skipped + line.length <= excerpt_start {
+                    skipped += line.length;
                     continue;
                 }
                 let from = excerpt_start.saturating_sub(skipped);
@@ -840,25 +855,33 @@ impl ReadText<'_> {
                         offset: line.cursor.offset + from as u64,
                         ..line.cursor
                     },
-                    &line.text[from..],
+                    &pending[skipped + from..skipped + line.length],
                 );
-                skipped += line.text.len();
+                skipped += line.length;
                 if full {
                     return Ok(true);
                 }
             }
         } else {
-            let suffix_start = pending.len().saturating_sub(query.len().saturating_sub(1));
+            let suffix_start = self
+                .pending_text
+                .len()
+                .saturating_sub(query_length.saturating_sub(1));
             let mut skipped = 0;
             let mut rows = 0usize;
             for line in &self.pending {
-                if skipped + line.text.len() > suffix_start {
+                if skipped + line.length > suffix_start {
                     break;
                 }
-                skipped += line.text.len();
+                skipped += line.length;
                 rows += 1;
             }
-            self.pending.drain(..rows.saturating_sub(1));
+            let removed: usize = self
+                .pending
+                .drain(..rows.saturating_sub(1))
+                .map(|line| line.length)
+                .sum();
+            self.pending_text.drain(..removed);
         }
         Ok(false)
     }
@@ -872,9 +895,14 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
     let mut incomplete = read.incomplete || read.cursor.row < first;
     let mut output = ReadText {
         read,
+        finder: read
+            .query
+            .as_ref()
+            .map(|query| memchr::memmem::Finder::new(query.as_bytes())),
         cursor: read.cursor,
         text: String::new(),
         pending: VecDeque::new(),
+        pending_text: String::new(),
         found: false,
         has_more: true,
     };
@@ -882,7 +910,7 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
         output.skip_to(first);
     }
     let mut cells = Vec::new();
-    let mut bytes = Vec::new();
+    let mut rendered = String::new();
     let mut full = false;
     for (path, start, end) in segments {
         if read.cancelled.load(Ordering::Relaxed) {
@@ -918,7 +946,7 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
                 break;
             }
             let row = read_row::<false>(&mut file, cells)?;
-            full = output.row(id, &row, &mut bytes)?;
+            full = output.row(id, &row, &mut rendered)?;
             cells = row.cells;
             if full {
                 break;
@@ -944,7 +972,7 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
             if id > read.end.0 {
                 break;
             }
-            if output.row(id, row, &mut bytes)? {
+            if output.row(id, row, &mut rendered)? {
                 break;
             }
         }
@@ -1586,8 +1614,12 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
     };
     let mut column = 0;
     while column < stored {
-        let mut utf8 = [0; 4];
-        bytes.extend_from_slice(cells[column].c.encode_utf8(&mut utf8).as_bytes());
+        let ch = cells[column].c;
+        if ch.is_ascii() {
+            bytes.push(ch as u8);
+        } else {
+            bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+        }
         column += 1 + usize::from(pair(column));
     }
     let text_bytes = bytes.len() - header - 10;
@@ -1600,6 +1632,7 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
     let (mut runs, mut column) = (0u16, 0);
     while column < stored {
         let (start, key) = (column, style(column));
+        column += 1 + usize::from(key.3);
         while column < stored && style(column) == key {
             column += 1 + usize::from(key.3);
         }
@@ -1641,13 +1674,17 @@ fn plain_row_text(bytes: &[u8]) -> Option<(usize, &[u8])> {
         || stored > columns
         || header[6..9] != [0; 3]
         || header[17..19] != [0; 2]
-        || text_bytes != stored
         || length != 6 + text_bytes
     {
         return None;
     }
     let text = bytes.get(19..13 + length)?;
-    text.is_ascii().then_some((13 + length, text))
+    let valid = if text_bytes == stored {
+        text.is_ascii()
+    } else {
+        std::str::from_utf8(text).is_ok_and(|text| text.chars().count() == stored)
+    };
+    valid.then_some((13 + length, text))
 }
 fn empty_row_headers(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
     // Empty rows have only a header; avoid materializing their cells.
@@ -1762,8 +1799,9 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
     }
     let mut extras = Vec::with_capacity(count);
     for _ in 0..count {
-        let column = u16::from_le_bytes(read_array(&mut file)?) as usize;
-        let count = u32::from_le_bytes(read_array(&mut file)?) as usize;
+        let header = read_array::<6>(&mut file)?;
+        let column = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
+        let count = u32::from_le_bytes(header[2..].try_into().unwrap()) as usize;
         let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
         for _ in 0..count {
             zerowidth.push(
@@ -2127,6 +2165,19 @@ mod eviction_tests {
             .collect::<Vec<_>>();
         let used = cells.len();
         Row::from_parts(cells, false, used, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn closed_histories_do_not_accumulate_notification_registrations() {
+        let budget = budget();
+        let live = History::new(HistoryConfig::new(budget.clone())).unwrap();
+        for _ in 0..32 {
+            drop(History::new(HistoryConfig::new(budget.clone())).unwrap());
+        }
+        let notifications = budget.notifications.lock().unwrap();
+        assert_eq!(notifications.len(), 2);
+        assert!(notifications[0].ptr_eq(&Arc::downgrade(&live.notification)));
+        assert!(notifications[1].upgrade().is_none());
     }
 
     #[test]

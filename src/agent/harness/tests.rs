@@ -189,6 +189,19 @@ fn sse(stream: &mut TcpStream, events: Vec<Value>) {
     }
 }
 
+fn truncated_chunked_sse(stream: &mut TcpStream, events: Vec<Value>) {
+    let body = events
+        .into_iter()
+        .map(|event| format!("data: {event}\r\n\r\n"))
+        .collect::<String>();
+    write!(
+        stream,
+        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
+        body.len()
+    )
+    .unwrap();
+}
+
 fn settled(agent: &Harness, mut terminal: impl FnMut(ToolRequest)) -> Vec<Event> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
@@ -570,7 +583,210 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
 }
 
 #[test]
-fn incomplete_streams_and_terminal_errors_do_not_poison_the_next_turn() {
+fn truncated_model_response_retries_without_replaying_completed_or_partial_tools() {
+    let mut interrupted = None;
+    let mut review = None;
+    let server = Server::new(6, move |index, body, stream| {
+        paired(body["messages"].as_array().unwrap());
+        match index {
+            0 => sse(
+                stream,
+                response("", &[("first", "shell", json!({"command":"first"}))]),
+            ),
+            1 => {
+                assert!(body["messages"].to_string().contains("first-completed"));
+                interrupted = Some(body.clone());
+                let mut events = response(
+                    "Discarded partial response.",
+                    &[("partial", "shell", json!({"command":"must-not-run"}))],
+                );
+                events.pop();
+                truncated_chunked_sse(stream, events);
+            }
+            2 => {
+                assert_eq!(Some(body), interrupted.as_ref());
+                sse(
+                    stream,
+                    response("", &[("second", "shell", json!({"command":"second"}))]),
+                );
+            }
+            3 => {
+                let text = body["messages"].to_string();
+                assert!(text.contains("first-completed") && text.contains("second-completed"));
+                assert!(
+                    !text.contains("Discarded partial response") && !text.contains("must-not-run")
+                );
+                sse(stream, response("Both actions verified.", &[]));
+            }
+            4 => {
+                review = Some(body.clone());
+                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater").unwrap();
+            }
+            5 => {
+                assert_eq!(Some(body), review.as_ref());
+                sse(stream, goal_response("complete", "Both actions verified."));
+            }
+            _ => unreachable!(),
+        }
+    });
+    let worker = Worker::new(server.url.clone());
+    let agent = worker.agent();
+    agent
+        .send("perform two actions".into(), 17, json!({}))
+        .unwrap();
+    let mut commands = Vec::new();
+    let events = settled(agent, |request| {
+        let command = request.input["command"].as_str().unwrap().to_owned();
+        request.respond(Ok(format!("{command}-completed"))).unwrap();
+        commands.push(command);
+    });
+    assert_eq!(commands, ["first", "second"]);
+    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, Event::ResetText))
+            .count(),
+        1
+    );
+    let (history, _) = worker.finish();
+    paired(&history[0].messages);
+    server.finish();
+}
+
+#[test]
+fn completed_model_message_does_not_wait_for_a_missing_http_chunk_trailer() {
+    for hold_open in [false, true] {
+        let server = Server::new(3, move |index, body, stream| match index {
+            0 => {
+                truncated_chunked_sse(
+                    stream,
+                    response("", &[("once", "shell", json!({"command":"once"}))]),
+                );
+                if hold_open {
+                    let mut byte = [0];
+                    // Closing with unread HTTP framing may send a reset instead of EOF.
+                    match stream.read(&mut byte) {
+                        Ok(0) => (),
+                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
+                        result => panic!("expected peer closure, got {result:?}"),
+                    }
+                }
+            }
+            1 => {
+                assert!(body["messages"].to_string().contains("once-completed"));
+                sse(stream, response("Verified.", &[]));
+            }
+            2 => sse(stream, goal_response("complete", "Verified.")),
+            _ => unreachable!(),
+        });
+        let worker = Worker::new(server.url.clone());
+        let agent = worker.agent();
+        agent
+            .send("perform one action".into(), 17, json!({}))
+            .unwrap();
+        let mut calls = 0;
+        let events = settled(agent, |request| {
+            assert_eq!(request.input["command"], "once");
+            calls += 1;
+            request.respond(Ok("once-completed".into())).unwrap();
+        });
+        assert_eq!(calls, 1);
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, Event::Error(_) | Event::ResetText))
+        );
+        worker.finish();
+        server.finish();
+    }
+}
+
+#[test]
+fn stopping_during_network_backoff_prevents_another_request_or_tool() {
+    let server = Server::new(1, |_, _, stream| {
+        let mut events = response("Partial.", &[]);
+        events.pop();
+        truncated_chunked_sse(stream, events);
+    });
+    let worker = Worker::new(server.url.clone());
+    let agent = worker.agent();
+    agent
+        .send("wait for a response".into(), 17, json!({}))
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        assert!(Instant::now() < deadline, "retry notice never arrived");
+        wait(agent.fd(), 100).unwrap();
+        let events = agent.poll().unwrap();
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, Event::Request(_)))
+        );
+        if events
+            .iter()
+            .any(|event| matches!(event, Event::Notice(text) if text.contains("Retrying")))
+        {
+            break;
+        }
+    }
+    let start = Instant::now();
+    agent.abort().unwrap();
+    let events = settled(agent, |_| panic!("tool executed after cancellation"));
+    assert!(start.elapsed() < Duration::from_millis(500));
+    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    worker.finish();
+    server.finish();
+}
+
+#[test]
+fn summary_network_recovery_is_bounded_and_keeps_the_request() {
+    let mut original = None;
+    let server = Server::new(6, move |index, body, stream| {
+        if let Some(original) = &original {
+            assert_eq!(body, original);
+        } else {
+            original = Some(body.clone());
+        }
+        if index < 4 {
+            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater").unwrap();
+        } else if index == 4 {
+            sse(
+                stream,
+                vec![json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}})],
+            );
+        } else {
+            sse(stream, response("Recovered summary.", &[]));
+        }
+    });
+    let shared = Shared {
+        state: Mutex::new(State::default()),
+        wake: crate::eventfd::new().unwrap(),
+        notification: crate::eventfd::new().unwrap(),
+    };
+    let mut session = Session {
+        http: Http::new(),
+        url: server.url.clone(),
+        headers: vec![],
+        model: "local-fixture".into(),
+        history: VecDeque::new(),
+        summary: String::new(),
+    };
+    let messages = [json!({"role":"user","content":"Keep completed command 123."})];
+    let body = session.summary_request(&messages).unwrap();
+    let canceled = AtomicBool::new(false);
+    let error = session.summarize(&shared, &body, &canceled).unwrap_err();
+    assert!(error.to_string().contains("503"));
+    assert_eq!(
+        session.summarize(&shared, &body, &canceled).unwrap(),
+        "Recovered summary."
+    );
+    server.finish();
+}
+
+#[test]
+fn malformed_streams_and_terminal_errors_do_not_poison_the_next_turn() {
     let server = Server::new(4, |index, body, stream| {
         paired(body["messages"].as_array().unwrap());
         if index == 0 {
@@ -580,6 +796,7 @@ fn incomplete_streams_and_terminal_errors_do_not_poison_the_next_turn() {
             );
             events.truncate(events.len() - 2);
             sse(stream, events);
+            stream.write_all(b"data: {\"type\":\r\n\r\n").unwrap();
         } else if index == 1 {
             assert!(body["messages"].to_string().contains("Turn interrupted"));
             sse(
@@ -928,7 +1145,7 @@ fn failed_compaction_preserves_executed_results_for_the_next_turn() {
                 assert!(text.contains(&format!("executed-{action}")));
             }
             if index == 5 {
-                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater").unwrap();
+                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 8\r\nConnection: close\r\n\r\nrejected").unwrap();
             } else {
                 sse(stream, response("All five actions already executed.", &[]));
             }
@@ -960,7 +1177,7 @@ fn failed_compaction_preserves_executed_results_for_the_next_turn() {
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::Error(text) if text.contains("503")))
+            .any(|event| matches!(event, Event::Error(text) if text.contains("400")))
     );
     agent
         .send("continue without repeating actions".into(), 17, json!({}))

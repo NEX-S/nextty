@@ -59,6 +59,17 @@ def fixture(directory):
                 os.write(1, f'\x1b[Hprobe-{index:04}\x1b[K'.encode())
 
 
+def exit_zero_observed(call, result, pane, command):
+    if (call['input'].get('pane') == pane and result.get('command') == command
+            and result.get('running') is False and result.get('exit_code') == 0):
+        return True
+    return any(
+        observation.get('pane') == pane and any(
+            block['id'] == command and block['exit_code'] == 0
+            for block in observation.get('command_blocks', []))
+        for observation in [result, *result.get('panes', [])])
+
+
 class Lab:
     def __init__(self, binary, tool_mode=False):
         self.binary = binary
@@ -106,6 +117,9 @@ class Lab:
                     request = json.loads(body)
                     if request.get('tool_choice', {}).get('type') == 'none' and request['messages'][-1]['content'].startswith('Harness goal review:'):
                         self.goal_reply(request)
+                        return
+                    if request.get('tool_choice', {}).get('type') == 'none':
+                        self.text_reply(lab.summary_text(request))
                         return
                     lab.execution_requests += 1
                     if lab.tool_mode:
@@ -169,13 +183,17 @@ class Lab:
 
             def goal_reply(self, body):
                 verdict = lab.goal_verdict(body)
+                self.text_reply(json.dumps(verdict))
+                lab.goal_reviews += 1
+
+            def text_reply(self, text):
                 self.send_response(200)
                 self.send_header('Content-Type', 'text/event-stream')
                 self.send_header('Connection', 'close')
                 self.end_headers()
                 events = [
                     {'type':'message_start','message':{'role':'assistant','content':[]}},
-                    {'type':'content_block_start','index':0,'content_block':{'type':'text','text':json.dumps(verdict)}},
+                    {'type':'content_block_start','index':0,'content_block':{'type':'text','text':text}},
                     {'type':'content_block_stop','index':0},
                     {'type':'message_delta','delta':{'stop_reason':'end_turn'}},
                     {'type':'message_stop'},
@@ -183,7 +201,6 @@ class Lab:
                 for event in events:
                     self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode())
                 self.wfile.flush()
-                lab.goal_reviews += 1
 
             def tool_reply(self, body):
                 lab.ready.set()
@@ -222,6 +239,9 @@ class Lab:
     def goal_verdict(self, body):
         return {'status':'complete', 'reason':'Fixture evidence verified.'}
 
+    def summary_text(self, body):
+        raise AssertionError('unexpected context summary request')
+
     def start(self):
         threading.Thread(target=self.model.serve_forever, daemon=True).start()
         config = self.root / 'config.toml'
@@ -250,6 +270,8 @@ class Lab:
                          if block['type'] == 'tool_result')
             assert not block.get('is_error'), block
             result = json.loads(block['content'])
+            if name == 'shell-ready' and result['shell_prompt'] is None:
+                return ('shell-ready', 'read', {'source':'screen','wait':1})
             if name in ('shell-output', 'command-wait'):
                 if name == 'shell-output':
                     assert result['input_queued'], result
@@ -287,6 +309,8 @@ class Lab:
                 completed = next(block for block in result['command_blocks'] if block['has_output'])
                 assert completed['exit_code'] == 0, result
         index = self.tool_index
+        if (index == 0 or 5 <= index < 13) and (not self.tool_sent or self.tool_sent[0] != 'shell-ready'):
+            return ('shell-ready', 'read', {'source':'screen'})
         self.tool_index += 1
         if index == 0:
             return ('shell-output', 'shell', {'command':"for i in $(seq 1 20000); do printf 'history-%06d payload-for-agent-benchmark\\n' \"$i\"; done"})
@@ -498,6 +522,114 @@ class Lab:
         assert self.tool_index == 3 and len(self.requests) == 5, self.requests
         return {'case':'default-goal', 'seconds':time.monotonic()-start,
                 'goal_reviews':self.goal_reviews, 'terminal_actions':1,
+                'request_bytes':self.requests}
+
+    def run_compaction(self):
+        content = ('{"payload":"context for bounded native reads"}\n' * 14000)[:512 * 1024]
+        (self.root / 'context.txt').write_text(content)
+        phase = 0
+        summaries = []
+
+        def summarize(body):
+            text = json.dumps(body['messages'])
+            summaries.append('active' if 'compaction-phase-1' in text else 'history')
+            pending = set()
+            for message in body['messages']:
+                if isinstance(message['content'], list):
+                    for block in message['content']:
+                        if block['type'] == 'tool_use':
+                            pending.add(block['id'])
+                        elif block['type'] == 'tool_result':
+                            pending.remove(block['tool_use_id'])
+            assert not pending, 'summary split a tool exchange'
+            assert body.get('cache_control') is None
+            return ('Earlier context.txt read_file pages were checked byte-for-byte. '
+                    'The file is unchanged; continue the requested range from the newest original result.')
+
+        def next_tool(body):
+            if phase == -1:
+                assert 'compaction-phase-0' in json.dumps(body['messages']), 'settled history lost'
+                return None
+            assert f'compaction-phase-{phase}' in json.dumps(body['messages']), 'active request lost'
+            if self.tool_index:
+                block = body['messages'][-1]['content'][0]
+                assert not block.get('is_error'), block
+                result = json.loads(block['content'])
+                offset = (self.tool_index - 1) * 16384
+                assert result['offset'] == offset and result['next_offset'] == offset + 16384, result
+                assert result['text'] == content[offset:offset + 16384], 'latest original result changed'
+            if self.tool_index == (10 if phase == 0 else 32):
+                return None
+            offset = self.tool_index * 16384
+            self.tool_index += 1
+            return ('context-page', 'read_file', {'path':'context.txt','offset':offset})
+
+        self.tool_mode = True
+        self.next_tool = next_tool
+        self.summary_text = summarize
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'compaction-phase-0: read the first ten pages\r')
+        self.wait(self.ready.is_set, 'context model request')
+        self.discover()
+        begin = self.sample()
+        self.go.set()
+        self.wait(lambda: self.goal_reviews == 1, 'history turn completed')
+        self.drain(.1)
+        phase = -1
+        for index in range(8):
+            os.write(self.master, f'history-reuse-{index}: answer from earlier context without tools\r'.encode())
+            self.wait(lambda: self.goal_reviews == index + 2, 'settled history reused')
+            self.drain(.1)
+        phase = 1
+        self.tool_index = 0
+        os.write(self.master, b'compaction-phase-1: read all thirty-two pages\r\x1bh')
+        latency = self.probes(False)
+        self.wait(lambda: self.goal_reviews == 10, 'compaction goal verified')
+        assert self.tool_index == 32 and 'history' in summaries and 'active' in summaries, summaries
+        assert (self.root / 'context.txt').read_text() == content
+        end = self.sample()
+        return {'case':'context-compaction', 'summary_kinds':summaries, 'file_pages_verified':42,
+                'history_followups_verified':8,
+                'input_ms':latency, 'request_bytes':self.requests,
+                'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds']
+                                       for role,value in begin.items()}}
+
+    def run_transport_completion(self):
+        lab = self
+        samples = []
+
+        class Model(self.model.RequestHandlerClass):
+            def do_POST(self):
+                first = not lab.requests
+                super().do_POST()
+                if first:
+                    lab.done.wait(2)
+
+        def next_tool(body):
+            if self.tool_index == 0:
+                self.tool_index += 1
+                return ('completion-proof', 'shell', {'command':"printf 'transport-proof\\n'"})
+            samples.append((time.monotonic_ns() - self.tool_sent[1]) / 1e6)
+            block = body['messages'][-1]['content'][0]
+            assert not block.get('is_error'), block
+            result = json.loads(block['content'])
+            assert result['input_queued'] and not result['running'] and result['exit_code'] == 0, result
+            assert result['text'].strip() == 'transport-proof', result
+            return None
+
+        self.model.RequestHandlerClass = Model
+        self.next_tool = next_tool
+        os.write(self.master, b'\x1ba')
+        self.drain(.05)
+        os.write(self.master, b'verify completed messages without waiting for HTTP EOF\r')
+        self.wait(self.ready.is_set, 'completion model request')
+        self.go.set()
+        self.wait(lambda: self.goal_reviews == 1, 'completion goal verified')
+        self.wait(lambda: b'tools-finished-proof' in self.output, 'completion final answer rendered')
+        assert len(self.requests) == 3 and self.tool_index == 1, self.requests
+        return {'case':'transport-completion', 'http_tail_limit_seconds':2,
+                'tool_result_ms':samples[0], 'terminal_submissions':1,
                 'request_bytes':self.requests}
 
     def run_input_observation(self, delay):
@@ -822,6 +954,92 @@ class Lab:
                 'quiet_waits':quiet_waits,
                 'request_bytes':self.requests}
 
+    def run_conversations(self):
+        lab = self
+        ready = set()
+        verified = set()
+        prefix = '**concurrent agent** `output`\n\n' * 4096
+        expected = {}
+
+        class Model(self.model.RequestHandlerClass):
+            def do_POST(self):
+                try:
+                    raw = self.rfile.read(int(self.headers['Content-Length']))
+                    lab.requests.append(len(raw))
+                    body = json.loads(raw)
+                    submission = next(message['content'] for message in reversed(body['messages'])
+                                      if isinstance(message['content'], str)
+                                      and message['content'].startswith('Target terminal at submission'))
+                    name = submission.rsplit('\n', 1)[-1]
+                    if body.get('tool_choice', {}).get('type') == 'none':
+                        text = ''.join(block.get('text', '') for message in body['messages']
+                                       if message['role'] == 'assistant' for block in message['content'])
+                        assert text == expected[name], 'conversations mixed or lost streamed text'
+                        self.goal_reply(body)
+                        verified.add(name)
+                        return
+                    assert name not in ready, 'conversation generated an unexpected extra request'
+                    expected[name] = prefix + (name + '\n') * 800 + name + '-finished'
+                    ready.add(name)
+                    if not lab.go.wait(10):
+                        raise TimeoutError('driver did not start concurrent streams')
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+
+                    def emit(event):
+                        self.wfile.write(('data: ' + json.dumps(event) + '\n\n').encode())
+                        self.wfile.flush()
+
+                    emit({'type':'message_start','message':{'role':'assistant','content':[]}})
+                    emit({'type':'content_block_start','index':0,'content_block':{'type':'text','text':prefix}})
+                    start = time.monotonic()
+                    for index in range(800):
+                        emit({'type':'content_block_delta','index':0,
+                              'delta':{'type':'text_delta','text':name + '\n'}})
+                        time.sleep(max(0, start + (index + 1) / 200 - time.monotonic()))
+                    emit({'type':'content_block_delta','index':0,
+                          'delta':{'type':'text_delta','text':name + '-finished'}})
+                    emit({'type':'content_block_stop','index':0})
+                    emit({'type':'message_delta','delta':{'stop_reason':'end_turn'}})
+                    emit({'type':'message_stop'})
+                except Exception as error:
+                    lab.errors.append(repr(error))
+
+        self.model.RequestHandlerClass = Model
+        os.write(self.master, b'\x1ba')
+        self.drain(.1)
+        for index in range(4):
+            if index:
+                # From the editor, reverse through close-panel, close-tab and the conversation tabs.
+                os.write(self.master, b'\x1b[Z' * (index + 3) + b'\r')
+                self.drain(.05)
+            os.write(self.master, f'conversation-{index}\r'.encode())
+            self.wait(lambda: len(ready) == index + 1, 'concurrent conversation request')
+        self.discover()
+        os.write(self.master, b'\x1bh')
+        self.drain(.05)
+        begin = self.sample()
+        self.go.set()
+        latency = self.probes(False)
+        self.wait(lambda: len(verified) == 4, 'all conversation histories verified')
+        self.wait(lambda: b'conversation-3-finished' in self.output, 'active conversation rendered')
+        end = self.sample()
+        os.write(self.master, b'\x1ba\x1ba')
+        self.drain(.05)
+        for index in range(4):
+            output_start = len(self.output)
+            os.write(self.master, b'\x1b[Z' * (6 - index) + b'\r')
+            marker = f'conversation-{index}-finished'.encode()
+            self.wait(lambda: marker in self.output[output_start:], 'completed conversation rendered after switching')
+        return {'case':'concurrent-conversations', 'conversations':4, 'input_ms':latency,
+                'histories_verified':len(verified), 'rendered_after_switch':4, 'request_bytes':self.requests,
+                'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds']
+                                       for role,value in begin.items()},
+                'product_pss_kib':{role:value['pss_kib'] for role,value in end.items()},
+                'threads':{role:value['threads'] for role,value in end.items()}}
+
     def discover(self):
         children = Path(f'/proc/{self.process.pid}/task/{self.process.pid}/children').read_text().split()
         for child in children:
@@ -984,6 +1202,14 @@ def main():
             print(json.dumps(result), file=sys.stderr, flush=True)
         finally:
             lab.close()
+    lab = Lab(binary)
+    try:
+        lab.start()
+        result = lab.run_conversations()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
     lab = Lab(binary, tool_mode=True)
     try:
         lab.start()
@@ -996,6 +1222,22 @@ def main():
     try:
         lab.start()
         result = lab.run_goal()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary, tool_mode=True)
+    try:
+        lab.start()
+        result = lab.run_transport_completion()
+        report['cases'].append(result)
+        print(json.dumps(result), file=sys.stderr, flush=True)
+    finally:
+        lab.close()
+    lab = Lab(binary)
+    try:
+        lab.start()
+        result = lab.run_compaction()
         report['cases'].append(result)
         print(json.dumps(result), file=sys.stderr, flush=True)
     finally:

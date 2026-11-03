@@ -63,9 +63,27 @@ pub struct FileNav {
 
 #[derive(Default)]
 struct Preview {
-    lines: Box<[String]>,
+    text: Box<str>,
+    // Escaping the bounded input still leaves every byte offset within u32.
+    line_offsets: Box<[u32]>,
     error: Option<io::Error>,
     truncated: bool,
+}
+
+impl Preview {
+    fn message(text: &str) -> Self {
+        Self {
+            text: text.into(),
+            line_offsets: Box::new([0, text.len() as u32]),
+            ..Self::default()
+        }
+    }
+
+    fn lines(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.line_offsets
+            .windows(2)
+            .map(|range| &self.text[range[0] as usize..range[1] as usize])
+    }
 }
 
 struct ScanRequest {
@@ -100,10 +118,15 @@ impl FileNav {
             move |request: ScanRequest, publish| {
                 drop(request.previous);
                 let cancelled = || cancellation.load(Ordering::Relaxed) != request.generation;
+                let publish_scan = |scan, complete| {
+                    if !cancelled() {
+                        publish((request.generation, scan, complete));
+                    }
+                };
                 let result = scan(&request.directory, &request.mode, &cancelled, &|scan| {
-                    publish((request.generation, scan, false));
+                    publish_scan(scan, false);
                 });
-                publish((request.generation, result, true));
+                publish_scan(result, true);
             },
         )?;
         let cancellation = Arc::clone(&preview_generation);
@@ -117,7 +140,9 @@ impl FileNav {
                     error: Some(error),
                     ..Preview::default()
                 });
-                publish((generation, result));
+                if !cancelled() {
+                    publish((generation, result));
+                }
             },
         )?;
         let mut nav = Self {
@@ -213,8 +238,8 @@ impl FileNav {
         self.update_preview();
     }
 
-    pub fn preview_lines(&self) -> &[String] {
-        &self.preview.lines
+    pub fn preview_lines(&self) -> impl ExactSizeIterator<Item = &str> {
+        self.preview.lines()
     }
 
     pub fn preview_scroll(&self) -> usize {
@@ -256,10 +281,12 @@ impl FileNav {
         match self.focus {
             FileFocus::List => self.move_selection(delta),
             FileFocus::Preview => {
-                self.preview_scroll = self
-                    .preview_scroll
-                    .saturating_add_signed(delta)
-                    .min(self.preview.lines.len().saturating_sub(visible_rows.max(1)));
+                self.preview_scroll = self.preview_scroll.saturating_add_signed(delta).min(
+                    self.preview
+                        .lines()
+                        .len()
+                        .saturating_sub(visible_rows.max(1)),
+                );
             }
         }
     }
@@ -512,10 +539,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
     }
     let metadata = fs::metadata(path)?;
     if !metadata.is_file() {
-        return Ok(Preview {
-            lines: Box::new(["Special file; preview unavailable".into()]),
-            ..Preview::default()
-        });
+        return Ok(Preview::message("Special file; preview unavailable"));
     }
     // NONBLOCK closes the metadata/open race with a file replaced by a FIFO.
     let mut file = OpenOptions::new()
@@ -524,10 +548,7 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         .open(path)?;
     let metadata = file.metadata()?;
     if !metadata.is_file() {
-        return Ok(Preview {
-            lines: Box::new(["Special file; preview unavailable".into()]),
-            ..Preview::default()
-        });
+        return Ok(Preview::message("Special file; preview unavailable"));
     }
     let mut bytes =
         Vec::with_capacity(metadata.len().min((PREVIEW_BYTE_LIMIT + 1) as u64) as usize);
@@ -554,30 +575,31 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         _ => None,
     };
     let Some(text) = text.filter(|text| memchr::memchr(0, text.as_bytes()).is_none()) else {
-        return Ok(Preview {
-            lines: Box::new(["Binary or non-UTF-8 file; preview unavailable".into()]),
-            ..Preview::default()
-        });
+        return Ok(Preview::message(
+            "Binary or non-UTF-8 file; preview unavailable",
+        ));
     };
     let mut source = text.split_terminator('\n');
-    let lines = source
-        .by_ref()
-        .take(PREVIEW_LINE_LIMIT)
-        .map(|line| preview_text(line.strip_suffix('\r').unwrap_or(line)))
-        .collect();
+    let mut rendered = String::new();
+    let mut line_offsets = vec![0];
+    for line in source.by_ref().take(PREVIEW_LINE_LIMIT) {
+        preview_text(line.strip_suffix('\r').unwrap_or(line), &mut rendered);
+        line_offsets.push(rendered.len() as u32);
+    }
     truncated |= source.next().is_some();
     Ok(Preview {
-        lines,
+        text: rendered.into_boxed_str(),
+        line_offsets: line_offsets.into_boxed_slice(),
         truncated,
         error: None,
     })
 }
 
-fn preview_text(text: &str) -> String {
+fn preview_text(text: &str, result: &mut String) {
     let Some(first) = text.bytes().position(|byte| !(b' '..=b'~').contains(&byte)) else {
-        return text.to_owned();
+        result.push_str(text);
+        return;
     };
-    let mut result = String::with_capacity(text.len());
     let mut start = 0;
     // The printable ASCII prefix makes first a UTF-8 boundary.
     for (index, ch) in text[first..]
@@ -593,7 +615,6 @@ fn preview_text(text: &str) -> String {
         start = index + ch.len_utf8();
     }
     result.push_str(&text[start..]);
-    result
 }
 
 fn scan(
@@ -729,20 +750,28 @@ fn search_directory(
             if (ascii_pattern || !relative.as_bytes().is_ascii())
                 && let Some(score) = fuzzy_score(&pattern, &relative.to_string_lossy())
             {
-                let item = (Reverse(score), path);
+                let score = Reverse(score);
+                let relative = Path::new(relative);
+                let compare = |current: &(Reverse<i64>, PathBuf)| {
+                    current.0.cmp(&score).then_with(|| {
+                        let current =
+                            OsStr::from_bytes(&current.1.as_os_str().as_bytes()[relative_start..]);
+                        Path::new(current).cmp(relative)
+                    })
+                };
                 let position = if matches.len() == SEARCH_LIMIT
-                    && matches.last().is_some_and(|worst| item >= *worst)
+                    && matches.last().is_some_and(|worst| compare(worst).is_le())
                 {
                     SEARCH_LIMIT
                 } else {
-                    matches.partition_point(|current| *current < item)
+                    matches.partition_point(|current| compare(current).is_lt())
                 };
                 if matches.len() == SEARCH_LIMIT && !scan.truncated {
                     scan.truncated = true;
                     dirty = true;
                 }
                 if position < SEARCH_LIMIT {
-                    matches.insert(position, item);
+                    matches.insert(position, (score, path));
                     matches.truncate(SEARCH_LIMIT);
                     dirty = true;
                 }
@@ -1087,7 +1116,7 @@ mod tests {
         fixture.file("b-dir/other");
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
-        assert!(nav.preview_lines().is_empty());
+        assert!(nav.preview_lines().len() == 0);
         assert!(!nav.preview_loading());
         assert!(nav.enter_selected());
         finish(&mut nav);
@@ -1120,10 +1149,13 @@ mod tests {
         nav.refresh();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
-        assert!(nav.preview_lines().is_empty());
+        assert!(nav.preview_lines().len() == 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
-        assert_eq!(nav.preview_lines(), ["selected contents"]);
+        assert_eq!(
+            nav.preview_lines().collect::<Vec<_>>(),
+            ["selected contents"]
+        );
         nav.focus_list();
         nav.start_search();
         finish(&mut nav);
@@ -1169,19 +1201,22 @@ mod tests {
         fs::write(&path, "\t你好\u{85}\x1b[31m\r\nline\n").unwrap();
         let preview = read_preview(&path, &|| false).unwrap();
         assert_eq!(
-            preview.lines.as_ref(),
+            preview.lines().collect::<Vec<_>>(),
             ["    你好\\u{85}\\u{1b}[31m", "line"]
         );
         assert!(!preview.truncated);
         let many_lines = "line\n".repeat(PREVIEW_LINE_LIMIT + 1);
         fs::write(&path, many_lines).unwrap();
         let preview = read_preview(&path, &|| false).unwrap();
-        assert_eq!(preview.lines.len(), PREVIEW_LINE_LIMIT);
+        assert_eq!(preview.lines().len(), PREVIEW_LINE_LIMIT);
         assert!(preview.truncated);
         let bytes = format!("{}你好", "a".repeat(PREVIEW_BYTE_LIMIT - 1));
         fs::write(&path, bytes).unwrap();
         let preview = read_preview(&path, &|| false).unwrap();
-        assert_eq!(preview.lines[0].len(), PREVIEW_BYTE_LIMIT - 1);
+        assert_eq!(
+            preview.lines().next().unwrap().len(),
+            PREVIEW_BYTE_LIMIT - 1
+        );
         assert!(preview.truncated);
     }
 
@@ -1198,12 +1233,15 @@ mod tests {
         assert_eq!(nav.selected().unwrap().path, fifo);
         assert!(nav.focus_preview());
         finish(&mut nav);
-        assert_eq!(nav.preview_lines(), ["Special file; preview unavailable"]);
+        assert_eq!(
+            nav.preview_lines().collect::<Vec<_>>(),
+            ["Special file; preview unavailable"]
+        );
         assert!(nav.preview_error().is_none());
         nav.move_selection(1);
         finish(&mut nav);
         assert_eq!(
-            nav.preview_lines(),
+            nav.preview_lines().collect::<Vec<_>>(),
             ["Binary or non-UTF-8 file; preview unavailable"]
         );
         let missing = read_preview(&fixture.0.join("missing"), &|| false)
@@ -1226,10 +1264,10 @@ mod tests {
         nav.set_query("中needle".into());
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
-        assert!(nav.preview_lines().is_empty());
+        assert!(nav.preview_lines().len() == 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
-        assert_eq!(nav.preview_lines(), ["new contents"]);
+        assert_eq!(nav.preview_lines().collect::<Vec<_>>(), ["new contents"]);
         assert_eq!(nav.preview_scroll(), 0);
         assert!(nav.preview_error().is_none());
     }

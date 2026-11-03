@@ -17,11 +17,10 @@ fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let (mut directory, mut program, mut config_path) = (None, None, None);
     let mut command = None;
-    let mut gui = false;
+    let mut gui = !cfg!(feature = "tui") && cfg!(feature = "gui");
     let mut positions = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
-            #[cfg(feature = "agent")]
             "--agent-owner" => {
                 nextty::agent::owner::run()?;
                 return Ok(());
@@ -115,6 +114,11 @@ fn run() -> Result<()> {
             "this build has no gui frontend; enable its Cargo feature",
         ));
     }
+    if matches!(command, "new" | "attach") && !gui && !cfg!(feature = "tui") {
+        return Err(Error::msg(
+            "this build has no tui frontend; enable its Cargo feature",
+        ));
+    }
     let socket = remote.is_none().then(workspace::socket_path).transpose()?;
     let connect = || match &remote {
         Some(target) => Client::connect_remote(target.command(), target.label()),
@@ -188,6 +192,7 @@ fn run() -> Result<()> {
     if gui {
         return nextty::WorkspaceView::new(client, config)?.run();
     }
+    #[cfg(feature = "tui")]
     nextty::tui::run(client, config)?;
     Ok(())
 }
@@ -233,7 +238,7 @@ fn help() {
     println!("nextty — terminal\n\nUsage: nextty [OPTIONS] [-e COMMAND [ARG...]]");
 
     println!(
-        "       nextty new [HOST] [NAME] [OPTIONS]\n       nextty attach [HOST] NAME [OPTIONS]\n       nextty list [HOST]\n       nextty terminate [HOST] NAME\n\nDefaults: use the current terminal; --tui selects it explicitly.\nHOST: [user@]host[:port] or ssh://[user@]host[:port]\nUse [IPv6]:port; SSH aliases work as HOST with NAME or ssh://alias."
+        "       nextty new [HOST] [NAME] [OPTIONS]\n       nextty attach [HOST] NAME [OPTIONS]\n       nextty list [HOST]\n       nextty terminate [HOST] NAME\n\nDefaults: use the current terminal when tui is compiled in, otherwise GUI. --tui selects the current terminal explicitly.\nHOST: [user@]host[:port] or ssh://[user@]host[:port]\nUse [IPv6]:port; SSH aliases work as HOST with NAME or ssh://alias."
     );
     #[cfg(feature = "gui")]
     println!("--gui opens a desktop window (Vulkan 1.3).");
@@ -242,27 +247,27 @@ fn help() {
     );
     #[cfg(feature = "gui")]
     println!(
-        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nCtrl+double-click Select a URL, path or quoted object\nShift+PageUp/Down Scroll history\nShift+Home/End    Top/bottom of history\nShift+mouse      Select when an application captures the mouse\nMiddle click     Paste primary selection"
+        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nShift+Home/End    Top/bottom of history\nAlt+mouse        Select/scroll when an application captures the mouse\nMiddle click     Paste primary selection\nRight click      Copy highlighted object; otherwise paste"
     );
 
     println!(
-        "\nWorkspace input:\nAlt+v/s          Split left/right or top/bottom; drag the divider to resize\nAlt+h/j/k/l      Focus a pane\nAlt+,/.          Previous/next tab\nAlt+Enter        New tab\nAlt+q            Detach; workspace keeps running\nAlt+o            Cycle input focus\nAlt+?            Context help\nAlt+/            Find pane output; Enter/ShiftEnter next/previous, Esc restores view\nAlt+p/n          Previous/next prompt\nAlt+c            Copy command output; an existing selection takes precedence\n\nNew unnamed sessions use the lowest available number: 0, 1, 2, ...\nAttach takes control; the previous frontend becomes read-only.\nRemote sessions use system ssh and require nextty on PATH at both ends.\nRemote cwd defaults to remote HOME; relative paths are resolved there."
-    );
-    #[cfg(feature = "agent")]
-    println!(
-        "\nAlt+a            Toggle Agent chat\nDouble-click     Attach object context to chat\nAgent editor: Enter sends, Ctrl+J inserts a newline, Ctrl+A selects all.\nEsc selects an earlier user message; repeat for older, Enter confirms rewind.\nCtrl+C copies a selection or clears the draft; in Agent output it copies a selection or stops the reply."
+        "\nWorkspace input:\nAlt+v/s          Split left/right or top/bottom; drag the divider to resize\nAlt+h/j/k/l      Focus a pane\nAlt+,/.          Previous/next tab\nAlt+Enter        New tab\nAlt+q            Detach; workspace keeps running\nAlt+/            Find pane output; Enter/ShiftEnter next/previous, Esc restores view\nAlt+p/n          Previous/next prompt\nAlt+c            Copy command output; an existing selection takes precedence\n\nNew unnamed sessions use the lowest available number: 0, 1, 2, ...\nAttach takes control; the previous frontend becomes read-only.\nRemote sessions use system ssh and require nextty on PATH at both ends.\nRemote cwd defaults to remote HOME; relative paths are resolved there."
     );
 
     println!(
-        "Alt+m or resource counters open the resizable monitor; Tab/arrows navigate, Enter activates. SSH counters describe the local machine."
+        "\nAlt+a            Toggle Agent chat\nDouble-click     Open highlighted object with xdg-open\nAgent editor: Enter sends, Shift+Enter inserts a newline, Ctrl+A selects all.\nEsc twice enters history; j/k selects, Enter rewinds, Esc leaves history.\nCtrl+C clears input; when empty, stops the Agent. Ctrl+h/j/k/l navigates input and prompt history."
     );
 
     println!(
-        "Alt+f            Files: left tree, l expands/previews, Enter copies path (local sessions)"
+        "Alt+m or resource counters open the resizable monitor; j/k selects controls, l enters, h returns. SSH counters describe the local machine."
+    );
+
+    println!(
+        "Alt+f            Files: left tree, l expands/previews, Enter inserts path (local sessions)"
     );
     println!(
-        "\nCompiled features: gui={}, agent={}",
+        "\nCompiled features: gui={}, tui={}",
         cfg!(feature = "gui"),
-        cfg!(feature = "agent")
+        cfg!(feature = "tui")
     );
 }

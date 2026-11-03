@@ -67,7 +67,6 @@ impl Grid {
     }
 
     /// Clears a recycled grid in place, reallocating only when its size changed.
-    #[cfg(feature = "agent")]
     pub fn reset(&mut self, rect: Rect, foreground: u32, background: u32) {
         if (self.rect.cols, self.rect.rows) != (rect.cols, rect.rows) {
             *self = Self::new(rect, foreground, background);
@@ -84,7 +83,9 @@ impl Grid {
             row.cells.fill(blank);
             row.wrapped = false;
             row.used = 0;
-            row.extras = None;
+            if !row.extras().is_empty() {
+                row.clear_all_extras();
+            }
         }
     }
 
@@ -119,9 +120,8 @@ impl Grid {
         {
             row.cells[end] = blank;
         }
-        row.cells[start..end].fill(blank);
-        if let Some(extras) = &mut row.extras {
-            std::sync::Arc::make_mut(extras).retain(|(column, _)| !(start..end).contains(column));
+        if !row.extras().is_empty() {
+            row.clear_extras(start, end);
         }
         let text = fit_label(text, (end - start) as u16);
         let mut column = start;
@@ -141,6 +141,7 @@ impl Grid {
             }
             column += width;
         }
+        row.cells[column..end].fill(blank);
         row.used = row.used.max(end);
     }
 

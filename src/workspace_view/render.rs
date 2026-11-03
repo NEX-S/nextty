@@ -464,33 +464,6 @@ impl WorkspaceView {
             column += width + 1;
         }
     }
-    pub(super) fn draw_help(&mut self, layout: GuiLayout) -> Result<()> {
-        let columns = (layout.width / self.cell.0).floor() as u16;
-        let lines = (layout.height / self.cell.1).floor() as u16;
-        let cols = columns.saturating_sub(4).min(78);
-        let rows = (self.ui.help_lines().count() as u16 + 4).min(lines.saturating_sub(2));
-        let rect = crate::workspace::Rect {
-            x: (columns - cols) / 2,
-            y: (lines - rows) / 2,
-            cols,
-            rows,
-        };
-        self.renderer.clip(0., 0., layout.width, layout.height)?;
-        self.renderer
-            .rect(0., 0., layout.width, layout.height, 0x00000088, false);
-        let grid = self.ui.help_view(rect, &self.config);
-        self.draw_panel(&grid)?;
-        self.control_hits.push(GuiHit {
-            bounds: (
-                f32::from(rect.x) * self.cell.0,
-                f32::from(rect.y + rows.saturating_sub(1)) * self.cell.1,
-                f32::from(cols) * self.cell.0,
-                self.cell.1,
-            ),
-            action: GuiAction::DismissHelp,
-        });
-        Ok(())
-    }
     pub(super) fn draw_search(&mut self, layout: GuiLayout) -> Result<()> {
         let Some(pane) = self
             .client
@@ -507,13 +480,8 @@ impl WorkspaceView {
         self.renderer.clip(x, y, width, self.cell.1)?;
         self.renderer.rect(x, y, width, self.cell.1, CHROME, false);
         let (label, caret) = self.ui.search.display(&self.preedit, usize::from(columns));
-        self.text.draw(
-            &self.renderer,
-            &fit_label(&label, columns),
-            x + self.cell.0,
-            y,
-            INK,
-        )?;
+        self.text
+            .draw(&self.renderer, &label, x + self.cell.0, y, INK)?;
         self.renderer.rect(x, y, width, 1., BORDER, false);
         self.window.cursor_rect(
             (x + self.cell.0 * (1 + caret.min(usize::from(columns))) as f32) as i32,

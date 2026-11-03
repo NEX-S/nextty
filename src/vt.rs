@@ -359,8 +359,7 @@ impl Parser {
                 self.text(core, &bytes[position..position + length]);
                 position += length;
             } else {
-                self.step(core, bytes[position]);
-                position += 1;
+                position += self.step(core, &bytes[position..]);
             }
         }
         !bytes.is_empty() && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
@@ -496,7 +495,10 @@ impl Parser {
         self.osc = Vec::new();
     }
 
-    fn step(&mut self, core: &mut Core, byte: u8) {
+    // Avoid a call per control byte while allowing OSC payloads to consume whole runs.
+    #[inline(always)]
+    fn step(&mut self, core: &mut Core, bytes: &[u8]) -> usize {
+        let byte = bytes[0];
         if matches!(
             self.state,
             State::Osc | State::OscEscape | State::IgnoreString | State::IgnoreStringEscape
@@ -531,14 +533,16 @@ impl Parser {
                 _ if matches!(self.state, State::OscEscape | State::IgnoreStringEscape) => {
                     self.clear_osc();
                     self.state = State::Escape;
-                    return self.step(core, byte);
+                    return self.step(core, bytes);
                 }
                 _ if self.state == State::Osc && byte >= 0x20 && byte != 0x7f => {
-                    self.osc.push(byte)
+                    let length = text_prefix(bytes);
+                    self.osc.extend_from_slice(&bytes[..length]);
+                    return length;
                 }
                 _ => (),
             }
-            return;
+            return 1;
         }
         if byte < 0x20 || byte == 0x7f {
             if self.utf8_len != 0 {
@@ -555,7 +559,7 @@ impl Parser {
                 }
                 _ => self.control(core, byte),
             }
-            return;
+            return 1;
         }
         match self.state {
             State::Ground => {
@@ -594,6 +598,7 @@ impl Parser {
             State::Csi => self.csi.byte(byte),
             _ => (),
         }
+        1
     }
 
     fn escape(&mut self, core: &mut Core, intermediate: u8, final_byte: u8) {
@@ -665,8 +670,12 @@ impl Parser {
             (0, 0, b'X') => core.erase_chars(count),
             (0, 0, b'b') => {
                 if let Some(c) = self.last_char {
-                    for _ in 0..count {
-                        core.input(c);
+                    if c.is_ascii() && count > 1 {
+                        core.repeat_ascii(c as u8, count);
+                    } else {
+                        for _ in 0..count {
+                            core.input(c);
+                        }
                     }
                 }
             }
@@ -1003,6 +1012,34 @@ mod tests {
     }
 
     #[test]
+    fn repeated_text_matches_literal_text_across_wraps_and_modes() {
+        for mode in [
+            "",
+            "\x1b[4h",
+            "\x1b(0",
+            "\x1b[?7l",
+            "\x1b[31;48;5;42;58;5;3;4m",
+        ] {
+            for count in [0, 1, 2, 63, 64, 65, 140, 300] {
+                let setup = format!("\x1b[?1049h中\u{301}abc\r\nold text\x1b[H{mode}q");
+                let (mut expected, mut literal) = terminal();
+                literal.advance(&mut expected, setup.as_bytes());
+                literal.advance(&mut expected, "q".repeat(count.max(1)).as_bytes());
+                let (mut core, mut parser) = terminal();
+                parser.advance(&mut core, setup.as_bytes());
+                parser.advance(&mut core, format!("\x1b[{count}b").as_bytes());
+                assert_eq!(core.cursor(), expected.cursor(), "{mode:?} {count}");
+                for row in 0..core.screen_lines() {
+                    assert_eq!(core.row(row).cells, expected.row(row).cells);
+                    assert_eq!(core.row(row).extras(), expected.row(row).extras());
+                    assert_eq!(core.row(row).used(), expected.row(row).used());
+                    assert_eq!(core.row(row).wrapped, expected.row(row).wrapped);
+                }
+            }
+        }
+    }
+
+    #[test]
     fn bulk_text_scanning_preserves_utf8_and_control_boundaries() {
         let mut input = "0123456789abcdef中文λ→\x7fG\r\n\x1b[31mabcdefghijklmnop\tZ\x08Q\x1b[0m\r\ncombining e\u{301}".as_bytes().to_vec();
         input.extend_from_slice(b"\xfftail\0\x1b[6n");
@@ -1025,6 +1062,30 @@ mod tests {
             assert_eq!(core.mode(), expected.mode());
             assert_eq!(core.history_size(), expected.history_size());
             assert_eq!(replies(&mut core), expected_replies);
+        }
+    }
+
+    #[test]
+    fn bulk_osc_preserves_payloads_and_control_boundaries_at_every_split() {
+        let input = b"\x1b]2;0123456789abcdef\0\t\r\n\x7f\xe4\xb8\xad\xff\x07\x1b]52;c;YWFhYWFhYWFh\x1b\\\x1b]2;cancelled\x18\x1b]2;also cancelled\x1a\x1b]2;interrupted\x1b[2J\x1b]2;final\x1b\\X";
+        for split in 0..=input.len() {
+            let (mut core, mut parser) = terminal();
+            parser.advance(&mut core, &input[..split]);
+            parser.advance(&mut core, &input[split..]);
+            let events = core.take_events();
+            assert!(
+                matches!(
+                    events.as_slice(),
+                    [Event::Title(Some(title)), Event::ClipboardStore { primary: false, text }, Event::Title(Some(last))]
+                        if title == "0123456789abcdef中\u{fffd}"
+                            && text == "aaaaaaaaa"
+                            && last == "final"
+                ),
+                "split {split}: {events:?}"
+            );
+            assert_eq!(core.row(0).cells[1].c, 'X', "split {split}");
+            assert_eq!(parser.state, State::Ground);
+            assert!(parser.osc.is_empty());
         }
     }
 

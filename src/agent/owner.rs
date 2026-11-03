@@ -127,7 +127,9 @@ impl Session {
                         return Err(error);
                     }
                 };
-                self.sent_context.insert(turn, basket);
+                if !basket.is_empty() {
+                    self.sent_context.insert(turn, basket);
+                }
                 self.rewind_restore = None;
                 self.failed_send = None;
                 Ok(())
@@ -149,12 +151,6 @@ impl Session {
             let items = self.sent_context.remove(&turn).unwrap_or_default();
             self.rewind_restore = Some((turn, input, items));
         }
-        self.sent_context.retain(|turn, _| {
-            self.model
-                .messages
-                .iter()
-                .any(|message| message.turn == *turn)
-        });
         Ok(())
     }
 
@@ -171,6 +167,12 @@ impl Session {
             let prefix_bytes = self.published.get(start).map_or(0, |(_, length)| *length);
             (start, prefix_bytes)
         } else {
+            self.sent_context.retain(|turn, _| {
+                self.model
+                    .messages
+                    .iter()
+                    .any(|message| message.turn == *turn)
+            });
             (0, 0)
         };
         let patch = AgentModelPatch {
@@ -202,7 +204,10 @@ impl Session {
         };
         self.published
             .resize_with(self.model.messages.len(), Default::default);
-        for ((role, length), message) in self.published.iter_mut().zip(&self.model.messages) {
+        for ((role, length), message) in self.published[start..]
+            .iter_mut()
+            .zip(&self.model.messages[start..])
+        {
             role.clone_from(&message.role);
             *length = message.text.len();
         }

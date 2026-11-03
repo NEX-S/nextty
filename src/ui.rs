@@ -1,9 +1,7 @@
 use crate::files::FileNav;
 use crate::input::keysym;
-use crate::panel::mix_color;
 use crate::workspace::{Action, Axis, Direction, PaneId};
 
-#[cfg(feature = "agent")]
 use crate::agent::panel::AgentPanel;
 use crate::monitor::Monitor;
 use crate::search::Search;
@@ -61,10 +59,8 @@ pub(crate) struct Ui {
     pub status: Option<(String, Instant)>,
     pub focus: Focus,
     pub close_prompt: Option<ClosePrompt>,
-    pub help: bool,
-    pub help_scroll: usize,
     pub search: Search,
-    #[cfg(feature = "agent")]
+
     pub agent: AgentPanel,
 
     pub resources: Monitor,
@@ -76,12 +72,7 @@ pub(crate) struct Ui {
 
 impl Ui {
     pub fn panel_state(&self) -> impl PartialEq + use<> {
-        (
-            self.resources.open,
-            self.files_open,
-            #[cfg(feature = "agent")]
-            self.agent.open,
-        )
+        (self.resources.open, self.files_open, self.agent.open)
     }
 
     pub fn new() -> io::Result<Self> {
@@ -89,10 +80,8 @@ impl Ui {
             status: None,
             focus: Focus::Terminal,
             close_prompt: None,
-            help: false,
-            help_scroll: 0,
             search: Search::default(),
-            #[cfg(feature = "agent")]
+
             agent: AgentPanel::default(),
 
             resources: Monitor::new()?,
@@ -114,7 +103,7 @@ impl Ui {
 
     pub fn input_target(&self) -> Option<crate::input::PasteTarget> {
         use crate::input::PasteTarget;
-        #[cfg(feature = "agent")]
+
         if self.agent.active().context.preview.is_some() {
             return Some(PasteTarget::Agent(self.agent.active().id));
         }
@@ -124,7 +113,7 @@ impl Ui {
         if self.resources.open && self.focus == Focus::Monitor {
             return Some(PasteTarget::Monitor);
         }
-        #[cfg(feature = "agent")]
+
         if self.agent.open && self.focus.is_agent() {
             return Some(PasteTarget::Agent(self.agent.active().id));
         }
@@ -139,7 +128,7 @@ impl Ui {
         use crate::input::PasteTarget;
         match self.input_target()? {
             PasteTarget::Monitor if !self.resources.searching => None,
-            #[cfg(feature = "agent")]
+
             PasteTarget::Agent(_)
                 if self.focus != Focus::Editor || self.agent.active().context.preview.is_some() =>
             {
@@ -169,7 +158,7 @@ impl Ui {
             return Ok(KeyResult::Handled);
         }
         let (control, shift, paste) = (key.control(), key.shift(), key.paste());
-        #[cfg(feature = "agent")]
+
         if let Some(result) = self.agent_key_input(client, &key, viewport)? {
             return Ok(result);
         }
@@ -264,8 +253,14 @@ impl Ui {
                 keysym::RETURN | keysym::KP_ENTER => {
                     if let Some(entry) = files.selected() {
                         let path = entry.path.to_string_lossy().into_owned();
-                        self.message("Copied file path");
-                        return Ok(KeyResult::Copy(path, false));
+                        if let Some(pane) = client.snapshot().and_then(|view| view.focused_pane()) {
+                            client.send(Action::Input {
+                                pane: pane.id,
+                                data: path.into_bytes(),
+                            })?;
+                            self.focus = Focus::Terminal;
+                        }
+                        return Ok(KeyResult::Handled);
                     }
                 }
                 0x2f if shortcut.is_some() => files.start_search(),
@@ -298,7 +293,7 @@ impl Ui {
                     files.insert_query(text);
                 }
             }
-            #[cfg(feature = "agent")]
+
             PasteTarget::Agent(id) => {
                 if let Err(error) = self.agent.insert(id, text) {
                     self.message(error);
@@ -316,7 +311,6 @@ impl Ui {
                 .as_ref()
                 .filter(|_| self.files_open)
                 .map_or(-1, FileNav::fd),
-            #[cfg(feature = "agent")]
             self.agent.layout_fd(),
         ]
         .into_iter()
@@ -423,161 +417,6 @@ impl Ui {
             .take_if(|(_, until)| Instant::now() >= *until)
             .is_some()
     }
-    pub fn cycle_focus(&mut self, reverse: bool) {
-        let targets = [
-            self.files_open.then_some(Focus::Files),
-            Some(Focus::Terminal),
-            #[cfg(feature = "agent")]
-            self.agent.open.then_some(Focus::Editor),
-            #[cfg(feature = "agent")]
-            self.agent.open.then_some(Focus::Output),
-            self.resources.open.then_some(Focus::Monitor),
-        ];
-        let mut targets = targets.iter().flatten();
-        let count = targets.clone().count();
-        let index = targets
-            .clone()
-            .position(|target| *target == self.focus)
-            .unwrap_or(0);
-        self.focus = *targets
-            .nth((index + if reverse { count - 1 } else { 1 }) % count)
-            .unwrap();
-    }
-
-    pub fn help_view(
-        &mut self,
-        rect: crate::workspace::Rect,
-        config: &crate::config::Config,
-    ) -> crate::panel::Grid {
-        let background = mix_color(config.foreground, config.background, 9);
-        let muted = mix_color(config.foreground, config.background, 176);
-        let mut grid = crate::panel::Grid::new(rect, config.foreground, background);
-        let columns = rect.cols.saturating_sub(4);
-        grid.text(
-            rect.x + 2,
-            rect.y,
-            columns,
-            "Keyboard shortcuts",
-            config.foreground,
-            background,
-        );
-        let count = usize::from(rect.rows.saturating_sub(4));
-        self.help_scroll = self
-            .help_scroll
-            .min(self.help_lines().count().saturating_sub(count));
-        for (row, line) in self
-            .help_lines()
-            .skip(self.help_scroll)
-            .take(count)
-            .enumerate()
-        {
-            let y = rect.y + 2 + row as u16;
-            if let Some((key, description)) = line.split_once("  ") {
-                let key_width = 16.min(columns);
-                grid.text(
-                    rect.x + 2,
-                    y,
-                    key_width,
-                    key.trim(),
-                    crate::panel::ACCENT,
-                    background,
-                );
-                grid.text(
-                    rect.x + 2 + key_width,
-                    y,
-                    columns.saturating_sub(key_width),
-                    description.trim(),
-                    muted,
-                    background,
-                );
-            } else if !line.is_empty() {
-                grid.text(rect.x + 2, y, columns, line, config.foreground, background);
-            }
-        }
-        grid.text(
-            rect.x + 2,
-            rect.y + rect.rows.saturating_sub(1),
-            columns,
-            "↑↓ scroll   Esc close",
-            muted,
-            background,
-        );
-        grid
-    }
-
-    pub fn help_lines(&self) -> impl Clone + Iterator<Item = &'static str> + use<> {
-        [
-            (
-                self.focus == Focus::Files,
-                &[
-                    "Files",
-                    "Enter          Copy selected absolute path",
-                    "/              Filter filenames",
-                    "l / Right      Expand directory / preview file",
-                    "h / Left       Collapse directory / go to parent",
-                    "Esc            Close preview, search, then tree",
-                    "",
-                ][..],
-            ),
-            (
-                self.focus == Focus::Monitor,
-                &[
-                    "Monitor",
-                    "Tab/Shift+Tab  Monitor controls",
-                    "Arrows / hjkl  Navigate; Enter activates",
-                    "/              Filter processes",
-                    "Esc            Leave filter, then close monitor",
-                    "",
-                ][..],
-            ),
-            #[cfg(feature = "agent")]
-            (
-                self.focus.is_agent(),
-                &[
-                    "Agent",
-                    "Tab/Shift+Tab  Agent input / output / controls",
-                    "Enter / Space  Activate selected control",
-                    "Ctrl+Space     Attach selection / visible screen",
-                    "Enter          Send draft; Ctrl+J inserts newline",
-                    "Ctrl+C         Copy selection; otherwise stop while busy",
-                    "Esc            Select previous user message; repeat for older",
-                    "Enter          Confirm selected rewind; click input to cancel",
-                    "",
-                ][..],
-            ),
-            (
-                self.focus == Focus::Terminal,
-                &[
-                    "Terminal",
-                    "Alt+p / Alt+n  Previous / next command",
-                    "Alt+c          Copy command output",
-                    "Alt+/          Find in this pane",
-                    "",
-                ][..],
-            ),
-            (
-                true,
-                &[
-                    "Workspace",
-                    "Alt+v / Alt+s  Split left-right / top-bottom",
-                    "Alt+h/j/k/l    Focus pane",
-                    "Alt+, / Alt+.  Previous / next tab",
-                    "Alt+Enter      New tab",
-                    "Alt+o          Cycle input focus",
-                    "Alt+m          System monitor",
-                    "Alt+f          Files",
-                    #[cfg(feature = "agent")]
-                    "Alt+a          Agent input",
-                    "Alt+q          Detach; keep workspace running",
-                    "Alt+?          Help",
-                ][..],
-            ),
-        ]
-        .into_iter()
-        .filter(|(visible, _)| *visible)
-        .flat_map(|(_, lines)| lines.iter().copied())
-    }
-
     pub fn toggle_monitor(&mut self) {
         self.resources.toggle();
 
@@ -593,18 +432,18 @@ impl Ui {
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Focus {
     Terminal,
-    #[cfg(feature = "agent")]
+
     Editor,
-    #[cfg(feature = "agent")]
+
     Output,
-    #[cfg(feature = "agent")]
+
     Controls,
 
     Monitor,
 
     Files,
 }
-#[cfg(feature = "agent")]
+
 impl Focus {
     pub fn is_agent(self) -> bool {
         matches!(self, Self::Editor | Self::Output | Self::Controls)

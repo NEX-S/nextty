@@ -187,16 +187,15 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
         background,
     );
     let error = files.preview_error().map(ToString::to_string);
+    let mut lines = files.preview_lines().skip(files.preview_scroll());
     for row in 0..rect.rows.saturating_sub(2) {
+        let line = lines.next();
         let (text, color) = match (row, files.preview_loading(), error.as_deref()) {
             (0, true, _) => ("Loading…", muted),
             (0, _, Some(error)) => (error, 0xe87575),
-            (0, false, None) if files.preview_lines().is_empty() => ("Empty file", muted),
-            _ => match files
-                .preview_lines()
-                .get(files.preview_scroll() + usize::from(row))
-            {
-                Some(text) => (text.as_str(), config.foreground),
+            (0, false, None) if files.preview_lines().len() == 0 => ("Empty file", muted),
+            _ => match line {
+                Some(text) => (text, config.foreground),
                 None => break,
             },
         };
@@ -214,9 +213,9 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
         rect.y + rect.rows.saturating_sub(1),
         columns,
         if files.preview_truncated() {
-            "Preview truncated · Esc close · Enter copy path"
+            "Preview truncated · Esc close · Enter insert path"
         } else {
-            "Esc close · Enter copy path"
+            "Esc close · Enter insert path"
         },
         muted,
         background,
@@ -235,7 +234,7 @@ mod tests {
         let directory =
             std::env::temp_dir().join(format!("nextty-file-grid-{}", std::process::id()));
         std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("中.txt"), "hello 中文\n").unwrap();
+        std::fs::write(directory.join("中.txt"), "hello 中文\nsecond\nthird\n").unwrap();
         let mut files = FileNav::new(directory.clone()).unwrap();
         let finish = |files: &mut FileNav| {
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -316,6 +315,23 @@ mod tests {
                 .map(|cell| cell.c)
                 .collect::<String>()
                 .contains("hello")
+        );
+        files.scroll(1, 1);
+        let scrolled = super::preview(
+            &files,
+            Rect {
+                rows: 3,
+                ..preview.rect
+            },
+            &config,
+        );
+        assert!(
+            scrolled.rows[1]
+                .cells
+                .iter()
+                .map(|cell| cell.c)
+                .collect::<String>()
+                .contains("second")
         );
         drop(files);
         std::fs::remove_dir_all(directory).unwrap();

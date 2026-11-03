@@ -23,6 +23,7 @@ mod shell_integration;
 
 pub mod system_stats;
 
+#[cfg(feature = "tui")]
 pub mod tui;
 
 mod wire;
@@ -49,8 +50,6 @@ mod file_panel;
 mod panel;
 mod ui;
 
-#[cfg(any(feature = "gui", feature = "agent"))]
 mod context;
 
-#[cfg(feature = "agent")]
 pub mod agent;

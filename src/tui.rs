@@ -3,7 +3,6 @@
 #[path = "tui_input.rs"]
 mod input;
 
-#[cfg(feature = "agent")]
 use crate::agent::panel::{AgentAction, AgentLine, editor};
 use crate::clipboard_reader::ClipboardReader;
 use crate::config::Config;
@@ -149,7 +148,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
         let mut output_ready = true;
         frontend.poll()?;
         while frontend.running {
-            #[cfg(feature = "agent")]
             {
                 let (changed, _) = frontend
                     .ui
@@ -310,7 +308,7 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
         }
         Ok(())
     })();
-    #[cfg(feature = "agent")]
+
     if frontend.client.snapshot().is_some() {
         frontend
             .ui
@@ -411,6 +409,9 @@ fn braille_trend(
         };
         let x = ((1. - age / seconds).clamp(0., 1.) * (columns * 2 - 1) as f32).round() as usize;
         let y = ((1. - value / maximum).clamp(0., 1.) * (rows * 4 - 1) as f32).round() as usize;
+        if previous == Some((x, y)) {
+            continue;
+        }
         let (from_x, from_y) = previous.unwrap_or((x, y));
         let count = from_x.abs_diff(x).max(from_y.abs_diff(y)).max(1);
         for step in 0..=count {
@@ -469,7 +470,7 @@ struct Frontend {
     clipboard_reader: Option<ClipboardReader>,
     copy_pending: bool,
     pointer: Option<(u16, u16)>,
-    #[cfg(feature = "agent")]
+
     agent: agent_ui::AgentState,
 }
 
@@ -488,7 +489,7 @@ impl Frontend {
             header: Vec::new(),
             ui: Ui::new()?,
             config,
-            #[cfg(feature = "agent")]
+
             agent: agent_ui::AgentState {
                 dirty: true,
                 ..Default::default()
@@ -529,7 +530,7 @@ impl Frontend {
             return 0;
         }
         let available = self.size.num_cols;
-        #[cfg(feature = "agent")]
+
         let available = if self.ui.agent.open {
             available.saturating_sub(self.agent_width())
         } else {
@@ -560,7 +561,7 @@ impl Frontend {
 
     fn view_size(&self) -> WindowSize {
         let size = self.size;
-        #[cfg(feature = "agent")]
+
         let size = if self.ui.agent.open {
             WindowSize {
                 num_cols: size.num_cols.saturating_sub(self.agent_width()),
@@ -635,7 +636,6 @@ impl Frontend {
                 usize::from(rect.rows.saturating_sub(2)),
             );
         } else {
-            #[cfg(feature = "agent")]
             if self.ui.agent.open && self.ui.focus.is_agent() {
                 let rect = editor(&self.ui, self.agent_rect()).0;
                 viewport = (
@@ -661,14 +661,13 @@ impl Frontend {
             KeyResult::Copy(text, cut) => {
                 let copied = self.copy_text(text, false);
                 if copied && cut {
-                    #[cfg(feature = "agent")]
                     self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
                 }
             }
             KeyResult::Paste => self.message("Paste with your host terminal's shortcut"),
             KeyResult::Text | KeyResult::Handled => (),
         }
-        #[cfg(feature = "agent")]
+
         {
             self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));
         }
@@ -708,7 +707,7 @@ impl Frontend {
             self.ui.paste(&mut self.client, target, &text)?;
             self.dirty = true;
             self.resource_dirty = true;
-            #[cfg(feature = "agent")]
+
             {
                 self.agent.dirty = true;
             }
@@ -967,7 +966,7 @@ impl Frontend {
     }
 
     fn draw_active_cursor(&self, output: &mut Vec<u8>) -> io::Result<()> {
-        if self.ui.help || self.ui.close_prompt.is_some() {
+        if self.ui.close_prompt.is_some() {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         if self.ui.search.open {
@@ -983,7 +982,7 @@ impl Frontend {
         {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.open {
             if self.ui.focus.is_agent() {
                 output.write_all(b"\x1b[?1l\x1b>")?;
@@ -1050,7 +1049,6 @@ impl Frontend {
 
     fn event(&mut self, event: ClientEvent) -> io::Result<()> {
         match event {
-            ClientEvent::AgentUpdated => {}
             ClientEvent::Updated => {
                 if self.ui.search.open {
                     self.ui.search.observe(&mut self.client)?;
@@ -1161,7 +1159,7 @@ impl Frontend {
             self.dirty = true;
             return Ok(());
         }
-        #[cfg(feature = "agent")]
+
         {
             if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
                 self.ui.cancel_rewind();
@@ -1172,16 +1170,10 @@ impl Frontend {
                 self.running = false;
                 return Ok(());
             }
-            if self.ui.help {
-                self.ui.help = false;
-                self.dirty = true;
-                return Ok(());
-            }
             if matches!(
                 key,
                 b'a' | b'f'
                     | b'm'
-                    | b'o'
                     | b'v'
                     | b's'
                     | b'h'
@@ -1199,16 +1191,6 @@ impl Frontend {
                 self.ui.search.close(&mut self.client)?;
             }
             match key {
-                b'?' => {
-                    self.ui.help = true;
-                    self.ui.help_scroll = 0;
-                    self.dirty = true;
-                    return Ok(());
-                }
-                b'o' => {
-                    self.ui.cycle_focus(false);
-                    return self.resize();
-                }
                 b'/' => {
                     if let Some(pane) = self.focused() {
                         self.ui.search.begin(&mut self.client, pane)?;
@@ -1216,7 +1198,7 @@ impl Frontend {
                     self.dirty = true;
                     return Ok(());
                 }
-                #[cfg(feature = "agent")]
+
                 b'a' => {
                     self.ui.toggle_agent();
                     return self.resize();
@@ -1234,23 +1216,6 @@ impl Frontend {
                 self.ui.focus = Focus::Terminal;
                 return Ok(());
             }
-        }
-        if self.ui.help {
-            match &event {
-                Input::Escape => self.ui.help = false,
-                Input::Bytes(bytes) => match bytes.as_slice() {
-                    b"\x1b[A" | b"k" => self.ui.help_scroll = self.ui.help_scroll.saturating_sub(1),
-                    b"\x1b[B" | b"j" => self.ui.help_scroll = self.ui.help_scroll.saturating_add(1),
-                    b"\x1b[5~" => self.ui.help_scroll = self.ui.help_scroll.saturating_sub(8),
-                    b"\x1b[6~" | b" " => {
-                        self.ui.help_scroll = self.ui.help_scroll.saturating_add(8)
-                    }
-                    _ => (),
-                },
-                _ => (),
-            }
-            self.dirty = true;
-            return Ok(());
         }
         if self.ui.input_target().is_some() {
             match &event {
@@ -1307,7 +1272,6 @@ impl Frontend {
                 }
             }
             Input::Mouse(mouse) => {
-                #[cfg(feature = "agent")]
                 if self.ui.agent.active().context.preview.is_some()
                     || self.agent.selecting_editor
                     || self.ui.agent.active().selecting()
@@ -1333,7 +1297,7 @@ impl Frontend {
                 if !mouse.release && mouse.code & 0b1110_0011 == 0 {
                     self.ui.focus = Focus::Terminal;
                 }
-                #[cfg(feature = "agent")]
+
                 if self.agent_mouse(mouse)? {
                     return Ok(());
                 }
@@ -1442,6 +1406,7 @@ impl Frontend {
     }
 
     fn mouse(&mut self, mouse: Mouse) -> io::Result<()> {
+        let old_object = self.hovered_object();
         let old_hover = self.hovered_block();
         let previous = self.pointer.replace((mouse.column, mouse.row));
         if previous != self.pointer && (mouse.row == 0 || previous.is_some_and(|(_, row)| row == 0))
@@ -1451,6 +1416,20 @@ impl Frontend {
         if old_hover != self.hovered_block() {
             self.damage_block(old_hover);
             self.damage_block(self.hovered_block());
+        }
+        let object = self.hovered_object();
+        if old_object != object {
+            for (pane, object) in old_object.iter().chain(object.iter()) {
+                let screen = &self.client.screens()[pane];
+                let view = self.client.snapshot().unwrap().pane(*pane).unwrap();
+                for line in object.range.start.line..=object.range.end.line {
+                    let row = line + screen.display_offset() as i32 + i32::from(view.rect.y);
+                    if let Some(damage) = self.damage.get_mut(row as usize) {
+                        *damage = true;
+                    }
+                }
+            }
+            self.dirty = true;
         }
         if let Some(drag) = self.split_drag {
             if mouse.release {
@@ -1545,10 +1524,6 @@ impl Frontend {
         };
         let mode = screen.mode();
         let offset = screen.display_offset();
-        let output_block = screen
-            .row_output(view, usize::from(y))
-            .map(|block| block.id);
-        let selected_pane = self.client.selected_pane();
         let x = usize::from(physical_x).min(screen.columns().saturating_sub(1)) as u16;
         if !self.controller() {
             return Ok(());
@@ -1556,8 +1531,11 @@ impl Frontend {
         if !mouse.release && mouse.code & 0b1100_0011 == 0 && self.focused() != Some(pane) {
             self.client.send(Action::Focus(pane))?;
         }
-        #[cfg(feature = "agent")]
-        if !mouse.release && mouse.code & 0b1110_0011 == 0 && mouse.code & 16 == 0 {
+
+        if !mouse.release
+            && mouse.code & 0b1110_0011 == 0
+            && (!mode.intersects(Mode::MOUSE_MODE) || mouse.code & 8 != 0)
+        {
             let point = Point {
                 line: i32::from(y) - offset as i32,
                 column: usize::from(x),
@@ -1579,12 +1557,24 @@ impl Frontend {
                     .get(&pane)
                     .and_then(|screen| crate::context::object_at(screen, point))
             {
-                self.ui.attach_object(&self.client, pane, object);
-                return self.resize();
+                let mut command = std::process::Command::new("xdg-open");
+                command.arg(&object.text);
+                if !self.client.is_remote()
+                    && let Some(cwd) = self
+                        .client
+                        .snapshot()
+                        .and_then(|snapshot| snapshot.pane(pane))
+                        .and_then(|pane| pane.cwd.as_ref())
+                {
+                    command.current_dir(cwd);
+                }
+                let mut child = command.spawn()?;
+                std::thread::spawn(move || child.wait());
+                return Ok(());
             }
         }
 
-        if mode.intersects(Mode::MOUSE_MODE) && mouse.code & 4 == 0 {
+        if mode.intersects(Mode::MOUSE_MODE) && mouse.code & 8 == 0 {
             if mouse.code & 32 != 0
                 && !mode.contains(Mode::MOUSE_MOTION)
                 && (!mode.contains(Mode::MOUSE_DRAG) || mouse.code & 3 == 3)
@@ -1602,7 +1592,7 @@ impl Frontend {
             }
         } else if mouse.code & 64 != 0 && !mouse.release {
             let up = mouse.code & 1 == 0;
-            if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) {
+            if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && mouse.code & 8 == 0 {
                 let bytes = if up { b"\x1b[A" } else { b"\x1b[B" }.to_vec();
                 self.send_input(pane, cursor_bytes(bytes, mode))?;
             } else {
@@ -1612,22 +1602,10 @@ impl Frontend {
                 })?;
             }
         } else if mouse.code & 3 == 2 && mouse.code & 32 == 0 && !mouse.release {
-            if self.copy_pending || self.clipboard.is_some() {
-                self.message("Clipboard transfer already in progress");
-                return Ok(());
-            }
-            let action = if let Some(pane) = selected_pane {
-                Some(Action::CopySelection { pane, request: 0 })
+            if let Some((_, object)) = self.hovered_object() {
+                self.copy_text(object.text, false);
             } else {
-                output_block.map(|block| Action::CopyBlock {
-                    pane,
-                    block,
-                    request: 0,
-                })
-            };
-            if let Some(action) = action {
-                self.client.send(action)?;
-                self.copy_pending = true;
+                self.message("Paste with your host terminal's shortcut");
             }
         } else if mouse.code & 3 == 0 {
             let point = Point {
@@ -1650,11 +1628,7 @@ impl Frontend {
                     pane,
                     point,
                     side: Side::Left,
-                    kind: if mouse.code & 16 != 0 {
-                        SelectionType::Object
-                    } else {
-                        SelectionType::Simple
-                    },
+                    kind: SelectionType::Simple,
                 })?;
             }
         }
@@ -1685,18 +1659,6 @@ impl Frontend {
         self.dirty = true;
     }
 
-    fn help_rect(&self) -> Rect {
-        let cols = self.size.num_cols.saturating_sub(4).min(78);
-        let rows =
-            (self.ui.help_lines().count() as u16 + 4).min(self.size.num_lines.saturating_sub(2));
-        Rect {
-            x: (self.size.num_cols - cols) / 2,
-            y: (self.size.num_lines - rows) / 2,
-            cols,
-            rows,
-        }
-    }
-
     fn close_rect(&self) -> Rect {
         let cols = self.size.num_cols.saturating_sub(4).min(64);
         let rows = 7.min(self.size.num_lines.saturating_sub(2));
@@ -1720,7 +1682,7 @@ impl Frontend {
         {
             overlays.push(self.file_preview_rect());
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.active().context.preview.is_some() {
             overlays.push(Rect {
                 x: 0,
@@ -1737,9 +1699,6 @@ impl Frontend {
                 rows: 1,
             });
         }
-        if self.ui.help {
-            overlays.push(self.help_rect());
-        }
         if self.ui.close_prompt.is_some() {
             overlays.push(self.close_rect());
         }
@@ -1751,6 +1710,17 @@ impl Frontend {
             }
             self.overlays = overlays;
         }
+    }
+
+    fn hovered_object(&self) -> Option<(PaneId, crate::context::Object)> {
+        let (x, y) = self.pointer?;
+        let pane = self.client.snapshot()?.pane_at(x, y)?;
+        let screen = self.client.screens().get(&pane.id)?;
+        let point = Point {
+            line: i32::from(y - pane.rect.y) - screen.display_offset() as i32,
+            column: usize::from(x - pane.rect.x),
+        };
+        crate::context::object_at(screen, point).map(|object| (pane.id, object))
     }
 
     fn hovered_block(&self) -> Option<(PaneId, u64)> {
@@ -1790,6 +1760,7 @@ impl Frontend {
             output.truncate(start);
         }
         let hovered = self.hovered_block();
+        let object = self.hovered_object();
         for pane in &snapshot.panes {
             if let Some(screen) = self.client.screens().get(&pane.id) {
                 let rows = screen
@@ -1815,7 +1786,13 @@ impl Frontend {
                         pane,
                         row,
                         size.num_cols + self.file_width(),
-                        highlight,
+                        (
+                            highlight,
+                            object
+                                .as_ref()
+                                .filter(|(id, _)| *id == pane.id)
+                                .map(|(_, object)| object.range),
+                        ),
                         self.file_width(),
                     )?;
                 }
@@ -1848,7 +1825,7 @@ impl Frontend {
             self.draw_resources(output)?;
             self.resource_dirty = false;
         }
-        #[cfg(feature = "agent")]
+
         if self.ui.agent.open
             && (self.full || self.agent.dirty || self.damage.iter().any(|dirty| *dirty))
         {
@@ -1882,11 +1859,6 @@ impl Frontend {
                 self.config.foreground,
                 crate::panel::CHROME,
             )?;
-        }
-        if self.ui.help {
-            self.ui
-                .help_view(self.help_rect(), &self.config)
-                .ansi(output, None, &[])?;
         }
         if let Some(prompt) = self.ui.close_prompt {
             let rect = self.close_rect();
@@ -2203,9 +2175,10 @@ fn draw_row(
     pane: &PaneView,
     row: usize,
     host_columns: u16,
-    highlight: bool,
+    highlight: (bool, Option<crate::core::SelectionRange>),
     left: u16,
 ) -> io::Result<()> {
+    let (highlight, object) = highlight;
     let mut rect = pane.rect;
     rect.x += left;
     if rect.x >= host_columns {
@@ -2246,8 +2219,9 @@ fn draw_row(
         if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
             continue;
         }
-        let selected = !cell.flags.contains(Flags::PROMPT)
-            && selection.is_some_and(|selection| selection.contains(Point { line, column }));
+        let selected = object.is_some_and(|range| range.contains(Point { line, column }))
+            || !cell.flags.contains(Flags::PROMPT)
+                && selection.is_some_and(|selection| selection.contains(Point { line, column }));
         let style = (cell.fg, cell.bg, cell.flags & Flags::TEXT_STYLE, selected);
         if previous != Some(style) {
             let mut fg = screen.color(cell.fg);
@@ -2343,17 +2317,18 @@ fn draw_separators(
             && pane.rect.y <= size.num_lines
             && (full || damage[usize::from(pane.rect.y - 1)])
         {
-            write!(
-                output,
-                "\x1b[{};{}H{}",
-                pane.rect.y,
-                pane.rect.x + left + 1,
-                "─".repeat(usize::from(
-                    pane.rect
-                        .cols
-                        .min(size.num_cols.saturating_sub(pane.rect.x))
-                ))
-            )?;
+            write!(output, "\x1b[{};{}H", pane.rect.y, pane.rect.x + left + 1)?;
+            let mut bytes = usize::from(
+                pane.rect
+                    .cols
+                    .min(size.num_cols.saturating_sub(pane.rect.x)),
+            ) * "─".len();
+            const RULE: &[u8] = "────────────────────────────────".as_bytes();
+            while bytes != 0 {
+                let count = bytes.min(RULE.len());
+                output.write_all(&RULE[..count])?;
+                bytes -= count;
+            }
         }
     }
     Ok(())
@@ -2446,7 +2421,7 @@ fn fit_text(output: &mut Vec<u8>, text: &str, columns: u16) {
 }
 
 // A multiple of three keeps intermediate base64 chunks unpadded.
-const OSC52_CHUNK_SIZE: usize = 3072;
+const OSC52_CHUNK_SIZE: usize = 48 * 1024;
 
 enum ClipboardSource {
     File,
@@ -2508,7 +2483,6 @@ impl ClipboardTransfer {
     }
 }
 
-#[cfg(feature = "agent")]
 mod agent_ui;
 #[cfg(test)]
 mod tests;

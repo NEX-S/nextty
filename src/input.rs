@@ -91,7 +91,7 @@ impl Key<'_> {
 pub(crate) enum PasteTarget {
     Search,
     Monitor,
-    #[cfg(feature = "agent")]
+
     Agent(u64),
     Pane {
         pane: crate::workspace::PaneId,
@@ -145,11 +145,14 @@ impl TextDecoder {
 }
 
 pub(crate) fn without_controls(text: &str) -> Cow<'_, str> {
-    if text.chars().any(char::is_control) {
-        Cow::Owned(text.chars().filter(|ch| !ch.is_control()).collect())
-    } else {
-        Cow::Borrowed(text)
-    }
+    let mut chars = text.chars();
+    let Some(control) = chars.find(|ch| ch.is_control()) else {
+        return Cow::Borrowed(text);
+    };
+    let start = text.len() - chars.as_str().len() - control.len_utf8();
+    let mut filtered = text[..start].to_owned();
+    filtered.extend(chars.filter(|ch| !ch.is_control()));
+    Cow::Owned(filtered)
 }
 
 pub(crate) fn character_key(ch: char) -> (u32, u32) {
@@ -157,7 +160,7 @@ pub(crate) fn character_key(ch: char) -> (u32, u32) {
         '\0' => (32, CONTROL),
         '\t' => (keysym::TAB, 0),
         '\r' => (keysym::RETURN, 0),
-        '\u{8}' | '\u{7f}' => (keysym::BACKSPACE, 0),
+        '\u{7f}' => (keysym::BACKSPACE, 0),
         '\u{1b}' => (keysym::ESCAPE, 0),
         '\u{1}'..='\u{1a}' => (u32::from(ch) + u32::from('a') - 1, CONTROL),
         _ => (u32::from(ch), 0),
@@ -338,15 +341,20 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
         });
         return data;
     }
-    let mut data = Vec::with_capacity(text.len() + 12);
-    data.extend_from_slice(b"\x1b[200~");
-    let text = text.as_bytes();
+
     // Control-heavy text stays on the scalar filter to avoid repeated searches.
     const CHUNK: usize = 256;
     let split = text
+        .as_bytes()
         .chunks(CHUNK)
         .position(|chunk| chunk.contains(&b'\r') || chunk.contains(&0x1b))
         .map_or(text.len(), |chunk| chunk * CHUNK);
+    if split == text.len() {
+        return bracketed_plain(text.into_bytes());
+    }
+    let mut data = Vec::with_capacity(text.len() + 12);
+    data.extend_from_slice(b"\x1b[200~");
+    let text = text.as_bytes();
     let (plain, text) = text.split_at(split);
     data.extend_from_slice(plain);
     let mut start = 0;
@@ -357,6 +365,19 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
         }
     }
     data.extend_from_slice(&text[start..]);
+    data.extend_from_slice(b"\x1b[201~");
+    data
+}
+
+#[cfg(feature = "gui")]
+// Keep buffer shifting out of the newline-normalization path.
+#[inline(never)]
+fn bracketed_plain(mut data: Vec<u8>) -> Vec<u8> {
+    let length = data.len();
+    data.reserve_exact(12);
+    data.resize(length + 6, 0);
+    data.copy_within(..length, 6);
+    data[..6].copy_from_slice(b"\x1b[200~");
     data.extend_from_slice(b"\x1b[201~");
     data
 }

@@ -20,6 +20,7 @@ typedef struct {
     hb_font_t *hb;
     FcCharSet *charset; /* Borrowed from the style's font set; NULL excludes a candidate. */
     int color;
+    hb_codepoint_t blank_glyph;
 } Font;
 
 typedef struct {
@@ -189,6 +190,7 @@ static Font *load_font(NtFonts *f, Style *s, int index) {
                       (int)llround(size * yscale * 1024));
     hb_font_set_synthetic_slant(font->hb, (float)slant);
     cairo_ft_scaled_font_unlock_face(cairo);
+    font->blank_glyph = HB_CODEPOINT_INVALID;
     font->cairo = cairo;
     return font;
 failed:
@@ -384,8 +386,10 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         hb_script_t script = HB_SCRIPT_LATIN;
         int boundary = 1;
         if (!printable_ascii) {
-            bytes = utf8proc_iterate((const uint8_t *)text + byte, (ptrdiff_t)(length - byte), &decoded);
-            if (bytes < 0) { fail(f, "Cannot decode terminal text: %s", utf8proc_errmsg(bytes)); goto failed; }
+            if (decoded >= 0x80) {
+                bytes = utf8proc_iterate((const uint8_t *)text + byte, (ptrdiff_t)(length - byte), &decoded);
+                if (bytes < 0) { fail(f, "Cannot decode terminal text: %s", utf8proc_errmsg(bytes)); goto failed; }
+            }
             script = hb_unicode_script(unicode, (uint32_t)decoded);
             if (script != HB_SCRIPT_COMMON && script != HB_SCRIPT_INHERITED && script != HB_SCRIPT_UNKNOWN) previous = script;
             else script = previous;
@@ -461,7 +465,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         /* The terminal column map uses UTF-8 byte offsets. */
         if (!printable_ascii)
             for (unsigned j = 0; j < shaped; ++j) info[j].cluster = chars[info[j].cluster].byte;
-        hb_codepoint_t blank_glyph = HB_CODEPOINT_INVALID;
+        hb_codepoint_t blank_glyph = font->blank_glyph;
         for (unsigned j = 0; j < shaped; ++j) {
             size_t offset = info[j].cluster;
             size_t column = columns ? columns[offset] : offset;
@@ -500,6 +504,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
             }
             pen += positions[j].x_advance / 1024.0;
         }
+        font->blank_glyph = blank_glyph;
         start = end;
     }
     *glyphs = out;

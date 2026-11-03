@@ -10,28 +10,26 @@ pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
     let mut output = vec![0; quartets.len() * 3];
     let mut length = output.len();
     let (decoded, _) = output.as_chunks_mut::<3>();
-    for (index, (&[a, b, c, d], bytes)) in quartets.iter().zip(decoded.iter_mut()).enumerate() {
-        let last = index + 1 == quartets.len();
-        let a = digit(a)?;
-        let b = digit(b)?;
-        bytes[0] = a << 2 | b >> 4;
-        match (c, d) {
-            (b'=', b'=') if last && b & 15 == 0 => length -= 2,
-            (c, b'=') if last => {
-                let c = digit(c)?;
-                if c & 3 != 0 {
-                    return None;
-                }
-                bytes[1] = b << 4 | c >> 2;
-                length -= 1;
+    for (index, (&quartet, bytes)) in quartets.iter().zip(decoded.iter_mut()).enumerate() {
+        let [a, b, mut c, mut d] = quartet.map(digit);
+        if a | b | c | d == u8::MAX {
+            if index + 1 != quartets.len() || a | b == u8::MAX {
+                return None;
             }
-            (c, d) => {
-                let c = digit(c)?;
-                let d = digit(d)?;
-                bytes[1] = b << 4 | c >> 2;
-                bytes[2] = c << 6 | d;
+            match (quartet[2], quartet[3]) {
+                (b'=', b'=') if b & 15 == 0 => {
+                    c = 0;
+                    d = 0;
+                    length -= 2;
+                }
+                (_, b'=') if c != u8::MAX && c & 3 == 0 => {
+                    d = 0;
+                    length -= 1;
+                }
+                _ => return None,
             }
         }
+        *bytes = [a << 2 | b >> 4, b << 4 | c >> 2, c << 6 | d];
     }
     output.truncate(length);
     String::from_utf8(output).ok()
@@ -65,7 +63,7 @@ pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
     }
 }
 
-fn digit(byte: u8) -> Option<u8> {
+fn digit(byte: u8) -> u8 {
     const TABLE: [u8; 256] = {
         let mut table = [u8::MAX; 256];
         let mut index = 0;
@@ -75,8 +73,7 @@ fn digit(byte: u8) -> Option<u8> {
         }
         table
     };
-    let value = TABLE[byte as usize];
-    (value != u8::MAX).then_some(value)
+    TABLE[byte as usize]
 }
 
 #[cfg(test)]

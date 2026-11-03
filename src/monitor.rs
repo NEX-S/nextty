@@ -3,7 +3,9 @@ use crate::system_stats::{Process, ResourceTrend, SystemStats};
 use crate::width::{fit_label, scalar_width, text_width};
 use std::{borrow::Cow, io};
 
-pub(crate) use crate::panel::{ACCENT as GREEN, BACKGROUND, INK, MUTED};
+#[cfg(feature = "tui")]
+pub(crate) use crate::panel::BACKGROUND;
+pub(crate) use crate::panel::{ACCENT as GREEN, INK, MUTED};
 pub(crate) const PURPLE: u32 = 0xb3a2ca;
 
 pub(crate) fn series_color(name: &str) -> u32 {
@@ -179,6 +181,7 @@ pub(crate) struct Monitor {
     pub height: u16,
     pub focus: Action,
     pub searching: bool,
+    selecting_control: bool,
     pub dragging: bool,
     pub tab: u8,
     pub scroll: usize,
@@ -203,6 +206,7 @@ impl Monitor {
             height: 18,
             focus: Action::Tab(0),
             searching: false,
+            selecting_control: true,
             dragging: false,
             tab: 0,
             scroll: 0,
@@ -300,6 +304,7 @@ impl Monitor {
         self.open = !self.open;
         self.pointer = None;
         self.searching = false;
+        self.selecting_control = true;
         if self.open && self.focus == Action::Close {
             self.focus = Action::Tab(self.tab);
         }
@@ -319,6 +324,7 @@ impl Monitor {
     pub fn action(&mut self, action: Action) {
         self.searching = false;
         self.focus = action;
+        self.selecting_control = false;
         self.reveal = true;
         match action {
             Action::Close => {
@@ -381,7 +387,9 @@ impl Monitor {
             .selected
             .filter(|identity| processes.iter().any(|p| (p.pid, p.start) == *identity));
         let query = self.query.to_lowercase();
+        let ascii_query = query.is_ascii();
         let numeric = query.bytes().all(|byte| byte.is_ascii_digit());
+        let mut number = String::new();
         self.process_order.clear();
         self.process_order.extend(
             processes
@@ -391,16 +399,15 @@ impl Monitor {
                     query.is_empty()
                         || if p.name.is_ascii() {
                             // comm names are short; compare ASCII without a lowercase allocation.
-                            p.name
-                                .as_bytes()
-                                .windows(query.len())
-                                .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
+                            ascii_query
+                                && p.name
+                                    .as_bytes()
+                                    .windows(query.len())
+                                    .any(|part| part.eq_ignore_ascii_case(query.as_bytes()))
                         } else {
                             p.name.to_lowercase().contains(&query)
                         }
-                        || numeric
-                            && (p.pid.to_string().contains(&query)
-                                || p.uid.to_string().contains(&query))
+                        || numeric && matches_process_number(p, &query, &mut number)
                 })
                 .map(|(index, _)| index),
         );
@@ -465,6 +472,7 @@ impl Monitor {
     }
     fn cycle(&mut self, backwards: bool) {
         self.searching = false;
+        self.selecting_control = true;
         let controls = self.controls();
         let current = controls
             .iter()
@@ -570,6 +578,9 @@ impl Monitor {
             return;
         }
         match symbol {
+            0x68 => self.selecting_control = true,
+            0x6c => self.action(self.focus),
+            0x6a | 0x6b if self.selecting_control => self.cycle(symbol == 0x6b),
             keysym::RETURN | 0x20 => self.action(self.focus),
             keysym::UP | keysym::DOWN | keysym::PAGE_UP | keysym::PAGE_DOWN | 0x6a | 0x6b => {
                 let delta: isize = match symbol {
@@ -591,8 +602,8 @@ impl Monitor {
                     _ => self.scroll = self.scroll.saturating_add_signed(delta),
                 }
             }
-            keysym::LEFT | keysym::RIGHT | 0x68 | 0x6c => {
-                let forward = matches!(symbol, keysym::RIGHT | 0x6c);
+            keysym::LEFT | keysym::RIGHT => {
+                let forward = symbol == keysym::RIGHT;
                 if matches!(self.focus, Action::Tab(_)) && forward {
                     self.focus = self
                         .controls()
@@ -1051,7 +1062,9 @@ impl Monitor {
         }
         for mut plot in body.plots {
             plot.y += offset;
-            view.plots.push(plot);
+            if plot.y < i32::from(height) && plot.y + i32::from(plot.height) > 0 {
+                view.plots.push(plot);
+            }
         }
         for mut hit in body.hits {
             let fixed = hit.y < pinned;
@@ -1277,6 +1290,7 @@ fn process_columns(width: u16, sort: u8) -> ([(u8, &'static str, u16); 5], usize
 
 fn process_row(p: &Process, width: u16, columns: &[(u8, &str, u16)]) -> String {
     let mut row = String::with_capacity(usize::from(width));
+    row.push(' ');
     for (index, &(id, _, cells)) in columns.iter().enumerate() {
         if index > 0 {
             row.push(' ');
@@ -1301,7 +1315,20 @@ fn process_row(p: &Process, width: u16, columns: &[(u8, &str, u16)]) -> String {
             usize::from(cells).saturating_sub(text_width(&value)),
         ));
     }
-    format!(" {} ", fit_label(&row, width.saturating_sub(2)))
+    row.truncate(row.trim_end().len());
+    row.push(' ');
+    row
+}
+
+// Keep numeric formatting out of the text-filtering loop.
+#[inline(never)]
+fn matches_process_number(process: &Process, query: &str, number: &mut String) -> bool {
+    use std::fmt::Write;
+    [process.pid, process.uid].into_iter().any(|id| {
+        number.clear();
+        write!(number, "{id}").unwrap();
+        number.contains(query)
+    })
 }
 
 #[cfg(test)]
@@ -1427,6 +1454,17 @@ mod tests {
         let mut monitor = Monitor::new().unwrap();
         monitor.toggle();
         monitor.view(80, 18);
+        monitor.key(u32::from('j'), "j", false);
+        assert_eq!(monitor.focus, Action::Tab(1));
+        assert_eq!(monitor.tab, 0);
+        monitor.key(u32::from('l'), "l", false);
+        assert_eq!(monitor.tab, 1);
+        monitor.key(u32::from('h'), "h", false);
+        monitor.key(u32::from('k'), "k", false);
+        assert_eq!(monitor.focus, Action::Tab(0));
+        assert_eq!(monitor.tab, 1);
+        monitor.key(u32::from('l'), "l", false);
+        assert_eq!(monitor.tab, 0);
         monitor.key(keysym::TAB, "", false);
         assert_eq!(monitor.focus, Action::Tab(1));
         monitor.key(keysym::RETURN, "", false);
@@ -1494,6 +1532,23 @@ mod tests {
                         .all(|hit| hit.x + hit.width <= width && (0..10).contains(&hit.y))
                 );
             }
+        }
+        monitor.action(Action::Tab(0));
+        for (scroll, expected) in [
+            (0, vec![(2, "CPU")]),
+            (7, vec![(2, "MEMORY")]),
+            (10, vec![(-1, "MEMORY"), (6, "READ")]),
+        ] {
+            monitor.scroll = scroll;
+            assert_eq!(
+                monitor
+                    .view(40, 8)
+                    .plots
+                    .iter()
+                    .map(|plot| (plot.y, plot.series[0].name))
+                    .collect::<Vec<_>>(),
+                expected
+            );
         }
     }
 }

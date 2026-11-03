@@ -71,7 +71,6 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
         self.notification.as_raw_fd()
     }
 
-    #[cfg(any(feature = "agent", test))]
     pub fn ready(&self, matches: impl FnOnce(&Output) -> bool) -> bool {
         let state = self.shared.0.lock().unwrap();
         state.closed || state.result.as_ref().is_some_and(matches)

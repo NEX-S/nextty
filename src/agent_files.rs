@@ -1,4 +1,4 @@
-use std::fs::{self, File, Metadata, OpenOptions, Permissions};
+use std::fs::{self, File, FileType, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -57,16 +57,27 @@ pub(crate) fn execute(
     check_canceled(canceled)?;
     match operation {
         FileOperation::Read { offset } => {
-            let mut file = open_regular(&path)?;
+            let (mut file, metadata) = open_regular(&path)?;
             file.seek(SeekFrom::Start(offset))?;
-            let bytes = read_bounded(&mut file, READ_LIMIT + 1, canceled)?;
-            let end = bytes.len().min(READ_LIMIT);
-            let text = match std::str::from_utf8(&bytes[..end]) {
+            let mut bytes = read_bounded(
+                &mut file,
+                metadata.len().saturating_sub(offset),
+                READ_LIMIT + 1,
+                canceled,
+            )?;
+            let available = bytes.len();
+            bytes.truncate(READ_LIMIT);
+            let text = match String::from_utf8(bytes) {
                 Ok(text) => text,
-                Err(error) if bytes.len() > end && error.error_len().is_none() => {
-                    std::str::from_utf8(&bytes[..error.valid_up_to()]).unwrap()
+                Err(error) => {
+                    let invalid = error.utf8_error();
+                    if available <= READ_LIMIT || invalid.error_len().is_some() {
+                        return Err(io::Error::new(io::ErrorKind::InvalidData, invalid));
+                    }
+                    let mut bytes = error.into_bytes();
+                    bytes.truncate(invalid.valid_up_to());
+                    String::from_utf8(bytes).unwrap()
                 }
-                Err(error) => return Err(io::Error::new(io::ErrorKind::InvalidData, error)),
             };
             if text.contains('\0') {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, "binary file"));
@@ -74,9 +85,9 @@ pub(crate) fn execute(
             Ok(FileResult::Read {
                 path,
                 offset,
-                text: text.to_owned(),
                 next_offset: offset + text.len() as u64,
-                has_more: bytes.len() > text.len(),
+                has_more: available > text.len(),
+                text,
             })
         }
         FileOperation::Search { query } => {
@@ -85,7 +96,8 @@ pub(crate) fn execute(
             let mut truncated = false;
             search(
                 &path,
-                &query,
+                None,
+                &memchr::memmem::Finder::new(query.as_bytes()),
                 &mut matches,
                 &mut remaining,
                 &mut truncated,
@@ -100,12 +112,11 @@ pub(crate) fn execute(
         FileOperation::Edit { old_text, new_text } => {
             if let Some(old_text) = old_text {
                 let target = fs::canonicalize(&path)?;
-                let mut file = open_regular(&target)?;
-                let metadata = file.metadata()?;
+                let (mut file, metadata) = open_regular(&target)?;
                 if metadata.len() > FILE_LIMIT as u64 {
                     return Err(io::Error::other("file exceeds 8 MiB edit limit"));
                 }
-                let bytes = read_bounded(&mut file, FILE_LIMIT + 1, canceled)?;
+                let bytes = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, canceled)?;
                 if bytes.len() > FILE_LIMIT {
                     return Err(io::Error::other("file exceeds 8 MiB edit limit"));
                 }
@@ -114,17 +125,15 @@ pub(crate) fn execute(
                 if text.contains('\0') {
                     return Err(io::Error::new(io::ErrorKind::InvalidData, "binary file"));
                 }
-                let Some(start) = text.find(&old_text) else {
+                let Some(start) = memchr::memmem::find(text.as_bytes(), old_text.as_bytes()) else {
                     return Err(io::Error::other("old_text was not found"));
                 };
-                if text.rfind(&old_text) != Some(start) {
+                if memchr::memmem::rfind(text.as_bytes(), old_text.as_bytes()) != Some(start) {
                     return Err(io::Error::other("old_text occurs more than once"));
                 }
-                let mut replacement = text.to_owned();
-                replacement.replace_range(start..start + old_text.len(), &new_text);
                 let staged = stage(
                     &target,
-                    &replacement,
+                    &[&text[..start], &new_text, &text[start + old_text.len()..]],
                     Some(metadata.permissions()),
                     canceled,
                 )?;
@@ -132,7 +141,7 @@ pub(crate) fn execute(
                 check_canceled(canceled)?;
                 fs::rename(&staged.0, &target)?;
             } else {
-                let staged = stage(&path, &new_text, None, canceled)?;
+                let staged = stage(&path, &[&new_text], None, canceled)?;
                 check_canceled(canceled)?;
                 fs::hard_link(&staged.0, &path)?;
             }
@@ -152,31 +161,34 @@ fn check_canceled(canceled: &AtomicBool) -> io::Result<()> {
     }
 }
 
-fn open_regular(path: &Path) -> io::Result<File> {
+fn open_regular(path: &Path) -> io::Result<(File, Metadata)> {
     let file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
         .open(path)?;
-    if !file.metadata()?.is_file() {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "not a regular file",
         ));
     }
-    Ok(file)
+    Ok((file, metadata))
 }
 
-fn read_bounded(file: &mut File, limit: usize, canceled: &AtomicBool) -> io::Result<Vec<u8>> {
-    let mut bytes = Vec::with_capacity(file.metadata()?.len().min(limit as u64) as usize);
+fn read_bounded(
+    file: &mut File,
+    size: u64,
+    limit: usize,
+    canceled: &AtomicBool,
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size.min(limit as u64) as usize);
     let mut file = file.take(limit as u64);
-    let mut buffer = [0; 8192];
     loop {
         check_canceled(canceled)?;
-        let count = file.read(&mut buffer)?;
-        if count == 0 {
+        if file.by_ref().take(64 * 1024).read_to_end(&mut bytes)? < 64 * 1024 {
             break;
         }
-        bytes.extend_from_slice(&buffer[..count]);
     }
     check_canceled(canceled)?;
     Ok(bytes)
@@ -184,35 +196,56 @@ fn read_bounded(file: &mut File, limit: usize, canceled: &AtomicBool) -> io::Res
 
 fn search(
     path: &Path,
-    query: &str,
+    kind: Option<FileType>,
+    finder: &memchr::memmem::Finder<'_>,
     matches: &mut Vec<FileMatch>,
     remaining: &mut usize,
     truncated: &mut bool,
     canceled: &AtomicBool,
 ) -> io::Result<bool> {
     check_canceled(canceled)?;
-    let kind = fs::symlink_metadata(path)?.file_type();
+    let kind = match kind {
+        Some(kind) if !kind.is_dir() => kind,
+        // A sorted directory entry may have been replaced with a symlink.
+        _ => fs::symlink_metadata(path)?.file_type(),
+    };
     if kind.is_dir() {
         let mut entries = Vec::new();
         for entry in fs::read_dir(path)? {
             check_canceled(canceled)?;
-            entries.push(entry?.path());
+            let entry = entry?;
+            entries.push((entry.path(), entry.file_type()?));
         }
-        entries.sort();
-        for entry in entries {
-            if search(&entry, query, matches, remaining, truncated, canceled)? {
+        entries.sort_unstable_by(|a, b| a.0.as_os_str().cmp(b.0.as_os_str()));
+        for (entry, kind) in entries {
+            if search(
+                &entry,
+                Some(kind),
+                finder,
+                matches,
+                remaining,
+                truncated,
+                canceled,
+            )? {
                 return Ok(true);
             }
         }
     } else if kind.is_file() || (kind.is_symlink() && fs::metadata(path)?.is_file()) {
-        let mut file = open_regular(path)?;
-        if file.metadata()?.len() > FILE_LIMIT as u64 {
+        let (mut file, metadata) = open_regular(path)?;
+        if metadata.len() > FILE_LIMIT as u64 {
             *truncated = true;
             return Ok(false);
         }
-        let bytes = read_bounded(&mut file, FILE_LIMIT + 1, canceled)?;
+        let bytes = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, canceled)?;
         if bytes.len() > FILE_LIMIT {
             *truncated = true;
+            return Ok(false);
+        }
+        if finder.needle().contains(&b'\n') {
+            return Ok(false);
+        }
+        let mut first_match = finder.find(&bytes);
+        if first_match.is_none() {
             return Ok(false);
         }
         let Ok(text) = std::str::from_utf8(&bytes) else {
@@ -221,11 +254,21 @@ fn search(
         if text.contains('\0') {
             return Ok(false);
         }
-        for (line, text) in text.split_terminator('\n').enumerate() {
+        let mut offset = 0;
+        let mut line = 1;
+        while offset < text.len() {
             check_canceled(canceled)?;
-            let Some(found) = text.find(query) else {
-                continue;
+            let Some(found) = first_match.take().or_else(|| finder.find(&bytes[offset..])) else {
+                break;
             };
+            let found = offset + found;
+            let skipped = &bytes[offset..found];
+            line += memchr::memchr_iter(b'\n', skipped).count() as u64;
+            let start = memchr::memrchr(b'\n', skipped).map_or(offset, |end| offset + end + 1);
+            let end = memchr::memchr(b'\n', &bytes[found..]).map_or(bytes.len(), |end| found + end);
+            let text = &text[start..end];
+            let found = found - start;
+            offset = end + 1;
             if matches.len() == MATCH_LIMIT || *remaining == 0 {
                 *truncated = true;
                 return Ok(true);
@@ -242,9 +285,10 @@ fn search(
             *remaining -= end - start;
             matches.push(FileMatch {
                 path: path.to_owned(),
-                line: line as u64 + 1,
+                line,
                 text: text[start..end].to_owned(),
             });
+            line += 1;
         }
     }
     Ok(false)
@@ -260,7 +304,7 @@ impl Drop for StagedFile {
 
 fn stage(
     target: &Path,
-    text: &str,
+    parts: &[&str],
     permissions: Option<Permissions>,
     canceled: &AtomicBool,
 ) -> io::Result<StagedFile> {
@@ -279,9 +323,11 @@ fn stage(
         .mode(if permissions.is_some() { 0o600 } else { 0o666 })
         .open(&path)?;
     let staged = StagedFile(path);
-    for bytes in text.as_bytes().chunks(8192) {
-        check_canceled(canceled)?;
-        file.write_all(bytes)?;
+    for part in parts {
+        for bytes in part.as_bytes().chunks(64 * 1024) {
+            check_canceled(canceled)?;
+            file.write_all(bytes)?;
+        }
     }
     if let Some(permissions) = permissions {
         file.set_permissions(permissions)?;
@@ -296,8 +342,26 @@ fn check_unchanged(
     bytes: &[u8],
     canceled: &AtomicBool,
 ) -> io::Result<()> {
-    let mut current = open_regular(target)?;
-    let current_bytes = read_bounded(&mut current, FILE_LIMIT + 1, canceled)?;
+    let (current, opened) = open_regular(target)?;
+    let mut current = current.take((FILE_LIMIT + 1) as u64);
+    let mut buffer = vec![0; opened.len().clamp(1, 64 * 1024) as usize];
+    let mut offset = 0;
+    let equal = loop {
+        check_canceled(canceled)?;
+        let length = match current.read(&mut buffer) {
+            Ok(length) => length,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if length == 0 {
+            break offset == bytes.len();
+        }
+        if bytes.get(offset..offset + length) != Some(&buffer[..length]) {
+            break false;
+        }
+        offset += length;
+    };
+    check_canceled(canceled)?;
     let metadata = fs::metadata(target)?;
     let version = |metadata: &Metadata| {
         (
@@ -310,10 +374,7 @@ fn check_unchanged(
             metadata.ctime_nsec(),
         )
     };
-    if fs::canonicalize(path)? != target
-        || version(original) != version(&metadata)
-        || current_bytes != bytes
-    {
+    if fs::canonicalize(path)? != target || version(original) != version(&metadata) || !equal {
         return Err(io::Error::other("file changed during edit"));
     }
     Ok(())
@@ -423,6 +484,32 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn search_rechecks_directories_before_recursing() {
+        let directory = Directory::new();
+        let target = Directory::new();
+        fs::write(target.0.join("text"), "needle").unwrap();
+        let path = directory.0.join("entry");
+        fs::create_dir(&path).unwrap();
+        let kind = fs::symlink_metadata(&path).unwrap().file_type();
+        fs::remove_dir(&path).unwrap();
+        symlink(&target.0, &path).unwrap();
+        let mut matches = Vec::new();
+        let mut remaining = READ_LIMIT;
+        let mut truncated = false;
+        search(
+            &path,
+            Some(kind),
+            &memchr::memmem::Finder::new(b"needle"),
+            &mut matches,
+            &mut remaining,
+            &mut truncated,
+            &AtomicBool::new(false),
+        )
+        .unwrap();
+        assert!(matches.is_empty());
     }
 
     #[test]
@@ -544,12 +631,41 @@ mod tests {
             );
             assert_eq!(fs::read_to_string(&path).unwrap(), "aaa\n");
         }
-        let mut file = open_regular(&path).unwrap();
-        let metadata = file.metadata().unwrap();
-        let original = read_bounded(&mut file, FILE_LIMIT + 1, &canceled).unwrap();
+        let (mut file, metadata) = open_regular(&path).unwrap();
+        let original = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, &canceled).unwrap();
         fs::write(&path, "bbb\n").unwrap();
         assert!(check_unchanged(&path, &path, &metadata, &original, &canceled).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "bbb\n");
+    }
+
+    #[test]
+    fn edit_content_comparison_checks_late_changes_and_length() {
+        let directory = Directory::new();
+        let path = directory.0.join("text");
+        let original = vec![b'x'; 128 * 1024 + 3];
+        let canceled = AtomicBool::new(false);
+        fs::write(&path, &original).unwrap();
+        let metadata = fs::metadata(&path).unwrap();
+        check_unchanged(&path, &path, &metadata, &original, &canceled).unwrap();
+        let mut changed = original.clone();
+        for index in [0, 64 * 1024 - 1, 64 * 1024, original.len() - 1] {
+            changed[index] = b'y';
+            fs::write(&path, &changed).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            assert_eq!(
+                check_unchanged(&path, &path, &metadata, &original, &canceled)
+                    .unwrap_err()
+                    .to_string(),
+                "file changed during edit"
+            );
+            changed[index] = b'x';
+        }
+        for length in [original.len() - 1, original.len() + 1] {
+            changed.resize(length, b'x');
+            fs::write(&path, &changed).unwrap();
+            let metadata = fs::metadata(&path).unwrap();
+            assert!(check_unchanged(&path, &path, &metadata, &original, &canceled).is_err());
+        }
     }
 
     #[test]

@@ -107,20 +107,27 @@ impl Screen {
                 let previous = &self.rows[*index];
                 previous.used() != row.used()
                     || previous.wrapped != row.wrapped
-                    || previous
-                        .cells_with_extras(0..previous.used())
-                        .zip(row.cells_with_extras(0..row.used()))
-                        .any(|((_, old, old_extra), (_, new, new_extra))| {
+                    || previous.cells[..previous.used()]
+                        .iter()
+                        .zip(&row.cells)
+                        .any(|(old, new)| {
                             let flags = Flags::HIDDEN | Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
                             old.flags & flags != new.flags & flags
-                                || (!old.flags.contains(Flags::HIDDEN)
-                                    && (old.c != new.c
-                                        || old_extra
-                                            .map_or(&[][..], |extra| extra.zerowidth.as_slice())
-                                            != new_extra.map_or(&[][..], |extra| {
-                                                extra.zerowidth.as_slice()
-                                            })))
+                                || (!old.flags.contains(Flags::HIDDEN) && old.c != new.c)
                         })
+                    || {
+                        let [old, new] = [previous, row].map(|row| {
+                            row.extras()
+                                .iter()
+                                .take_while(|(column, _)| *column < row.used())
+                                .filter(|(column, extra)| {
+                                    !extra.zerowidth.is_empty()
+                                        && !row.cells[*column].flags.contains(Flags::HIDDEN)
+                                })
+                                .map(|(column, extra)| (column, &extra.zerowidth))
+                        });
+                        !old.eq(new)
+                    }
             })
     }
 
@@ -326,6 +333,15 @@ fn activity_compares_text_independently_of_render_damage_and_colors() {
     assert!(!screen.changes_activity(&update));
     update.cursor.1 = CursorShape::Hidden;
     assert!(screen.changes_activity(&update));
+    let mut update = Update::capture_live(&core);
+    screen.apply(update.clone()).unwrap();
+    update.rows[0].1.extra_mut(2).underline_color = Some(Color::Indexed(1));
+    assert!(!screen.changes_activity(&update));
+    update.rows[0].1.extra_mut(2).zerowidth.clear();
+    assert!(screen.changes_activity(&update));
+    screen.rows[0].cells[2].flags.insert(Flags::HIDDEN);
+    update.rows[0].1.cells[2].flags.insert(Flags::HIDDEN);
+    assert!(!screen.changes_activity(&update));
 }
 
 #[test]

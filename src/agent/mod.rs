@@ -270,17 +270,19 @@ impl Agent {
         for event in events {
             changed |= !matches!(event, Event::Request(_));
             match event {
+                Event::ResetText => {
+                    if let Some(index) = self.response.take() {
+                        self.messages.remove(index);
+                        self.revision += 1;
+                    }
+                }
                 Event::Text(text) => {
-                    let index = *self.response.get_or_insert_with(|| {
-                        self.messages.push(AgentMessage {
-                            turn: self.turn,
-                            role: "Agent".into(),
-                            text: String::new(),
-                            id: None,
-                        });
-                        self.messages.len() - 1
-                    });
-                    self.messages[index].text.push_str(&text);
+                    if let Some(index) = self.response {
+                        self.messages[index].text.push_str(&text);
+                    } else {
+                        self.response = Some(self.messages.len());
+                        self.message("Agent", text);
+                    }
                 }
                 Event::Tool {
                     id,

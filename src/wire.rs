@@ -530,12 +530,12 @@ impl Peer {
                     file.as_raw_fd(),
                 )
             } else {
-                let count = if self.output.len() > 1 && bytes.len() < 64 * 1024 {
+                let count = if self.output.len() > 1 {
                     let mut vectors = [libc::iovec {
                         iov_base: std::ptr::null_mut(),
                         iov_len: 0,
                     }; 64];
-                    let mut remaining = budget.min(64 * 1024);
+                    let mut remaining = budget;
                     let mut count = 0;
                     for packet in self.output.iter().take(vectors.len()) {
                         if packet.file.is_some() {
@@ -1958,7 +1958,13 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
             Arc::new(decode_process(d)?)
         } else {
             previous
-                .and_then(|snapshot| snapshot.pane(id))
+                .and_then(|snapshot| {
+                    snapshot
+                        .panes
+                        .get(panes.len())
+                        .filter(|pane| pane.id == id)
+                        .or_else(|| snapshot.pane(id))
+                })
                 .map(|pane| Arc::clone(&pane.process))
                 .ok_or_else(|| invalid("pane process metadata has no prior snapshot"))?
         };
