@@ -1,28 +1,64 @@
-use crate::core::{Flags, Mode};
+use crate::core::Mode;
 use crate::screen::Screen;
+use crate::workspace::Client;
 use serde_json::{Value, json};
+use std::io;
 
-pub(crate) fn shape(screen: &Screen) -> Value {
+/// The model's view of a pane: identity, processes, viewport and shell state.
+pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> {
+    let snapshot = client
+        .snapshot()
+        .ok_or_else(|| io::Error::other("No workspace"))?;
+    let view = snapshot
+        .panes
+        .iter()
+        .find(|view| view.id == pane)
+        .ok_or_else(|| io::Error::other("Pane no longer exists in this tab"))?;
+    let screen = client
+        .screens()
+        .get(&pane)
+        .ok_or_else(|| io::Error::other("No screen for pane"))?;
+    Ok(json!({
+        "target": {
+            "workspace": snapshot.name,
+            "pane": pane,
+            "tab": snapshot.active_tab,
+            "connection": if client.is_remote() { "ssh" } else { "local" },
+            "ssh_target": client.remote_target(),
+            "writable": client.can_agent_input(),
+            "title": view.title,
+            "cwd": view.cwd,
+            "process": {
+                "launch_argv": view.process.launch_argv,
+                "child_pid": view.process.child_pid,
+                "foreground_pgid": view.process.foreground_pgid,
+                "foreground_pid": view.process.foreground_pid,
+                "foreground_scope": "pty_process_group_leader",
+                "foreground_executable": view.process.foreground_executable,
+                "foreground_argv": view.process.foreground_argv,
+                "foreground_cwd": view.process.foreground_cwd,
+                "sampled_at_ms": view.process.sampled_at_ms,
+                "unavailable": view.process.unavailable,
+            },
+            "symbols": {"availability": "unknown"},
+        },
+        "screen": shape(screen),
+        "command_blocks": view.command_blocks.iter().rev().map(|b| json!({
+            "id":b.id,"has_output":b.has_output,"exit_code":b.status,
+            "output_incomplete":!b.complete,
+        })).collect::<Vec<_>>(),
+        "history_rows": screen.history,
+        "input_generation": view.input_generation,
+        "shell_prompt": view.shell_prompt,
+    }))
+}
+
+fn shape(screen: &Screen) -> Value {
     let mut rows = Vec::new();
     let mut omitted = Vec::<Value>::new();
     for (index, row) in screen.rows.iter().enumerate() {
         let mut text = String::new();
-        for (_, cell, extra) in row.cells_with_extras(0..row.used()) {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                continue;
-            }
-            if cell.flags.contains(Flags::HIDDEN) {
-                text.push(' ');
-                if cell.flags.contains(Flags::WIDE_CHAR) {
-                    text.push(' ');
-                }
-            } else {
-                text.push(cell.c);
-                if let Some(extra) = extra {
-                    text.extend(&extra.zerowidth);
-                }
-            }
-        }
+        crate::context::push_text(&mut text, row, 0..row.used());
         let text = text.trim_end_matches(' ');
         let reason = if text.is_empty() {
             Some("blank")
