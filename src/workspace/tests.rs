@@ -562,10 +562,9 @@ impl TestServer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::current_dir().unwrap().join(format!(
-            "target/workspace-server/test-{}-{stamp}",
-            std::process::id()
-        ));
+        // The socket path must fit sockaddr_un even in a deeply nested checkout.
+        let directory =
+            std::env::temp_dir().join(format!("nextty-test-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let home = directory.join("home");
