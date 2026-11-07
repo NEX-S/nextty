@@ -130,32 +130,6 @@ pub enum CursorShape {
     Hidden,
 }
 
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Attr {
-    Reset,
-    Bold,
-    Dim,
-    Italic,
-    Underline,
-    DoubleUnderline,
-    Undercurl,
-    DottedUnderline,
-    DashedUnderline,
-    Reverse,
-    Hidden,
-    Strike,
-    CancelBold,
-    CancelBoldDim,
-    CancelItalic,
-    CancelUnderline,
-    CancelReverse,
-    CancelHidden,
-    CancelStrike,
-    Foreground(Color),
-    Background(Color),
-    UnderlineColor(Option<Color>),
-}
-
 #[derive(Clone, Copy, Debug, Default)]
 pub(crate) enum StandardCharset {
     #[default]
@@ -235,12 +209,13 @@ enum State {
 
 // CSI has a small fixed parameter list; an overfull or malformed sequence is ignored whole.
 #[derive(Default)]
-struct Csi {
+pub(crate) struct Csi {
     values: [u16; 32],
-    count: usize,
-    colons: u32,
-    prefix: u8,
-    intermediate: u8,
+    len: usize,
+    /// Bit `n` is set when parameter `n` follows a colon rather than a semicolon.
+    pub(crate) colons: u32,
+    pub(crate) prefix: u8,
+    pub(crate) intermediate: u8,
     ignored: bool,
     started: bool,
 }
@@ -248,7 +223,7 @@ struct Csi {
 impl Csi {
     fn start(&mut self) {
         *self = Self {
-            count: 1,
+            len: 1,
             ..Self::default()
         };
     }
@@ -257,7 +232,7 @@ impl Csi {
         match byte {
             b'0'..=b'9' if self.intermediate == 0 => {
                 self.started = true;
-                let value = &mut self.values[self.count - 1];
+                let value = &mut self.values[self.len - 1];
                 let next = u32::from(*value) * 10 + u32::from(byte - b'0');
                 if next <= u32::from(u16::MAX) {
                     *value = next as u16;
@@ -267,20 +242,17 @@ impl Csi {
             }
             b';' | b':' if self.intermediate == 0 => {
                 self.started = true;
-                if self.count == self.values.len() {
+                if self.len == self.values.len() {
                     self.ignored = true;
                 } else {
                     if byte == b':' {
-                        self.colons |= 1 << self.count;
+                        self.colons |= 1 << self.len;
                     }
-                    self.count += 1;
+                    self.len += 1;
                 }
             }
             b'<'..=b'?'
-                if self.count == 1
-                    && !self.started
-                    && self.prefix == 0
-                    && self.intermediate == 0 =>
+                if self.len == 1 && !self.started && self.prefix == 0 && self.intermediate == 0 =>
             {
                 self.prefix = byte
             }
@@ -289,18 +261,20 @@ impl Csi {
         }
     }
 
-    fn value(&self, index: usize) -> u16 {
-        self.values
-            .get(index)
-            .copied()
-            .filter(|_| index < self.count)
-            .unwrap_or(0)
+    pub(crate) fn params(&self) -> &[u16] {
+        &self.values[..self.len]
     }
-    fn count(&self, index: usize) -> usize {
+    pub(crate) fn value(&self, index: usize) -> u16 {
+        self.params().get(index).copied().unwrap_or(0)
+    }
+    pub(crate) fn count(&self, index: usize) -> usize {
         usize::from(self.value(index).max(1))
     }
-    fn colon(&self, index: usize) -> bool {
-        self.colons & (1 << index) != 0
+    fn sync(&self) -> bool {
+        self.prefix == b'?'
+            && self.intermediate == 0
+            && self.colons == 0
+            && self.params().contains(&2026)
     }
 }
 
@@ -316,7 +290,6 @@ pub struct Parser {
     escape_intermediate: u8,
     utf8: [u8; 4],
     utf8_len: usize,
-    last_char: Option<char>,
     osc: Vec<u8>,
     sync: Vec<u8>,
     deadline: Option<Instant>,
@@ -465,7 +438,7 @@ impl Parser {
                 }
             } else if replay {
                 self.replaying = false;
-                core.unset_private_mode(2026);
+                core.set_private_mode(2026, false);
                 return true;
             }
             if remaining == 0 || !core.history_read_ready() {
@@ -499,13 +472,8 @@ impl Parser {
         }
         self.advance(core, &bytes);
         self.replaying = false;
-        core.unset_private_mode(2026);
+        core.set_private_mode(2026, false);
         !bytes.is_empty()
-    }
-
-    fn print(&mut self, core: &mut Core, text: &str) {
-        core.input_text(text);
-        self.last_char = text.chars().next_back().or(self.last_char);
     }
 
     fn text(&mut self, core: &mut Core, mut bytes: &[u8]) {
@@ -516,16 +484,13 @@ impl Parser {
             loop {
                 match std::str::from_utf8(&self.utf8[..self.utf8_len]) {
                     Ok(text) => {
-                        let c = text.chars().next().unwrap();
-                        core.input(c);
-                        self.last_char = Some(c);
+                        core.input_text(text);
                         self.utf8_len = 0;
                         break;
                     }
                     Err(error) if error.error_len().is_some() => {
                         let length = error.error_len().unwrap();
-                        core.input('\u{fffd}');
-                        self.last_char = Some('\u{fffd}');
+                        core.input_text("\u{fffd}");
                         self.utf8.copy_within(length..self.utf8_len, 0);
                         self.utf8_len -= length;
                         if self.utf8_len == 0 {
@@ -539,17 +504,17 @@ impl Parser {
         while !bytes.is_empty() {
             match std::str::from_utf8(bytes) {
                 Ok(text) => {
-                    self.print(core, text);
+                    core.input_text(text);
                     break;
                 }
                 Err(error) => {
                     let valid = error.valid_up_to();
                     if valid != 0 {
-                        self.print(core, std::str::from_utf8(&bytes[..valid]).unwrap());
+                        core.input_text(std::str::from_utf8(&bytes[..valid]).unwrap());
                     }
                     bytes = &bytes[valid..];
                     if let Some(length) = error.error_len() {
-                        self.print(core, "\u{fffd}");
+                        core.input_text("\u{fffd}");
                         bytes = &bytes[length..];
                     } else {
                         self.utf8[..bytes.len()].copy_from_slice(bytes);
@@ -558,18 +523,6 @@ impl Parser {
                     }
                 }
             }
-        }
-    }
-
-    fn control(&mut self, core: &mut Core, byte: u8) {
-        match byte {
-            0x08 => core.backspace(),
-            0x09 => core.put_tab(1),
-            0x0a..=0x0c => core.newline(),
-            0x0d => core.carriage_return(),
-            0x0e => core.set_active_charset(1),
-            0x0f => core.set_active_charset(0),
-            _ => (),
         }
     }
 
@@ -588,6 +541,14 @@ impl Parser {
         self.osc = Vec::new();
     }
 
+    /// A control interrupting an incomplete UTF-8 sequence prints one replacement.
+    fn interrupt_utf8(&mut self, core: &mut Core) {
+        if self.utf8_len != 0 {
+            core.input_text("\u{fffd}");
+            self.utf8_len = 0;
+        }
+    }
+
     fn step(&mut self, core: &mut Core, byte: u8, scan: bool) -> bool {
         if matches!(
             self.state,
@@ -598,7 +559,7 @@ impl Parser {
                     self.clear_osc();
                     self.state = State::Ground;
                     if !scan && byte == 0x1a {
-                        self.print(core, "\u{fffd}");
+                        core.input_text("\u{fffd}");
                     }
                 }
                 0x1b => {
@@ -609,14 +570,14 @@ impl Parser {
                 }
                 b'\\' if matches!(self.state, State::OscEscape | State::IgnoreStringEscape) => {
                     if self.state == State::OscEscape && !scan {
-                        self.dispatch_osc(core, "\x1b\\");
+                        core.osc(&self.osc, "\x1b\\");
                     }
                     self.clear_osc();
                     self.state = State::Ground;
                 }
                 0x07 if matches!(self.state, State::Osc | State::OscEscape) => {
                     if !scan {
-                        self.dispatch_osc(core, "\x07");
+                        core.osc(&self.osc, "\x07");
                     }
                     self.clear_osc();
                     self.state = State::Ground;
@@ -634,9 +595,8 @@ impl Parser {
             return false;
         }
         if byte == 0x1b {
-            if !scan && self.utf8_len != 0 {
-                self.print(core, "\u{fffd}");
-                self.utf8_len = 0;
+            if !scan {
+                self.interrupt_utf8(core);
             }
             self.state = State::Escape;
             return false;
@@ -644,23 +604,17 @@ impl Parser {
         if matches!(byte, 0x18 | 0x1a) {
             self.state = State::Ground;
             if !scan {
-                if self.utf8_len != 0 {
-                    self.print(core, "\u{fffd}");
-                    self.utf8_len = 0;
-                }
+                self.interrupt_utf8(core);
                 if byte == 0x1a {
-                    self.print(core, "\u{fffd}");
+                    core.input_text("\u{fffd}");
                 }
             }
             return false;
         }
         if byte < 0x20 || byte == 0x7f {
             if !scan {
-                if self.utf8_len != 0 {
-                    self.print(core, "\u{fffd}");
-                    self.utf8_len = 0;
-                }
-                self.control(core, byte);
+                self.interrupt_utf8(core);
+                core.control(byte);
             }
             return false;
         }
@@ -687,7 +641,7 @@ impl Parser {
                 _ => {
                     self.state = State::Ground;
                     if !scan {
-                        self.escape(core, 0, byte);
+                        core.esc(0, byte);
                     } else if byte == b'c' {
                         // RIS resets synchronized output too; replay it at the batch boundary.
                         return true;
@@ -698,7 +652,7 @@ impl Parser {
                 if byte >= 0x30 {
                     self.state = State::Ground;
                     if !scan {
-                        self.escape(core, self.escape_intermediate, byte);
+                        core.esc(self.escape_intermediate, byte);
                     }
                 } else {
                     self.escape_intermediate = 0xff;
@@ -707,21 +661,17 @@ impl Parser {
             State::Csi if (0x40..=0x7e).contains(&byte) => {
                 self.state = State::Ground;
                 if !self.csi.ignored {
-                    if scan {
-                        if self.csi.prefix == b'?'
-                            && self.csi.intermediate == 0
-                            && self.csi.colons == 0
-                            && self.csi.values[..self.csi.count].contains(&2026)
-                        {
-                            if byte == b'l' {
-                                return true;
-                            }
-                            if byte == b'h' {
-                                self.deadline = Some(Instant::now() + SYNC_TIMEOUT);
-                            }
+                    if !scan {
+                        core.csi(&self.csi, byte);
+                    }
+                    if self.csi.sync() {
+                        if scan && byte == b'l' {
+                            return true;
                         }
-                    } else {
-                        self.dispatch_csi(core, byte);
+                        // A replayed frame must not reopen the frame it is committing.
+                        if byte == b'h' && !self.replaying {
+                            self.deadline = Some(Instant::now() + SYNC_TIMEOUT);
+                        }
                     }
                 }
             }
@@ -730,423 +680,6 @@ impl Parser {
         }
         false
     }
-
-    fn escape(&mut self, core: &mut Core, intermediate: u8, final_byte: u8) {
-        match (intermediate, final_byte) {
-            (0, b'7') => core.save_cursor_position(),
-            (0, b'8') => core.restore_cursor_position(),
-            (0, b'D') => core.linefeed(),
-            (0, b'E') => {
-                core.linefeed();
-                core.carriage_return();
-            }
-            (0, b'H') => core.set_horizontal_tabstop(),
-            (0, b'M') => core.reverse_index(),
-            (0, b'Z') => core.identify_terminal(None),
-            (0, b'=') => core.set_keypad_application_mode(),
-            (0, b'>') => core.unset_keypad_application_mode(),
-            (0, b'c') => {
-                core.reset_state();
-                self.last_char = None;
-            }
-            (b'#', b'8') => core.decaln(),
-            (b'('..=b'+', b'0' | b'B') => core.configure_charset(
-                usize::from(intermediate - b'('),
-                if final_byte == b'0' {
-                    StandardCharset::SpecialGraphics
-                } else {
-                    StandardCharset::Ascii
-                },
-            ),
-            _ => (),
-        }
-    }
-
-    fn dispatch_csi(&mut self, core: &mut Core, final_byte: u8) {
-        let p = &self.csi;
-        if p.colons != 0 && (p.prefix != 0 || p.intermediate != 0 || final_byte != b'm') {
-            return;
-        }
-        let count = p.count(0);
-        match (p.prefix, p.intermediate, final_byte) {
-            (0, 0, b'@') => core.insert_blank(count),
-            (0, 0, b'A') => core.move_up(count),
-            (0, 0, b'B' | b'e') => core.move_down(count),
-            (0, 0, b'C' | b'a') => core.move_forward(count),
-            (0, 0, b'D') => core.move_backward(count),
-            (0, 0, b'E') => core.move_down_and_cr(count),
-            (0, 0, b'F') => core.move_up_and_cr(count),
-            (0, 0, b'G' | b'`') => core.goto_col(count - 1),
-            (0, 0, b'H' | b'f') => core.goto((count - 1) as i32, p.count(1) - 1),
-            (0, 0, b'd') => core.goto_line((count - 1) as i32),
-            (0, 0, b'I') => core.move_forward_tabs(count as u16),
-            (0, 0, b'Z') => core.move_backward_tabs(count as u16),
-            (0, 0, b'J') => match p.value(0) {
-                0 => core.clear_screen(ClearMode::Below),
-                1 => core.clear_screen(ClearMode::Above),
-                2 => core.clear_screen(ClearMode::All),
-                3 => core.clear_screen(ClearMode::Saved),
-                _ => (),
-            },
-            (0, 0, b'K') => match p.value(0) {
-                0 => core.clear_line(LineClearMode::Right),
-                1 => core.clear_line(LineClearMode::Left),
-                2 => core.clear_line(LineClearMode::All),
-                _ => (),
-            },
-            (0, 0, b'L') => core.insert_blank_lines(count),
-            (0, 0, b'M') => core.delete_lines(count),
-            (0, 0, b'P') => core.delete_chars(count),
-            (0, 0, b'S') => core.scroll_up(count),
-            (0, 0, b'T') => core.scroll_down(count),
-            (0, 0, b'X') => core.erase_chars(count),
-            (0, 0, b'b') => {
-                if let Some(c) = self.last_char {
-                    for _ in 0..count {
-                        core.input(c);
-                    }
-                }
-            }
-            (0, 0, b'g') => match p.value(0) {
-                0 => core.clear_tabs(false),
-                3 => core.clear_tabs(true),
-                _ => (),
-            },
-            (0, 0, b'h' | b'l') => {
-                for mode in &p.values[..p.count] {
-                    if final_byte == b'h' {
-                        core.set_mode(*mode);
-                    } else {
-                        core.unset_mode(*mode);
-                    }
-                }
-            }
-            (b'?', 0, b'h' | b'l') => {
-                for mode in &p.values[..p.count] {
-                    if final_byte == b'h' {
-                        core.set_private_mode(*mode);
-                    } else {
-                        core.unset_private_mode(*mode);
-                    }
-                }
-                if final_byte == b'h' && p.values[..p.count].contains(&2026) && !self.replaying {
-                    self.deadline = Some(Instant::now() + SYNC_TIMEOUT);
-                }
-            }
-            (0, 0, b'm') => self.sgr(core),
-            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => {
-                core.identify_terminal(if p.prefix == 0 {
-                    None
-                } else {
-                    Some(char::from(p.prefix))
-                })
-            }
-            (0, 0, b'n') => core.device_status(usize::from(p.value(0))),
-            (0, b'$', b'p') => core.report_mode(p.value(0)),
-            (b'?', b'$', b'p') => core.report_private_mode(p.value(0)),
-            (0, b' ', b'q') => core.set_cursor_shape(match p.value(0) {
-                0..=2 => CursorShape::Block,
-                3..=4 => CursorShape::Underline,
-                5..=6 => CursorShape::Beam,
-                _ => return,
-            }),
-            (0, 0, b'r') => {
-                core.set_scrolling_region(count, (p.value(1) != 0).then(|| usize::from(p.value(1))))
-            }
-            (0, 0, b's') => core.save_cursor_position(),
-            (0, 0, b'u') => core.restore_cursor_position(),
-            (b'?', 0, b'u') => core.report_keyboard_mode(),
-            (b'?', 0, b'm') if p.value(0) == 4 => core.report_modify_other_keys(),
-            (0, 0, b't') => match p.value(0) {
-                14 => core.text_area_size_pixels(),
-                18 => core.text_area_size_chars(),
-                22 => core.push_title(),
-                23 => core.pop_title(),
-                _ => (),
-            },
-            (b'?', 0, b'W') if p.value(0) == 5 => core.set_tabs(8),
-            _ => (),
-        }
-    }
-
-    fn sgr(&self, core: &mut Core) {
-        let p = &self.csi;
-        let mut index = 0;
-        while index < p.count {
-            let value = p.values[index];
-            let mut end = index + 1;
-            while end < p.count && p.colon(end) {
-                end += 1;
-            }
-            let attr = match value {
-                0 => Some(Attr::Reset),
-                1 => Some(Attr::Bold),
-                2 => Some(Attr::Dim),
-                3 => Some(Attr::Italic),
-                4 => match if end > index + 1 {
-                    p.values[index + 1]
-                } else {
-                    1
-                } {
-                    0 => Some(Attr::CancelUnderline),
-                    1 => Some(Attr::Underline),
-                    2 => Some(Attr::DoubleUnderline),
-                    3 => Some(Attr::Undercurl),
-                    4 => Some(Attr::DottedUnderline),
-                    5 => Some(Attr::DashedUnderline),
-                    _ => None,
-                },
-                7 => Some(Attr::Reverse),
-                8 => Some(Attr::Hidden),
-                9 => Some(Attr::Strike),
-                21 => Some(Attr::CancelBold),
-                22 => Some(Attr::CancelBoldDim),
-                23 => Some(Attr::CancelItalic),
-                24 => Some(Attr::CancelUnderline),
-                27 => Some(Attr::CancelReverse),
-                28 => Some(Attr::CancelHidden),
-                29 => Some(Attr::CancelStrike),
-                30..=37 | 90..=97 => Some(Attr::Foreground(ansi_color(if value < 90 {
-                    value - 30
-                } else {
-                    value - 90 + 8
-                }))),
-                39 => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
-                40..=47 | 100..=107 => Some(Attr::Background(ansi_color(if value < 100 {
-                    value - 40
-                } else {
-                    value - 100 + 8
-                }))),
-                49 => Some(Attr::Background(Color::Named(NamedColor::Background))),
-                38 | 48 | 58 => {
-                    let colon = end > index + 1;
-                    let mode = p.value(index + 1);
-                    let channels = if mode == 2 {
-                        3
-                    } else if mode == 5 {
-                        1
-                    } else {
-                        0
-                    };
-                    let start = if colon && mode == 2 && end - index == 6 {
-                        index + 3
-                    } else {
-                        index + 2
-                    };
-                    let available = if colon { end } else { p.count };
-                    let color = if channels != 0 && start + channels <= available {
-                        if mode == 5 {
-                            u8::try_from(p.values[start]).ok().map(Color::Indexed)
-                        } else {
-                            match (
-                                u8::try_from(p.values[start]),
-                                u8::try_from(p.values[start + 1]),
-                                u8::try_from(p.values[start + 2]),
-                            ) {
-                                (Ok(r), Ok(g), Ok(b)) => Some(Color::Spec(Rgb { r, g, b })),
-                                _ => None,
-                            }
-                        }
-                    } else {
-                        None
-                    };
-                    if !colon {
-                        end = (start + channels).min(p.count);
-                    }
-                    color.map(|color| match value {
-                        38 => Attr::Foreground(color),
-                        48 => Attr::Background(color),
-                        _ => Attr::UnderlineColor(Some(color)),
-                    })
-                }
-                59 => Some(Attr::UnderlineColor(None)),
-                _ => None,
-            };
-            if let Some(attr) = attr {
-                core.terminal_attribute(attr);
-            }
-            index = end;
-        }
-    }
-
-    fn dispatch_osc(&self, core: &mut Core, terminator: &str) {
-        let mut parts = self.osc.split(|b| *b == b';');
-        let Some(command) = parts.next().and_then(decimal) else {
-            return;
-        };
-        match command {
-            0 | 2 => {
-                let offset = self
-                    .osc
-                    .iter()
-                    .position(|b| *b == b';')
-                    .map_or(self.osc.len(), |i| i + 1);
-                core.set_title(Some(String::from_utf8_lossy(&self.osc[offset..])));
-            }
-            #[cfg(feature = "tui")]
-            7 => {
-                if let Some(directory) = parts.next() {
-                    core.set_directory_uri(directory);
-                }
-            }
-            #[cfg(feature = "tui")]
-            133 => {
-                if let Some(marker) = parts.next() {
-                    core.shell_marker(marker, parts.next());
-                }
-            }
-            4 => {
-                while let (Some(index), Some(value)) = (parts.next(), parts.next()) {
-                    if let Some(index) = decimal(index).filter(|i| *i < 256) {
-                        if value == b"?" {
-                            core.dynamic_color_sequence(
-                                format_args!("4;{index}"),
-                                index,
-                                terminator,
-                            );
-                        } else if let Some(color) = parse_color(value) {
-                            core.set_color(index, color);
-                        }
-                    }
-                }
-            }
-            10..=12 => {
-                for (offset, value) in parts.enumerate() {
-                    let command = command + offset;
-                    if command > 12 {
-                        break;
-                    }
-                    let index = command + 246;
-                    if value == b"?" {
-                        core.dynamic_color_sequence(command, index, terminator);
-                    } else if let Some(color) = parse_color(value) {
-                        core.set_color(index, color);
-                    }
-                }
-            }
-            50 => {
-                if let Some(value) = parts
-                    .next()
-                    .and_then(|part| part.strip_prefix(b"CursorShape="))
-                    && let Some(shape) = match value.first() {
-                        Some(b'0') => Some(CursorShape::Block),
-                        Some(b'1') => Some(CursorShape::Beam),
-                        Some(b'2') => Some(CursorShape::Underline),
-                        _ => None,
-                    }
-                {
-                    core.set_cursor_shape(shape);
-                }
-            }
-            52 => {
-                if let (Some(target), Some(data)) = (parts.next(), parts.next()) {
-                    let clipboard = target.first().copied().unwrap_or(b'c');
-                    if data == b"?" {
-                        core.clipboard_load(clipboard, terminator);
-                    } else {
-                        core.clipboard_store(clipboard, data);
-                    }
-                }
-            }
-            104 => {
-                let mut supplied = false;
-                for part in parts {
-                    supplied |= !part.is_empty();
-                    if let Some(index) = decimal(part).filter(|i| *i < 256) {
-                        core.reset_color(index);
-                    }
-                }
-                if !supplied {
-                    for index in 0..256 {
-                        core.reset_color(index);
-                    }
-                }
-            }
-            110..=112 => core.reset_color(command + 146),
-            _ => (),
-        }
-    }
-}
-
-fn ansi_color(index: u16) -> Color {
-    const NAMES: [NamedColor; 16] = [
-        NamedColor::Black,
-        NamedColor::Red,
-        NamedColor::Green,
-        NamedColor::Yellow,
-        NamedColor::Blue,
-        NamedColor::Magenta,
-        NamedColor::Cyan,
-        NamedColor::White,
-        NamedColor::BrightBlack,
-        NamedColor::BrightRed,
-        NamedColor::BrightGreen,
-        NamedColor::BrightYellow,
-        NamedColor::BrightBlue,
-        NamedColor::BrightMagenta,
-        NamedColor::BrightCyan,
-        NamedColor::BrightWhite,
-    ];
-    Color::Named(NAMES[usize::from(index)])
-}
-
-fn decimal(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() {
-        return None;
-    }
-    bytes.iter().try_fold(0usize, |value, byte| {
-        if byte.is_ascii_digit() {
-            value.checked_mul(10)?.checked_add(usize::from(byte - b'0'))
-        } else {
-            None
-        }
-    })
-}
-
-fn parse_color(bytes: &[u8]) -> Option<Rgb> {
-    fn hex_value(bytes: &[u8]) -> Option<u16> {
-        if bytes.is_empty() || bytes.len() > 4 {
-            return None;
-        }
-        bytes.iter().try_fold(0u16, |value, byte| {
-            Some(value * 16 + char::from(*byte).to_digit(16)? as u16)
-        })
-    }
-    fn channel(bytes: &[u8]) -> Option<u8> {
-        let value = u32::from(hex_value(bytes)?);
-        Some((value * 255 / ((1u32 << (bytes.len() * 4)) - 1)) as u8)
-    }
-    if let Some(hex) = bytes.strip_prefix(b"#") {
-        if !matches!(hex.len(), 3 | 6 | 9 | 12) {
-            return None;
-        }
-        let width = hex.len() / 3;
-        let legacy = |part: &[u8]| {
-            let value = hex_value(part)?;
-            Some(match width {
-                1 => value << 4,
-                2 => value,
-                3 => value >> 4,
-                _ => value >> 8,
-            } as u8)
-        };
-        return Some(Rgb {
-            r: legacy(&hex[..width])?,
-            g: legacy(&hex[width..width * 2])?,
-            b: legacy(&hex[width * 2..])?,
-        });
-    }
-    let rgb = bytes.strip_prefix(b"rgb:")?;
-    let mut parts = rgb.split(|b| *b == b'/');
-    let channels = [parts.next()?, parts.next()?, parts.next()?];
-    if parts.next().is_some() {
-        return None;
-    }
-    Some(Rgb {
-        r: channel(channels[0])?,
-        g: channel(channels[1])?,
-        b: channel(channels[2])?,
-    })
 }
 
 #[cfg(test)]
