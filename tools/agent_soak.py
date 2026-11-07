@@ -21,7 +21,7 @@ import tomllib
 import urllib.error
 import urllib.request
 
-from agent_bench import Lab, exit_zero_observed
+from agent_bench import Lab, exit_zero_observed, model_headers, prepare_model_request
 
 
 FIXTURE = '''from pathlib import Path
@@ -52,12 +52,7 @@ def run(binary, config):
     finished = threading.Event()
     fault = None
     latencies = []
-    headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream',
-               'anthropic-version': '2023-06-01'}
-    if os.environ.get('ANTHROPIC_AUTH_TOKEN'):
-        headers['Authorization'] = 'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN']
-    elif os.environ.get('ANTHROPIC_API_KEY'):
-        headers['x-api-key'] = os.environ['ANTHROPIC_API_KEY']
+    headers = model_headers()
 
     class Proxy(http.server.BaseHTTPRequestHandler):
         protocol_version = 'HTTP/1.1'
@@ -67,29 +62,20 @@ def run(binary, config):
 
         def do_POST(self):
             nonlocal fault
-            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            body['model'] = config['model']
-            for message in body['messages']:
-                if isinstance(message['content'], list):
-                    for block in message['content']:
-                        if block['type'] == 'tool_result':
-                            results[block['tool_use_id']] = block
-            last = body['messages'][-1]['content']
-            kind = ('review' if isinstance(last, str) and last.startswith('Harness goal review:')
-                    else 'summary' if body.get('tool_choice', {}).get('type') == 'none'
-                    else 'execute')
+            payload, kind = prepare_model_request(
+                self.rfile.read(int(self.headers['Content-Length'])), config['model'], results)
             index = len(records)
             record = {'index': index, 'kind': kind, 'usage': {}, 'tools': [], 'text': '',
                       'response_bytes': 0, 'event_counts': {},
-                      'request_sha256': hashlib.sha256(json.dumps(body).encode()).hexdigest(),
+                      'request_sha256': hashlib.sha256(payload).hexdigest(),
                       'at': time.monotonic()}
             records.append(record)
-            (evidence / f'request-{index:03}.json').write_text(json.dumps(body))
+            (evidence / f'request-{index:03}.json').write_bytes(payload)
             ledger = lab.root / 'ledger.jsonl'
             inject = fault is None and kind == 'execute' and ledger.exists() and len(ledger.read_text().splitlines()) >= 4
             request = urllib.request.Request(
                 (config.get('base_url') or 'https://api.anthropic.com').rstrip('/') + '/v1/messages',
-                data=json.dumps(body).encode(), headers=headers)
+                data=payload, headers=headers)
             try:
                 with (
                     urllib.request.urlopen(request, timeout=150) as response,
@@ -124,9 +110,9 @@ def run(binary, config):
                             elif event_type == 'message_delta':
                                 record['usage'].update(event.get('usage', {}))
                             elif event_type == 'content_block_start':
-                                block = event['content_block'].copy()
+                                block = event['content_block']
                                 if block['type'] == 'tool_use':
-                                    calls[event['index']] = [block, '']
+                                    calls[event['index']] = [block, []]
                                     record['tools'].append(block)
                                 elif block['type'] == 'text':
                                     record['text'] += block['text']
@@ -135,9 +121,10 @@ def run(binary, config):
                                 if delta['type'] == 'text_delta':
                                     record['text'] += delta['text']
                                 elif delta['type'] == 'input_json_delta':
-                                    calls[event['index']][1] += delta['partial_json']
+                                    calls[event['index']][1].append(delta['partial_json'])
                             elif event_type == 'content_block_stop' and event['index'] in calls:
-                                block, partial = calls[event['index']]
+                                block, partial = calls.pop(event['index'])
+                                partial = ''.join(partial)
                                 if partial:
                                     block['input'] = json.loads(partial)
                             elif event_type == 'message_stop':
@@ -184,7 +171,8 @@ def run(binary, config):
     try:
         lab.start()
         shutil.copyfile(f'/proc/{lab.process.pid}/exe', evidence / 'nextty-tested')
-        binary_sha256 = hashlib.sha256((evidence / 'nextty-tested').read_bytes()).hexdigest()
+        with (evidence / 'nextty-tested').open('rb') as source:
+            binary_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
         (lab.root / 'stages.py').write_text(FIXTURE)
         os.write(lab.master, b'\x1ba')
         lab.drain(.1)

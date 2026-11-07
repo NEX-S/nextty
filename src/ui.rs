@@ -428,7 +428,7 @@ impl Ui {
         }
     }
 
-    pub fn expire_status(&mut self) -> bool {
+    fn expire_status(&mut self) -> bool {
         self.status
             .take_if(|(_, until)| Instant::now() >= *until)
             .is_some()
@@ -714,8 +714,8 @@ impl Search {
         label.extend(std::iter::repeat_n(' ', padding));
         label.push_str(&status);
         match fit_label(&label, columns as u16) {
-            std::borrow::Cow::Borrowed(text) => label.truncate(text.len()),
-            std::borrow::Cow::Owned(text) => label = text,
+            Cow::Borrowed(text) => label.truncate(text.len()),
+            Cow::Owned(text) => label = text,
         }
         (label, caret.min(columns.saturating_sub(1)))
     }

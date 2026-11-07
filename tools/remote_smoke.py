@@ -110,7 +110,7 @@ def delay_proxy(host, port, rtt_ms):
             writers = [fd for fd, queue in queues.items() if queue and queue[0][0] <= now]
             deadlines = [queue[0][0] for queue in queues.values() if queue]
             timeout = max(0, min(deadlines) - now) if deadlines else None
-            ready, writable, _ = select.select(list(readers), writers, [], timeout)
+            ready, writable, _ = select.select(readers, writers, [], timeout)
             for fd in ready:
                 data = os.read(fd, 65536)
                 destination = readers[fd]
@@ -320,7 +320,7 @@ class Lab:
             samples.append((time.monotonic() - started) * 1000)
         self.record('remote input reaches the child and returns to the displayed screen',
                     added_rtt_ms=self.rtt_ms, samples=len(samples),
-                    p50_ms=statistics.median(samples), p99_ms=sorted(samples)[-1])
+                    p50_ms=statistics.median(samples), p99_ms=max(samples))
 
     def exercise_agent_files(self):
         agent = AgentLab(self.binary, tool_mode=True)
@@ -476,7 +476,7 @@ class Lab:
         for name in ['smoke', 'explicit', 'agent-workspace']:
             try:
                 subprocess.run([str(self.binary), 'terminate', name], env=env,
-                               capture_output=True, timeout=5)
+                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
             except subprocess.TimeoutExpired as error:
                 errors.append(repr(error))
         # No session may have been created. Locate only a daemon using our exact private socket.
@@ -527,8 +527,10 @@ def main():
         fixture(args.fixture)
         return
     lab = Lab(args.binary, args.output_dir, args.rtt_ms)
+    with lab.binary.open('rb') as source:
+        binary_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
     report = {'scope': __doc__, 'binary': str(lab.binary),
-              'binary_sha256': hashlib.sha256(lab.binary.read_bytes()).hexdigest(), 'checks': lab.checks,
+              'binary_sha256': binary_sha256, 'checks': lab.checks,
               'not_covered': ['GUI rendering and IBus', 'large command-block clipboard export',
                               'prediction/local echo (not implemented in this stage)', 'real WAN packet loss and bandwidth limits']}
     try:

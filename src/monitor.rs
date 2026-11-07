@@ -7,7 +7,7 @@ use std::{borrow::Cow, io};
 #[cfg(feature = "tui")]
 pub(crate) use crate::panel::BACKGROUND;
 pub(crate) use crate::panel::{ACCENT as GREEN, INK, MUTED};
-pub(crate) const PURPLE: u32 = 0xb3a2ca;
+const PURPLE: u32 = 0xb3a2ca;
 
 pub(crate) fn series_color(name: &str) -> u32 {
     match name {
@@ -255,8 +255,6 @@ impl Monitor {
     }
     pub fn set_workspace(&mut self, snapshot: &Snapshot) {
         use std::fmt::Write;
-        self.tasks
-            .reserve_exact(snapshot.panes.len().saturating_sub(self.tasks.len()));
         for (index, pane) in snapshot.panes.iter().enumerate() {
             let command = pane
                 .command_blocks
@@ -285,10 +283,6 @@ impl Monitor {
                 {
                     self.tasks.swap(index, index + offset);
                 } else {
-                    if self.tasks.len() > index {
-                        self.tasks
-                            .retain(|task| snapshot.panes.iter().any(|pane| pane.id == task.pane));
-                    }
                     let last = self.tasks.len();
                     self.tasks.push(Task {
                         pane: pane.id,
@@ -349,7 +343,6 @@ impl Monitor {
             }
         }
         self.tasks.truncate(snapshot.panes.len());
-        self.tasks.shrink_to_fit();
         if matches!(self.focus, Action::Task(pane) if !self.tasks.iter().any(|task| task.pane == pane))
         {
             self.focus = Action::Tab(7);
@@ -546,7 +539,7 @@ impl Monitor {
                 })
                 .map(|(index, _)| index),
         );
-        self.process_order.sort_by(|&a, &b| {
+        self.process_order.sort_unstable_by(|&a, &b| {
             let a = &processes[a];
             let b = &processes[b];
             let value = |p: &Process| match self.sort {
@@ -726,9 +719,8 @@ impl Monitor {
         }
         match symbol {
             0x68 => self.selecting_control = true,
-            0x6c => self.action(self.focus),
             0x6a | 0x6b if self.selecting_control => self.cycle(symbol == 0x6b),
-            keysym::RETURN | 0x20 => self.action(self.focus),
+            0x6c | keysym::RETURN | 0x20 => self.action(self.focus),
             keysym::UP | keysym::DOWN | keysym::PAGE_UP | keysym::PAGE_DOWN | 0x6a | 0x6b => {
                 let delta: isize = match symbol {
                     keysym::UP | 0x6b => -1,
@@ -1873,6 +1865,32 @@ mod tests {
         monitor.key(keysym::RETURN, "", false);
         assert_eq!(monitor.jump.take(), Some(2));
         assert!(!monitor.open);
+
+        let sampled = monitor.tasks[1].sampled;
+        snapshot.panes.insert(0, pane(3, Vec::new()));
+        snapshot.panes.insert(2, pane(4, Vec::new()));
+        monitor.set_workspace(&snapshot);
+        assert_eq!(
+            monitor
+                .tasks
+                .iter()
+                .map(|task| task.pane)
+                .collect::<Vec<_>>(),
+            [3, 1, 4, 2]
+        );
+        snapshot.panes.remove(1);
+        snapshot.panes.remove(0);
+        snapshot.panes.swap(0, 1);
+        monitor.set_workspace(&snapshot);
+        assert_eq!(
+            monitor
+                .tasks
+                .iter()
+                .map(|task| task.pane)
+                .collect::<Vec<_>>(),
+            [2, 4]
+        );
+        assert_eq!(monitor.tasks[0].sampled, sampled);
     }
 
     #[test]

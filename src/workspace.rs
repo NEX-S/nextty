@@ -1573,6 +1573,16 @@ impl FileWorker {
         })
     }
 
+    fn take(&mut self) -> Option<Response> {
+        self.active.as_ref()?;
+        let result = self.worker.take()?;
+        let request = self.active.take().unwrap().request;
+        Some(Response::AgentFile {
+            request,
+            result: result.map_err(|error| error.to_string()),
+        })
+    }
+
     fn cancel(&mut self, matches: impl Fn(&FileSource) -> bool) {
         if let Some(source) = self.active.as_ref().filter(|source| matches(source)) {
             source.cancelled.store(true, Ordering::Relaxed);
@@ -1581,14 +1591,7 @@ impl FileWorker {
             job.source.cancelled.store(true, Ordering::Relaxed);
             // Retain its FIFO error reply without keeping the unused payload.
             job.path = PathBuf::new();
-            match &mut job.operation {
-                FileOperation::Read { .. } => {}
-                FileOperation::Search { query } => *query = String::new(),
-                FileOperation::Edit { old_text, new_text } => {
-                    *old_text = None;
-                    *new_text = String::new();
-                }
-            }
+            job.operation = FileOperation::Read { offset: 0 };
         }
     }
 }
@@ -1689,13 +1692,9 @@ impl Connection {
         self.copy = None;
         self.search = None;
         if let Some(files) = &mut self.files
-            && let Some(result) = files.worker.take()
+            && let Some(response) = files.take()
         {
-            let request = files.active.take().unwrap().request;
-            self.respond(Response::AgentFile {
-                request,
-                result: result.map_err(|error| error.to_string()),
-            });
+            self.respond(response);
         }
         self.files = None;
         self.respond(Response::Detached);
@@ -2118,15 +2117,8 @@ fn complete_requests(
             client.files = None;
             continue;
         }
-        let file_result = client.files.as_mut().and_then(|files| {
-            files.active.as_ref()?;
-            files.worker.take().map(|result| {
-                let source = files.active.take().unwrap();
-                (source.request, result.map_err(|error| error.to_string()))
-            })
-        });
-        if let Some((request, result)) = file_result {
-            client.respond(Response::AgentFile { request, result });
+        if let Some(response) = client.files.as_mut().and_then(FileWorker::take) {
+            client.respond(response);
         }
         if client.failed {
             client.files = None;
@@ -3336,12 +3328,12 @@ fn apply_agent_action(
 
 fn try_search(search: &mut PaneSearch, terminal: &Terminal) -> io::Result<()> {
     let wake = unsafe { BorrowedFd::borrow_raw(terminal.event_fd()) };
-    match search
+    let result = search
         .core
         .lock()
         .map_err(|e| io::Error::other(e.to_string()))?
-        .search(&search.query, &search.cancelled, wake)
-    {
+        .search(&search.query, &search.cancelled, wake);
+    match result {
         Ok(receiver) => search.state = SearchState::Pending(receiver),
         Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
         Err(error) => return Err(error),

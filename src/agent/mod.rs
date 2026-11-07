@@ -528,11 +528,7 @@ impl Agent {
                                 "Shell editing controls require bracketed paste; use a single printable command",
                             ));
                         }
-                        let mut data = text.as_bytes().to_vec();
-                        if shell {
-                            data.push(b'\r');
-                        }
-                        data
+                        [text.as_bytes(), if shell { b"\r" } else { b"" }].concat()
                     };
                     let id = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
                     let generation = self.observed_input.get(&pane).copied().ok_or_else(|| {

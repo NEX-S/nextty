@@ -399,6 +399,7 @@ impl Terminal {
             set_size(master.as_raw_fd(), pty_size)?;
         }
         core.resize(size);
+        drop(core);
         self.event_wakeup.notify()
     }
 

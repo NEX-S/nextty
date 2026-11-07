@@ -99,10 +99,9 @@ impl Server {
                 let length: usize = header
                     .lines()
                     .find_map(|line| {
-                        line.to_ascii_lowercase()
-                            .strip_prefix("content-length:")
-                            .map(str::trim)
-                            .map(str::to_owned)
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length")
+                            .then_some(value.trim())
                     })
                     .unwrap()
                     .parse()

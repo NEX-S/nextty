@@ -213,8 +213,8 @@ int nt_fonts_scale(NtFonts *f, double scale) {
 }
 
 void nt_fonts_metrics(const NtFonts *f, float *width, float *height) {
-    if (width) *width = f->width;
-    if (height) *height = f->height;
+    *width = f->width;
+    *height = f->height;
 }
 
 NtFonts *nt_fonts_new(const char *family, float size, char *error, size_t error_size) {

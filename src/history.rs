@@ -166,7 +166,6 @@ impl Drop for HistoryBudget {
     }
 }
 
-#[derive(Clone)]
 pub struct HistoryConfig {
     pub budget: Arc<HistoryBudget>,
     pub hot_rows: usize,
@@ -1282,7 +1281,7 @@ impl Archive {
         Ok(incomplete)
     }
     fn expand_selection(
-        &mut self,
+        &self,
         start: &mut (u64, usize),
         end: &mut (u64, usize),
         first: u64,
@@ -1965,7 +1964,7 @@ mod tests {
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut archive = Archive::new(HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap());
+        let mut archive = Archive::new(HistoryBudget::new(directory, 1024 * 1024).unwrap());
         let mut core = crate::core::Core::new(
             crate::core::WindowSize {
                 num_cols: 4,

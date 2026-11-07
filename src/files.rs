@@ -25,7 +25,7 @@ pub enum FileFocus {
     Preview,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct FileEntry {
     pub path: PathBuf,
     pub is_dir: bool,
@@ -741,7 +741,7 @@ fn search_directory(
     publish: &impl Fn(Scan),
 ) -> Scan {
     let pattern: smallvec::SmallVec<[char; 16]> = query.to_lowercase().chars().collect();
-    let ascii_pattern = pattern.iter().all(|ch| ch.is_ascii());
+    let ascii_pattern = pattern.iter().all(char::is_ascii);
     // Keep the root verbatim, including trailing separators and `.` components.
     let relative_start = directory.as_os_str().len()
         + usize::from(!directory.as_os_str().as_bytes().ends_with(b"/"));

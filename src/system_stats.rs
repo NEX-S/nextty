@@ -34,7 +34,6 @@ pub struct ResourceTrend {
     pub unit: &'static str,
 }
 
-#[derive(Clone)]
 pub struct Network {
     pub name: String,
     pub rx: Option<f64>,
@@ -233,6 +232,7 @@ impl SystemStats {
         let mut state = self.sampler.state.lock().unwrap();
         if state.process_detail != identity {
             state.process_detail = identity;
+            drop(state);
             self.sampler.changed.notify_one();
         }
     }
@@ -364,22 +364,13 @@ impl SystemStats {
                 now.saturating_duration_since(point.at).as_secs_f32() > seconds as f32
             });
             let history = state.history.range(start..);
-            if let Some((first, rest)) = result.split_first_mut() {
-                first.points = history
-                    .clone()
-                    .map(|point| {
-                        (
-                            now.saturating_duration_since(point.at).as_secs_f32(),
-                            point.values[indices.start],
-                        )
-                    })
-                    .collect();
-                for (index, trend) in (indices.start + 1..indices.end).zip(rest) {
-                    trend.points = history
-                        .clone()
-                        .zip(&first.points)
-                        .map(|(point, (age, _))| (*age, point.values[index]))
-                        .collect();
+            for trend in &mut result {
+                trend.points.reserve(history.len());
+            }
+            for point in history {
+                let age = now.saturating_duration_since(point.at).as_secs_f32();
+                for (index, trend) in indices.clone().zip(&mut result) {
+                    trend.points.push((age, point.values[index]));
                 }
             }
         }
@@ -971,7 +962,7 @@ fn sample_physical_networks(text: &str, known: &mut HashMap<String, (bool, bool)
         .collect();
     // Interface names may be reused after a device disappears.
     known.retain(|_, (_, present)| std::mem::take(present));
-    result.sort_by(|a, b| a.name.cmp(&b.name));
+    result.sort_unstable_by(|a, b| a.name.cmp(&b.name));
     result
 }
 fn sample_physical_disks(

@@ -187,14 +187,9 @@ static void clear_frame(Frame *f) {
     if (first) retire_lines(first, last);
 }
 
-static void free_line_input(NtLine *line) {
-    free(line->input);
-    line->input = NULL;
-}
-
 static void destroy_line(NtLine *line) {
     nt_font_glyphs_free(line->glyphs, line->count);
-    free_line_input(line);
+    free(line->input);
     free(line);
 }
 
@@ -1097,7 +1092,7 @@ int nt_renderer_finish(NtRenderer *r) {
 
 NtRenderer *nt_renderer_new(NtWindow *window, const char *family, float font_size) {
     creation_error[0] = 0;
-    if (!window || !family || !*family || !isfinite(font_size) || font_size <= 0) {
+    if (!*family || !isfinite(font_size) || font_size <= 0) {
         fail(NULL, "Renderer requires a window, font family, and finite positive font size");
         return NULL;
     }
@@ -1119,7 +1114,6 @@ NtRenderer *nt_renderer_new(NtWindow *window, const char *family, float font_siz
 }
 
 void nt_renderer_free(NtRenderer *r) {
-    if (!r) return;
     if (r->swap.started) {
         nt_renderer_finish(r);
         clear_frame(&r->frame);
@@ -1138,12 +1132,12 @@ void nt_renderer_free(NtRenderer *r) {
 }
 
 void nt_renderer_metrics(NtRenderer *r, float *width, float *height) {
-    if (width) *width = r->cell_width;
-    if (height) *height = r->cell_height;
+    *width = r->cell_width;
+    *height = r->cell_height;
 }
 
 void nt_line_free(NtLine *line) {
-    if (!line || --line->references) return;
+    if (--line->references) return;
     retire_lines(line, line);
 }
 
@@ -1157,8 +1151,8 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
                     const NtRun *runs, size_t run_count,
                     const uint16_t *columns) {
     size_t stride = columns ? sizeof *columns + 1 : 1;
-    if (length > INT_MAX || length > (SIZE_MAX - sizeof(LineInput) - 1) / stride ||
-        run_count > (SIZE_MAX - sizeof(LineInput) - length * stride - 1) / sizeof *runs) {
+    if (length > INT_MAX || length > (SIZE_MAX - sizeof(LineInput)) / stride ||
+        run_count > (SIZE_MAX - sizeof(LineInput) - length * stride) / sizeof *runs) {
         fail(r, "Shaped line is too large");
         return NULL;
     }
@@ -1166,8 +1160,9 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
     if (!line) { fail(r, "Cannot allocate terminal line"); return NULL; }
     line->renderer = r;
     line->references = 1;
+    if (!length) return line;
     size_t run_bytes = run_count * sizeof *runs;
-    LineInput *input = malloc(sizeof *input + run_bytes + length * stride + 1);
+    LineInput *input = malloc(sizeof *input + run_bytes + length * stride);
     if (!input) {
         fail(r, "Cannot allocate terminal line input");
         free(line);
@@ -1176,10 +1171,8 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
     line->input = input;
     input->length = length;
     input->run_count = run_count;
-    input->columns = columns && length ? (uint16_t *)((char *)input->runs + run_bytes) : NULL;
-    char *copy = line_text(line);
-    memcpy(copy, text, length);
-    copy[length] = 0;
+    input->columns = columns ? (uint16_t *)((char *)input->runs + run_bytes) : NULL;
+    memcpy(line_text(line), text, length);
     if (run_count) memcpy(input->runs, runs, run_bytes);
     if (input->columns) memcpy(input->columns, columns, length * sizeof *columns);
     return line;
@@ -1191,7 +1184,8 @@ static int shape_line(NtRenderer *r, NtLine *line) {
     int success = nt_fonts_shape(r->fonts, line_text(line), input->length,
                                 input->runs, input->run_count, input->columns,
                                 &line->glyphs, &line->count);
-    free_line_input(line);
+    free(line->input);
+    line->input = NULL;
     return success;
 }
 

@@ -21,7 +21,7 @@ import tomllib
 import urllib.error
 import urllib.request
 
-from agent_bench import Lab, exit_zero_observed
+from agent_bench import Lab, exit_zero_observed, model_headers, prepare_model_request
 
 
 def run(binary, config, interactive):
@@ -29,30 +29,15 @@ def run(binary, config, interactive):
     records = []
     results = {}
     finished = threading.Event()
-    headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream',
-               'anthropic-version': '2023-06-01'}
-    if os.environ.get('ANTHROPIC_AUTH_TOKEN'):
-        headers['Authorization'] = 'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN']
-    elif os.environ.get('ANTHROPIC_API_KEY'):
-        headers['x-api-key'] = os.environ['ANTHROPIC_API_KEY']
+    headers = model_headers()
 
     class Proxy(http.server.BaseHTTPRequestHandler):
         def log_message(self, *_):
             pass
 
         def do_POST(self):
-            body = json.loads(self.rfile.read(int(self.headers['Content-Length'])))
-            body['model'] = config['model']
-            for message in body['messages']:
-                if isinstance(message['content'], list):
-                    for block in message['content']:
-                        if block['type'] == 'tool_result':
-                            results[block['tool_use_id']] = block
-            last = body['messages'][-1]['content']
-            kind = ('review' if isinstance(last, str) and last.startswith('Harness goal review:')
-                    else 'summary' if body.get('tool_choice', {}).get('type') == 'none'
-                    else 'execute')
-            payload = json.dumps(body).encode()
+            payload, kind = prepare_model_request(
+                self.rfile.read(int(self.headers['Content-Length'])), config['model'], results)
             record = {'kind': kind, 'request_bytes': len(payload), 'usage': {},
                       'tools': [], 'text': ''}
             records.append(record)
@@ -81,8 +66,8 @@ def run(binary, config, interactive):
                             elif event_type == 'content_block_start':
                                 block = event['content_block']
                                 if block['type'] == 'tool_use':
-                                    calls[event['index']] = [block.copy(), '']
-                                    record['tools'].append(calls[event['index']][0])
+                                    calls[event['index']] = [block, []]
+                                    record['tools'].append(block)
                                 elif block['type'] == 'text':
                                     record['text'] += block['text']
                             elif event_type == 'content_block_delta':
@@ -90,9 +75,10 @@ def run(binary, config, interactive):
                                 if delta['type'] == 'text_delta':
                                     record['text'] += delta['text']
                                 elif delta['type'] == 'input_json_delta':
-                                    calls[event['index']][1] += delta['partial_json']
+                                    calls[event['index']][1].append(delta['partial_json'])
                             elif event_type == 'content_block_stop' and event['index'] in calls:
-                                block, partial = calls[event['index']]
+                                block, partial = calls.pop(event['index'])
+                                partial = ''.join(partial)
                                 if partial:
                                     block['input'] = json.loads(partial)
                         self.wfile.write(line)
@@ -180,13 +166,14 @@ print("check passed {marker}")
                 raise RuntimeError(lab.errors)
             lab.drain(.2)
             followup = records[first:]
-            answers = [record['text'] for record in followup
-                       if record['kind'] == 'execute' and not record['tools']]
+            answer = next((record['text'] for record in reversed(followup)
+                           if record['kind'] == 'execute' and not record['tools']), '')
             context_reads = [json.loads(results[call['id']]['content']) for record in followup
                              for call in record['tools'] if call['name'] == 'read_file'
                              and not results[call['id']].get('is_error')]
+            context_reads.sort(key=lambda read: read['offset'])
             context_end = 0
-            for read in sorted(context_reads, key=lambda read: read['offset']):
+            for read in context_reads:
                 if read['offset'] > context_end or read['text'] != context[read['offset']:read['next_offset']]:
                     break
                 context_end = max(context_end, read['next_offset'])
@@ -225,14 +212,14 @@ print("check passed {marker}")
             lab.wait(lambda: len((lab.root / 'input.jsonl').read_text().splitlines()) == 2,
                      'original foreground receives input in current tab')
             check = subprocess.run([sys.executable, '-B', 'check.py'], cwd=lab.root,
-                                   capture_output=True)
+                                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             outcome = {
                 'checked_by_agent': checked_by_agent,
                 'independent_check_exit_zero': check.returncode == 0,
                 'fixture_unchanged': (lab.root / 'check.py').read_text() == fixture,
                 'foreground_untouched': untouched,
                 'focus_and_foreground_preserved': True,
-                'history_marker_recalled': bool(answers) and marker in answers[-1],
+                'history_marker_recalled': marker in answer,
                 'followup_only_read_context_file': all(
                     call['name'] == 'read_file' and (lab.root / call['input']['path']).resolve() == lab.root / 'context.txt'
                     for record in followup for call in record['tools']),
@@ -258,7 +245,9 @@ def main():
     binary = args.binary.resolve()
     config = tomllib.loads(args.config.read_text())
     cases = [run(binary, config, interactive) for interactive in (False, True)]
-    print(json.dumps({'binary_sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
+    with binary.open('rb') as source:
+        binary_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
+    print(json.dumps({'binary_sha256': binary_sha256,
                       'model': config['model'], 'cases': cases}, indent=2))
     if not all(case['passed'] for case in cases):
         sys.exit(1)

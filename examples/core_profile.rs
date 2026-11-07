@@ -16,12 +16,13 @@ fn memory(stage: &str, term: Option<&Core>) {
                 || line.starts_with("Private_Dirty:")
         })
         .collect();
+    let values = values.join("; ");
+    let allocation = unsafe { libc::mallinfo2() };
     println!(
-        "{stage}: {}; history_lines={}; malloc_live_bytes={}; malloc_free_arena_bytes={}",
-        values.join("; "),
+        "{stage}: {values}; history_lines={}; malloc_live_bytes={}; malloc_free_arena_bytes={}",
         term.map_or(0, Core::history_size),
-        unsafe { libc::mallinfo2() }.uordblks,
-        unsafe { libc::mallinfo2() }.fordblks,
+        allocation.uordblks,
+        allocation.fordblks,
     );
 }
 

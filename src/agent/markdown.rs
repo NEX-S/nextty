@@ -5,8 +5,8 @@ use std::ops::Range;
 pub(crate) const BOLD: u8 = 1;
 pub(crate) const ITALIC: u8 = 2;
 pub(crate) const CODE: u8 = 4;
-pub(crate) const LINK: u8 = 8;
-pub(crate) const QUOTE: u8 = 16;
+const LINK: u8 = 8;
+const QUOTE: u8 = 16;
 
 pub(crate) fn color(style: u8, foreground: u32) -> u32 {
     let dark_text = (foreground >> 16 & 255) + (foreground >> 8 & 255) + (foreground & 255) < 384;
@@ -52,6 +52,14 @@ impl Markdown {
             *end = self.text.len();
         } else if !text.is_empty() {
             self.spans.push((self.text.len(), style));
+        }
+    }
+
+    fn finish_link(&mut self, start: usize, destination: &str) {
+        if &self.text[start..] != destination {
+            self.push(" (", LINK);
+            self.push(destination, LINK);
+            self.push(")", LINK);
         }
     }
 
@@ -135,11 +143,7 @@ impl Markdown {
                             styles.pop();
                             if matches!(tag, TagEnd::Link | TagEnd::Image) {
                                 let (start, destination) = links.pop().unwrap();
-                                if cell.text[start..] != *destination {
-                                    cell.push(" (", LINK);
-                                    cell.push(&destination, LINK);
-                                    cell.push(")", LINK);
-                                }
+                                cell.finish_link(start, &destination);
                             }
                         }
                         Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
@@ -166,12 +170,12 @@ impl Markdown {
             .collect();
         let spaces = " ".repeat(widths.iter().max().unwrap() + 1);
         self.newline(2);
-        for (row_index, row) in rows.iter().enumerate() {
+        for (row_index, row) in rows.into_iter().enumerate() {
             for _ in 0..quote_depth {
                 self.push("│ ", QUOTE);
             }
             self.push("│", QUOTE);
-            for (column, cell) in row.iter().enumerate() {
+            for (column, cell) in row.into_iter().enumerate() {
                 let padding = widths[column].saturating_sub(crate::width::text_width(&cell.text));
                 let left = match alignments[column] {
                     Alignment::Right => padding,
@@ -284,7 +288,6 @@ impl Markdown {
                             output.newline(2);
                             next |= CODE;
                         }
-                        Tag::Paragraph => (),
                         Tag::BlockQuote(_) => {
                             output.newline(1);
                             quote_depth += 1;
@@ -332,11 +335,7 @@ impl Markdown {
                         }
                         TagEnd::Link | TagEnd::Image => {
                             let (start, destination) = links.pop().unwrap();
-                            if output.text[start..] != *destination {
-                                output.push(" (", LINK);
-                                output.push(&destination, LINK);
-                                output.push(")", LINK);
-                            }
+                            output.finish_link(start, &destination);
                         }
                         _ => (),
                     }

@@ -1230,6 +1230,7 @@ fn automatic_session_names_are_atomic_reusable_and_attachable() {
     wait(&mut named, |client, _| client.snapshot().is_some());
 
     let barrier = Arc::new(std::sync::Barrier::new(8));
+    // Spawn every barrier participant before joining any thread.
     let handles: Vec<_> = (0..8)
         .map(|_| {
             let socket = server.socket();
@@ -3275,30 +3276,30 @@ fn forced_screen_read_waits_for_its_own_reply() {
     let mut peer = Peer::new(right).unwrap();
     client.request_screen().unwrap();
     client.flush().unwrap();
-    let old = match peer.next_action().unwrap().unwrap() {
-        Action::ScreenRequest {
-            request,
-            wait: true,
-        } => request,
-        _ => panic!("expected a pending frame request"),
+    let Action::ScreenRequest {
+        request: old,
+        wait: true,
+    } = peer.next_action().unwrap().unwrap()
+    else {
+        panic!("expected a pending frame request");
     };
     client.refresh_screen().unwrap();
     client.flush().unwrap();
-    let fresh = match peer.next_action().unwrap().unwrap() {
-        Action::ScreenRequest {
-            request,
-            wait: false,
-        } => request,
-        _ => panic!("expected a fresh screen read"),
+    let Action::ScreenRequest {
+        request: fresh,
+        wait: false,
+    } = peer.next_action().unwrap().unwrap()
+    else {
+        panic!("expected a fresh screen read");
     };
     client.refresh_screen().unwrap();
     client.flush().unwrap();
-    let newest = match peer.next_action().unwrap().unwrap() {
-        Action::ScreenRequest {
-            request,
-            wait: false,
-        } => request,
-        _ => panic!("expected a newer forced screen read"),
+    let Action::ScreenRequest {
+        request: newest,
+        wait: false,
+    } = peer.next_action().unwrap().unwrap()
+    else {
+        panic!("expected a newer forced screen read");
     };
     peer.send_response(Response::State(snapshot.clone(), Vec::new(), old))
         .unwrap();
@@ -4626,12 +4627,12 @@ fn input_queues_a_fresh_screen_request_before_each_payload() {
     let payloads: [Option<&[u8]>; 3] = [None, Some(b"\x1b[I"), Some(b"z")];
     let mut previous = 0;
     for payload in payloads {
-        let request = match peer.next_action().unwrap().unwrap() {
-            Action::ScreenRequest {
-                request,
-                wait: true,
-            } => request,
-            _ => panic!("expected a fresh screen request before input"),
+        let Action::ScreenRequest {
+            request,
+            wait: true,
+        } = peer.next_action().unwrap().unwrap()
+        else {
+            panic!("expected a fresh screen request before input");
         };
         assert!(request > previous);
         previous = request;

@@ -248,7 +248,7 @@ impl Drop for Harness {
 
 fn emit(shared: &Shared, event: Event) -> io::Result<()> {
     let bytes = match &event {
-        Event::Text(s) | Event::Notice(s) | Event::Error(s) => s.len(),
+        Event::Text(s) | Event::Notice(s) | Event::Blocked(s) | Event::Error(s) => s.len(),
         Event::Tool { id, name, text, .. } => id.len() + name.len() + text.len(),
         _ => 0,
     };
@@ -403,7 +403,10 @@ impl Session {
                 if remaining.is_zero() {
                     break;
                 }
-                wait(shared.wake.as_raw_fd(), remaining.as_millis().max(1) as i32)?;
+                wait(
+                    shared.wake.as_raw_fd(),
+                    crate::poll::timeout_millis(remaining),
+                )?;
             }
         }
         unreachable!()

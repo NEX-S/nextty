@@ -18,6 +18,7 @@ fn sources(directory: &Path, result: &mut Vec<std::path::PathBuf>) {
 
 fn main() {
     if env::var_os("CARGO_FEATURE_GUI").is_none() {
+        println!("cargo:rerun-if-changed=build.rs");
         return;
     }
     println!("cargo:rerun-if-changed=native");
@@ -54,7 +55,7 @@ fn main() {
     }
     let mut files = Vec::new();
     sources(Path::new("native"), &mut files);
-    files.sort();
+    files.sort_unstable();
     let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
     let debug = env::var("DEBUG").expect("Cargo DEBUG") == "true";
     let archive_path = out.join("libnextty_native.a");

@@ -369,26 +369,12 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
     let (plain, text) = text.split_at(split);
     data.extend_from_slice(plain);
     let mut start = 0;
-    let mut copy = |index: usize, byte: u8| {
+    for index in memchr::memchr2_iter(b'\r', 0x1b, text) {
+        let byte = text[index];
         if (byte == b'\r' && text.get(index + 1) == Some(&b'\n')) || byte == 0x1b {
             data.extend_from_slice(&text[start..index]);
             start = index + 1;
         }
-    };
-    let (blocks, tail) = text.as_chunks::<32>();
-    for (block_index, block) in blocks.iter().enumerate() {
-        if matches!(block[0], b'\r' | 0x1b)
-            || block.iter().fold(false, |special, byte| {
-                special | matches!(byte, b'\r' | 0x1b)
-            })
-        {
-            for (index, &byte) in block.iter().enumerate() {
-                copy(block_index * 32 + index, byte);
-            }
-        }
-    }
-    for (index, &byte) in tail.iter().enumerate() {
-        copy(blocks.len() * 32 + index, byte);
     }
     data.extend_from_slice(&text[start..]);
     data.extend_from_slice(b"\x1b[201~");

@@ -330,14 +330,11 @@ pub fn run() -> io::Result<()> {
                         .iter()
                         .map(|session| serde_json::from_value(session["id"].clone()))
                         .collect::<Result<_, _>>()?;
-                    for session in sessions
-                        .iter_mut()
-                        .filter(|session| !ids.contains(&session.id))
+                    for mut session in sessions.extract_if(.., |session| !ids.contains(&session.id))
                     {
                         session.model.close(&mut client)?;
                         client.send(Action::AgentRemove(session.id))?;
                     }
-                    sessions.retain(|session| ids.contains(&session.id));
                     for id in ids {
                         if !sessions.iter().any(|session| session.id == id) {
                             sessions.push(Session {

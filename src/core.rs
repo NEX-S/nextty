@@ -612,7 +612,7 @@ pub enum SelectionType {
     Object = 3,
 }
 
-pub(crate) fn semantic_group(c: char) -> u8 {
+fn semantic_group(c: char) -> u8 {
     if c.is_whitespace() {
         0
     } else if matches!(
@@ -700,8 +700,8 @@ pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
 
 pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
     point: (i64, usize),
-    mut row: impl FnMut(i64) -> std::result::Result<Option<R>, E>,
-) -> std::result::Result<Option<[(i64, usize); 2]>, E> {
+    mut row: impl FnMut(i64) -> Result<Option<R>, E>,
+) -> Result<Option<[(i64, usize); 2]>, E> {
     // Bound work on one user gesture, even for output containing enormous soft-wrapped lines.
     const LIMIT: usize = 4096;
     let Some(anchor_row) = row(point.0)? else {
@@ -1279,10 +1279,9 @@ impl Core {
             return color;
         }
         let value = match index {
-            0..256 => return DEFAULT_PALETTE[index],
-            256 | 258 | 267 => self.foreground,
+            0..=255 => return DEFAULT_PALETTE[index],
             257 => self.background,
-            259..267 | 268 => {
+            259..=266 | 268 => {
                 let c = self.palette_color(if index == 268 {
                     NamedColor::Foreground as usize
                 } else {

@@ -17,7 +17,7 @@ pub(crate) fn notify(fd: RawFd) -> io::Result<()> {
         }
         let error = io::Error::last_os_error();
         match error.kind() {
-            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::Interrupted => (),
             io::ErrorKind::WouldBlock => return Ok(()),
             _ => return Err(error),
         }
@@ -32,7 +32,7 @@ pub(crate) fn consume_notification(fd: RawFd) -> io::Result<bool> {
         }
         let error = io::Error::last_os_error();
         match error.kind() {
-            io::ErrorKind::Interrupted => continue,
+            io::ErrorKind::Interrupted => (),
             io::ErrorKind::WouldBlock => return Ok(false),
             _ => return Err(error),
         }

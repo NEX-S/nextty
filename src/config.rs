@@ -1,7 +1,7 @@
 use crate::error::{Error, Result};
 use std::{borrow::Cow, io::ErrorKind, path::PathBuf};
 
-pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
+const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TabStyle {
@@ -10,7 +10,7 @@ pub enum TabStyle {
     Flat,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub struct Config {
     pub font_family: Cow<'static, str>,
     pub font_size_px: f32,

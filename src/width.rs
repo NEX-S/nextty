@@ -2,6 +2,7 @@
 
 #[path = "width_tables.rs"]
 mod tables;
+use std::borrow::Cow;
 use tables::*;
 
 /// Width of one scalar, with C0/C1 controls mapped to zero. U+17D8 has width 3.
@@ -44,7 +45,7 @@ pub(crate) fn printable_ascii_prefix(bytes: &[u8]) -> usize {
 }
 
 /// One clipping policy keeps the GUI and TUI header labels on the same columns.
-pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
+pub fn fit_label(text: &str, columns: u16) -> Cow<'_, str> {
     let columns = usize::from(columns);
     // With widths capped at two columns, UTF-8 byte length is an upper bound.
     if text.len() <= columns
@@ -52,7 +53,7 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
             .chars()
             .any(char::is_control)
     {
-        return std::borrow::Cow::Borrowed(text.trim_end());
+        return Cow::Borrowed(text.trim_end());
     }
     let end = text.len().min(columns);
     // A non-ASCII scalar at the boundary may extend the label without using a column.
@@ -60,7 +61,7 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
         && text.as_bytes()[end].is_ascii()
         && printable_ascii_prefix(&text.as_bytes()[..end]) == end
     {
-        return std::borrow::Cow::Borrowed(text[..end].trim_end());
+        return Cow::Borrowed(text[..end].trim_end());
     }
     let mut used = 0usize;
     let mut end = 0;
@@ -80,7 +81,7 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
     }
     let text = &text[..end];
     if !controls {
-        return std::borrow::Cow::Borrowed(text.trim_end());
+        return Cow::Borrowed(text.trim_end());
     }
     let mut label = String::with_capacity(text.len());
     label.extend(
@@ -88,19 +89,19 @@ pub fn fit_label(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
             .map(|ch| if ch.is_control() { ' ' } else { ch }),
     );
     label.truncate(label.trim_end().len());
-    std::borrow::Cow::Owned(label)
+    Cow::Owned(label)
 }
 
-pub fn fit_middle(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
+pub fn fit_middle(text: &str, columns: u16) -> Cow<'_, str> {
     let prefix = printable_ascii_prefix(text.as_bytes());
     let clean = if text[prefix..].chars().any(char::is_control) {
-        std::borrow::Cow::Owned(
+        Cow::Owned(
             text.chars()
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
                 .collect::<String>(),
         )
     } else {
-        std::borrow::Cow::Borrowed(text)
+        Cow::Borrowed(text)
     };
     if clean.len() <= usize::from(columns)
         || prefix <= usize::from(columns) && text_width(&clean) <= usize::from(columns)
@@ -108,7 +109,7 @@ pub fn fit_middle(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
         return clean;
     }
     if columns == 0 {
-        return std::borrow::Cow::Borrowed("");
+        return Cow::Borrowed("");
     }
     let left = (columns - 1) / 2;
     let right = usize::from(columns - 1 - left);
@@ -123,7 +124,7 @@ pub fn fit_middle(text: &str, columns: u16) -> std::borrow::Cow<'_, str> {
         used += width;
         start = index;
     }
-    std::borrow::Cow::Owned([prefix.as_ref(), "…", &clean[start..]].concat())
+    Cow::Owned([prefix.as_ref(), "…", &clean[start..]].concat())
 }
 
 #[cfg(test)]

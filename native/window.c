@@ -11,7 +11,6 @@
 #include <fcntl.h>
 #include <limits.h>
 #include <locale.h>
-#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
@@ -68,8 +67,8 @@ struct Source {
     NtWindow *window;
     int primary, file_fd;
     void *proxy;
-    char *bytes;
     size_t length;
+    char bytes[];
 };
 typedef struct Offer Offer;
 struct Offer {
@@ -209,7 +208,7 @@ static void wayland_error(NtWindow *w, const char *operation) {
         fail(w, "%s: %s", operation, strerror(error ? error : errno));
 }
 static void queue_event(NtWindow *w, const NtEvent *event) {
-    Queued *q = malloc(sizeof *q + (event->text ? event->length + 1 : 0));
+    Queued *q = malloc(sizeof *q + (event->text ? event->length : 0));
     if (!q) {
         fail(w, "allocating pending window event: %s", strerror(errno));
         return;
@@ -218,7 +217,6 @@ static void queue_event(NtWindow *w, const NtEvent *event) {
     q->next = NULL;
     if (event->text) {
         memcpy(q->text, event->text, event->length);
-        q->text[event->length] = 0;
         q->event.text = q->text;
     }
     *w->queued_tail = q;
@@ -250,12 +248,12 @@ static void clear_events(Queued *q) {
 }
 static int append_bytes(NtWindow *w, char **bytes, size_t *length, size_t *capacity,
                         const void *data, size_t n) {
-    if (n > SIZE_MAX - *length - 1) {
+    if (n > SIZE_MAX - *length) {
         fail(w, "clipboard size overflow");
         return 0;
     }
-    if (*length + n + 1 > *capacity) {
-        size_t cap = *length + n + 1;
+    if (*length + n > *capacity) {
+        size_t cap = *length + n;
         if (cap < 4096)
             cap = 4096;
         else if (cap <= SIZE_MAX / 2)
@@ -268,10 +266,8 @@ static int append_bytes(NtWindow *w, char **bytes, size_t *length, size_t *capac
         *bytes = p;
         *capacity = cap;
     }
-    if (n)
-        memcpy(*bytes + *length, data, n);
+    memcpy(*bytes + *length, data, n);
     *length += n;
-    (*bytes)[*length] = 0;
     return 1;
 }
 static void start_paste(NtWindow *w);
@@ -307,14 +303,16 @@ static void *file_sender_run(void *data) {
     for (;;) {
         ssize_t n;
         pthread_mutex_lock(&sender->mutex);
-        while (sender->pending) {
-            FileTransfer *t = sender->pending;
-            sender->pending = t->next;
+        FileTransfer *pending = sender->pending;
+        sender->pending = NULL;
+        int closed = sender->closed;
+        pthread_mutex_unlock(&sender->mutex);
+        while (pending) {
+            FileTransfer *t = pending;
+            pending = t->next;
             t->next = active;
             active = t;
         }
-        int closed = sender->closed;
-        pthread_mutex_unlock(&sender->mutex);
         if (closed)
             break;
         FileTransfer **link = &active;
@@ -361,7 +359,7 @@ static void *file_sender_run(void *data) {
                     t->buffered = (size_t)n;
                     t->sent = 0;
                 } else
-                    done = !n || (errno != EAGAIN && errno != EWOULDBLOCK);
+                    done = !n || errno != EAGAIN;
             }
             if (!done && t->write_ready && t->sent < t->buffered) {
                 if (file_sender_closed(sender))
@@ -375,7 +373,7 @@ static void *file_sender_run(void *data) {
                     t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
                 }
                 done = ((size_t)t->offset == t->length && t->sent == t->buffered) || !n ||
-                       (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+                       (n < 0 && errno != EAGAIN);
             }
             if (done) {
                 *link = t->next;
@@ -427,13 +425,15 @@ done:
     pthread_mutex_lock(&sender->mutex);
     sender->closed = 1;
     sender->error = error;
-    while (sender->pending) {
-        FileTransfer *t = sender->pending;
-        sender->pending = t->next;
+    FileTransfer *pending = sender->pending;
+    sender->pending = NULL;
+    pthread_mutex_unlock(&sender->mutex);
+    while (pending) {
+        FileTransfer *t = pending;
+        pending = t->next;
         t->next = active;
         active = t;
     }
-    pthread_mutex_unlock(&sender->mutex);
     if (error)
         fprintf(stderr, "clipboard file sender: %s\n", strerror(error));
     while (active) {
@@ -448,7 +448,11 @@ static int file_sender_start(NtWindow *w) {
     if (w->file_sender)
         return 1;
     FileSender *sender = calloc(1, sizeof *sender);
-    int error = sender ? pthread_mutex_init(&sender->mutex, NULL) : errno;
+    if (!sender) {
+        fail(w, "creating clipboard file sender: %s", strerror(errno));
+        return 0;
+    }
+    int error = pthread_mutex_init(&sender->mutex, NULL);
     if (error) {
         free(sender);
         fail(w, "creating clipboard file sender: %s", strerror(error));
@@ -549,16 +553,15 @@ static void add_transfer(NtWindow *w, int fd, int writing, const char *bytes, si
     t->fd = fd;
     t->writing = writing;
     t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
-    if (writing) {
-        t->bytes = malloc(length ? length : 1);
+    if (writing && length) {
+        t->bytes = malloc(length);
         if (!t->bytes) {
             fail(w, "allocating clipboard transfer: %s", strerror(errno));
             close(fd);
             free(t);
             return;
         }
-        if (length)
-            memcpy(t->bytes, bytes, length);
+        memcpy(t->bytes, bytes, length);
         t->length = length;
     }
     t->next = w->transfers;
@@ -598,7 +601,7 @@ static void process_transfers(NtWindow *w, const struct pollfd *fds) {
                 }
             } else if (!n) {
                 done = 1;
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            } else if (errno != EAGAIN) {
                 done = 1;
                 good = 0;
             }
@@ -1049,10 +1052,9 @@ static const struct zwp_text_input_v3_listener text_listener = {.enter = text_en
 static void source_remove(Source *source) {
     NtWindow *w = source->window;
     Source **link = &w->sources;
-    while (*link && *link != source)
+    while (*link != source)
         link = &(*link)->next;
-    if (*link)
-        *link = source->next;
+    *link = source->next;
     if (w->current_source[source->primary] == source)
         w->current_source[source->primary] = NULL;
     if (w->pending_source[source->primary] == source)
@@ -1063,7 +1065,6 @@ static void source_remove(Source *source) {
         else
             wl_data_source_destroy(source->proxy);
     }
-    free(source->bytes);
     if (source->file_fd >= 0)
         queue_file(w, -1, source->file_fd);
     free(source);
@@ -1145,10 +1146,9 @@ static void offer_destroy(Offer *o) {
         return;
     NtWindow *w = o->window;
     Offer **link = &w->offers;
-    while (*link && *link != o)
+    while (*link != o)
         link = &(*link)->next;
-    if (*link)
-        *link = o->next;
+    *link = o->next;
     if (w->dnd_offer == o)
         w->dnd_offer = NULL;
     if (o->primary)
@@ -1477,8 +1477,6 @@ static int poll_timeout(NtWindow *w, int timeout) {
     return timeout;
 }
 int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int timeout_ms, NtEventFn callback, void *data) {
-    if (!w || !callback)
-        return -1;
     struct pollfd local[16], *fds = local;
     w->callback = callback;
     w->callback_data = data;
@@ -1570,8 +1568,8 @@ NtWindow *nt_window_new(int width, int height) {
         return NULL;
     }
     w->tracing = getenv("NEXTTY_TRACE") != NULL;
-    w->width = width > 0 ? width : 800;
-    w->height = height > 0 ? height : 600;
+    w->width = width;
+    w->height = height;
     w->scale = 1;
     w->cursor_w = w->cursor_h = 1;
     w->queued_tail = &w->queued;
@@ -1646,11 +1644,11 @@ void nt_window_cursor_rect(NtWindow *w, int x, int y, int width, int height) {
         zwp_text_input_v3_commit(w->text_input);
     }
 }
-static void set_selection(NtWindow *w, int primary, char *bytes, size_t length, int fd) {
-    Source *source = malloc(sizeof *source);
+static void set_selection(NtWindow *w, int primary, const char *bytes, size_t length, int fd) {
+    primary = !!primary;
+    Source *source = malloc(sizeof *source + length);
     if (!source) {
         fail(w, "allocating clipboard source: %s", strerror(errno));
-        free(bytes);
         if (fd >= 0)
             queue_file(w, -1, fd);
         return;
@@ -1661,25 +1659,17 @@ static void set_selection(NtWindow *w, int primary, char *bytes, size_t length, 
                        .window = w,
                        .primary = primary,
                        .file_fd = fd,
-                       .bytes = bytes,
                        .length = length};
+    if (length)
+        memcpy(source->bytes, bytes, length);
     w->sources = source;
     w->pending_source[primary] = source;
     wayland_selection(w, primary);
 }
 void nt_window_set_selection(NtWindow *w, int primary, const char *bytes, size_t length) {
-    primary = !!primary;
-    char *copy = malloc(length + 1);
-    if (!copy) {
-        fail(w, "copying selection: %s", strerror(errno));
-        return;
-    }
-    memcpy(copy, bytes, length);
-    copy[length] = 0;
-    set_selection(w, primary, copy, length, -1);
+    set_selection(w, primary, bytes, length, -1);
 }
 void nt_window_set_selection_file(NtWindow *w, int primary, int fd) {
-    primary = !!primary;
     if (fcntl(fd, F_SETFD, FD_CLOEXEC) < 0) {
         int error = errno;
         close(fd);
@@ -1753,8 +1743,6 @@ void *nt_window_surface(NtWindow *w) {
     return w->surface;
 }
 void nt_window_free(NtWindow *w) {
-    if (!w)
-        return;
     while (w->sources)
         source_remove(w->sources);
     if (w->display) {

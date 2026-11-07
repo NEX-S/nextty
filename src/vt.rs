@@ -476,7 +476,7 @@ impl Parser {
         }
     }
 
-    fn control(&mut self, core: &mut Core, byte: u8) {
+    fn control(core: &mut Core, byte: u8) {
         match byte {
             0x08 => core.move_backward(1),
             0x09 => core.move_tabs(1, true),
@@ -565,7 +565,7 @@ impl Parser {
                         self.print(core, "\u{fffd}");
                     }
                 }
-                _ => self.control(core, byte),
+                _ => Self::control(core, byte),
             }
             return 1;
         }
@@ -801,12 +801,10 @@ impl Parser {
                         if mode == 5 {
                             u8::try_from(p.values[start]).ok().map(Color::Indexed)
                         } else {
-                            match (
-                                u8::try_from(p.values[start]),
-                                u8::try_from(p.values[start + 1]),
-                                u8::try_from(p.values[start + 2]),
-                            ) {
-                                (Ok(r), Ok(g), Ok(b)) => Some(Color::Spec(Rgb { r, g, b })),
+                            match [p.values[start], p.values[start + 1], p.values[start + 2]]
+                                .map(u8::try_from)
+                            {
+                                [Ok(r), Ok(g), Ok(b)] => Some(Color::Spec(Rgb { r, g, b })),
                                 _ => None,
                             }
                         }

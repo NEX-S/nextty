@@ -626,30 +626,23 @@ impl Frontend {
             usize::from(self.size.num_lines),
         );
         if self.ui.files_open && self.ui.focus == Focus::Files {
-            let rect = if self
-                .ui
-                .files
-                .as_ref()
-                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
-            {
+            let preview = self.ui.file_preview_open();
+            let rect = if preview {
                 self.file_preview_rect()
             } else {
                 self.file_rect()
             };
             viewport = (
                 usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(if self.ui.file_preview_open() {
-                    5
-                } else {
-                    0
-                })),
+                usize::from(rect.rows.saturating_sub(if preview { 5 } else { 0 })),
             );
         } else if self.ui.agent.open && self.ui.focus.is_agent() {
             let rect = editor(&self.ui, self.agent_rect()).0;
             viewport = (
-                usize::from(rect.cols)
-                    .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
-                    .max(1),
+                self.ui
+                    .agent
+                    .active()
+                    .editor_columns(usize::from(rect.cols)),
                 usize::from(rect.rows),
             );
         }
@@ -1148,7 +1141,7 @@ impl Frontend {
                     self.panel_bytes(&bytes, None)?;
                 }
                 Input::Mouse(mouse) => {
-                    self.file_mouse(mouse)?;
+                    self.file_mouse(mouse);
                 }
                 _ => (),
             }
@@ -1330,7 +1323,7 @@ impl Frontend {
                 if self.ui.files_open && self.file_rect().contains(mouse.column, mouse.row) {
                     if !mouse.release && mouse.code & 32 == 0 {
                         self.ui.focus = Focus::Files;
-                        return self.file_mouse(mouse);
+                        self.file_mouse(mouse);
                     }
                     return Ok(());
                 }
@@ -2010,7 +2003,7 @@ impl Frontend {
         self.resize()
     }
 
-    fn file_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
+    fn file_mouse(&mut self, mouse: Mouse) {
         let preview = self.ui.file_preview_open();
         let rect = if preview {
             self.file_preview_rect()
@@ -2026,7 +2019,7 @@ impl Frontend {
                 files.focus_list();
                 self.dirty = true;
             }
-            return Ok(());
+            return;
         }
         if !mouse.release && mouse.code & 64 != 0 {
             files.scroll(
@@ -2047,7 +2040,6 @@ impl Frontend {
             files.focus_preview();
         }
         self.dirty = true;
-        Ok(())
     }
 
     fn draw_files(&mut self, output: &mut Vec<u8>) -> io::Result<()> {

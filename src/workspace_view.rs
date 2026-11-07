@@ -156,9 +156,8 @@ impl GuiLayout {
     }
     fn size(self, cell: (f32, f32)) -> WindowSize {
         WindowSize {
-            num_cols: (((self.side - self.left - TERMINAL_PADDING * 2.) / cell.0).floor() as u16)
-                .max(2),
-            num_lines: (((self.footer - self.top - TERMINAL_PADDING * 2.) / cell.1).floor() as u16)
+            num_cols: (((self.side - self.left - TERMINAL_PADDING * 2.) / cell.0) as u16).max(2),
+            num_lines: (((self.footer - self.top - TERMINAL_PADDING * 2.) / cell.1) as u16)
                 .saturating_add(1)
                 .max(2),
             cell_width: cell.0.round() as u16,
@@ -176,8 +175,8 @@ impl GuiLayout {
         let (ox, oy) = self.origin(cell);
         let size = self.size(cell);
         (
-            (((pointer.0 - ox) / cell.0).max(0.) as u16).min(size.num_cols - 1),
-            (((pointer.1 - oy) / cell.1).max(0.) as u16).min(size.num_lines - 1),
+            (((pointer.0 - ox) / cell.0) as u16).min(size.num_cols - 1),
+            (((pointer.1 - oy) / cell.1) as u16).min(size.num_lines - 1),
         )
     }
     fn terminal_contains(self, point: (f32, f32)) -> bool {
@@ -536,11 +535,9 @@ impl WorkspaceView {
             self.ui.poll_agent(&mut self.client, &self.config)?;
         }
         self.client.flush()?;
-        if let Some(trace) = &mut self.trace {
-            trace.output.get_mut().draining = true;
-        }
         self.renderer.finish()?;
         if let Some(trace) = &mut self.trace {
+            trace.output.get_mut().draining = true;
             trace.record_swap(self.renderer.swap_time())?;
             trace.finish()?;
         }
@@ -895,23 +892,15 @@ impl WorkspaceView {
         let mut viewport = (1, 1);
         if self.ui.files_open && self.ui.focus == Focus::Files {
             let layout = self.layout();
-            let rect = if self
-                .ui
-                .files
-                .as_ref()
-                .is_some_and(|files| files.focus() == FileFocus::Preview)
-            {
+            let preview = self.ui.file_preview_open();
+            let rect = if preview {
                 self.file_preview_layout(layout)
             } else {
                 self.file_rect(layout)
             };
             viewport = (
                 usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(if self.ui.file_preview_open() {
-                    5
-                } else {
-                    0
-                })),
+                usize::from(rect.rows.saturating_sub(if preview { 5 } else { 0 })),
             );
         } else if let Some(layout) = self.editor_viewport() {
             viewport = (layout.columns, layout.rows);
@@ -1057,11 +1046,11 @@ impl WorkspaceView {
 
         if self.ui.files_open {
             layout.left = f32::from(crate::file_panel::sidebar_width(
-                (layout.side / self.cell.0).floor() as u16,
+                (layout.side / self.cell.0) as u16,
             )) * self.cell.0;
         }
         if self.ui.resources.open {
-            let total = ((layout.height - layout.top - 12.) / self.cell.1).max(0.) as u16;
+            let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
             layout.footer -= f32::from(self.ui.resources.rows(total)) * self.cell.1 + 6.;
         }
         layout
@@ -1090,18 +1079,14 @@ impl WorkspaceView {
         let rect = pane.rect;
         let screen = self.client.screens().get(&pane.id)?;
         let (ox, oy) = layout.origin(self.cell);
-        let row = ((self.pointer.1 - oy) / self.cell.1 - f32::from(rect.y))
-            .floor()
-            .clamp(0., f32::from(rect.rows - 1)) as usize;
+        let row = (((self.pointer.1 - oy) / self.cell.1 - f32::from(rect.y)) as usize)
+            .min(usize::from(rect.rows - 1));
         let x = (self.pointer.0 - ox) / self.cell.0 - f32::from(rect.x);
         Some((
             pane.id,
             Point {
                 line: row as i32 - screen.display_offset() as i32,
-                column: x
-                    .floor()
-                    .clamp(0., screen.columns().saturating_sub(1) as f32)
-                    as usize,
+                column: (x as usize).min(screen.columns().saturating_sub(1)),
             },
             if x < screen.columns() as f32 && x.fract() < 0.5 {
                 Side::Left
@@ -1121,7 +1106,7 @@ impl WorkspaceView {
                 && (top..layout.height - self.cell.1 - 12.).contains(&self.pointer.1))
             .then(|| {
                 (
-                    ((self.pointer.0 - PADDING) / self.cell.0).floor() as u16,
+                    ((self.pointer.0 - PADDING) / self.cell.0) as u16,
                     ((self.pointer.1 - top) / self.cell.1).floor() as i32,
                 )
             });
@@ -1648,8 +1633,8 @@ impl WorkspaceView {
 
         if self.ui.resources.dragging {
             let bottom = layout.height - self.cell.1 - 12.;
-            let total = ((layout.height - layout.top - 12.) / self.cell.1).max(0.) as u16;
-            let rows = ((bottom - pointer.1) / self.cell.1).round().max(0.) as u16;
+            let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
+            let rows = ((bottom - pointer.1) / self.cell.1).round() as u16;
             let old = self.ui.resources.height;
             self.ui.resources.resize(rows, total);
             if self.ui.resources.height != old {
@@ -2163,8 +2148,8 @@ impl WorkspaceView {
         crate::workspace::Rect {
             x: 0,
             y: 1,
-            cols: (layout.left / self.cell.0).floor() as u16,
-            rows: ((layout.footer - layout.top) / self.cell.1).floor().max(1.) as u16,
+            cols: (layout.left / self.cell.0) as u16,
+            rows: (((layout.footer - layout.top) / self.cell.1) as u16).max(1),
         }
     }
 
@@ -2172,8 +2157,8 @@ impl WorkspaceView {
         crate::file_panel::preview_rect(crate::workspace::Rect {
             x: 0,
             y: 1,
-            cols: (layout.width / self.cell.0).floor() as u16,
-            rows: ((layout.footer - layout.top) / self.cell.1).floor() as u16,
+            cols: (layout.width / self.cell.0) as u16,
+            rows: ((layout.footer - layout.top) / self.cell.1) as u16,
         })
     }
 }

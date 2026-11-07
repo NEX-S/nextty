@@ -59,6 +59,31 @@ def fixture(directory):
                 os.write(1, f'\x1b[Hprobe-{index:04}\x1b[K'.encode())
 
 
+def model_headers():
+    headers = {'Content-Type': 'application/json', 'Accept': 'text/event-stream',
+               'anthropic-version': '2023-06-01'}
+    if os.environ.get('ANTHROPIC_AUTH_TOKEN'):
+        headers['Authorization'] = 'Bearer ' + os.environ['ANTHROPIC_AUTH_TOKEN']
+    elif os.environ.get('ANTHROPIC_API_KEY'):
+        headers['x-api-key'] = os.environ['ANTHROPIC_API_KEY']
+    return headers
+
+
+def prepare_model_request(payload, model, results):
+    body = json.loads(payload)
+    body['model'] = model
+    for message in body['messages']:
+        if isinstance(message['content'], list):
+            for block in message['content']:
+                if block['type'] == 'tool_result':
+                    results[block['tool_use_id']] = block
+    last = body['messages'][-1]['content']
+    kind = ('review' if isinstance(last, str) and last.startswith('Harness goal review:')
+            else 'summary' if body.get('tool_choice', {}).get('type') == 'none'
+            else 'execute')
+    return json.dumps(body).encode(), kind
+
+
 def exit_zero_observed(call, result, pane, command):
     if (call['input'].get('pane') == pane and result.get('command') == command
             and result.get('running') is False and result.get('exit_code') == 0):
@@ -1032,7 +1057,7 @@ class Lab:
             output_start = len(self.output)
             os.write(self.master, b'\x1b[Z' * (6 - index) + b'\r')
             marker = f'conversation-{index}-finished'.encode()
-            self.wait(lambda: marker in self.output[output_start:], 'completed conversation rendered after switching')
+            self.wait(lambda: self.output.find(marker, output_start) >= 0, 'completed conversation rendered after switching')
         return {'case':'concurrent-conversations', 'conversations':4, 'input_ms':latency,
                 'histories_verified':len(verified), 'rendered_after_switch':4, 'request_bytes':self.requests,
                 'product_cpu_seconds':{role:end[role]['cpu_seconds']-value['cpu_seconds']
@@ -1099,7 +1124,6 @@ class Lab:
 
     def run(self, name, prefix=0, hz=50, visible=True):
         self.hz = hz
-        self.prefix = ('**agent** `shell` and history.\n\n' * 8192)[:prefix]
         if name in ('code-stream', 'open-code-stream'):
             self.prefix = '```text\n' + ('0123456789abcdef output line\n' * 8192)[:prefix] + '\n'
             if name == 'code-stream':
@@ -1108,6 +1132,8 @@ class Lab:
             paragraph = ('终端响应 延迟 agent 输出 文本🙂 e\u0301 ' * 20) + '\n\n'
             size = len(paragraph.encode())
             self.prefix = paragraph * (prefix // size) + ' ' * (prefix % size)
+        else:
+            self.prefix = ('**agent** `shell` and history.\n\n' * 8192)[:prefix]
         if name != 'idle':
             os.write(self.master, b'\x1ba')
             self.drain(.05)
@@ -1191,8 +1217,10 @@ def main():
              ('long-stream', 128 * 1024, 200, True), ('code-stream', 128 * 1024, 200, True),
              ('open-code-stream', 128 * 1024, 200, True), ('unicode-stream', 128 * 1024, 200, True),
              ('long-hidden', 128 * 1024, 200, False)]
-    report = {'binary': str(binary), 'sha256': hashlib.sha256(binary.read_bytes()).hexdigest(),
-              'scope': __doc__, 'platform': list(os.uname()), 'samples_per_case': 80, 'cases': []}
+    with binary.open('rb') as source:
+        binary_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
+    report = {'binary': str(binary), 'sha256': binary_sha256,
+              'scope': __doc__, 'platform': os.uname(), 'samples_per_case': 80, 'cases': []}
     for name, prefix, hz, visible in cases:
         lab = Lab(binary)
         try:

@@ -37,16 +37,11 @@ impl WorkspaceView {
                 (y..y + self.cell.1).contains(&self.pointer.1)
             })?
         };
-        let column =
-            ((self.pointer.0 - f32::from(rect.x) * self.cell.0) / self.cell.0).max(0.) as usize;
+        let column = ((self.pointer.0 - f32::from(rect.x) * self.cell.0) / self.cell.0) as usize;
         self.ui
             .agent
             .active()
             .point(*line, column.min(usize::from(rect.cols)))
-    }
-
-    pub(super) fn agent_editor_reserved(&self) -> usize {
-        3 * usize::from(self.ui.agent.active().model.busy)
     }
 
     pub(super) fn editor_viewport(&self) -> Option<EditorViewport> {
@@ -54,9 +49,11 @@ impl WorkspaceView {
             .control_hits
             .iter()
             .find(|hit| hit.action == GuiAction::Agent(AgentAction::Editor))?;
-        let columns = ((hit.bounds.2 / self.cell.0).floor().max(1.) as usize)
-            .saturating_sub(self.agent_editor_reserved())
-            .max(1);
+        let columns = self
+            .ui
+            .agent
+            .active()
+            .editor_columns((hit.bounds.2 / self.cell.0) as usize);
         let rows = (hit.bounds.3 / self.cell.1).round().max(1.) as usize;
         Some(EditorViewport {
             x: hit.bounds.0,
@@ -201,9 +198,10 @@ impl WorkspaceView {
             });
         }
         let editor = self.ui.agent.active().editor_layout(
-            usize::from(panel.editor.cols)
-                .saturating_sub(self.agent_editor_reserved())
-                .max(1),
+            self.ui
+                .agent
+                .active()
+                .editor_columns(usize::from(panel.editor.cols)),
             usize::from(panel.editor.rows),
         );
         let chat = panel.chat;

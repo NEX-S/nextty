@@ -19,7 +19,7 @@ impl WorkspaceView {
         let controller = snapshot.controller;
         let cell = self.cell;
         let label = if self.client.is_remote() { "SSH" } else { "" };
-        let columns = ((layout.width - self.control_width()) / cell.0).max(0.) as u16;
+        let columns = ((layout.width - self.control_width()) / cell.0) as u16;
         self.text.draw(
             &self.renderer,
             "›",
@@ -271,8 +271,8 @@ impl WorkspaceView {
     }
     fn draw_resources(&mut self, layout: GuiLayout, summary_y: f32) -> Result<()> {
         let top = layout.footer + 6.;
-        let columns = ((layout.width - PADDING * 2.) / self.cell.0).max(0.) as u16;
-        let rows = ((summary_y - 6. - top) / self.cell.1).max(0.) as u16;
+        let columns = ((layout.width - PADDING * 2.) / self.cell.0) as u16;
+        let rows = ((summary_y - 6. - top) / self.cell.1) as u16;
         let view = self.ui.resources.view(columns, rows);
         let body_left = PADDING + f32::from(view.body_x) * self.cell.0;
         let body_top = top;
@@ -376,7 +376,7 @@ impl WorkspaceView {
             self.renderer
                 .rect(0., summary_y - 6., layout.width, 1., BORDER, false);
         }
-        let columns = (layout.width / self.cell.0).max(0.) as u16;
+        let columns = (layout.width / self.cell.0) as u16;
         let origin = layout.width - f32::from(columns) * self.cell.0;
         let view = self
             .ui
@@ -432,7 +432,7 @@ impl WorkspaceView {
             &self.renderer,
             &crate::width::fit_middle(
                 &label,
-                ((right - PADDING - self.cell.0 * 2.) / self.cell.0).max(0.) as u16,
+                ((right - PADDING - self.cell.0 * 2.) / self.cell.0) as u16,
             ),
             PADDING,
             summary_y,
@@ -606,7 +606,7 @@ impl WorkspaceView {
                     false,
                 );
             }
-            let label = fit(label, (bw / self.cell.0).floor() as usize);
+            let label = fit(label, (bw / self.cell.0) as usize);
             self.text.draw(
                 &self.renderer,
                 &label,

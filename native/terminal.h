@@ -33,8 +33,9 @@ typedef struct {
  * Key code is an XKB keysym; printable text arrives only through NT_TEXT.
  * Paste code: primary; text is the completed, unmodified UTF-8 selection.
  * Trace-only frame code/x/y: frame id, monotonic receipt, raw server time (ms).
- * Trace-only window state code: activated/suspended/fullscreen/maximized bits;
- * x: monotonic receipt. Trace-only frame rate x: submission interval in nanoseconds. */
+ * Window state code: activated/suspended/fullscreen/maximized bits;
+ * x: monotonic receipt when tracing, zero otherwise.
+ * Trace-only frame rate x: submission interval in nanoseconds. */
 typedef void (*NtEventFn)(void *, const NtEvent *);
 
 NtWindow *nt_window_new(int width, int height);

@@ -59,7 +59,7 @@ impl RemoteTarget {
         };
         let port = port
             .map(|port| {
-                if port.is_empty() || !port.bytes().all(|c| c.is_ascii_digit()) {
+                if !port.bytes().all(|c| c.is_ascii_digit()) {
                     return Err(invalid());
                 }
                 port.parse::<u16>()

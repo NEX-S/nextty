@@ -19,7 +19,7 @@ use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
@@ -666,7 +666,7 @@ impl Peer {
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
                 Err(error) => {
                     self.read_error = Some(error);
                     break;
@@ -1117,10 +1117,8 @@ impl Encoder {
             self.string(value);
         }
     }
-    fn path(&mut self, value: &Option<PathBuf>) {
-        self.optional(value.as_ref(), |e, path| {
-            e.bytes(path.as_os_str().as_bytes())
-        });
+    fn path(&mut self, value: &Path) {
+        self.bytes(value.as_os_str().as_bytes());
     }
     fn size(&mut self, size: WindowSize) {
         self.u16(size.num_cols);
@@ -1217,12 +1215,10 @@ impl<'a> Decoder<'a> {
         }
         Ok(strings)
     }
-    fn path(&mut self) -> io::Result<Option<PathBuf>> {
-        self.optional(|d| {
-            Ok(PathBuf::from(std::ffi::OsString::from_vec(
-                d.bytes(65536)?.to_vec(),
-            )))
-        })
+    fn path(&mut self) -> io::Result<PathBuf> {
+        Ok(PathBuf::from(std::ffi::OsString::from_vec(
+            self.bytes(65536)?.to_vec(),
+        )))
     }
     fn size(&mut self) -> io::Result<WindowSize> {
         Ok(WindowSize {
@@ -1255,7 +1251,7 @@ fn encode_options(e: &mut Encoder, options: &CreateOptions) {
     e.size(options.size);
     e.u32(options.foreground);
     e.u32(options.background);
-    e.path(&options.directory);
+    e.optional(options.directory.as_deref(), Encoder::path);
     e.optional(options.program.as_ref(), |e, shell| {
         e.string(&shell.program);
         e.strings(&shell.args);
@@ -1267,7 +1263,7 @@ fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
         size: d.size()?,
         foreground: d.u32()?,
         background: d.u32()?,
-        directory: d.path()?,
+        directory: d.optional(Decoder::path)?,
         program: d.optional(|d| Ok(Shell::new(d.string(65536)?, d.strings(4096)?)))?,
         history_capacity: d.u64()?,
     })
@@ -1277,7 +1273,7 @@ fn encode_agent_change(e: &mut Encoder, change: &AgentChange) {
     e.0.reserve(29 + change.tool_id.len() + change.path.as_os_str().len() + change.diff.len());
     e.u64(change.turn);
     e.string(&change.tool_id);
-    e.bytes(change.path.as_os_str().as_bytes());
+    e.path(&change.path);
     e.u32(change.added);
     e.u32(change.removed);
     e.string(&change.diff);
@@ -1287,7 +1283,7 @@ fn decode_agent_change(d: &mut Decoder<'_>) -> io::Result<AgentChange> {
     Ok(AgentChange {
         turn: d.u64()?,
         tool_id: d.string(65536)?,
-        path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+        path: d.path()?,
         added: d.u32()?,
         removed: d.u32()?,
         diff: d.string(MAX_FRAME)?,
@@ -1425,7 +1421,7 @@ fn encode_file_result(e: &mut Encoder, result: &FileResult) {
         } => {
             e.0.reserve(26 + path.as_os_str().len() + text.len());
             e.u8(0);
-            e.bytes(path.as_os_str().as_bytes());
+            e.path(path);
             e.u64(*offset);
             e.string(text);
             e.u64(*next_offset);
@@ -1444,10 +1440,10 @@ fn encode_file_result(e: &mut Encoder, result: &FileResult) {
                         .sum::<usize>(),
             );
             e.u8(1);
-            e.bytes(path.as_os_str().as_bytes());
+            e.path(path);
             e.u32(matches.len() as u32);
             for found in matches {
-                e.bytes(found.path.as_os_str().as_bytes());
+                e.path(&found.path);
                 e.u64(found.line);
                 e.string(&found.text);
             }
@@ -1466,7 +1462,7 @@ fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
             change: decode_agent_change(d)?,
         });
     }
-    let path = PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec()));
+    let path = d.path()?;
     Ok(match kind {
         0 => FileResult::Read {
             path,
@@ -1480,7 +1476,7 @@ fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
             let mut matches = Vec::with_capacity(count);
             for _ in 0..count {
                 matches.push(FileMatch {
-                    path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+                    path: d.path()?,
                     line: d.u64()?,
                     text: d.string(MAX_FRAME)?,
                 });
@@ -1506,7 +1502,7 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.u8(37);
             e.u64(*pane);
             e.u64(*request);
-            e.bytes(path.as_os_str().as_bytes());
+            e.path(path);
             encode_file_operation(e, operation);
         }
         Action::CancelAgentFile { request } => {
@@ -1736,7 +1732,7 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
         37 => Action::AgentFile {
             pane: d.u64()?,
             request: d.u64()?,
-            path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+            path: d.path()?,
             operation: decode_file_operation(d)?,
         },
         38 => Action::CancelAgentFile { request: d.u64()? },
@@ -1882,9 +1878,9 @@ fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
     for pid in [process.foreground_pgid, process.foreground_pid] {
         e.optional(pid, Encoder::u32);
     }
-    e.path(&process.foreground_executable);
+    e.optional(process.foreground_executable.as_deref(), Encoder::path);
     e.optional(process.foreground_argv.as_deref(), Encoder::strings);
-    e.path(&process.foreground_cwd);
+    e.optional(process.foreground_cwd.as_deref(), Encoder::path);
     e.optional(process.sampled_at_ms, Encoder::u64);
     e.strings(&process.unavailable);
 }
@@ -1900,9 +1896,9 @@ fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMet
         },
         foreground_pgid: d.optional(Decoder::u32)?,
         foreground_pid: d.optional(Decoder::u32)?,
-        foreground_executable: d.path()?,
+        foreground_executable: d.optional(Decoder::path)?,
         foreground_argv: d.optional(|d| d.strings(65536))?,
-        foreground_cwd: d.path()?,
+        foreground_cwd: d.optional(Decoder::path)?,
         sampled_at_ms: d.optional(Decoder::u64)?,
         unavailable: d.strings(16)?,
     })
@@ -1948,7 +1944,7 @@ fn encode_snapshot(
         e.u16(pane.rect.cols);
         e.u16(pane.rect.rows);
         e.string(&pane.title);
-        e.path(&pane.cwd);
+        e.optional(pane.cwd.as_deref(), Encoder::path);
         e.u64(pane.input_generation);
         e.optional(pane.shell_prompt, Encoder::u64);
         let process_changed = previous
@@ -2011,7 +2007,7 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
             rows: d.u16()?,
         };
         let title = d.string(65536)?;
-        let cwd = d.path()?;
+        let cwd = d.optional(Decoder::path)?;
         let input_generation = d.u64()?;
         let shell_prompt = d.optional(Decoder::u64)?;
         let process = if d.bool()? {

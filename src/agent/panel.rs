@@ -81,7 +81,7 @@ impl AgentView {
         (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
     }
 
-    pub fn select_all(&mut self) {
+    fn select_all(&mut self) {
         self.anchor = Some(0);
         self.cursor = self.input.len();
     }
@@ -91,7 +91,7 @@ impl AgentView {
         self.set_cursor(0, false);
     }
 
-    pub fn set_cursor(&mut self, offset: usize, extend: bool) {
+    fn set_cursor(&mut self, offset: usize, extend: bool) {
         if extend {
             self.anchor.get_or_insert(self.cursor);
         } else {
@@ -184,12 +184,7 @@ impl Panel {
 pub(crate) fn editor(ui: &Ui, side: Rect) -> (Rect, EditorLines) {
     let session = ui.agent.active();
     let max_rows = usize::from((side.rows / 3).clamp(1, 8));
-    let columns = usize::from(
-        side.cols
-            .saturating_sub(2)
-            .saturating_sub(u16::from(session.model.busy) * 3)
-            .max(1),
-    );
+    let columns = session.editor_columns(usize::from(side.cols.saturating_sub(2)));
     let layout = session.editor_layout(columns, max_rows);
     let rows = layout.lines.len().max(3).min(max_rows) as u16;
     (
@@ -923,9 +918,11 @@ impl AgentPainter<'_> {
             display = std::borrow::Cow::Owned(
                 [&input[..cursor], self.preedit, &input[cursor..]].concat(),
             );
-            let columns = usize::from(editor.cols)
-                .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
-                .max(1);
+            let columns = self
+                .ui
+                .agent
+                .active()
+                .editor_columns(usize::from(editor.cols));
             lines = wrap_context(&display, columns);
             let cursor = cursor + self.preedit.len();
             caret_row = lines
@@ -1256,7 +1253,7 @@ impl ContextPreview {
         }
     }
 
-    pub fn prepare(&mut self, columns: usize) {
+    fn prepare(&mut self, columns: usize) {
         let columns = columns.max(1);
         if self.columns != columns {
             let mut lines = std::mem::take(&mut self.lines);
@@ -1488,11 +1485,7 @@ impl AgentPanel {
         Ok(redraw)
     }
 
-    pub fn poll_remote(
-        &mut self,
-        client: &mut Client,
-        config: &Config,
-    ) -> io::Result<(bool, bool)> {
+    fn poll_remote(&mut self, client: &mut Client, config: &Config) -> io::Result<(bool, bool)> {
         if client.snapshot().is_none() {
             return Ok((false, false));
         }
@@ -1576,7 +1569,7 @@ impl AgentPanel {
         Ok((changed, messages))
     }
 
-    pub fn view_state(&self) -> serde_json::Value {
+    fn view_state(&self) -> serde_json::Value {
         let sessions = self.sessions.iter().map(|session| serde_json::json!({
             "id": session.id,
             "input": session.model.input,
@@ -1589,7 +1582,7 @@ impl AgentPanel {
         view
     }
 
-    pub fn restore_view_state(&mut self, mut value: serde_json::Value) -> io::Result<()> {
+    fn restore_view_state(&mut self, mut value: serde_json::Value) -> io::Result<()> {
         let next_id = serde_json::from_value(value["next_id"].take())?;
         let values: Vec<serde_json::Value> = serde_json::from_value(value["sessions"].take())?;
         let current = self.active().id;
@@ -1653,7 +1646,7 @@ impl AgentPanel {
         &mut self.sessions[self.current]
     }
 
-    pub fn prepare_layout(&mut self, columns: usize) -> io::Result<()> {
+    fn prepare_layout(&mut self, columns: usize) -> io::Result<()> {
         if !self.open {
             return Ok(());
         }
@@ -1801,7 +1794,7 @@ impl AgentPanel {
         }
     }
 
-    pub fn new_session(&mut self) {
+    fn new_session(&mut self) {
         let session = self.active_mut();
         session.end_selection();
         session.rewind_target = None;
@@ -1815,7 +1808,7 @@ impl AgentPanel {
         self.keyboard = AgentAction::Editor;
     }
 
-    pub fn switch(&mut self, index: usize) {
+    fn switch(&mut self, index: usize) {
         if index < self.sessions.len() {
             let session = self.active_mut();
             session.end_selection();
@@ -2006,7 +1999,7 @@ impl AgentPanel {
     }
 }
 
-pub(crate) fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
+fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
     let mut result = Vec::new();
     wrap_context_into(text, columns, |line| result.push(line));
     result
@@ -2089,7 +2082,7 @@ pub(crate) struct AgentSession {
     pub id: u64,
     pub model: AgentView,
     pub context: ChatContext,
-    pub expanded_tools: HashSet<String>,
+    expanded_tools: HashSet<String>,
     changes_expanded: bool,
     pub lines: Vec<AgentLine>,
     pub columns: usize,
@@ -2142,7 +2135,7 @@ impl AgentSession {
         }
     }
 
-    pub fn rewind_index(&self) -> Option<usize> {
+    fn rewind_index(&self) -> Option<usize> {
         let turn = self.rewind_target?;
         self.model
             .messages
@@ -2323,7 +2316,7 @@ impl AgentSession {
         (from < to).then_some(from..to)
     }
 
-    pub fn selection_columns(&self, line: usize) -> Option<Range<usize>> {
+    fn selection_columns(&self, line: usize) -> Option<Range<usize>> {
         let selection = self.selection.as_ref()?;
         let (point, range, text) = self.line_text(line)?;
         let selected = Self::selected_range(selection, point, range.clone())?;
@@ -2377,6 +2370,12 @@ impl AgentSession {
         (!output.is_empty()).then_some(output)
     }
 
+    pub fn editor_columns(&self, width: usize) -> usize {
+        width
+            .saturating_sub(3 * usize::from(self.model.busy))
+            .max(1)
+    }
+
     pub fn editor_layout(&self, columns: usize, rows: usize) -> EditorLines {
         let columns = columns.max(1);
         let rows = rows.max(1);
@@ -2422,7 +2421,7 @@ impl AgentSession {
             caret_column: width % columns,
         }
     }
-    pub fn move_vertical(&mut self, layout: EditorLines, up: bool, extend: bool) {
+    fn move_vertical(&mut self, layout: EditorLines, up: bool, extend: bool) {
         let row = if up {
             layout.caret_row.saturating_sub(1)
         } else {
@@ -2449,7 +2448,7 @@ impl AgentSession {
                 layout.first = (layout.first + 1).min(layout.lines.len().saturating_sub(rows));
             }
         }
-        let row = row.floor().clamp(0., rows.saturating_sub(1) as f32) as usize;
+        let row = (row as usize).min(rows.saturating_sub(1));
         let end = self.model.input.len();
         let range = layout
             .lines
@@ -2460,7 +2459,7 @@ impl AgentSession {
         self.editor_scroll = Some(layout.first);
         self.model.set_cursor(cursor, extend);
     }
-    pub fn add_context(&mut self, item: ContextItem) -> Result<(), &'static str> {
+    fn add_context(&mut self, item: ContextItem) -> Result<(), &'static str> {
         if self.context.basket.iter().any(|old| {
             old.source == item.source && old.label == item.label && old.snapshot == item.snapshot
         }) {
@@ -2481,7 +2480,7 @@ impl AgentSession {
         self.context.basket.push(item);
         Ok(())
     }
-    pub fn toggle_tool(&mut self, index: usize) {
+    fn toggle_tool(&mut self, index: usize) {
         self.clear_selection();
         if let Some(id) = self
             .model
@@ -2538,7 +2537,7 @@ impl AgentSession {
         Ok(true)
     }
 
-    pub fn attach_screen(
+    fn attach_screen(
         &mut self,
         client: &Client,
         pane: PaneId,
@@ -2680,7 +2679,7 @@ fn context_source(client: &Client, pane: PaneId) -> String {
 }
 
 impl Ui {
-    pub fn agent_tab(&mut self, reverse: bool) {
+    fn agent_tab(&mut self, reverse: bool) {
         let actions = self.agent.controls();
         let current = match self.focus {
             Focus::Editor => AgentAction::Editor,
@@ -2749,7 +2748,7 @@ impl Ui {
         };
         self.message(hint);
     }
-    pub fn agent_key(&mut self, symbol: u32, shift: bool, control: bool) -> Option<AgentAction> {
+    fn agent_key(&mut self, symbol: u32, shift: bool, control: bool) -> Option<AgentAction> {
         if matches!(symbol, keysym::TAB | keysym::LEFT_TAB) {
             self.agent_tab(shift || symbol == keysym::LEFT_TAB);
             return None;
@@ -3011,7 +3010,7 @@ impl Ui {
         }
     }
 
-    pub(crate) fn confirm_agent_rewind(&mut self) {
+    fn confirm_agent_rewind(&mut self) {
         let turn = self.agent.active().rewind_target;
         self.cancel_rewind();
         self.focus = Focus::Editor;
@@ -3024,7 +3023,7 @@ impl Ui {
         }
     }
 
-    pub fn agent_rewind_key(&mut self, symbol: u32) -> bool {
+    fn agent_rewind_key(&mut self, symbol: u32) -> bool {
         if !self.focus.is_agent() {
             self.cancel_rewind();
             return false;
@@ -3198,10 +3197,7 @@ impl Ui {
                     ),
                     Some('j' | 'k') => {
                         let up = letter == Some('k');
-                        let layout = self
-                            .agent
-                            .active()
-                            .editor_layout(viewport.0.max(1), viewport.1.max(1));
+                        let layout = self.agent.active().editor_layout(viewport.0, viewport.1);
                         if (up && layout.caret_row == 0)
                             || (!up && layout.caret_row + 1 == layout.lines.len())
                         {
@@ -3257,10 +3253,7 @@ impl Ui {
                         }
                     }
                     keysym::UP | keysym::DOWN => {
-                        let layout = self
-                            .agent
-                            .active()
-                            .editor_layout(viewport.0.max(1), viewport.1.max(1));
+                        let layout = self.agent.active().editor_layout(viewport.0, viewport.1);
                         self.agent.active_mut().move_vertical(
                             layout,
                             key.symbol == keysym::UP,

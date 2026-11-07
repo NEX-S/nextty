@@ -59,7 +59,8 @@ def fixture(directory, busy_hz, pattern):
                                 for col in range(columns):
                                     r, g, b = (frame*17+col*13)&255, (frame*7+col*29)&255, (frame*37+col*11)&255
                                     line.extend(f"\x1b[38;2;{r};{g};{b};48;2;{b};{r};{g}m{chr(33+(frame+col)%90)}".encode())
-                                colored.append(bytes(line)+b"\x1b[0m\r\n")
+                                line.extend(b"\x1b[0m\r\n")
+                                colored.append(line)
                     emit({"ack": command["seq"], "phase": phase})
             if 0 in ready:
                 received = time.monotonic()
@@ -127,7 +128,6 @@ def main():
     for name in ("DISPLAY", "IBUS_ADDRESS", "LD_PRELOAD", "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER"):
         env.pop(name, None)
     env["NEXTTY_TRACE"] = str(directory / "trace.log")
-    import gi
     from gi.repository import Gio, GLib
     connection = Gio.DBusConnection.new_for_address_sync(env["DBUS_SESSION_BUS_ADDRESS"],
         Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION, None, None)
@@ -147,8 +147,10 @@ def main():
         key(symbol, True)
         key(symbol, False)
 
+    with binary.open("rb") as source:
+        binary_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
     report = {"binary": str(binary), "binary_bytes": binary.stat().st_size,
-              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(), "scope": __doc__,
+              "binary_sha256": binary_sha256, "scope": __doc__,
               "samples_per_phase": args.samples, "busy_hz": args.busy_hz, "busy_pattern": args.busy_pattern, "sent": [], "phases": {}}
     app, control = None, None
     try:
@@ -252,7 +254,7 @@ def main():
             result.update(raw_samples=received, samples=samples, received=len(received), presented=len(samples),
                           missing_presentations=args.samples-len(samples),
                           synthetic_key_to_pty_ms=quantiles(received),
-                          synthetic_key_to_presentation_ms=quantiles([(s["presentation"]-s["call_start"])*1000 for s in samples]))
+                          synthetic_key_to_presentation_ms=quantiles((s["presentation"]-s["call_start"])*1000 for s in samples))
             if not all(s["focused"] for s in samples):
                 raise RuntimeError("presentation samples include an unfocused terminal")
             result["terminal_cpu_cores"] = sum(result["after"][role]["cpu_seconds"]-v["cpu_seconds"] for role,v in result["before"].items())/(result["end"]-result["start"])
@@ -270,7 +272,8 @@ def main():
             os.close(control)
         control_path.unlink()
         if app:
-            subprocess.run([str(binary), "terminate", workspace_name], env=env, capture_output=True, timeout=5)
+            subprocess.run([str(binary), "terminate", workspace_name], env=env,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5)
         if app and app.poll() is None:
             os.killpg(app.pid, signal.SIGTERM)
             app.wait(timeout=5)

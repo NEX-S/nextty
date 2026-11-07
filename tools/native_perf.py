@@ -12,6 +12,7 @@ import ctypes
 import errno
 import fcntl
 import hashlib
+from itertools import pairwise
 import json
 import math
 import os
@@ -85,7 +86,7 @@ def cost(pid):
             raise
         # Linux invalidates a process clock when that process exits.
         raise ProcessLookupError(errno.ESRCH, os.strerror(errno.ESRCH)) from error
-    result["threads"] = len(list(Path(f"/proc/{pid}/task").iterdir()))
+    result["threads"] = sum(1 for _ in Path(f"/proc/{pid}/task").iterdir())
     result["drm"] = []
     for item in Path(f"/proc/{pid}/fdinfo").iterdir():
         try:
@@ -122,8 +123,10 @@ def main():
     env.setdefault("WAYLAND_DISPLAY", "wayland-0")
     env.setdefault("DBUS_SESSION_BUS_ADDRESS", f"unix:path={env['XDG_RUNTIME_DIR']}/bus")
     env["NEXTTY_TRACE"] = str(directory / "trace.log")
+    with binary.open("rb") as source:
+        binary_sha256 = hashlib.file_digest(source, "sha256").hexdigest()
     report = {"binary": str(binary), "binary_bytes": binary.stat().st_size,
-              "binary_sha256": hashlib.sha256(binary.read_bytes()).hexdigest(),
+              "binary_sha256": binary_sha256,
               "scope": __doc__, "config": config.read_text(), "cost_samples": [],
               "seconds_per_phase": args.seconds, "warmup_seconds_per_phase": args.warmup,
               "producer_hz": args.producer_hz,
@@ -162,29 +165,30 @@ def main():
     window_states = []
     frame_rates = []
     discarded = set()
-    for line in (directory / "trace.log").read_text().splitlines():
-        fields = line.split()
-        if fields[0] == "frame":
-            frames[int(fields[1])] = {"begin": float(fields[2]),
-                                     "prepared": float(fields[3]), "swapped": float(fields[4]),
-                                     "marker": int(fields[6]),
-                                     "geometry": [int(fields[8]), int(fields[9]), float(fields[10])],
-                                     "focused": bool(int(fields[11]))}
-        elif fields[0] == "frame_callback":
-            callbacks[int(fields[1])] = {"received": float(fields[2]),
-                                        "dispatched": float(fields[3]),
-                                        "server_raw_ms_u32": int(fields[4])}
-        elif fields[0] == "window_state":
-            window_states.append({"received": float(fields[1]), "flags": int(fields[2])})
-        elif fields[0] == "frame_rate":
-            frame_rates.append({"dispatched": float(fields[1]), "frame_interval_ns": int(fields[2])})
-        elif fields[0] == "presented" and fields[4] == "1":
-            discarded.add(int(fields[1]))
-        elif fields[0] == "presented" and fields[4] == "0":
-            if fields[3] != "1":
-                raise RuntimeError(f"presentation clock {fields[3]} is not CLOCK_MONOTONIC")
-            presented[int(fields[1])] = {"time": float(fields[2]), "flags": int(fields[5]),
-                                        "refresh_ns": float(fields[6])}
+    with (directory / "trace.log").open() as trace:
+        for line in trace:
+            fields = line.split()
+            if fields[0] == "frame":
+                frames[int(fields[1])] = {"begin": float(fields[2]),
+                                         "prepared": float(fields[3]), "swapped": float(fields[4]),
+                                         "marker": int(fields[6]),
+                                         "geometry": [int(fields[8]), int(fields[9]), float(fields[10])],
+                                         "focused": bool(int(fields[11]))}
+            elif fields[0] == "frame_callback":
+                callbacks[int(fields[1])] = {"received": float(fields[2]),
+                                            "dispatched": float(fields[3]),
+                                            "server_raw_ms_u32": int(fields[4])}
+            elif fields[0] == "window_state":
+                window_states.append({"received": float(fields[1]), "flags": int(fields[2])})
+            elif fields[0] == "frame_rate":
+                frame_rates.append({"dispatched": float(fields[1]), "frame_interval_ns": int(fields[2])})
+            elif fields[0] == "presented" and fields[4] == "1":
+                discarded.add(int(fields[1]))
+            elif fields[0] == "presented" and fields[4] == "0":
+                if fields[3] != "1":
+                    raise RuntimeError(f"presentation clock {fields[3]} is not CLOCK_MONOTONIC")
+                presented[int(fields[1])] = {"time": float(fields[2]), "flags": int(fields[5]),
+                                            "refresh_ns": float(fields[6])}
     writes_path = directory / "writes.json"
     if not writes_path.is_file():
         raise RuntimeError("fixture exited before writing samples; no performance result")
@@ -216,23 +220,23 @@ def main():
         report["phases"][phase] = {
             "frames_submitted": len(submitted),
             "swap_return_hz": (len(swap_times) - 1) / (swap_times[-1] - swap_times[0]) if len(swap_times) >= 2 else None,
-            "swap_return_interval_ms": percentile([(b - a) * 1e3 for a, b in zip(swap_times, swap_times[1:])]),
+            "swap_return_interval_ms": percentile((b - a) * 1e3 for a, b in pairwise(swap_times)),
             "discarded_submissions": sum(n in discarded for n, _ in submitted),
             "frames_presented": len(pairs), "effective_hz": (len(times) - 1) / (times[-1] - times[0]),
-            "presentation_interval_ms": percentile([(b - a) * 1e3 for a, b in zip(times, times[1:])]),
+            "presentation_interval_ms": percentile((b - a) * 1e3 for a, b in pairwise(times)),
             "output_markers_presented": len(first_presentations),
-            "pty_write_to_presentation_ms": percentile([(presented - written) * 1e3 for presented, written in first_presentations.values()]),
-            "prepare_cpu_ms": percentile([(f["prepared"] - f["begin"]) * 1e3 for f, _, _ in pairs]),
-            "present_wrapper_ms": percentile([(f["swapped"] - f["prepared"]) * 1e3 for f, _, _ in pairs]),
-            "draw_begin_to_presentation_ms": percentile([(p["time"] - f["begin"]) * 1e3 for f, p, _ in pairs]),
-            "write_to_draw_begin_ms": percentile([(f["begin"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
+            "pty_write_to_presentation_ms": percentile((presented - written) * 1e3 for presented, written in first_presentations.values()),
+            "prepare_cpu_ms": percentile((f["prepared"] - f["begin"]) * 1e3 for f, _, _ in pairs),
+            "present_wrapper_ms": percentile((f["swapped"] - f["prepared"]) * 1e3 for f, _, _ in pairs),
+            "draw_begin_to_presentation_ms": percentile((p["time"] - f["begin"]) * 1e3 for f, p, _ in pairs),
+            "write_to_draw_begin_ms": percentile((f["begin"] - w["write_begin"]) * 1e3 for f, _, w in pairs),
             "focused_frames": sum(f["focused"] is True for f, _, _ in pairs),
             "unfocused_frames": sum(f["focused"] is False for f, _, _ in pairs),
-            "geometry_logical_px_scale": [list(v) for v in sorted({tuple(f["geometry"]) for f, _, _ in pairs})],
-            "callback_after_swap_ms": percentile([(c["received"] - f["swapped"]) * 1e3 for f, c in callback_pairs]),
-            "callback_server_emission_after_swap_ms": percentile([(c["server_emitted"] - f["swapped"]) * 1e3 for f, c in callback_pairs]),
-            "callback_server_emission_to_receipt_ms": percentile([(c["received"] - c["server_emitted"]) * 1e3 for _, c in callback_pairs]),
-            "callback_receipt_to_rust_dispatch_ms": percentile([(c["dispatched"] - c["received"]) * 1e3 for _, c in callback_pairs]),
+            "geometry_logical_px_scale": sorted({tuple(f["geometry"]) for f, _, _ in pairs}),
+            "callback_after_swap_ms": percentile((c["received"] - f["swapped"]) * 1e3 for f, c in callback_pairs),
+            "callback_server_emission_after_swap_ms": percentile((c["server_emitted"] - f["swapped"]) * 1e3 for f, c in callback_pairs),
+            "callback_server_emission_to_receipt_ms": percentile((c["received"] - c["server_emitted"]) * 1e3 for _, c in callback_pairs),
+            "callback_receipt_to_rust_dispatch_ms": percentile((c["dispatched"] - c["received"]) * 1e3 for _, c in callback_pairs),
             "presentation_flags": sorted({p["flags"] for _, p, _ in pairs}),
             "refresh_ns": sorted({p["refresh_ns"] for _, p, _ in pairs}),
         }

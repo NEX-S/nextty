@@ -23,8 +23,8 @@ fn parser() {
     let data = line.repeat(1024);
     let iterations = (64 * 1024 * 1024) / data.len();
     let bytes = iterations * data.len();
-    let mut rates = Vec::new();
-    for _ in 0..5 {
+    let mut rates = [0.; 5];
+    for rate in &mut rates {
         let mut term = Core::new(size(), 0xd8dee9, 0x14161b);
         let mut parser = Parser::new();
         parser.advance(&mut term, data.as_bytes());
@@ -34,10 +34,10 @@ fn parser() {
         }
         let elapsed = start.elapsed();
         black_box(term.row(0));
-        rates.push(bytes as f64 / 1048576. / elapsed.as_secs_f64());
+        *rate = bytes as f64 / 1048576. / elapsed.as_secs_f64();
     }
-    let mut ordered = rates.clone();
-    ordered.sort_by(f64::total_cmp);
+    let mut ordered = rates;
+    ordered.sort_unstable_by(f64::total_cmp);
     println!("parser+grid only (no PTY, UI, font shaping or rendering)");
     println!("  workload: {bytes} bytes/run, 100x30 grid, default scrollback, 5 runs");
     println!("  MiB/s: {rates:?}; median {:.2}", ordered[2]);
@@ -59,7 +59,7 @@ fn wait_for(terminal: &terminal::Terminal, expected: char) -> Result<()> {
         };
         nextty::poll::poll(
             std::slice::from_mut(&mut fd),
-            remaining.as_millis().max(1) as i32,
+            nextty::poll::timeout_millis(remaining),
         )?;
         terminal.drain_notification()?;
         terminal.acknowledge_wakeup();
@@ -110,7 +110,7 @@ fn pty() -> Result<()> {
             samples.push(start.elapsed().as_secs_f64() * 1e6);
         }
     }
-    samples.sort_by(f64::total_cmp);
+    samples.sort_unstable_by(f64::total_cmp);
     println!("raw PTY echo to parsed grid (no GUI/display latency)");
     println!("  path: Terminal::write → PTY → raw /bin/cat → event loop → grid observation");
     println!("  observer: eventfd poll; 100 warmups, 2000 samples, two bytes/input");

@@ -104,16 +104,16 @@ _nextty_precmd() {
   _nextty_executing=0
   _nextty_cwd
   local begin=$'%{\e]133;A\a%}' end=$'%{\e]133;B\a%}'
-  [[ $PROMPT == $begin* ]] && PROMPT=${PROMPT#$begin}
-  [[ $PROMPT == *$end ]] && PROMPT=${PROMPT%$end}
+  PROMPT=${PROMPT#$begin}
+  PROMPT=${PROMPT%$end}
   PROMPT=$begin$PROMPT$end
   local scope_begin=$'%{\e]133;P;1\a%}' scope_end=$'%{\e]133;P;0\a%}'
   local right_begin=$'%{\e]133;P;2\a%}'
-  [[ $RPROMPT == $right_begin* ]] && RPROMPT=${RPROMPT#$right_begin}
-  [[ $RPROMPT == *$scope_end ]] && RPROMPT=${RPROMPT%$scope_end}
+  RPROMPT=${RPROMPT#$right_begin}
+  RPROMPT=${RPROMPT%$scope_end}
   RPROMPT=$right_begin$RPROMPT$scope_end
-  [[ $PS2 == $scope_begin* ]] && PS2=${PS2#$scope_begin}
-  [[ $PS2 == *$scope_end ]] && PS2=${PS2%$scope_end}
+  PS2=${PS2#$scope_begin}
+  PS2=${PS2%$scope_end}
   PS2=$scope_begin$PS2$scope_end
   return "$nextty_exit_status"
 }
@@ -139,12 +139,12 @@ _nextty_precmd() {
     printf '\007'
   fi
   local begin=$'\[\e]133;A\a\]' end=$'\[\e]133;B\a\]'
-  [[ $PS1 == "$begin"* ]] && PS1=${PS1#"$begin"}
-  [[ $PS1 == *"$end" ]] && PS1=${PS1%"$end"}
+  PS1=${PS1#"$begin"}
+  PS1=${PS1%"$end"}
   PS1=$begin$PS1$end
   local scope_begin=$'\[\e]133;P;1\a\]' scope_end=$'\[\e]133;P;0\a\]'
-  [[ $PS2 == "$scope_begin"* ]] && PS2=${PS2#"$scope_begin"}
-  [[ $PS2 == *"$scope_end" ]] && PS2=${PS2%"$scope_end"}
+  PS2=${PS2#"$scope_begin"}
+  PS2=${PS2%"$scope_end"}
   PS2=$scope_begin$PS2$scope_end
   return "$nextty_exit_status"
 }
@@ -195,8 +195,7 @@ mod tests {
             0x202020,
         )
         .unwrap();
-        let quote =
-            |path: &Path| format!("'{}'", path.display().to_string().replace('\'', "'\\''"));
+        let quote = |path: &Path| format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"));
         terminal
             .write(format!("source {}\n", quote(&script)).into_bytes())
             .unwrap();

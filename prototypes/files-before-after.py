@@ -69,7 +69,7 @@ def main(screen):
             put(y, x, '│', 5)
 
     def code(y, x, width, height):
-        name, path, content = FILES[selected]
+        _, path, content = FILES[selected]
         put(y, x, path, 3, width)
         put(y + 1, x, '只读预览 · 示例片段', 2, width)
         line(y + 2, x, width)
