@@ -59,8 +59,17 @@ fn main() {
     for (index, file) in files.iter().enumerate() {
         let object = out.join(format!("native-{index}.o"));
         let mut cc = Command::new(env::var_os("CC").unwrap_or_else(|| "cc".into()));
+        // Wayland listeners must implement every event, so most ignore some parameters.
         cc.args([
-            "-std=c11", "-O2", "-g", "-fPIC", "-Wall", "-Wextra", "-Werror", "-Inative",
+            "-std=c11",
+            "-O2",
+            "-g",
+            "-fPIC",
+            "-Wall",
+            "-Wextra",
+            "-Wno-unused-parameter",
+            "-Werror",
+            "-Inative",
         ])
         .arg("-I")
         .arg(out)

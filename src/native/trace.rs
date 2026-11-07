@@ -1,140 +1,23 @@
+use super::Event;
+use crate::screen::Screen;
 use std::{
-    collections::VecDeque,
-    ffi::OsString,
     fs::File,
     io::{self, BufWriter, Write},
-    sync::{Arc, Condvar, Mutex},
-    thread::{self, JoinHandle},
 };
 
+/// Frame and presentation records for tools/native_perf.py and tools/wayland_input.py.
 pub(crate) struct Trace {
-    pub(crate) output: BufWriter<TraceWriter>,
-    pub(crate) frame: u32,
-    pub(crate) pending: Option<(String, String)>,
+    output: BufWriter<File>,
+    frame: u32,
+    pending: Option<String>,
 }
-const TRACE_BLOCK: usize = 8192;
-struct TraceQueue {
-    bytes: VecDeque<Vec<u8>>,
-    opened: bool,
-    closed: bool,
-    error: Option<io::Error>,
-}
-struct TraceShared {
-    queue: Mutex<TraceQueue>,
-    changed: Condvar,
-}
-pub(crate) struct TraceWriter {
-    shared: Arc<TraceShared>,
-    worker: Option<JoinHandle<()>>,
-    pub(crate) draining: bool,
-}
-impl TraceWriter {
-    fn new(path: OsString) -> io::Result<Self> {
-        let shared = Arc::new(TraceShared {
-            queue: Mutex::new(TraceQueue {
-                bytes: VecDeque::new(),
-                opened: false,
-                closed: false,
-                error: None,
-            }),
-            changed: Condvar::new(),
-        });
-        let queue = Arc::clone(&shared);
-        let worker = thread::Builder::new()
-            .name("nextty-trace".into())
-            .spawn(move || {
-                let result = (|| {
-                    let mut file = File::create(path)?;
-                    {
-                        let mut state = queue.queue.lock().unwrap();
-                        state.opened = true;
-                        queue.changed.notify_all();
-                    }
-                    loop {
-                        let bytes = {
-                            let mut state = queue.queue.lock().unwrap();
-                            while state.bytes.is_empty() && !state.closed {
-                                state = queue.changed.wait(state).unwrap();
-                            }
-                            let Some(bytes) = state.bytes.pop_front() else {
-                                return Ok(());
-                            };
-                            queue.changed.notify_all();
-                            bytes
-                        };
-                        file.write_all(&bytes)?;
-                    }
-                })();
-                let mut state = queue.queue.lock().unwrap();
-                state.error = result.err();
-                state.opened = true;
-                state.closed = true;
-                queue.changed.notify_all();
-            })?;
-        // Preserve construction-time path errors before the input loop starts.
-        let mut state = shared.queue.lock().unwrap();
-        while !state.opened {
-            state = shared.changed.wait(state).unwrap();
-        }
-        if let Some(error) = state.error.take() {
-            return Err(error);
-        }
-        drop(state);
-        Ok(Self {
-            shared,
-            worker: Some(worker),
-            draining: false,
-        })
-    }
-    pub(crate) fn finish(&mut self) -> io::Result<()> {
-        self.shared.queue.lock().unwrap().closed = true;
-        self.shared.changed.notify_all();
-        if let Some(worker) = self.worker.take() {
-            worker.join().unwrap();
-        }
-        self.shared
-            .queue
-            .lock()
-            .unwrap()
-            .error
-            .take()
-            .map_or(Ok(()), Err)
-    }
-}
-impl Write for TraceWriter {
-    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        let mut state = self.shared.queue.lock().unwrap();
-        while self.draining && state.bytes.len() == 8 && !state.closed {
-            state = self.shared.changed.wait(state).unwrap();
-        }
-        if state.closed {
-            return Err(io::Error::new(
-                io::ErrorKind::BrokenPipe,
-                "trace writer stopped",
-            ));
-        }
-        if state.bytes.len() == 8 {
-            return Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "trace queue is full; recording incomplete",
-            ));
-        }
-        let count = bytes.len().min(TRACE_BLOCK);
-        state.bytes.push_back(bytes[..count].to_vec());
-        self.shared.changed.notify_all();
-        Ok(count)
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        // BufWriter has queued its bytes; the worker writes directly to File.
-        Ok(())
-    }
-}
+
 impl Trace {
     pub(crate) fn from_env() -> io::Result<Option<Self>> {
         std::env::var_os("NEXTTY_TRACE")
             .map(|path| {
-                TraceWriter::new(path).map(|output| Self {
-                    output: BufWriter::with_capacity(TRACE_BLOCK, output),
+                Ok(Self {
+                    output: BufWriter::new(File::create(path)?),
                     frame: 0,
                     pending: None,
                 })
@@ -142,31 +25,55 @@ impl Trace {
             .transpose()
     }
 
+    /// Counts frames in step with the native presentation feedback ids.
+    pub(crate) fn frame(
+        &mut self,
+        begin: f64,
+        prepared: f64,
+        marker: u32,
+        (width, height, scale): (i32, i32, f64),
+        focused: bool,
+    ) {
+        self.frame = self.frame.wrapping_add(1);
+        self.pending = Some(format!(
+            "frame {} {begin:.9} {prepared:.9} {marker} {width} {height} {scale:.9} {}",
+            self.frame,
+            u8::from(focused)
+        ));
+    }
+
     pub(crate) fn record_swap(&mut self, time: f64) -> io::Result<()> {
-        if let Some((prefix, suffix)) = self.pending.take() {
-            writeln!(self.output, "{prefix} {time:.9}{suffix}")?;
+        if let Some(frame) = self.pending.take() {
+            writeln!(self.output, "{frame} {time:.9}")?;
         }
         Ok(())
     }
 
+    pub(crate) fn presented(&mut self, event: &Event) -> io::Result<()> {
+        writeln!(
+            self.output,
+            "presented {} {:.9} {} {} {} {:.0}",
+            event.code, event.x, event.start, event.end, event.modifiers, event.y
+        )
+    }
+
+    pub(crate) fn focus(&mut self, focused: bool) -> io::Result<()> {
+        writeln!(self.output, "focus {:.9} {}", monotonic(), u8::from(focused))?;
+        // The input probe waits for focus before frames fill the buffer.
+        self.output.flush()
+    }
+
     pub(crate) fn finish(&mut self) -> io::Result<()> {
-        if self.output.get_ref().worker.is_none() {
-            return Ok(());
-        }
-        // Only teardown may wait for storage, so successful traces retain every byte.
-        self.output.get_mut().draining = true;
-        let flushed = self.output.flush();
-        let completed = self.output.get_mut().finish();
-        completed.and(flushed)
+        self.output.flush()
     }
 }
-impl Drop for Trace {
-    fn drop(&mut self) {
-        if let Err(error) = self.finish() {
-            eprintln!("trace: {error}");
-        }
-    }
+
+/// The measurement fixtures encode their output marker in the first cell's background.
+pub(crate) fn marker(screen: &Screen) -> u32 {
+    let color = screen.color(screen.row(0).cells[0].bg);
+    (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b)
 }
+
 pub(crate) fn monotonic() -> f64 {
     let mut time = libc::timespec {
         tv_sec: 0,

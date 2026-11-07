@@ -146,26 +146,15 @@ def main():
                 if app.poll() is None:
                     os.killpg(app.pid, signal.SIGTERM)
                     app.wait(timeout=5)
-    frames, presented, callbacks = {}, {}, {}
-    window_states = []
-    frame_rates = []
+    frames, presented = {}, {}
     discarded = set()
     for line in (directory / "trace.log").read_text().splitlines():
         fields = line.split()
         if fields[0] == "frame":
-            frames[int(fields[1])] = {"begin": float(fields[2]), "snapshot": float(fields[3]),
-                                     "prepared": float(fields[4]), "swapped": float(fields[5]),
-                                     "marker": int(fields[7]),
-                                     "geometry": [int(fields[9]), int(fields[10]), float(fields[11])] if len(fields) >= 12 else None,
-                                     "focused": bool(int(fields[12])) if len(fields) >= 13 else None}
-        elif fields[0] == "frame_callback":
-            callbacks[int(fields[1])] = {"received": float(fields[2]),
-                                        "dispatched": float(fields[3]),
-                                        "server_raw_ms_u32": int(fields[4]) if len(fields) >= 5 else None}
-        elif fields[0] == "window_state":
-            window_states.append({"received": float(fields[1]), "flags": int(fields[2])})
-        elif fields[0] == "frame_rate":
-            frame_rates.append({"dispatched": float(fields[1]), "frame_interval_ns": int(fields[2])})
+            frames[int(fields[1])] = {"begin": float(fields[2]), "prepared": float(fields[3]),
+                                     "marker": int(fields[4]),
+                                     "geometry": (int(fields[5]), int(fields[6]), float(fields[7])),
+                                     "focused": fields[8] == "1", "swapped": float(fields[9])}
         elif fields[0] == "presented" and fields[4] == "1":
             discarded.add(int(fields[1]))
         elif fields[0] == "presented" and fields[4] == "0":
@@ -177,15 +166,6 @@ def main():
     if not writes_path.is_file():
         raise RuntimeError("fixture exited before writing samples; no performance result")
     writes = {item["marker"]: item for item in json.loads(writes_path.read_text())}
-    report["window_states"] = window_states
-    report["frame_rates"] = frame_rates
-    report["callback_clock_scope"] = ("server time decoded as CLOCK_MONOTONIC only for the verified Mutter 50.6/GLib 2.88.4 environment; "
-                                      "server batch emission is millisecond truncated, so emission-to-receipt is overestimated by less than 1 ms")
-    for callback in callbacks.values():
-        raw = callback["server_raw_ms_u32"]
-        if raw is not None:
-            received_ms = callback["received"] * 1e3
-            callback["server_emitted"] = (received_ms - ((received_ms - raw) % 2**32)) / 1e3
     report["phases"] = {}
     for phase in ("sparse", "scrolling"):
         submitted = [(n, f) for n, f in frames.items()
@@ -201,9 +181,6 @@ def main():
             if previous is None or p["time"] < previous[0]:
                 first_presentations[f["marker"]] = (p["time"], w["write_begin"])
         times = sorted(p["time"] for _, p, _ in pairs)
-        callback_pairs = [(f, callbacks[n]) for n, f in frames.items()
-                          if n in callbacks and f["marker"] in writes
-                          and writes[f["marker"]]["phase"] == phase and writes[f["marker"]].get("record", True)]
         if len(times) < 2:
             raise RuntimeError(f"insufficient presentation feedback for {phase}")
         report["phases"][phase] = {
@@ -215,18 +192,13 @@ def main():
             "presentation_interval_ms": percentile([(b - a) * 1e3 for a, b in zip(times, times[1:])]),
             "output_markers_presented": len(first_presentations),
             "pty_write_to_presentation_ms": percentile([(presented - written) * 1e3 for presented, written in first_presentations.values()]),
-            "snapshot_cpu_ms": percentile([(f["snapshot"] - f["begin"]) * 1e3 for f, _, _ in pairs]),
-            "prepare_cpu_ms": percentile([(f["prepared"] - f["snapshot"]) * 1e3 for f, _, _ in pairs]),
+            "prepare_cpu_ms": percentile([(f["prepared"] - f["begin"]) * 1e3 for f, _, _ in pairs]),
             "present_wrapper_ms": percentile([(f["swapped"] - f["prepared"]) * 1e3 for f, _, _ in pairs]),
             "draw_begin_to_presentation_ms": percentile([(p["time"] - f["begin"]) * 1e3 for f, p, _ in pairs]),
-            "snapshot_age_ms": percentile([(f["snapshot"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
-            "focused_frames": sum(f["focused"] is True for f, _, _ in pairs),
-            "unfocused_frames": sum(f["focused"] is False for f, _, _ in pairs),
-            "geometry_logical_px_scale": [list(v) for v in sorted({tuple(f["geometry"]) for f, _, _ in pairs if f["geometry"]})],
-            "callback_after_swap_ms": percentile([(c["received"] - f["swapped"]) * 1e3 for f, c in callback_pairs]),
-            "callback_server_emission_after_swap_ms": percentile([(c["server_emitted"] - f["swapped"]) * 1e3 for f, c in callback_pairs if "server_emitted" in c]),
-            "callback_server_emission_to_receipt_ms": percentile([(c["received"] - c["server_emitted"]) * 1e3 for _, c in callback_pairs if "server_emitted" in c]),
-            "callback_receipt_to_rust_dispatch_ms": percentile([(c["dispatched"] - c["received"]) * 1e3 for _, c in callback_pairs]),
+            "snapshot_age_ms": percentile([(f["begin"] - w["write_begin"]) * 1e3 for f, _, w in pairs]),
+            "focused_frames": sum(f["focused"] for f, _, _ in pairs),
+            "unfocused_frames": sum(not f["focused"] for f, _, _ in pairs),
+            "geometry_logical_px_scale": [list(v) for v in sorted({f["geometry"] for f, _, _ in pairs})],
             "presentation_flags": sorted({p["flags"] for _, p, _ in pairs}),
             "refresh_ns": sorted({p["refresh_ns"] for _, p, _ in pairs}),
         }

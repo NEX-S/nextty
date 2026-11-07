@@ -5,7 +5,7 @@ use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
     native::{
         self, Event, Line, Renderer, Run, Window,
-        trace::{Trace, monotonic},
+        trace::{self, Trace, monotonic},
     },
     paint::{Frame, LineCache, text_columns},
     screen::{Screen, Update},
@@ -15,7 +15,6 @@ use crate::{
 };
 use std::{
     collections::VecDeque,
-    io::Write,
     path::PathBuf,
     time::{Duration, Instant},
 };
@@ -164,9 +163,6 @@ impl Desktop {
             self.dirty |= core.scroll_display(Scroll::Bottom);
         }
         self.terminal.write(data)?;
-        if let Some(trace) = &mut self.trace {
-            writeln!(trace.output, "write_queued {:.9}", monotonic())?;
-        }
         Ok(())
     }
 
@@ -450,17 +446,6 @@ impl Desktop {
     }
 
     fn event(&mut self, event: Event) -> Result<()> {
-        if let Some(trace) = &mut self.trace
-            && matches!(event.kind, native::KEY | native::TEXT | native::PREEDIT)
-        {
-            writeln!(
-                trace.output,
-                "dispatch {:.9} {} {}",
-                monotonic(),
-                event.kind,
-                event.text.len()
-            )?;
-        }
         match event.kind {
             native::KEY => self.key(event.code, event.modifiers, &event.text)?,
             native::TEXT => {
@@ -493,7 +478,7 @@ impl Desktop {
                 self.terminal.resize(grid_size(width, height, self.cell))?;
                 self.dirty = true;
             }
-            native::EXPOSE | native::WINDOW_STATE => self.dirty = true,
+            native::WINDOW_STATE => self.dirty = true,
             native::POINTER_LEAVE => self.pointer = (-1., -1.),
             native::CLOSE => self.running = false,
             native::FOCUS => {
@@ -507,12 +492,7 @@ impl Desktop {
                     })?;
                 }
                 if let Some(trace) = &mut self.trace {
-                    writeln!(
-                        trace.output,
-                        "focus {:.9} {}",
-                        monotonic(),
-                        u8::from(self.focused)
-                    )?;
+                    trace.focus(self.focused)?;
                 }
             }
             native::MOTION => {
@@ -525,38 +505,9 @@ impl Desktop {
             }
             native::SCROLL => self.scroll(event.y as f32, event.modifiers)?,
             native::PASTE => self.pasted(event.text)?,
-            native::FRAME => {
-                if event.code != 0
-                    && let Some(trace) = &mut self.trace
-                {
-                    writeln!(
-                        trace.output,
-                        "frame_callback {} {:.9} {:.9} {:.0}",
-                        event.code,
-                        event.x,
-                        monotonic(),
-                        event.y
-                    )?;
-                }
-            }
             native::PRESENTED => {
                 if let Some(trace) = &mut self.trace {
-                    writeln!(
-                        trace.output,
-                        "presented {} {:.9} {} {} {} {:.0} {:.9}",
-                        event.code,
-                        event.x,
-                        event.start,
-                        event.end,
-                        event.modifiers,
-                        event.y,
-                        monotonic()
-                    )?;
-                }
-            }
-            native::FRAME_RATE => {
-                if let Some(trace) = &mut self.trace {
-                    writeln!(trace.output, "frame_rate {:.9} {:.0}", monotonic(), event.x)?;
+                    trace.presented(&event)?;
                 }
             }
             _ => (),
@@ -641,29 +592,9 @@ impl Desktop {
         }
         let prepared = begin.map(|_| monotonic());
         self.renderer.present()?;
-        if let Some(trace) = &mut self.trace {
-            let cell = self.screen.row(0).cells[0];
-            let bg = self.screen.color(cell.bg);
-            trace.frame = trace.frame.wrapping_add(1);
-            trace.pending = Some((
-                format!(
-                    "frame {} {:.9} {:.9} {:.9}",
-                    trace.frame,
-                    begin.unwrap(),
-                    begin.unwrap(),
-                    prepared.unwrap()
-                ),
-                format!(
-                    " {} {} {} {} {} {:.9} {}",
-                    cell.c as u32,
-                    (u32::from(bg.r) << 16) | (u32::from(bg.g) << 8) | u32::from(bg.b),
-                    u8::from(!self.preedit.is_empty()),
-                    width,
-                    height,
-                    scale,
-                    u8::from(self.focused)
-                ),
-            ));
+        if let (Some(trace), Some(begin), Some(prepared)) = (&mut self.trace, begin, prepared) {
+            let marker = trace::marker(&self.screen);
+            trace.frame(begin, prepared, marker, (width, height, scale), self.focused);
         }
         Ok(())
     }

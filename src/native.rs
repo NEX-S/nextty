@@ -23,12 +23,9 @@ pub const FOCUS: i32 = 7;
 pub const RESIZE: i32 = 8;
 pub const CLOSE: i32 = 9;
 pub const PASTE: i32 = 10;
-pub const FRAME: i32 = 11;
-pub const EXPOSE: i32 = 12;
-pub const PRESENTED: i32 = 13;
-pub const WINDOW_STATE: i32 = 14;
-pub const FRAME_RATE: i32 = 15;
-pub const POINTER_LEAVE: i32 = 16;
+pub const PRESENTED: i32 = 11;
+pub const WINDOW_STATE: i32 = 12;
+pub const POINTER_LEAVE: i32 = 13;
 
 #[repr(C)]
 struct RawEvent {

@@ -18,13 +18,12 @@ use crate::{
 };
 use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
-    native::trace::{Trace, monotonic},
+    native::trace::{self, Trace, monotonic},
     native::{self, Event, Line, Renderer, Run, Window},
     paint::{Frame, LineCache, text_columns},
 };
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
     time::{Duration, Instant},
 };
 
@@ -682,9 +681,6 @@ impl WorkspaceView {
             self.ui.agent.width = Some(self.agent_width);
             self.ui.poll_agent(&mut self.client, &self.config)?;
         }
-        if let Some(trace) = &mut self.trace {
-            trace.output.get_mut().draining = true;
-        }
         self.renderer.finish()?;
         if let Some(trace) = &mut self.trace {
             trace.record_swap(self.renderer.swap_time())?;
@@ -746,9 +742,6 @@ impl WorkspaceView {
             return Ok(());
         }
         self.action(Action::Input { pane, data })?;
-        if let Some(trace) = &mut self.trace {
-            writeln!(trace.output, "write_queued {:.9}", monotonic())?;
-        }
         Ok(())
     }
     fn resize(&mut self) -> Result<()> {
@@ -772,58 +765,15 @@ impl WorkspaceView {
         Ok(())
     }
     fn event(&mut self, event: Event) -> Result<()> {
-        if matches!(event.kind, native::KEY | native::TEXT | native::PREEDIT)
-            && let Some(trace) = &mut self.trace
-        {
-            writeln!(
-                trace.output,
-                "dispatch {:.9} {} {}",
-                monotonic(),
-                event.kind,
-                event.text.len()
-            )?;
-        }
         match event.kind {
-            native::FRAME => {
-                if event.code != 0
-                    && let Some(trace) = &mut self.trace
-                {
-                    writeln!(
-                        trace.output,
-                        "frame_callback {} {:.9} {:.9} {:.0}",
-                        event.code,
-                        event.x,
-                        monotonic(),
-                        event.y
-                    )?;
-                }
-            }
             native::PRESENTED => {
                 if let Some(trace) = &mut self.trace {
-                    writeln!(
-                        trace.output,
-                        "presented {} {:.9} {} {} {} {:.0} {:.9}",
-                        event.code,
-                        event.x,
-                        event.start,
-                        event.end,
-                        event.modifiers,
-                        event.y,
-                        monotonic()
-                    )?;
+                    trace.presented(&event)?;
                 }
             }
             native::WINDOW_STATE => {
-                self.maximized = event.code & 8 != 0;
+                self.maximized = event.code != 0;
                 self.dirty = true;
-                if let Some(trace) = &mut self.trace {
-                    writeln!(trace.output, "window_state {:.9} {}", event.x, event.code)?;
-                }
-            }
-            native::FRAME_RATE => {
-                if let Some(trace) = &mut self.trace {
-                    writeln!(trace.output, "frame_rate {:.9} {:.0}", monotonic(), event.x)?;
-                }
             }
             native::KEY => self.key(event.code, event.modifiers, &event.text)?,
             native::TEXT => {
@@ -943,21 +893,13 @@ impl WorkspaceView {
                 }
             }
             native::RESIZE => self.resize()?,
-            native::EXPOSE => self.dirty = true,
             native::CLOSE => {
                 self.open_close();
             }
             native::FOCUS => {
                 self.focused = event.code != 0;
                 if let Some(trace) = &mut self.trace {
-                    writeln!(
-                        trace.output,
-                        "focus {:.9} {}",
-                        monotonic(),
-                        u8::from(self.focused)
-                    )?;
-                    // The input probe needs this before the buffered frame log is filled.
-                    trace.output.flush()?;
+                    trace.focus(self.focused)?;
                 }
                 if let Some(pane) = self.active() {
                     if self.mode(pane).contains(Mode::FOCUS_IN_OUT) {
@@ -3040,40 +2982,13 @@ impl WorkspaceView {
         self.text.lines.truncate(self.text.used);
         let prepared = begin.map(|_| monotonic());
         self.renderer.present()?;
-        if let Some(trace) = &mut self.trace {
+        if let (Some(trace), Some(begin), Some(prepared)) = (&mut self.trace, begin, prepared) {
             let marker = self
                 .client
                 .snapshot()
                 .and_then(|snapshot| self.client.screens().get(&snapshot.focused))
-                .map(|screen| {
-                    let cell = screen.row(0).cells[0];
-                    let color = screen.color(cell.bg);
-                    (
-                        cell.c as u32,
-                        (u32::from(color.r) << 16) | (u32::from(color.g) << 8) | u32::from(color.b),
-                    )
-                })
-                .unwrap_or((0, 0));
-            trace.frame = trace.frame.wrapping_add(1);
-            trace.pending = Some((
-                format!(
-                    "frame {} {:.9} {:.9} {:.9}",
-                    trace.frame,
-                    begin.unwrap(),
-                    begin.unwrap(),
-                    prepared.unwrap()
-                ),
-                format!(
-                    " {} {} {} {} {} {:.9} {}",
-                    marker.0,
-                    marker.1,
-                    u8::from(!self.preedit.is_empty()),
-                    width,
-                    height,
-                    scale,
-                    u8::from(self.focused)
-                ),
-            ));
+                .map_or(0, trace::marker);
+            trace.frame(begin, prepared, marker, (width, height, scale), self.focused);
         }
         Ok(())
     }

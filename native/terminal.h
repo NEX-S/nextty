@@ -12,8 +12,7 @@ typedef struct NtLine NtLine;
 enum { NT_SHIFT = 1, NT_CONTROL = 2, NT_ALT = 4, NT_SUPER = 8 };
 enum {
     NT_KEY = 1, NT_TEXT, NT_PREEDIT, NT_MOTION, NT_BUTTON, NT_SCROLL,
-    NT_FOCUS, NT_RESIZE, NT_CLOSE, NT_PASTE, NT_FRAME, NT_EXPOSE, NT_PRESENTED,
-    NT_WINDOW_STATE, NT_FRAME_RATE, NT_POINTER_LEAVE
+    NT_FOCUS, NT_RESIZE, NT_CLOSE, NT_PASTE, NT_PRESENTED, NT_WINDOW_STATE, NT_POINTER_LEAVE
 };
 
 typedef struct {
@@ -32,9 +31,8 @@ typedef struct {
  * Pointer leave clears hover without reporting a terminal mouse movement.
  * Key code is an XKB keysym; printable text arrives only through NT_TEXT.
  * Paste code: primary; text is the completed, unmodified UTF-8 selection.
- * Trace-only frame code/x/y: frame id, monotonic receipt, raw server time (ms).
- * Trace-only window state code: activated/suspended/fullscreen/maximized bits;
- * x: monotonic receipt. Trace-only frame rate x: submission interval in nanoseconds. */
+ * Window state code: maximized. Presented (NEXTTY_TRACE only) code: frame id,
+ * x: time, y: refresh ns, start: clock id, end: discarded, modifiers: flags. */
 typedef void (*NtEventFn)(void *, const NtEvent *);
 
 NtWindow *nt_window_new(int width, int height);

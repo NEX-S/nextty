@@ -93,7 +93,7 @@ struct Feedback {
     uint32_t id;
 };
 struct NtWindow {
-    int width, height, tracing;
+    int width, height;
     int frame_fd;
     int64_t frame_interval_ns, last_frame_ns, frame_deadline_ns;
     double scale, mouse_x, mouse_y;
@@ -127,14 +127,13 @@ struct NtWindow {
     struct wp_fractional_scale_v1 *fractional_scale;
     struct wp_presentation *presentation;
     Feedback *feedbacks;
-    uint32_t frame_id, frame_callback_id;
+    uint32_t frame_id;
     int suspended;
     int presentation_clock;
     struct wl_seat *seat;
     struct wl_keyboard *keyboard;
     struct wl_pointer *pointer;
     struct xkb_state *key_state;
-    struct wl_callback *frame;
     struct wp_cursor_shape_manager_v1 *cursor_manager;
     struct wp_cursor_shape_device_v1 *cursor_device;
     struct wl_data_device_manager *data_manager;
@@ -193,11 +192,8 @@ static void set_frame_period(NtWindow *w, int64_t frame_interval_ns) {
     if (w->frame_interval_ns == frame_interval_ns)
         return;
     w->frame_interval_ns = frame_interval_ns;
-    schedule_frame(w, 0);
-    /* A new deadline may already have elapsed while Rust was waiting. */
-    emit(w, (NtEvent){.kind = NT_FRAME});
-    if (w->tracing)
-        emit(w, (NtEvent){.kind = NT_FRAME_RATE, .x = frame_interval_ns});
+    /* Expire at once so the event loop rechecks a waiting frame against the new period. */
+    schedule_frame(w, 1);
 }
 static void wayland_error(NtWindow *w, const char *operation) {
     int error = wl_display_get_error(w->display);
@@ -679,70 +675,32 @@ static void wayland_selection(NtWindow *w, int primary);
 
 /* Wayland listeners use the display's default queue; the driver may enqueue onto it. */
 static void shell_ping(void *data, struct xdg_wm_base *shell, uint32_t serial) {
-    (void)data;
     xdg_wm_base_pong(shell, serial);
 }
 static const struct xdg_wm_base_listener shell_listener = {.ping = shell_ping};
-static void frame_done(void *data, struct wl_callback *cb, uint32_t time) {
-    NtWindow *w = data;
-    NtEvent event = {.kind = NT_FRAME};
-    struct timespec received;
-    clock_gettime(CLOCK_MONOTONIC, &received);
-    event.code = w->frame_callback_id;
-    event.x = received.tv_sec + received.tv_nsec / 1e9;
-    event.y = time;
-    wl_callback_destroy(cb);
-    w->frame = NULL;
-    emit(w, event);
-}
-static const struct wl_callback_listener frame_listener = {.done = frame_done};
 static void toplevel_configure(void *data, struct xdg_toplevel *top, int32_t width, int32_t height,
                                struct wl_array *states) {
-    (void)top;
     NtWindow *w = data;
     w->pending_width = width;
     w->pending_height = height;
-    uint32_t flags = 0;
+    int suspended = 0, maximized = 0;
     uint32_t *state;
     wl_array_for_each(state, states) {
-        if (*state == XDG_TOPLEVEL_STATE_ACTIVATED)
-            flags |= 1;
-        else if (*state == XDG_TOPLEVEL_STATE_SUSPENDED)
-            flags |= 2;
-        else if (*state == XDG_TOPLEVEL_STATE_FULLSCREEN)
-            flags |= 4;
-        else if (*state == XDG_TOPLEVEL_STATE_MAXIMIZED)
-            flags |= 8;
+        suspended |= *state == XDG_TOPLEVEL_STATE_SUSPENDED;
+        maximized |= *state == XDG_TOPLEVEL_STATE_MAXIMIZED;
     }
-    int suspended = !!(flags & 2);
     if (suspended != w->suspended) {
         w->suspended = suspended;
         schedule_frame(w, 0);
-        if (!suspended)
-            emit(w, (NtEvent){.kind = NT_EXPOSE});
     }
-    double received = 0;
-    if (w->tracing) {
-        struct timespec timestamp;
-        clock_gettime(CLOCK_MONOTONIC, &timestamp);
-        received = timestamp.tv_sec + timestamp.tv_nsec / 1e9;
-    }
-    emit(w, (NtEvent){.kind = NT_WINDOW_STATE, .code = flags, .x = received});
+    emit(w, (NtEvent){.kind = NT_WINDOW_STATE, .code = maximized});
 }
 static void toplevel_close(void *data, struct xdg_toplevel *top) {
-    (void)top;
     emit(data, (NtEvent){.kind = NT_CLOSE});
 }
 static void toplevel_bounds(void *data, struct xdg_toplevel *top, int32_t width, int32_t height) {
-    (void)data;
-    (void)top;
-    (void)width;
-    (void)height;
 }
 static void toplevel_capabilities(void *data, struct xdg_toplevel *top, struct wl_array *caps) {
-    (void)data;
-    (void)top;
-    (void)caps;
 }
 static const struct xdg_toplevel_listener toplevel_listener = {.configure = toplevel_configure,
                                                                .close = toplevel_close,
@@ -768,28 +726,20 @@ static void update_refresh(NtWindow *w) {
     set_frame_period(w, refresh ? (1000000000000LL + refresh - 1) / refresh : 0);
 }
 static void surface_enter(void *data, struct wl_surface *surface, struct wl_output *output) {
-    (void)surface;
     NtWindow *w = data;
     Output *o = wl_output_get_user_data(output);
     o->entered = 1;
     update_refresh(w);
 }
 static void surface_leave(void *data, struct wl_surface *surface, struct wl_output *output) {
-    (void)surface;
     NtWindow *w = data;
     Output *o = wl_output_get_user_data(output);
     o->entered = 0;
     update_refresh(w);
 }
 static void surface_scale(void *data, struct wl_surface *surface, int32_t scale) {
-    (void)data;
-    (void)surface;
-    (void)scale;
 }
 static void surface_transform(void *data, struct wl_surface *surface, uint32_t transform) {
-    (void)data;
-    (void)surface;
-    (void)transform;
 }
 static const struct wl_surface_listener surface_listener = {.enter = surface_enter,
                                                             .leave = surface_leave,
@@ -797,7 +747,6 @@ static const struct wl_surface_listener surface_listener = {.enter = surface_ent
                                                             .preferred_buffer_transform =
                                                                 surface_transform};
 static void fractional_scale(void *data, struct wp_fractional_scale_v1 *obj, uint32_t scale) {
-    (void)obj;
     NtWindow *w = data;
     double value = scale / 120.0;
     if (value != w->scale) {
@@ -810,40 +759,20 @@ static const struct wp_fractional_scale_v1_listener fractional_listener = {.pref
 static void output_geometry(void *data, struct wl_output *o, int32_t x, int32_t y, int32_t pw,
                             int32_t ph, int32_t sub, const char *make, const char *model,
                             int32_t transform) {
-    (void)data;
-    (void)o;
-    (void)x;
-    (void)y;
-    (void)pw;
-    (void)ph;
-    (void)sub;
-    (void)make;
-    (void)model;
-    (void)transform;
 }
 static void output_mode(void *data, struct wl_output *o, uint32_t flags, int32_t width,
                         int32_t height, int32_t refresh) {
-    (void)width;
-    (void)height;
     Output *output = data;
     if (flags & WL_OUTPUT_MODE_CURRENT)
         output->refresh = refresh > 0 ? refresh : 0;
-    (void)o;
 }
 static void output_done(void *data, struct wl_output *o) {
-    (void)o;
     Output *out = data;
     update_refresh(out->window);
 }
 static void output_scale(void *data, struct wl_output *o, int32_t scale) {
-    (void)o;
-    (void)data;
-    (void)scale;
 }
 static void output_name(void *data, struct wl_output *o, const char *name) {
-    (void)data;
-    (void)o;
-    (void)name;
 }
 static const struct wl_output_listener output_listener = {.geometry = output_geometry,
                                                           .mode = output_mode,
@@ -854,7 +783,6 @@ static const struct wl_output_listener output_listener = {.geometry = output_geo
 
 static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t format, int fd,
                             uint32_t size) {
-    (void)keyboard;
     NtWindow *w = data;
     if (format != WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size) {
         close(fd);
@@ -885,18 +813,12 @@ static void keyboard_keymap(void *data, struct wl_keyboard *keyboard, uint32_t f
 }
 static void keyboard_enter(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface, struct wl_array *keys) {
-    (void)keyboard;
-    (void)surface;
-    (void)keys;
     NtWindow *w = data;
     w->serial = serial;
     emit(w, (NtEvent){.kind = NT_FOCUS, .code = 1});
 }
 static void keyboard_leave(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                            struct wl_surface *surface) {
-    (void)keyboard;
-    (void)serial;
-    (void)surface;
     NtWindow *w = data;
     w->modifiers = 0;
     if (w->compose)
@@ -916,8 +838,6 @@ static void wayland_key(NtWindow *w, uint32_t key, int composing) {
 }
 static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t serial, uint32_t time,
                          uint32_t key, uint32_t state) {
-    (void)keyboard;
-    (void)time;
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
@@ -929,7 +849,6 @@ static void keyboard_key(void *data, struct wl_keyboard *keyboard, uint32_t seri
 static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_t serial,
                                uint32_t depressed, uint32_t latched, uint32_t locked,
                                uint32_t group) {
-    (void)keyboard;
     NtWindow *w = data;
     w->serial = serial;
     if (w->key_state) {
@@ -939,10 +858,6 @@ static void keyboard_modifiers(void *data, struct wl_keyboard *keyboard, uint32_
 }
 static void keyboard_repeat(void *data, struct wl_keyboard *keyboard, int32_t rate, int32_t delay) {
     /* Mutter owns repetition for wl_keyboard v10 and sends repeat_info(0, 0). */
-    (void)data;
-    (void)keyboard;
-    (void)rate;
-    (void)delay;
 }
 static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard_keymap,
                                                               .enter = keyboard_enter,
@@ -952,8 +867,6 @@ static const struct wl_keyboard_listener keyboard_listener = {.keymap = keyboard
                                                               .repeat_info = keyboard_repeat};
 static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y) {
-    (void)pointer;
-    (void)surface;
     NtWindow *w = data;
     w->pointer_serial = serial;
     w->pointer_inside = 1;
@@ -967,17 +880,12 @@ static void pointer_enter(void *data, struct wl_pointer *pointer, uint32_t seria
 }
 static void pointer_leave(void *data, struct wl_pointer *pointer, uint32_t serial,
                           struct wl_surface *surface) {
-    (void)pointer;
-    (void)serial;
-    (void)surface;
     NtWindow *w = data;
     w->pointer_inside = 0;
     emit(w, (NtEvent){.kind = NT_POINTER_LEAVE});
 }
 static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time, wl_fixed_t x,
                            wl_fixed_t y) {
-    (void)pointer;
-    (void)time;
     NtWindow *w = data;
     w->mouse_x = wl_fixed_to_double(x);
     w->mouse_y = wl_fixed_to_double(y);
@@ -986,8 +894,6 @@ static void pointer_motion(void *data, struct wl_pointer *pointer, uint32_t time
 }
 static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t serial, uint32_t time,
                            uint32_t button, uint32_t state) {
-    (void)pointer;
-    (void)time;
     NtWindow *w = data;
     w->serial = serial;
     for (int i = 0; i < 2; i++)
@@ -1003,17 +909,14 @@ static void pointer_button(void *data, struct wl_pointer *pointer, uint32_t seri
 }
 static void pointer_axis(void *data, struct wl_pointer *pointer, uint32_t time, uint32_t axis,
                          wl_fixed_t value) {
-    (void)time;
     NtWindow *w = data;
     double v = wl_fixed_to_double(value);
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
         w->axis_y += v / 10.0;
     else
         w->axis_x += v / 10.0;
-    (void)pointer;
 }
 static void pointer_frame(void *data, struct wl_pointer *pointer) {
-    (void)pointer;
     NtWindow *w = data;
     double x = w->axis_value_x ? w->axis_value_x / 120.0 : w->axis_x;
     double y = w->axis_value_y ? w->axis_value_y / 120.0 : w->axis_y;
@@ -1023,20 +926,12 @@ static void pointer_frame(void *data, struct wl_pointer *pointer) {
     w->axis_value_x = w->axis_value_y = 0;
 }
 static void pointer_axis_source(void *data, struct wl_pointer *pointer, uint32_t source) {
-    (void)data;
-    (void)pointer;
-    (void)source;
 }
 static void pointer_axis_stop(void *data, struct wl_pointer *pointer, uint32_t time,
                               uint32_t axis) {
-    (void)data;
-    (void)pointer;
-    (void)time;
-    (void)axis;
 }
 static void pointer_axis_value(void *data, struct wl_pointer *pointer, uint32_t axis,
                                int32_t value) {
-    (void)pointer;
     NtWindow *w = data;
     if (axis == WL_POINTER_AXIS_VERTICAL_SCROLL)
         w->axis_value_y = value;
@@ -1045,10 +940,6 @@ static void pointer_axis_value(void *data, struct wl_pointer *pointer, uint32_t 
 }
 static void pointer_axis_direction(void *data, struct wl_pointer *pointer, uint32_t axis,
                                    uint32_t direction) {
-    (void)data;
-    (void)pointer;
-    (void)axis;
-    (void)direction;
 }
 static const struct wl_pointer_listener pointer_listener = {.enter = pointer_enter,
                                                             .leave = pointer_leave,
@@ -1062,7 +953,6 @@ static const struct wl_pointer_listener pointer_listener = {.enter = pointer_ent
                                                             .axis_relative_direction =
                                                                 pointer_axis_direction};
 static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
-    (void)surface;
     NtWindow *w = data;
     w->text_enabled = 1;
     zwp_text_input_v3_enable(input);
@@ -1073,7 +963,6 @@ static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_su
     zwp_text_input_v3_commit(w->text_input);
 }
 static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
-    (void)surface;
     NtWindow *w = data;
     if (w->text_enabled) {
         zwp_text_input_v3_disable(input);
@@ -1088,7 +977,6 @@ static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_su
 }
 static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char *text,
                          int32_t begin, int32_t end) {
-    (void)input;
     NtWindow *w = data;
     free(w->pending_preedit);
     w->pending_preedit = strdup(text ? text : "");
@@ -1100,7 +988,6 @@ static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char
     w->preedit_end = end;
 }
 static void text_commit_string(void *data, struct zwp_text_input_v3 *input, const char *text) {
-    (void)input;
     NtWindow *w = data;
     free(w->pending_commit);
     w->pending_commit = strdup(text ? text : "");
@@ -1113,14 +1000,11 @@ static void text_delete(void *data, struct zwp_text_input_v3 *input, uint32_t be
                         uint32_t after) {
     /* No surrounding text is offered by this terminal; the protocol forbids
        nonzero deletion beyond the offered range. */
-    (void)input;
     NtWindow *w = data;
     if (before || after)
         fail(w, "input method requested deletion without surrounding text");
 }
 static void text_done(void *data, struct zwp_text_input_v3 *input, uint32_t serial) {
-    (void)input;
-    (void)serial;
     NtWindow *w = data;
     /* Stale serials still carry valid edits. No state requests are issued from
        done: application cursor changes have already committed their own state. */
@@ -1167,28 +1051,17 @@ static void source_remove(Source *source) {
     free(source);
 }
 static void source_target(void *data, struct wl_data_source *source, const char *mime) {
-    (void)data;
-    (void)source;
-    (void)mime;
 }
 static void source_send(void *data, struct wl_data_source *proxy, const char *mime, int32_t fd) {
-    (void)proxy;
-    (void)mime;
     Source *s = data;
     add_transfer(s->window, fd, 1, s->bytes, s->length, s->file_fd);
 }
 static void source_cancel(void *data, struct wl_data_source *proxy) {
-    (void)proxy;
     source_remove(data);
 }
 static void source_drop(void *data, struct wl_data_source *proxy) {
-    (void)data;
-    (void)proxy;
 }
 static void source_action(void *data, struct wl_data_source *proxy, uint32_t action) {
-    (void)data;
-    (void)proxy;
-    (void)action;
 }
 static const struct wl_data_source_listener source_listener = {.target = source_target,
                                                                .send = source_send,
@@ -1198,11 +1071,9 @@ static const struct wl_data_source_listener source_listener = {.target = source_
                                                                .action = source_action};
 static void primary_send(void *data, struct zwp_primary_selection_source_v1 *source,
                          const char *mime, int32_t fd) {
-    (void)source;
     source_send(data, NULL, mime, fd);
 }
 static void primary_cancel(void *data, struct zwp_primary_selection_source_v1 *source) {
-    (void)source;
     source_remove(data);
 }
 static const struct zwp_primary_selection_source_v1_listener primary_source_listener = {
@@ -1251,19 +1122,14 @@ static void offer_mime(Offer *o, const char *mime) {
         o->mime = "text/plain";
 }
 static void data_offer_mime(void *data, struct wl_data_offer *offer, const char *mime) {
-    (void)offer;
     offer_mime(data, mime);
 }
 static void data_offer_action(void *data, struct wl_data_offer *offer, uint32_t action) {
-    (void)data;
-    (void)offer;
-    (void)action;
 }
 static const struct wl_data_offer_listener offer_listener = {
     .offer = data_offer_mime, .source_actions = data_offer_action, .action = data_offer_action};
 static void primary_offer_mime(void *data, struct zwp_primary_selection_offer_v1 *offer,
                                const char *mime) {
-    (void)offer;
     offer_mime(data, mime);
 }
 static const struct zwp_primary_selection_offer_v1_listener primary_offer_listener = {
@@ -1286,7 +1152,6 @@ static void offer_destroy(Offer *o) {
     free(o);
 }
 static void data_offer(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *o = calloc(1, sizeof *o);
     if (!o) {
@@ -1300,7 +1165,6 @@ static void data_offer(void *data, struct wl_data_device *device, struct wl_data
     wl_data_offer_add_listener(offer, &offer_listener, o);
 }
 static void data_leave(void *data, struct wl_data_device *device) {
-    (void)device;
     NtWindow *w = data;
     Offer *offer = w->dnd_offer;
     w->dnd_offer = NULL;
@@ -1310,9 +1174,6 @@ static void data_leave(void *data, struct wl_data_device *device) {
 static void data_enter(void *data, struct wl_data_device *device, uint32_t serial,
                        struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y,
                        struct wl_data_offer *offer) {
-    (void)surface;
-    (void)x;
-    (void)y;
     NtWindow *w = data;
     data_leave(data, device);
     if (offer) {
@@ -1322,14 +1183,8 @@ static void data_enter(void *data, struct wl_data_device *device, uint32_t seria
 }
 static void data_motion(void *data, struct wl_data_device *device, uint32_t time, wl_fixed_t x,
                         wl_fixed_t y) {
-    (void)data;
-    (void)device;
-    (void)time;
-    (void)x;
-    (void)y;
 }
 static void data_selection(void *data, struct wl_data_device *device, struct wl_data_offer *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *old = w->selection[0];
     w->selection[0] = offer ? wl_data_offer_get_user_data(offer) : NULL;
@@ -1346,7 +1201,6 @@ static const struct wl_data_device_listener data_listener = {.data_offer = data_
                                                              .selection = data_selection};
 static void primary_offer(void *data, struct zwp_primary_selection_device_v1 *device,
                           struct zwp_primary_selection_offer_v1 *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *o = calloc(1, sizeof *o);
     if (!o) {
@@ -1362,7 +1216,6 @@ static void primary_offer(void *data, struct zwp_primary_selection_device_v1 *de
 }
 static void primary_selection(void *data, struct zwp_primary_selection_device_v1 *device,
                               struct zwp_primary_selection_offer_v1 *offer) {
-    (void)device;
     NtWindow *w = data;
     Offer *old = w->selection[1];
     w->selection[1] = offer ? zwp_primary_selection_offer_v1_get_user_data(offer) : NULL;
@@ -1395,15 +1248,11 @@ static void seat_capabilities(void *data, struct wl_seat *seat, uint32_t caps) {
     }
 }
 static void seat_name(void *data, struct wl_seat *seat, const char *name) {
-    (void)data;
-    (void)seat;
-    (void)name;
 }
 static const struct wl_seat_listener seat_listener = {.capabilities = seat_capabilities,
                                                       .name = seat_name};
 static void presentation_clock(void *data, struct wp_presentation *presentation,
                                uint32_t clock_id) {
-    (void)presentation;
     NtWindow *w = data;
     w->presentation_clock = (int)clock_id;
 }
@@ -1419,16 +1268,11 @@ static void feedback_remove(Feedback *feedback) {
 }
 static void feedback_output(void *data, struct wp_presentation_feedback *feedback,
                             struct wl_output *output) {
-    (void)data;
-    (void)feedback;
-    (void)output;
 }
 static void feedback_presented(void *data, struct wp_presentation_feedback *proxy,
                                uint32_t seconds_hi, uint32_t seconds_lo, uint32_t nanoseconds,
                                uint32_t refresh, uint32_t sequence_hi, uint32_t sequence_lo,
                                uint32_t flags) {
-    (void)sequence_hi;
-    (void)sequence_lo;
     Feedback *feedback = data;
     NtWindow *w = feedback->window;
     double seconds =
@@ -1439,7 +1283,6 @@ static void feedback_presented(void *data, struct wp_presentation_feedback *prox
                       .x = seconds,
                       .y = refresh,
                       .start = w->presentation_clock});
-    (void)proxy;
     feedback_remove(feedback);
 }
 static void feedback_discarded(void *data, struct wp_presentation_feedback *proxy) {
@@ -1449,7 +1292,6 @@ static void feedback_discarded(void *data, struct wp_presentation_feedback *prox
                       .code = feedback->id,
                       .start = w->presentation_clock,
                       .end = 1});
-    (void)proxy;
     feedback_remove(feedback);
 }
 static const struct wp_presentation_feedback_listener feedback_listener = {
@@ -1476,7 +1318,7 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
     else BIND(wp_cursor_shape_manager_v1, cursor_manager, 1)
     else BIND(wp_viewporter, viewporter, 1)
     else BIND(wp_fractional_scale_manager_v1, scale_manager, 1)
-    else if (w->tracing && !strcmp(interface, "wp_presentation")) {
+    else if (!strcmp(interface, "wp_presentation") && getenv("NEXTTY_TRACE")) {
         w->presentation = wl_registry_bind(registry, name, &wp_presentation_interface, 1);
         wp_presentation_add_listener(w->presentation, &presentation_listener, w);
     } else if (!strcmp(interface, "wl_output")) {
@@ -1499,7 +1341,6 @@ static void registry_global(void *data, struct wl_registry *registry, uint32_t n
 #undef BIND
 }
 static void registry_remove(void *data, struct wl_registry *registry, uint32_t name) {
-    (void)registry;
     NtWindow *w = data;
     Output **link = &w->outputs;
     while (*link) {
@@ -1700,10 +1541,8 @@ int nt_window_wait(NtWindow *w, struct pollfd *sources, size_t source_count, int
         wayland_error(w, "dispatching Wayland display");
     if (fds[1].revents & POLLIN) {
         uint64_t expirations;
-        if (read(w->frame_fd, &expirations, sizeof expirations) == sizeof expirations) {
+        if (read(w->frame_fd, &expirations, sizeof expirations) == sizeof expirations)
             w->frame_deadline_ns = 0;
-            emit(w, (NtEvent){.kind = NT_FRAME});
-        }
     }
     if (fds[0].revents & (POLLHUP | POLLERR | POLLNVAL))
         fail(w, "display connection closed");
@@ -1725,7 +1564,6 @@ NtWindow *nt_window_new(int width, int height) {
                  strerror(errno));
         return NULL;
     }
-    w->tracing = getenv("NEXTTY_TRACE") != NULL;
     w->width = width > 0 ? width : 800;
     w->height = height > 0 ? height : 600;
     w->scale = 1;
@@ -1868,30 +1706,16 @@ void nt_window_prepare_frame(NtWindow *w) {
         elapsed >= w->frame_interval_ns && elapsed < 2 * w->frame_interval_ns
         ? w->last_frame_ns + w->frame_interval_ns : now;
     schedule_frame(w, 0);
-    if (w->tracing)
-        w->frame_id++;
     if (w->presentation) {
         Feedback *feedback = calloc(1, sizeof *feedback);
         if (!feedback) {
             fail(w, "allocating presentation feedback: %s", strerror(errno));
             return;
         }
-        feedback->window = w;
-        feedback->id = w->frame_id;
-        feedback->proxy = wp_presentation_feedback(w->presentation, w->surface);
-        if (!feedback->proxy) {
-            free(feedback);
-            fail(w, "allocating presentation feedback: %s", strerror(errno));
-            return;
-        }
-        feedback->next = w->feedbacks;
+        *feedback = (Feedback){.next = w->feedbacks, .window = w, .id = ++w->frame_id,
+                               .proxy = wp_presentation_feedback(w->presentation, w->surface)};
         w->feedbacks = feedback;
         wp_presentation_feedback_add_listener(feedback->proxy, &feedback_listener, feedback);
-    }
-    if (w->tracing && !w->frame) {
-        w->frame_callback_id = w->frame_id;
-        w->frame = wl_surface_frame(w->surface);
-        wl_callback_add_listener(w->frame, &frame_listener, w);
     }
 }
 void *nt_window_display(NtWindow *w) {
@@ -1904,8 +1728,6 @@ void nt_window_free(NtWindow *w) {
     if (!w)
         return;
     if (w->display) {
-        if (w->frame)
-            wl_callback_destroy(w->frame);
         while (w->feedbacks)
             feedback_remove(w->feedbacks);
         if (w->presentation)
