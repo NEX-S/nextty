@@ -111,14 +111,11 @@ impl Terminal {
         foreground: u32,
         background: u32,
     ) -> Result<Self> {
-        Self::new_inner(
+        Self::spawn(
             shell,
             working_directory,
             size,
-            foreground,
-            background,
-            #[cfg(feature = "tui")]
-            None,
+            Core::new(size, foreground, background),
         )
     }
 
@@ -131,34 +128,19 @@ impl Terminal {
         background: u32,
         history: crate::history::HistoryConfig,
     ) -> Result<Self> {
-        Self::new_inner(
-            shell,
-            working_directory,
-            size,
-            foreground,
-            background,
-            Some(history),
-        )
+        let mut core = Core::new(size, foreground, background);
+        core.enable_history(history)?;
+        Self::spawn(shell, working_directory, size, core)
     }
 
-    fn new_inner(
+    fn spawn(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
         size: WindowSize,
-        foreground: u32,
-        background: u32,
-        #[cfg(feature = "tui")] history: Option<crate::history::HistoryConfig>,
+        core: Core,
     ) -> Result<Self> {
-        let pty_size = winsize(size)?;
-        let terminal_core = Core::new(size, foreground, background);
-        #[cfg(feature = "tui")]
-        let mut terminal_core = terminal_core;
-        #[cfg(feature = "tui")]
-        if let Some(history) = history {
-            terminal_core.enable_history(history)?;
-        }
         let (master, slave) =
-            open_pty(pty_size).map_err(|error| Error::context("cannot create PTY", error))?;
+            open_pty(winsize(size)).map_err(|error| Error::context("cannot create PTY", error))?;
         let wakeup = Arc::new(Wakeup {
             fd: crate::eventfd::new()?,
             pending: AtomicBool::new(false),
@@ -227,7 +209,7 @@ impl Terminal {
                 return Err(Error::context("cannot monitor terminal child", error));
             }
         };
-        let core = Arc::new(Mutex::new(terminal_core));
+        let core = Arc::new(Mutex::new(core));
         let (sender, receiver) = mpsc::channel();
         let (event_sender, events) = mpsc::channel();
         let input_bytes = Arc::new(AtomicUsize::new(0));
@@ -275,10 +257,7 @@ impl Terminal {
         &self,
         id: u64,
     ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryCopy>>> {
-        self.core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .copy_block(id)
+        self.core.lock().unwrap().copy_block(id)
     }
 
     #[cfg(feature = "tui")]
@@ -293,7 +272,7 @@ impl Terminal {
     )> {
         self.core
             .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
+            .unwrap()
             .read_history(block, cursor, query)
     }
 
@@ -303,11 +282,7 @@ impl Terminal {
 
     pub fn current_directory(&self) -> io::Result<PathBuf> {
         #[cfg(feature = "tui")]
-        if let Some(directory) = self
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .current_directory()
+        if let Some(directory) = self.core.lock().unwrap().current_directory()
         {
             return Ok(directory.to_path_buf());
         }
@@ -318,10 +293,7 @@ impl Terminal {
     pub fn copy_selection(
         &self,
     ) -> io::Result<mpsc::Receiver<io::Result<crate::history::HistoryCopy>>> {
-        self.core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .copy_selection()
+        self.core.lock().unwrap().copy_selection()
     }
 
     pub fn write(&self, data: impl Into<Cow<'static, [u8]>>) -> io::Result<()> {
@@ -368,12 +340,8 @@ impl Terminal {
     }
 
     pub fn resize(&self, size: WindowSize) -> io::Result<()> {
-        let pty_size = winsize(size)?;
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        self.send(Message::Resize(pty_size))?;
+        let mut core = self.core.lock().unwrap();
+        self.send(Message::Resize(winsize(size)))?;
         core.resize(size);
         Ok(())
     }
@@ -588,10 +556,7 @@ impl PtyLoop {
             }
             #[cfg(feature = "tui")]
             let (history_fd, history_ready) = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut core = self.core.lock().unwrap();
                 if core.poll_history(history_notified)? {
                     self.proxy.wakeup();
                 }
@@ -726,10 +691,7 @@ impl PtyLoop {
                 }
                 process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
                 let (committed, events) = {
-                    let mut core = self
-                        .core
-                        .lock()
-                        .map_err(|error| io::Error::other(error.to_string()))?;
+                    let mut core = self.core.lock().unwrap();
                     #[cfg(feature = "tui")]
                     let committed = parser.advance_queued(&mut core, &buffer[..count as usize]);
                     #[cfg(not(feature = "tui"))]
@@ -756,10 +718,7 @@ impl PtyLoop {
                 }
             }
             let (ready, history_fd, committed, events) = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut core = self.core.lock().unwrap();
                 core.poll_history(true)?;
                 let ready = core.history_read_ready();
                 let committed = ready && parser.advance_queued(&mut core, &[]);
@@ -809,10 +768,7 @@ impl PtyLoop {
     ) -> io::Result<()> {
         if parser.deadline().is_some() {
             let events = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut core = self.core.lock().unwrap();
                 #[cfg(feature = "tui")]
                 parser.finish_sync_queued(&mut core);
                 #[cfg(not(feature = "tui"))]
@@ -973,32 +929,13 @@ fn fd(value: i32) -> io::Result<OwnedFd> {
     }
 }
 
-fn winsize(size: WindowSize) -> io::Result<libc::winsize> {
-    if size.num_cols == 0 || size.num_lines == 0 {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "terminal size must be at least 1×1",
-        ));
-    }
-    Ok(libc::winsize {
+fn winsize(size: WindowSize) -> libc::winsize {
+    libc::winsize {
         ws_row: size.num_lines,
         ws_col: size.num_cols,
-        ws_xpixel: size.num_cols.checked_mul(size.cell_width).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "terminal pixel width exceeds 65535",
-            )
-        })?,
-        ws_ypixel: size
-            .num_lines
-            .checked_mul(size.cell_height)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "terminal pixel height exceeds 65535",
-                )
-            })?,
-    })
+        ws_xpixel: size.num_cols.saturating_mul(size.cell_width),
+        ws_ypixel: size.num_lines.saturating_mul(size.cell_height),
+    }
 }
 
 fn set_size(fd: RawFd, size: libc::winsize) -> io::Result<()> {

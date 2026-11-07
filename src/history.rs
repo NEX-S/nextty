@@ -1,20 +1,20 @@
-//! Bounded, workspace-owned disk history. Only this worker performs archive I/O.
+//! Bounded, workspace-owned disk history.
 use std::borrow::Cow;
 use std::collections::{HashSet, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Condvar, Mutex, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 
 use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection, semantic_group};
 use crate::eventfd::{consume_notification, notify};
 use crate::vt::{Color, NamedColor, Rgb};
 
-pub const HOT_ROWS: usize = 512;
+const HOT_ROWS: usize = 512;
 const BATCH: usize = 32;
 const SEGMENT_BYTES: u64 = 64 * 1024;
 static NEXT: AtomicU64 = AtomicU64::new(1);
@@ -33,12 +33,6 @@ struct BudgetFiles {
 }
 impl HistoryBudget {
     pub fn new(directory: PathBuf, capacity: u64) -> io::Result<Arc<Self>> {
-        if capacity == 0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "history capacity must be nonzero",
-            ));
-        }
         fs::create_dir(&directory)?;
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))?;
         Ok(Arc::new(Self {
@@ -62,10 +56,7 @@ impl HistoryBudget {
     ) -> io::Result<u64> {
         // Serialization with eviction prevents another pane from unlinking a segment
         // between opening it and publishing the appended rows.
-        let mut files = self
-            .files
-            .lock()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut files = self.files.lock().unwrap();
         let previous = if create || files.open.as_ref().is_none_or(|(open, _)| open != path) {
             let file = if create {
                 OpenOptions::new()
@@ -112,11 +103,7 @@ impl HistoryBudget {
             if files.open.as_ref().is_some_and(|(open, _)| open == &path) {
                 files.open = None;
             }
-            match fs::remove_file(path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
-            }
+            remove_segment(&path)?;
             files.used -= bytes;
             evicted = true;
         }
@@ -125,10 +112,7 @@ impl HistoryBudget {
         drop(previous);
         if evicted {
             self.generation.fetch_add(1, Ordering::Release);
-            let mut notifications = self
-                .notifications
-                .lock()
-                .map_err(|e| io::Error::other(e.to_string()))?;
+            let mut notifications = self.notifications.lock().unwrap();
             notifications.retain(|weak| weak.strong_count() != 0);
             for fd in notifications.iter().filter_map(std::sync::Weak::upgrade) {
                 notify(fd.as_raw_fd())?;
@@ -140,10 +124,7 @@ impl HistoryBudget {
         if segments.is_empty() {
             return Ok(());
         }
-        let mut files = self
-            .files
-            .lock()
-            .map_err(|e| io::Error::other(e.to_string()))?;
+        let mut files = self.files.lock().unwrap();
         let mut removed = 0;
         if let [segment] = segments {
             let first = files
@@ -179,11 +160,7 @@ impl HistoryBudget {
             {
                 files.open = None;
             }
-            match fs::remove_file(&segment.path) {
-                Ok(()) => (),
-                Err(e) if e.kind() == io::ErrorKind::NotFound => (),
-                Err(e) => return Err(e),
-            }
+            remove_segment(&segment.path)?;
         }
         Ok(())
     }
@@ -245,126 +222,53 @@ pub(crate) struct HistoryRead {
 }
 
 struct SearchJob {
-    segments: Vec<(Arc<Path>, u64, u64)>,
+    segments: Vec<Segment>,
     hot_start: u64,
     hot: Vec<Row>,
     query: String,
     columns: usize,
     alternate: bool,
     cancelled: Arc<AtomicBool>,
-    wake: OwnedFd,
-    sender: mpsc::Sender<io::Result<crate::search::SearchResult>>,
 }
-struct ReadJob {
-    read: HistoryRead,
-    segments: Vec<(Arc<Path>, u64, u64)>,
-    sender: mpsc::Sender<io::Result<HistoryPage>>,
-    wake: Arc<OwnedFd>,
-}
-enum SearchWork {
-    Find(SearchJob),
-    Read(ReadJob),
-}
-impl SearchWork {
-    fn cancelled(&self) -> &Arc<AtomicBool> {
-        match self {
-            Self::Find(job) => &job.cancelled,
-            Self::Read(job) => &job.read.cancelled,
-        }
+/// Searches and reads scan a segment snapshot on their own thread, so appends keep flowing.
+fn spawn_scan<T: Send + 'static>(
+    cancelled: Arc<AtomicBool>,
+    sender: mpsc::Sender<io::Result<T>>,
+    wake: impl AsRawFd + Send + 'static,
+    scan: impl FnOnce() -> io::Result<T> + Send + 'static,
+) {
+    if cancelled.load(Ordering::Relaxed) {
+        return;
     }
-}
-#[derive(Default)]
-struct SearchState {
-    pending: VecDeque<SearchWork>,
-    active: Option<Arc<AtomicBool>>,
-    closed: bool,
-}
-struct SearchWorker(Arc<(Mutex<SearchState>, Condvar)>);
-impl SearchWorker {
-    fn new() -> io::Result<Self> {
-        let shared = Arc::new((Mutex::new(SearchState::default()), Condvar::new()));
-        let worker = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name("history-search".into())
-            .spawn(move || {
-                loop {
-                    let (lock, changed) = &*worker;
-                    let mut state = lock.lock().unwrap();
-                    while state.pending.is_empty() && !state.closed {
-                        state = changed.wait(state).unwrap();
-                    }
-                    if state.closed {
-                        return;
-                    }
-                    let job = state.pending.pop_front().unwrap();
-                    state.active = Some(Arc::clone(job.cancelled()));
-                    drop(state);
-                    match job {
-                        SearchWork::Find(job) => {
-                            let result = search_archive(&job);
-                            if !job.cancelled.load(Ordering::Relaxed) {
-                                let _ = job.sender.send(result);
-                                if let Err(error) = notify(job.wake.as_raw_fd()) {
-                                    eprintln!("notify pane search: {error}");
-                                }
-                            }
-                        }
-                        SearchWork::Read(job) => {
-                            let result = read_archive(&job.read, &job.segments);
-                            if !job.read.cancelled.load(Ordering::Relaxed) {
-                                let _ = job.sender.send(result);
-                                if let Err(error) = notify(job.wake.as_raw_fd()) {
-                                    eprintln!("notify history read: {error}");
-                                }
-                            }
-                        }
-                    }
-                    lock.lock().unwrap().active = None;
+    let failed = sender.clone();
+    let spawned = std::thread::Builder::new()
+        .name("history-search".into())
+        .spawn(move || {
+            let result = scan();
+            if !cancelled.load(Ordering::Relaxed) {
+                let _ = sender.send(result);
+                if let Err(error) = notify(wake.as_raw_fd()) {
+                    eprintln!("notify history scan: {error}");
                 }
-            })?;
-        Ok(Self(shared))
-    }
-    fn submit(&self, job: SearchWork) {
-        let (lock, changed) = &*self.0;
-        let mut state = lock.lock().unwrap();
-        state
-            .pending
-            .retain(|job| !job.cancelled().load(Ordering::Relaxed));
-        if !job.cancelled().load(Ordering::Relaxed) {
-            state.pending.push_back(job);
-            changed.notify_one();
-        }
-    }
-}
-impl Drop for SearchWorker {
-    fn drop(&mut self) {
-        let (lock, changed) = &*self.0;
-        let mut state = lock.lock().unwrap();
-        state.closed = true;
-        if let Some(cancelled) = &state.active {
-            cancelled.store(true, Ordering::Relaxed);
-        }
-        state.pending.clear();
-        changed.notify_one();
+            }
+        });
+    if let Err(error) = spawned {
+        let _ = failed.send(Err(error));
     }
 }
 fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
     let mut matcher = crate::search::Matcher::new(&job.query);
     let mut cells = Vec::new();
-    for (path, start, end) in &job.segments {
+    for segment in &job.segments {
         if job.cancelled.load(Ordering::Relaxed) {
             break;
         }
-        let mut reader = match File::open(path) {
-            Ok(file) => BufReader::new(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                matcher.gap();
-                continue;
-            }
-            Err(error) => return Err(error),
+        let Some(mut reader) = open_segment(&segment.path)? else {
+            matcher.gap();
+            continue;
         };
-        let mut id = *start;
-        let end = (*end).min(job.hot_start);
+        let mut id = segment.start;
+        let end = segment.end.min(job.hot_start);
         while id < end {
             if job.cancelled.load(Ordering::Relaxed) {
                 return Ok(matcher.finish(job.columns, job.alternate));
@@ -441,7 +345,11 @@ enum Request {
         incomplete: bool,
         sender: mpsc::Sender<io::Result<HistoryCopy>>,
     },
-    Search(SearchJob),
+    Search {
+        job: SearchJob,
+        wake: OwnedFd,
+        sender: mpsc::Sender<io::Result<crate::search::SearchResult>>,
+    },
     Clear,
     Status,
     Reflow(Reflow),
@@ -473,7 +381,7 @@ impl History {
             .budget
             .notifications
             .lock()
-            .map_err(|e| io::Error::other(e.to_string()))?
+            .unwrap()
             .push(Arc::downgrade(&notification));
         let budget = config.budget.clone();
         let generation = budget.generation.load(Ordering::Acquire);
@@ -483,49 +391,25 @@ impl History {
         let thread = std::thread::Builder::new()
             .name("history-io".into())
             .spawn(move || {
-                let mut archive = Archive {
-                    budget: config.budget,
-                    segments: VecDeque::new(),
-                    end: 0,
-                    order_hint: None,
-                    encoded: Vec::new(),
-                };
-                let mut search_worker: Option<SearchWorker> = None;
+                let mut archive = Archive::new(config.budget);
                 while let Ok(request) = requests.recv() {
                     let result = match request {
                         Request::Read { read, sender } => {
-                            let setup = archive.first().and_then(|_| {
-                                if search_worker.is_none() {
-                                    search_worker = Some(SearchWorker::new()?);
-                                }
-                                Ok(())
-                            });
-                            match setup {
-                                Ok(()) => {
-                                    let begin = archive
-                                        .segments
-                                        .partition_point(|segment| segment.end <= read.cursor.row);
-                                    let segments = archive
-                                        .segments
-                                        .range(begin..)
-                                        .take_while(|segment| segment.start <= read.end.0)
-                                        .map(|segment| {
-                                            (segment.path.clone(), segment.start, segment.end)
-                                        })
-                                        .collect();
-                                    search_worker.as_ref().unwrap().submit(SearchWork::Read(
-                                        ReadJob {
-                                            read,
-                                            segments,
-                                            sender,
-                                            wake: Arc::clone(&wake),
-                                        },
-                                    ));
-                                }
-                                Err(error) => {
-                                    let _ = sender.send(Err(error));
-                                }
-                            }
+                            let begin = archive
+                                .segments
+                                .partition_point(|segment| segment.end <= read.cursor.row);
+                            let segments: Vec<_> = archive
+                                .segments
+                                .range(begin..)
+                                .take_while(|segment| segment.start <= read.end.0)
+                                .cloned()
+                                .collect();
+                            spawn_scan(
+                                Arc::clone(&read.cancelled),
+                                sender,
+                                Arc::clone(&wake),
+                                move || read_archive(&read, &segments),
+                            );
                             None
                         }
                         Request::Append { start, rows } => Some(
@@ -562,33 +446,22 @@ impl History {
                                 .send(archive.copy(start, end, hot_start, &hot, kind, incomplete));
                             None
                         }
-                        Request::Search(mut job) => {
-                            if !job.cancelled.load(Ordering::Relaxed) {
-                                if !job.alternate {
-                                    job.segments = archive
-                                        .segments
-                                        .iter()
-                                        .filter(|segment| segment.start < job.hot_start)
-                                        .map(|segment| {
-                                            (segment.path.clone(), segment.start, segment.end)
-                                        })
-                                        .collect();
-                                }
-                                if search_worker.is_none() {
-                                    match SearchWorker::new() {
-                                        Ok(worker) => search_worker = Some(worker),
-                                        Err(error) => {
-                                            let _ = job.sender.send(Err(error));
-                                            let _ = notify(job.wake.as_raw_fd());
-                                            continue;
-                                        }
-                                    }
-                                }
-                                search_worker
-                                    .as_ref()
-                                    .unwrap()
-                                    .submit(SearchWork::Find(job));
+                        Request::Search {
+                            mut job,
+                            wake,
+                            sender,
+                        } => {
+                            if !job.alternate {
+                                job.segments = archive
+                                    .segments
+                                    .iter()
+                                    .filter(|segment| segment.start < job.hot_start)
+                                    .cloned()
+                                    .collect();
                             }
+                            spawn_scan(Arc::clone(&job.cancelled), sender, wake, move || {
+                                search_archive(&job)
+                            });
                             None
                         }
                         Request::Clear => Some(archive.clear().map(|()| Reply::Cleared)),
@@ -627,14 +500,7 @@ impl History {
     }
     pub fn check_budget(&mut self) {
         let generation = self.budget.generation.load(Ordering::Acquire);
-        if generation != self.generation
-            && self
-                .sender
-                .as_ref()
-                .unwrap()
-                .try_send(Request::Status)
-                .is_ok()
-        {
+        if generation != self.generation && self.try_send(Request::Status).is_ok() {
             self.generation = generation;
         }
     }
@@ -645,12 +511,7 @@ impl History {
         self.replies.try_iter()
     }
     pub fn append(&self, start: u64, rows: Vec<Row>) -> Result<(), Vec<Row>> {
-        match self
-            .sender
-            .as_ref()
-            .unwrap()
-            .try_send(Request::Append { start, rows })
-        {
+        match self.try_send(Request::Append { start, rows }) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(Request::Append { rows, .. }))
             | Err(mpsc::TrySendError::Disconnected(Request::Append { rows, .. })) => Err(rows),
@@ -658,38 +519,29 @@ impl History {
         }
     }
     pub fn page(&self, epoch: u64, start: u64, count: usize) -> bool {
-        self.sender
-            .as_ref()
-            .unwrap()
-            .try_send(Request::Page {
-                epoch,
-                start,
-                count,
-            })
-            .is_ok()
+        self.try_send(Request::Page {
+            epoch,
+            start,
+            count,
+        })
+        .is_ok()
+    }
+    fn try_send(&self, request: Request) -> Result<(), mpsc::TrySendError<Request>> {
+        self.sender.as_ref().unwrap().try_send(request)
     }
     fn send(&self, request: Request) -> io::Result<()> {
-        self.sender
-            .as_ref()
-            .unwrap()
-            .try_send(request)
-            .map_err(|error| match error {
-                mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
-                mpsc::TrySendError::Disconnected(_) => {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
-                }
-            })
+        self.try_send(request).map_err(|error| match error {
+            mpsc::TrySendError::Full(_) => io::ErrorKind::WouldBlock.into(),
+            mpsc::TrySendError::Disconnected(_) => {
+                io::Error::new(io::ErrorKind::BrokenPipe, "history worker stopped")
+            }
+        })
     }
     pub fn clear(&self) -> io::Result<()> {
         self.send(Request::Clear)
     }
     pub fn reflow(&self, request: Reflow) -> Result<(), Reflow> {
-        match self
-            .sender
-            .as_ref()
-            .unwrap()
-            .try_send(Request::Reflow(request))
-        {
+        match self.try_send(Request::Reflow(request)) {
             Ok(()) => Ok(()),
             Err(mpsc::TrySendError::Full(Request::Reflow(request)))
             | Err(mpsc::TrySendError::Disconnected(Request::Reflow(request))) => Err(request),
@@ -707,17 +559,19 @@ impl History {
         let (hot_start, hot) = hot;
         let (columns, alternate) = geometry;
         let (sender, receiver) = mpsc::channel();
-        self.send(Request::Search(SearchJob {
-            segments: Vec::new(),
-            hot_start,
-            hot,
-            query,
-            columns,
-            alternate,
-            cancelled,
+        self.send(Request::Search {
+            job: SearchJob {
+                segments: Vec::new(),
+                hot_start,
+                hot,
+                query,
+                columns,
+                alternate,
+                cancelled,
+            },
             wake,
             sender,
-        }))?;
+        })?;
         Ok(receiver)
     }
     pub fn copy(
@@ -844,10 +698,10 @@ impl ReadText<'_> {
     }
 }
 
-fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::Result<HistoryPage> {
+fn read_archive(read: &HistoryRead, segments: &[Segment]) -> io::Result<HistoryPage> {
     let first = segments
         .first()
-        .map_or(read.hot_start, |(_, start, _)| *start)
+        .map_or(read.hot_start, |segment| segment.start)
         .min(read.hot_start);
     let mut incomplete = read.incomplete || read.cursor.row < first;
     let cursor = if read.cursor.row < first {
@@ -869,33 +723,29 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
     let mut cells = Vec::new();
     let mut bytes = Vec::new();
     let mut full = false;
-    for (path, start, end) in segments {
+    for segment in segments {
         if read.cancelled.load(Ordering::Relaxed) {
             return Err(io::ErrorKind::Interrupted.into());
         }
-        if *start >= read.hot_start || *start > read.end.0 {
+        if segment.start >= read.hot_start || segment.start > read.end.0 {
             break;
         }
-        if *start > output.cursor.row {
+        if segment.start > output.cursor.row {
             incomplete = true;
-            output.cursor.row = *start;
+            output.cursor.row = segment.start;
             output.cursor.offset = 0;
             output.carry.clear();
         }
-        let mut file = match File::open(path) {
-            Ok(file) => BufReader::new(file),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                incomplete = true;
-                output.cursor.row = *end;
-                output.cursor.offset = 0;
-                output.carry.clear();
-                continue;
-            }
-            Err(error) => return Err(error),
+        let Some(mut file) = open_segment(&segment.path)? else {
+            incomplete = true;
+            output.cursor.row = segment.end;
+            output.cursor.offset = 0;
+            output.carry.clear();
+            continue;
         };
-        let from = output.cursor.row.max(*start);
-        skip_rows(&mut file, from - *start)?;
-        for id in from..(*end).min(read.hot_start) {
+        let from = output.cursor.row.max(segment.start);
+        skip_rows(&mut file, from - segment.start)?;
+        for id in from..segment.end.min(read.hot_start) {
             if id > read.end.0 {
                 break;
             }
@@ -940,6 +790,7 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
     })
 }
 
+#[derive(Clone)]
 struct Segment {
     path: Arc<Path>,
     start: u64,
@@ -955,6 +806,15 @@ struct Archive {
     encoded: Vec<u8>,
 }
 impl Archive {
+    fn new(budget: Arc<HistoryBudget>) -> Self {
+        Self {
+            budget,
+            segments: VecDeque::new(),
+            end: 0,
+            order_hint: None,
+            encoded: Vec::new(),
+        }
+    }
     fn first(&mut self) -> io::Result<u64> {
         while let Some(segment) = self.segments.front() {
             if segment.path.try_exists()? {
@@ -1030,16 +890,11 @@ impl Archive {
             if segment.start >= end {
                 break;
             }
-            let mut file = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    // Another pane can evict a not-yet-open segment. Keep only a
-                    // contiguous suffix and retain its real row ID.
-                    actual = segment.end.min(end);
-                    rows.clear();
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(mut file) = open_segment(&segment.path)? else {
+                // Keep only a contiguous suffix and retain its real row ID.
+                actual = segment.end.min(end);
+                rows.clear();
+                continue;
             };
             let start = actual.max(segment.start);
             skip_rows(&mut file, start - segment.start)?;
@@ -1119,14 +974,10 @@ impl Archive {
             if segment.start >= hot_start || segment.start > end.0 {
                 break;
             }
-            let mut reader = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                    incomplete = true;
-                    next = segment.end.min(hot_start);
-                    continue;
-                }
-                Err(error) => return Err(error),
+            let Some(mut reader) = open_segment(&segment.path)? else {
+                incomplete = true;
+                next = segment.end.min(hot_start);
+                continue;
             };
             // Keep the segment open while copying it. Repeated small pages would
             // decode the same prefix for every batch, especially for empty rows.
@@ -1193,17 +1044,10 @@ impl Archive {
                 else {
                     return Ok(None);
                 };
-                let file = match File::open(&segment.path) {
-                    Ok(file) => file,
-                    Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
-                    Err(error) => return Err(error),
+                let Some(file) = open_segment(&segment.path)? else {
+                    return Ok(None);
                 };
-                input = Some((
-                    segment.start,
-                    segment.end,
-                    VecDeque::new(),
-                    BufReader::new(file),
-                ));
+                input = Some((segment.start, segment.end, VecDeque::new(), file));
             }
             let (next, _, rows, file) = input.as_mut().unwrap();
             while *next <= id {
@@ -1389,10 +1233,8 @@ impl Archive {
         }
         let mut cells = Vec::new();
         while let Some(segment) = self.segments.pop_front() {
-            let mut file = match File::open(&segment.path) {
-                Ok(file) => BufReader::new(file),
-                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error),
+            let Some(mut file) = open_segment(&segment.path)? else {
+                continue;
             };
             output.archive.order_hint = Some(segment.order);
             for id in segment.start..segment.end {
@@ -1489,13 +1331,7 @@ struct ReflowOutput {
 impl ReflowOutput {
     fn new(budget: Arc<HistoryBudget>, request: &Reflow) -> Self {
         Self {
-            archive: Archive {
-                budget,
-                segments: VecDeque::new(),
-                end: 0,
-                order_hint: None,
-                encoded: Vec::new(),
-            },
+            archive: Archive::new(budget),
             tail: VecDeque::new(),
             pending: Vec::new(),
             row: Row::new(request.columns, Cell::default()),
@@ -1620,7 +1456,20 @@ impl ReflowOutput {
         Ok(row.cells)
     }
 }
-use std::os::unix::fs::OpenOptionsExt;
+/// `None` means another pane's append evicted the segment.
+fn open_segment(path: &Path) -> io::Result<Option<BufReader<File>>> {
+    match File::open(path) {
+        Ok(file) => Ok(Some(BufReader::new(file))),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+fn remove_segment(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => Err(error),
+        _ => Ok(()),
+    }
+}
 fn write_text(
     file: &mut impl Write,
     row: &Row,
@@ -1833,22 +1682,37 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[test]
-    fn search_keeps_unicode_matches_across_the_cold_hot_boundary() {
+    use std::sync::Barrier;
+
+    fn budget() -> Arc<HistoryBudget> {
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
         fs::create_dir_all(&root).unwrap();
-        let directory = root.join(format!(
-            "search-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let mut archive = Archive {
-            budget: HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap(),
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        };
+        HistoryBudget::new(
+            root.join(format!(
+                "test-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            )),
+            256 * 1024,
+        )
+        .unwrap()
+    }
+    fn row(id: u64) -> Row {
+        let value = format!("{id:06} {}", "x".repeat(65));
+        let cells = value
+            .chars()
+            .map(|c| Cell {
+                c,
+                ..Cell::default()
+            })
+            .collect::<Vec<_>>();
+        let used = cells.len();
+        Row::from_parts(cells, false, used, Vec::new()).unwrap()
+    }
+
+    #[test]
+    fn search_keeps_unicode_matches_across_the_cold_hot_boundary() {
+        let mut archive = Archive::new(budget());
         let mut core = crate::core::Core::new(
             crate::core::WindowSize {
                 num_cols: 4,
@@ -1861,28 +1725,16 @@ mod tests {
         );
         crate::vt::Parser::new().advance(&mut core, "中a\u{301}bc".as_bytes());
         archive.append(0, &[core.row(0).clone()]).unwrap();
-        let (sender, receiver) = mpsc::channel();
-        let job = SearchJob {
-            segments: archive
-                .segments
-                .iter()
-                .map(|s| (s.path.clone(), s.start, s.end))
-                .collect(),
+        let result = search_archive(&SearchJob {
+            segments: archive.segments.iter().cloned().collect(),
             hot_start: 1,
             hot: vec![core.row(1).clone()],
             query: "a\u{301}bc".into(),
             columns: 4,
             alternate: false,
             cancelled: Default::default(),
-            wake: crate::eventfd::new().unwrap(),
-            sender,
-        };
-        let worker = SearchWorker::new().unwrap();
-        worker.submit(SearchWork::Find(job));
-        let result = receiver
-            .recv_timeout(std::time::Duration::from_secs(2))
-            .unwrap()
-            .unwrap();
+        })
+        .unwrap();
         assert_eq!(
             result.matches,
             vec![crate::search::SearchMatch {
@@ -1891,9 +1743,7 @@ mod tests {
             }]
         );
         assert!(!result.truncated);
-        drop(worker);
         archive.clear().unwrap();
-        drop(archive);
     }
     #[test]
     fn copied_unicode_and_combining_marks_survive_long_rows_and_prompt_filtering() {
@@ -1987,21 +1837,9 @@ mod tests {
     }
     #[test]
     fn empty_line_flood_uses_filled_segments_and_charges_filesystem_blocks() {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
-        fs::create_dir_all(&root).unwrap();
-        let directory = root.join(format!(
-            "empty-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let budget = HistoryBudget::new(directory.clone(), 1024 * 1024).unwrap();
-        let mut archive = Archive {
-            budget: budget.clone(),
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        };
+        let budget = budget();
+        let directory = budget.directory.clone();
+        let mut archive = Archive::new(budget.clone());
         let rows =
             vec![Row::from_parts(vec![Cell::default(); 80], false, 0, Vec::new()).unwrap(); 32];
         for _ in 0..625 {
@@ -2023,53 +1861,10 @@ mod tests {
         drop(budget);
         assert!(!directory.exists());
     }
-}
-
-#[cfg(test)]
-mod eviction_tests {
-    use super::*;
-    use std::sync::{
-        Barrier,
-        atomic::{AtomicBool, Ordering},
-    };
-    fn budget() -> Arc<HistoryBudget> {
-        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
-        fs::create_dir_all(&root).unwrap();
-        HistoryBudget::new(
-            root.join(format!(
-                "concurrent-{}-{}",
-                std::process::id(),
-                NEXT.fetch_add(1, Ordering::Relaxed)
-            )),
-            256 * 1024,
-        )
-        .unwrap()
-    }
-    fn archive(budget: Arc<HistoryBudget>) -> Archive {
-        Archive {
-            budget,
-            segments: VecDeque::new(),
-            end: 0,
-            order_hint: None,
-            encoded: Vec::new(),
-        }
-    }
-    fn row(id: u64) -> Row {
-        let value = format!("{id:06} {}", "x".repeat(65));
-        let cells = value
-            .chars()
-            .map(|c| Cell {
-                c,
-                ..Cell::default()
-            })
-            .collect::<Vec<_>>();
-        let used = cells.len();
-        Row::from_parts(cells, false, used, Vec::new()).unwrap()
-    }
 
     #[test]
     fn removed_cached_segment_is_replaced_before_publishing_more_rows() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive.append(0, &[row(0)]).unwrap();
         fs::remove_file(&archive.segments.back().unwrap().path).unwrap();
         archive.append(1, &[row(1)]).unwrap();
@@ -2086,7 +1881,7 @@ mod eviction_tests {
             if evicted {
                 Arc::get_mut(&mut budget).unwrap().capacity = 1;
             }
-            let mut archive = archive(budget.clone());
+            let mut archive = Archive::new(budget.clone());
             archive
                 .append(0, &(0..BATCH as u64).map(row).collect::<Vec<_>>())
                 .unwrap();
@@ -2578,7 +2373,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
                 row
             })
             .collect::<Vec<_>>();
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive.append(0, &rows[..300]).unwrap();
         for kind in [
             SelectionType::Lines,
@@ -2598,7 +2393,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn paging_and_copy_preserve_mixed_rows_after_long_empty_prefixes() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         let blank = Row::from_parts(vec![Cell::default(); 80], false, 0, Vec::new()).unwrap();
         let mut rows = vec![blank; 2000];
         rows[910] = row(910);
@@ -2636,7 +2431,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn paging_and_copy_only_require_the_requested_prefix_to_be_readable() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         let rows = (0..4).map(row).collect::<Vec<_>>();
         archive.append(0, &rows).unwrap();
         let mut prefix = Vec::new();
@@ -2714,8 +2509,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn unregister_distinguishes_segments_with_the_same_order() {
         let budget = budget();
-        let mut first = archive(budget.clone());
-        let mut second = archive(budget.clone());
+        let mut first = Archive::new(budget.clone());
+        let mut second = Archive::new(budget.clone());
         first.order_hint = Some(7);
         second.order_hint = Some(7);
         let row = Row::from_parts(
@@ -2765,7 +2560,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
 
     #[test]
     fn height_reflow_preserves_cold_files_and_recovers_the_required_tail() {
-        let mut archive = archive(budget());
+        let mut archive = Archive::new(budget());
         archive
             .append(0, &(0..320).map(row).collect::<Vec<_>>())
             .unwrap();
@@ -2859,8 +2654,8 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn pages_return_the_actual_start_after_another_pane_evicts_the_old_prefix() {
         let budget = budget();
-        let mut first = archive(budget.clone());
-        let mut other = archive(budget);
+        let mut first = Archive::new(budget.clone());
+        let mut other = Archive::new(budget);
         let rows = (0..192).map(row).collect::<Vec<_>>();
         first.append(0, &rows).unwrap();
         other
@@ -2906,7 +2701,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
     #[test]
     fn concurrent_eviction_marks_copy_incomplete_and_keeps_the_hot_suffix_in_order() {
         let budget = budget();
-        let mut first = archive(budget.clone());
+        let mut first = Archive::new(budget.clone());
         let rows = (0..192).map(row).collect::<Vec<_>>();
         first.append(0, &rows).unwrap();
         assert_eq!(first.first().unwrap(), 0);
@@ -2915,7 +2710,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
         let flood_barrier = barrier.clone();
         let flood_evicted = evicted.clone();
         let thread = std::thread::spawn(move || {
-            let mut other = archive(budget);
+            let mut other = Archive::new(budget);
             flood_barrier.wait();
             let batch = (0..192).map(row).collect::<Vec<_>>();
             for _ in 0..4 {
