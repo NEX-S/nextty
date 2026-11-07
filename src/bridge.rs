@@ -9,7 +9,7 @@ use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-pub const BRIDGE_VERSION: u8 = 3;
+pub const BRIDGE_VERSION: u8 = 4;
 
 pub fn run_bridge(version: u8) -> io::Result<()> {
     if version != BRIDGE_VERSION {
@@ -157,6 +157,9 @@ fn bridge(remote: &mut Peer, daemon: &mut Peer, list: bool) -> io::Result<()> {
                     || !copy && !copies.is_empty()
                     || copy && !reader.as_ref().unwrap().pending());
         poll(&mut fds, if buffered { 0 } else { -1 })?;
+        if fds[3].revents != 0 {
+            crate::eventfd::consume_notification(fds[3].fd)?;
+        }
         if fds[0].revents & libc::POLLNVAL != 0
             || fds[1].revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
         {

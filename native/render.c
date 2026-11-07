@@ -68,22 +68,26 @@ typedef struct {
 
 enum { ATLAS_MAX = 2048, GLYPH_SLOTS = 8192 };
 
+typedef struct {
+    size_t length, run_count;
+    uint16_t *columns;
+    NtRun runs[];
+} LineInput;
+
 struct NtLine {
     NtRenderer *renderer;
-    NtLine *retired_next;
-    size_t references;
-    char *text;
-    size_t length;
-    NtRun *runs; /* Owns the runs/columns/text allocation until shaping. */
-    size_t run_count;
-    uint16_t *columns;
+    /* The last reference becomes the retirement link. */
+    union {
+        size_t references;
+        NtLine *retired_next;
+    };
+    LineInput *input;
     /* Each contiguous font group owns one reference. */
     NtFontGlyph *glyphs;
     size_t count;
 };
 
 typedef struct {
-    cairo_scaled_font_t *font;
     uint32_t glyph;
     uint16_t x, y, width, height;
     int left, top;
@@ -108,7 +112,7 @@ typedef struct {
 } Op;
 
 typedef struct {
-    int width, height, pixel_width, pixel_height;
+    int width, height;
     double scale;
     Op *ops;
     size_t op_count, op_capacity;
@@ -136,6 +140,7 @@ struct NtRenderer {
     double scale;
     int texture_size[2];
     int atlas_size[2], atlas_x[2], atlas_y[2], atlas_row[2];
+    cairo_scaled_font_t *glyph_fonts[GLYPH_SLOTS];
     CachedGlyph glyphs[GLYPH_SLOTS];
     size_t glyph_count;
     Quad *quads;
@@ -158,17 +163,33 @@ const char *nt_renderer_error(NtRenderer *r) {
     return r ? r->error : creation_error;
 }
 
+static void retire_lines(NtLine *first, NtLine *last) {
+    Swap *s = &first->renderer->swap;
+    pthread_mutex_lock(&s->lock);
+    int empty = s->retired == NULL;
+    last->retired_next = s->retired;
+    s->retired = first;
+    if (empty) pthread_cond_signal(&s->changed);
+    pthread_mutex_unlock(&s->lock);
+}
+
 static void clear_frame(Frame *f) {
-    for (size_t i = 0; i < f->op_count; ++i)
-        if (f->ops[i].kind == OP_LINE) nt_line_free(f->ops[i].line.line);
+    NtLine *first = NULL, *last = NULL;
+    for (size_t i = 0; i < f->op_count; ++i) {
+        if (f->ops[i].kind != OP_LINE) continue;
+        NtLine *line = f->ops[i].line.line;
+        if (--line->references) continue;
+        line->retired_next = first;
+        first = line;
+        if (!last) last = line;
+    }
     f->op_count = 0;
+    if (first) retire_lines(first, last);
 }
 
 static void free_line_input(NtLine *line) {
-    free(line->runs);
-    line->text = NULL;
-    line->runs = NULL;
-    line->columns = NULL;
+    free(line->input);
+    line->input = NULL;
 }
 
 static void destroy_line(NtLine *line) {
@@ -209,9 +230,9 @@ static void clear_glyphs(NtRenderer *r) {
     if (!r->glyph_count) return;
     /* Font marks occupancy; leave empty slots' zero pages untouched. */
     for (size_t i = 0; i < GLYPH_SLOTS; ++i) {
-        if (!r->glyphs[i].font) continue;
-        cairo_scaled_font_destroy(r->glyphs[i].font);
-        r->glyphs[i].font = NULL;
+        if (!r->glyph_fonts[i]) continue;
+        cairo_scaled_font_destroy(r->glyph_fonts[i]);
+        r->glyph_fonts[i] = NULL;
     }
     r->glyph_count = 0;
     memset(r->atlas_x, 0, sizeof r->atlas_x);
@@ -596,7 +617,7 @@ static void vk_free_swapchain(NtRenderer *r) {
     v->swapchain = VK_NULL_HANDLE;
 }
 
-static int vk_create_swapchain(NtRenderer *r) {
+static int vk_create_swapchain(NtRenderer *r, VkExtent2D requested) {
     NtVulkan *v = &r->vk;
     VK_CHECK(vkDeviceWaitIdle(v->device));
     vk_free_swapchain(r);
@@ -621,8 +642,7 @@ static int vk_create_swapchain(NtRenderer *r) {
     if (format.format == VK_FORMAT_UNDEFINED) return fail(r, "Wayland surface has no Vulkan RGBA8 UNORM format");
     VkExtent2D extent = caps.currentExtent;
     if (extent.width == UINT32_MAX) {
-        extent.width = (uint32_t)r->frame.pixel_width;
-        extent.height = (uint32_t)r->frame.pixel_height;
+        extent = requested;
         if (extent.width < caps.minImageExtent.width) extent.width = caps.minImageExtent.width;
         if (extent.width > caps.maxImageExtent.width) extent.width = caps.maxImageExtent.width;
         if (extent.height < caps.minImageExtent.height) extent.height = caps.minImageExtent.height;
@@ -813,9 +833,11 @@ static int replay(NtRenderer *r) {
         vk_free_atlas(r, atlas);
     }
     for (NtVkUpload *upload = v->uploads; upload; upload = upload->next) upload->used = 0;
-    if (!v->swapchain || v->resize || v->extent.width != (uint32_t)f->pixel_width ||
-        v->extent.height != (uint32_t)f->pixel_height)
-        if (!vk_create_swapchain(r)) return 0;
+    VkExtent2D requested = {(uint32_t)lround(f->width * f->scale),
+                            (uint32_t)lround(f->height * f->scale)};
+    if (!v->swapchain || v->resize || v->extent.width != requested.width ||
+        v->extent.height != requested.height)
+        if (!vk_create_swapchain(r, requested)) return 0;
     for (;;) {
         VkResult result = vkAcquireNextImageKHR(v->device, v->swapchain, UINT64_MAX,
                                                 v->acquired, VK_NULL_HANDLE, &v->image_index);
@@ -824,7 +846,7 @@ static int replay(NtRenderer *r) {
             break;
         }
         if (result != VK_ERROR_OUT_OF_DATE_KHR) return fail(r, "Acquiring Vulkan frame: %d", result);
-        if (!vk_create_swapchain(r)) return 0;
+        if (!vk_create_swapchain(r, requested)) return 0;
     }
     VkCommandBufferBeginInfo begin = {
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
@@ -1122,20 +1144,21 @@ void nt_renderer_metrics(NtRenderer *r, float *width, float *height) {
 
 void nt_line_free(NtLine *line) {
     if (!line || --line->references) return;
-    Swap *s = &line->renderer->swap;
-    pthread_mutex_lock(&s->lock);
-    line->retired_next = s->retired;
-    s->retired = line;
-    if (!line->retired_next) pthread_cond_signal(&s->changed);
-    pthread_mutex_unlock(&s->lock);
+    retire_lines(line, line);
+}
+
+static char *line_text(const NtLine *line) {
+    const LineInput *input = line->input;
+    return input->columns ? (char *)(input->columns + input->length)
+                          : (char *)(input->runs + input->run_count);
 }
 
 NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
                     const NtRun *runs, size_t run_count,
                     const uint16_t *columns) {
     size_t stride = columns ? sizeof *columns + 1 : 1;
-    if (length > INT_MAX || (columns && length > (SIZE_MAX - 1) / (sizeof *columns + 1)) ||
-        run_count > (SIZE_MAX - length * stride - 1) / sizeof *runs) {
+    if (length > INT_MAX || length > (SIZE_MAX - sizeof(LineInput) - 1) / stride ||
+        run_count > (SIZE_MAX - sizeof(LineInput) - length * stride - 1) / sizeof *runs) {
         fail(r, "Shaped line is too large");
         return NULL;
     }
@@ -1143,28 +1166,30 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
     if (!line) { fail(r, "Cannot allocate terminal line"); return NULL; }
     line->renderer = r;
     line->references = 1;
-    line->length = length;
-    line->run_count = run_count;
     size_t run_bytes = run_count * sizeof *runs;
-    line->runs = malloc(run_bytes + length * stride + 1);
-    if (!line->runs) {
+    LineInput *input = malloc(sizeof *input + run_bytes + length * stride + 1);
+    if (!input) {
         fail(r, "Cannot allocate terminal line input");
         free(line);
         return NULL;
     }
-    line->columns = columns && length ? (uint16_t *)((char *)line->runs + run_bytes) : NULL;
-    line->text = (char *)line->runs + run_bytes + (columns ? length * sizeof *columns : 0);
-    memcpy(line->text, text, length);
-    line->text[length] = 0;
-    if (run_count) memcpy(line->runs, runs, run_bytes);
-    if (line->columns) memcpy(line->columns, columns, length * sizeof *columns);
+    line->input = input;
+    input->length = length;
+    input->run_count = run_count;
+    input->columns = columns && length ? (uint16_t *)((char *)input->runs + run_bytes) : NULL;
+    char *copy = line_text(line);
+    memcpy(copy, text, length);
+    copy[length] = 0;
+    if (run_count) memcpy(input->runs, runs, run_bytes);
+    if (input->columns) memcpy(input->columns, columns, length * sizeof *columns);
     return line;
 }
 
 static int shape_line(NtRenderer *r, NtLine *line) {
-    if (!line->text) return 1;
-    int success = nt_fonts_shape(r->fonts, line->text, line->length,
-                                line->runs, line->run_count, line->columns,
+    const LineInput *input = line->input;
+    if (!input) return 1;
+    int success = nt_fonts_shape(r->fonts, line_text(line), input->length,
+                                input->runs, input->run_count, input->columns,
                                 &line->glyphs, &line->count);
     free_line_input(line);
     return success;
@@ -1193,9 +1218,9 @@ static int reserve_quads(NtRenderer *r, size_t count) {
 static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
     size_t hash = (((uintptr_t)glyph->font >> 4) ^ ((size_t)glyph->glyph * 2654435761u)) & (GLYPH_SLOTS - 1);
     size_t slot = hash;
-    while (r->glyphs[slot].font) {
+    while (r->glyph_fonts[slot]) {
         CachedGlyph *entry = &r->glyphs[slot];
-        if (entry->font == glyph->font && entry->glyph == glyph->glyph)
+        if (r->glyph_fonts[slot] == glyph->font && entry->glyph == glyph->glyph)
             return entry;
         slot = (slot + 1) & (GLYPH_SLOTS - 1);
     }
@@ -1251,7 +1276,8 @@ static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
         if (r->atlas_row[color] < height) r->atlas_row[color] = height;
     }
     CachedGlyph *entry = &r->glyphs[slot];
-    *entry = (CachedGlyph){ .font = cairo_scaled_font_reference(glyph->font), .glyph = glyph->glyph,
+    r->glyph_fonts[slot] = cairo_scaled_font_reference(glyph->font);
+    *entry = (CachedGlyph){ .glyph = glyph->glyph,
         .x = x, .y = y, .width = width,
         .height = height, .left = left, .top = top };
     ++r->glyph_count;
@@ -1269,15 +1295,19 @@ int nt_renderer_begin(NtRenderer *r, uint32_t background) {
     clear_frame(f);
     nt_window_size(r->window, &f->width, &f->height, &f->scale);
     if (f->width <= 0 || f->height <= 0) return fail(r, "Cannot render an empty window");
-    f->pixel_width = (int)lround(f->width * f->scale);
-    f->pixel_height = (int)lround(f->height * f->scale);
     nt_window_prepare_frame(r->window);
     return nt_renderer_clear(r, background);
 }
 
 int nt_renderer_clip(NtRenderer *r, float x, float y, float width, float height) {
     if (r->error[0]) return 0;
-    return add_op(r, (Op){.kind = OP_CLIP, .clip = {x, y, width, height}});
+    Op op = {.kind = OP_CLIP, .clip = {x, y, width, height}};
+    Frame *f = &r->frame;
+    if (f->op_count && f->ops[f->op_count - 1].kind == OP_CLIP) {
+        f->ops[f->op_count - 1] = op;
+        return 1;
+    }
+    return add_op(r, op);
 }
 
 void nt_renderer_rect(NtRenderer *r, float x, float y, float width, float height,
@@ -1289,10 +1319,11 @@ void nt_renderer_rect(NtRenderer *r, float x, float y, float width, float height
 void nt_renderer_stroke(NtRenderer *r, float x1, float y1, float x2, float y2,
                         float width, uint32_t color) {
     if (r->error[0] || width <= 0 || !(color & 255)) return;
+    /* Plot coordinates are finite; comparisons avoid two libm calls per segment. */
     float radius = width * 0.5f, padding = radius + 1.0f;
     float dx = x2 - x1, dy = y2 - y1;
     Op op = {.kind = OP_QUAD, .quad = make_quad(
-        fminf(x1, x2) - padding, fminf(y1, y2) - padding,
+        (x1 < x2 ? x1 : x2) - padding, (y1 < y2 ? y1 : y2) - padding,
         fabsf(dx) + padding * 2.0f, fabsf(dy) + padding * 2.0f,
         color, dx * dy < 0 ? 7 : 6)};
     op.quad.uv[0] = radius;
@@ -1308,7 +1339,7 @@ void nt_renderer_tab(NtRenderer *r, float x, float y, float width, float height,
 }
 
 void nt_renderer_line(NtRenderer *r, NtLine *line, float x, float y) {
-    if (r->error[0] || (!line->text && !line->count)) return;
+    if (r->error[0] || (!line->input && !line->count)) return;
     if (add_op(r, (Op){.kind = OP_LINE, .line = {line, x, y}}))
         ++line->references;
 }
@@ -1322,9 +1353,42 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
     for (size_t i = 0; i < line->count; ++i) {
         const NtFontGlyph *glyph = &line->glyphs[i];
         if (!(glyph->color & 255)) continue;
+        if (glyph->cell_shape >= 0x2580) {
+            unsigned code = glyph->cell_shape;
+            unsigned mask = 1;
+            unsigned left = 0, top = 0, right = 8, bottom = 8;
+            if (code == 0x2580) bottom = 4;
+            else if (code <= 0x2588) top = 8 - (code - 0x2580);
+            else if (code <= 0x258f) right = 0x2590 - code;
+            else if (code == 0x2590) left = 4;
+            else if (code == 0x2594) bottom = 1;
+            else if (code == 0x2595) left = 7;
+            else {
+                static const unsigned quadrants[] = {4, 8, 1, 13, 9, 7, 11, 2, 6, 14};
+                mask = quadrants[code - 0x2596];
+                /* Quadrant masks contain at most three parts. */
+                if (!reserve_quads(r, r->quad_count + 3 + line->count - i - 1)) return 0;
+            }
+            for (unsigned part = 0; part < 4; ++part) {
+                if (!(mask & (1u << part))) continue;
+                if (code >= 0x2596) {
+                    left = (part % 2) * 4;
+                    top = (part / 2) * 4;
+                    right = left + 4;
+                    bottom = top + 4;
+                }
+                /* Round shared edges, not individual widths, so adjacent blocks meet. */
+                float x0 = roundf((x + glyph->x + r->cell_width * left / 8) * r->scale) / r->scale;
+                float y0 = roundf((y + r->cell_height * top / 8) * r->scale) / r->scale;
+                float x1 = roundf((x + glyph->x + r->cell_width * right / 8) * r->scale) / r->scale;
+                float y1 = roundf((y + r->cell_height * bottom / 8) * r->scale) / r->scale;
+                r->quads[r->quad_count++] = make_quad(x0, y0, x1 - x0, y1 - y0, glyph->color, 0);
+            }
+            continue;
+        }
         Quad q;
-        if (glyph->straight) {
-            if (glyph->straight == 0x2502) {
+        if (glyph->cell_shape) {
+            if (glyph->cell_shape == 0x2502) {
                 float left = roundf((x + glyph->x + (r->cell_width - stroke) * 0.5f) * r->scale) / r->scale;
                 q = make_quad(left, y, stroke, r->cell_height, glyph->color, 0);
             } else {

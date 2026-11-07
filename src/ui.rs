@@ -1,10 +1,9 @@
 use crate::files::FileNav;
 use crate::input::keysym;
-use crate::workspace::{Action, Axis, Direction, PaneId};
+use crate::workspace::{Action, Axis, Client, Direction, PaneId};
 
 use crate::agent::panel::AgentPanel;
 use crate::monitor::Monitor;
-use crate::search::Search;
 use std::{
     borrow::Cow,
     io,
@@ -101,9 +100,20 @@ impl Ui {
         Ok(())
     }
 
+    pub fn file_preview_open(&self) -> bool {
+        self.files_open
+            && self
+                .files
+                .as_ref()
+                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
+    }
+
     pub fn input_target(&self) -> Option<crate::input::PasteTarget> {
         use crate::input::PasteTarget;
 
+        if self.file_preview_open() {
+            return Some(PasteTarget::Files);
+        }
         if self.agent.active().context.preview.is_some() {
             return Some(PasteTarget::Agent(self.agent.active().id));
         }
@@ -186,6 +196,7 @@ impl Ui {
                 key.text,
                 control,
             );
+            self.monitor_jump(client)?;
             if !self.resources.open {
                 self.focus = Focus::Terminal;
             }
@@ -199,7 +210,11 @@ impl Ui {
         if self.files_open && self.focus == Focus::Files {
             use crate::files::FileFocus;
             if paste {
-                return Ok(KeyResult::Paste);
+                return Ok(if self.file_preview_open() {
+                    KeyResult::Handled
+                } else {
+                    KeyResult::Paste
+                });
             }
             let Some(files) = &mut self.files else {
                 return Ok(KeyResult::Handled);
@@ -253,6 +268,7 @@ impl Ui {
                 keysym::RETURN | keysym::KP_ENTER => {
                     if let Some(entry) = files.selected() {
                         let path = entry.path.to_string_lossy().into_owned();
+                        files.focus_list();
                         if let Some(pane) = client.snapshot().and_then(|view| view.focused_pane()) {
                             client.send(Action::Input {
                                 pane: pane.id,
@@ -332,6 +348,9 @@ impl Ui {
     ) -> io::Result<(bool, bool)> {
         let mut resources = false;
         if let Some(snapshot) = client.snapshot() {
+            if self.resources.open {
+                self.resources.set_workspace(snapshot);
+            }
             let directory = if client.is_remote() {
                 Some(std::path::Path::new("/"))
             } else if self.files_open && self.focus == Focus::Files {
@@ -347,13 +366,11 @@ impl Ui {
         let mut changed = resources | self.expire_status();
         if self.files_open
             && let Some(files) = &mut self.files
-        {
-            if fds
+            && fds
                 .iter()
                 .any(|source| source.fd == files.fd() && source.revents != 0)
-            {
-                files.drain_notification()?;
-            }
+        {
+            files.drain_notification()?;
             changed |= files.poll();
         }
         Ok((resources, changed))
@@ -392,9 +409,8 @@ impl Ui {
         let Some(directory) = directory else {
             return Cow::Borrowed("");
         };
-        let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
         let path = if !remote
-            && let Some(relative) = home
+            && let Some(relative) = std::env::var_os("HOME")
                 .as_deref()
                 .and_then(|home| directory.strip_prefix(home).ok())
         {
@@ -407,7 +423,7 @@ impl Ui {
             directory.to_string_lossy()
         };
         match self.resources.stats.branch().filter(|_| !remote) {
-            Some(branch) => Cow::Owned(format!("{path} 󱐋 {branch}")),
+            Some(branch) => Cow::Owned([path.as_ref(), " 󱐋 ", branch].concat()),
             None => path,
         }
     }
@@ -417,6 +433,34 @@ impl Ui {
             .take_if(|(_, until)| Instant::now() >= *until)
             .is_some()
     }
+    pub fn monitor_jump(&mut self, client: &mut crate::workspace::Client) -> io::Result<()> {
+        if let Some(pane) = self.resources.jump.take() {
+            let snapshot = client
+                .snapshot()
+                .ok_or_else(|| io::Error::other("workspace is not ready"))?;
+            let target = snapshot
+                .pane(pane)
+                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task pane closed"))?
+                .tab;
+            let current = snapshot
+                .tabs
+                .iter()
+                .position(|tab| tab.id == snapshot.active_tab)
+                .unwrap();
+            let target = snapshot
+                .tabs
+                .iter()
+                .position(|tab| tab.id == target)
+                .unwrap();
+            if target != current {
+                client.send(Action::Tab(target as i32 - current as i32))?;
+            }
+            client.send(Action::Focus(pane))?;
+            self.focus = Focus::Terminal;
+        }
+        Ok(())
+    }
+
     pub fn toggle_monitor(&mut self) {
         self.resources.toggle();
 
@@ -447,5 +491,275 @@ pub(crate) enum Focus {
 impl Focus {
     pub fn is_agent(self) -> bool {
         matches!(self, Self::Editor | Self::Output | Self::Controls)
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct Search {
+    pub open: bool,
+    pub pane: PaneId,
+    pub query: String,
+    pub cursor: usize,
+    pub index: usize,
+    pub pending: bool,
+    pub count: usize,
+    pub truncated: bool,
+    controller: bool,
+    request: u64,
+}
+impl Search {
+    pub fn begin(&mut self, client: &mut Client, pane: PaneId) -> io::Result<()> {
+        self.close(client)?;
+        self.open = true;
+        self.controller = client
+            .snapshot()
+            .is_some_and(|snapshot| snapshot.controller);
+        self.pane = pane;
+        self.submit(client)
+    }
+    pub fn observe(&mut self, client: &mut Client) -> io::Result<()> {
+        if self.open
+            && !client.snapshot().is_some_and(|snapshot| {
+                snapshot.controller == self.controller && snapshot.pane(self.pane).is_some()
+            })
+        {
+            self.close(client)?;
+        }
+        Ok(())
+    }
+    fn submit(&mut self, client: &mut Client) -> io::Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        self.request += 1;
+        self.index = 0;
+        self.count = 0;
+        self.truncated = false;
+        self.pending = !self.query.is_empty();
+        client.send(Action::Search {
+            pane: self.pane,
+            request: self.request,
+            query: self.query.clone(),
+        })
+    }
+    pub fn edit(&mut self, client: &mut Client, text: &str) -> io::Result<()> {
+        let text = crate::input::without_controls(text);
+        if text.is_empty() {
+            return Ok(());
+        }
+        self.query.insert_str(self.cursor, &text);
+        self.cursor += text.len();
+        self.submit(client)
+    }
+    pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
+        self.query = String::new();
+        self.cursor = 0;
+        if !std::mem::take(&mut self.open) {
+            return Ok(());
+        }
+        self.pending = false;
+        self.count = 0;
+        client.send(Action::SearchCancel {
+            pane: self.pane,
+            request: self.request,
+        })
+    }
+    pub fn next(&mut self, client: &mut Client, previous: bool) -> io::Result<()> {
+        self.observe(client)?;
+        if !self.open || !self.controller || self.pending || self.count == 0 {
+            return Ok(());
+        }
+        self.index = if previous {
+            (self.index + self.count - 1) % self.count
+        } else {
+            (self.index + 1) % self.count
+        };
+        client.send(Action::SearchSelect {
+            pane: self.pane,
+            request: self.request,
+            index: self.index as u32,
+        })
+    }
+    pub fn result(
+        &mut self,
+        client: &mut Client,
+        pane: PaneId,
+        request: u64,
+        count: usize,
+        truncated: bool,
+    ) -> io::Result<bool> {
+        self.observe(client)?;
+        if !self.open || pane != self.pane || request != self.request {
+            return Ok(false);
+        }
+        self.pending = false;
+        self.index = count.saturating_sub(1);
+        self.count = count;
+        self.truncated = truncated;
+        if self.controller && self.count != 0 {
+            client.send(Action::SearchSelect {
+                pane,
+                request,
+                index: self.index as u32,
+            })?;
+        }
+        Ok(true)
+    }
+    pub fn key(
+        &mut self,
+        client: &mut Client,
+        symbol: u32,
+        shift: bool,
+        control: bool,
+    ) -> io::Result<()> {
+        if !self.open {
+            return Ok(());
+        }
+        match symbol {
+            keysym::ESCAPE => self.close(client)?,
+            keysym::RETURN | keysym::KP_ENTER => self.next(client, shift)?,
+            keysym::UP => self.next(client, true)?,
+            keysym::DOWN => self.next(client, false)?,
+            keysym::LEFT => self.cursor = self.previous(),
+            keysym::RIGHT => self.cursor = self.following(),
+            keysym::HOME => self.cursor = 0,
+            keysym::END => self.cursor = self.query.len(),
+            keysym::BACKSPACE | keysym::DELETE => {
+                let range = if symbol == keysym::BACKSPACE {
+                    self.previous()..self.cursor
+                } else {
+                    self.cursor..self.following()
+                };
+                if self.delete(range) {
+                    self.submit(client)?;
+                }
+            }
+            _ if control
+                && matches!(char::from_u32(symbol), Some('a' | 'A' | 'u' | 'U'))
+                && self.delete(0..self.query.len()) =>
+            {
+                self.submit(client)?;
+            }
+            _ => (),
+        }
+        Ok(())
+    }
+    fn previous(&self) -> usize {
+        self.query
+            .floor_char_boundary(self.cursor.saturating_sub(1))
+    }
+    fn following(&self) -> usize {
+        self.query.ceil_char_boundary(self.cursor + 1)
+    }
+    fn delete(&mut self, range: std::ops::Range<usize>) -> bool {
+        self.cursor = range.start;
+        let changed = !range.is_empty();
+        self.query.replace_range(range, "");
+        changed
+    }
+    pub fn display(&self, preedit: &str, columns: usize) -> (String, usize) {
+        use crate::width::{fit_label, scalar_width, text_width};
+        let mut status = if self.pending {
+            Cow::Borrowed("searching")
+        } else {
+            Cow::Owned(format!(
+                "{}/{}",
+                if self.count == 0 { 0 } else { self.index + 1 },
+                self.count
+            ))
+        };
+        if self.truncated {
+            status.to_mut().push('+');
+        }
+        if !self.controller {
+            status
+                .to_mut()
+                .push_str(if columns >= 40 { " read-only" } else { " RO" });
+        }
+        let status = fit_label(&status, (columns.saturating_sub(5).min(columns / 2)) as u16);
+        let status_width = text_width(&status);
+        let budget = columns.saturating_sub(status_width + 4);
+        let before = &self.query[..self.cursor];
+        let mut width = 0;
+        let start = preedit
+            .char_indices()
+            .map(|(index, ch)| (before.len() + index, ch))
+            .rev()
+            .chain(before.char_indices().rev())
+            .take_while(|(_, ch)| {
+                let next = width + usize::from(scalar_width(*ch).min(2));
+                if next > budget.saturating_sub(1) {
+                    false
+                } else {
+                    width = next;
+                    true
+                }
+            })
+            .last()
+            .map_or(before.len() + preedit.len(), |(index, _)| index);
+        let preedit = &preedit[start.saturating_sub(before.len())..];
+        let before = &before[start.min(before.len())..];
+        let after = fit_label(
+            &self.query[self.cursor..],
+            budget.saturating_sub(width + 1) as u16,
+        );
+        let caret = 2 + width;
+        let padding = columns.saturating_sub(caret + 1 + text_width(&after) + status_width);
+        let mut label = String::with_capacity(
+            "⌕ ▏".len() + before.len() + preedit.len() + after.len() + padding + status.len(),
+        );
+        for piece in ["⌕ ", before, preedit, "▏", &after] {
+            label.push_str(piece);
+        }
+        label.extend(std::iter::repeat_n(' ', padding));
+        label.push_str(&status);
+        match fit_label(&label, columns as u16) {
+            std::borrow::Cow::Borrowed(text) => label.truncate(text.len()),
+            std::borrow::Cow::Owned(text) => label = text,
+        }
+        (label, caret.min(columns.saturating_sub(1)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn label_inserts_preedit_at_the_cursor_after_a_literal_caret_marker() {
+        let search = Search {
+            query: "A▏中B".into(),
+            cursor: "A▏中".len(),
+            controller: true,
+            ..Search::default()
+        };
+        let (label, caret) = search.display("预", 40);
+        assert!(label.starts_with("⌕ A▏中预▏B"));
+        assert!(label.ends_with("0/0"));
+        assert_eq!(caret, 8);
+        let (label, caret) = search.display("", 12);
+        assert!(label.ends_with("0/0"));
+        assert!(crate::width::text_width(&label) <= 12);
+        assert!(caret < 12);
+    }
+
+    #[test]
+    fn search_label_clamps_scalar_width_to_terminal_cells() {
+        let search = Search {
+            query: "A\u{17d8}BCDEF".into(),
+            cursor: "A\u{17d8}B".len(),
+            controller: true,
+            ..Search::default()
+        };
+        assert_eq!(search.display("", 16), ("⌕ A\u{17d8}B▏CDEF  0/0".into(), 6));
+        let search = Search {
+            query: "ABCDEF".into(),
+            cursor: 2,
+            ..search
+        };
+        assert_eq!(
+            search.display("\u{17d8}", 16),
+            ("⌕ AB\u{17d8}▏CDEF  0/0".into(), 6)
+        );
     }
 }

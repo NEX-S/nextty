@@ -67,7 +67,8 @@ def stop_process(process):
 def fixture(root):
     """The private sshd ForceCommand: preserve the real bridge and wire codec."""
     command = shlex.split(os.environ.get('SSH_ORIGINAL_COMMAND', ''))
-    if command != ['nextty', '--bridge', '3']:
+    # Leave protocol-version validation to the bridge.
+    if len(command) != 3 or command[:2] != ['nextty', '--bridge']:
         raise RuntimeError('Unexpected bridge invocation: ' + repr(command))
     mode = (root / 'mode').read_text().strip()
     env = dict(os.environ, HOME=str(root / 'remote-home'),

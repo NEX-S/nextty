@@ -35,6 +35,7 @@ pub(crate) fn decode_utf8(input: &[u8]) -> Option<String> {
     String::from_utf8(output).ok()
 }
 
+#[cfg(any(feature = "tui", test))]
 pub(crate) fn encode(bytes: &[u8], output: &mut Vec<u8>) {
     let start = output.len();
     output.resize(start + bytes.len().div_ceil(3) * 4, b'=');

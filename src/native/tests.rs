@@ -15,7 +15,7 @@ struct Glyph {
     y: f32,
     color: u32,
     color_glyph: u32,
-    straight: u32,
+    cell_shape: u32,
 }
 
 #[repr(C)]
@@ -342,5 +342,31 @@ fn fallback_selection_survives_scale_changes() {
                 expected
             );
         }
+    }
+}
+
+#[test]
+fn block_graphics_use_cell_geometry_at_fractional_scales() {
+    let mut fonts = Fonts::new(c"Nextty Test Metrics");
+    let text = "█▀▄▌▐▁▇▉▏▔▕▖▗▘▙▚▛▜▝▞▟";
+    let columns: Vec<_> = text
+        .chars()
+        .enumerate()
+        .flat_map(|(column, ch)| std::iter::repeat_n(column as u16, ch.len_utf8()))
+        .collect();
+    let metrics = fonts.shape("mm", &[], &[0, 1]);
+    let width = metrics.glyphs()[1].x - metrics.glyphs()[0].x;
+    for scale in [1.0, 1.25, 1.5, 2.0] {
+        assert_ne!(unsafe { nt_fonts_scale(fonts.raw, scale) }, 0);
+        let shaped = fonts.shape(text, &[], &columns);
+        assert_eq!(shaped.glyphs().len(), text.chars().count());
+        for (column, (glyph, ch)) in shaped.glyphs().iter().zip(text.chars()).enumerate() {
+            assert_eq!(glyph.cell_shape, ch as u32);
+            assert_eq!(glyph.x, column as f32 * width);
+            assert_eq!(glyph.y, 0.0);
+            assert_eq!(glyph.color_glyph, 0);
+        }
+        let text = fonts.shape("m░▒▓", &[], &[0, 1, 1, 1, 2, 2, 2, 3, 3, 3]);
+        assert!(text.glyphs().iter().all(|glyph| glyph.cell_shape == 0));
     }
 }

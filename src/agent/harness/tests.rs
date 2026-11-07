@@ -13,7 +13,7 @@ impl Worker {
     fn new(url: String) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
-            wake: crate::eventfd::new().unwrap(),
+            wake: Arc::new(crate::eventfd::new().unwrap()),
             notification: crate::eventfd::new().unwrap(),
         });
         let control = Arc::clone(&shared);
@@ -209,7 +209,7 @@ fn settled(agent: &Harness, mut terminal: impl FnMut(ToolRequest)) -> Vec<Event>
         assert!(Instant::now() < deadline, "agent did not settle");
         wait(agent.fd(), 100).unwrap();
         let mut done = false;
-        for event in agent.poll().unwrap() {
+        for event in agent.poll() {
             if let Event::Request(request) = event {
                 terminal(request);
             } else {
@@ -313,7 +313,7 @@ fn completed_tool_result_survives_a_full_event_queue() {
     let request = loop {
         assert!(Instant::now() < deadline);
         wait(agent.fd(), 50).unwrap();
-        if let Some(request) = agent.poll().unwrap().into_iter().find_map(|event| {
+        if let Some(request) = agent.poll().into_iter().find_map(|event| {
             if let Event::Request(request) = event {
                 Some(request)
             } else {
@@ -343,7 +343,7 @@ fn completed_tool_result_survives_a_full_event_queue() {
         !agent.worker.as_ref().unwrap().is_finished(),
         "backpressure killed the session"
     );
-    let events = agent.poll().unwrap();
+    let events = agent.poll();
     assert!(events.iter().any(|event| matches!(event, Event::Settled)));
     assert!(
         events
@@ -521,15 +521,10 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
         let pending = loop {
             assert!(Instant::now() < deadline);
             wait(agent.fd(), 50).unwrap();
-            if let Some(request) = agent
-                .poll()
-                .unwrap()
-                .into_iter()
-                .find_map(|event| match event {
-                    Event::Request(request) => Some(request),
-                    _ => None,
-                })
-            {
+            if let Some(request) = agent.poll().into_iter().find_map(|event| match event {
+                Event::Request(request) => Some(request),
+                _ => None,
+            }) {
                 break request;
             }
         };
@@ -549,7 +544,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
                 while !rewound {
                     assert!(Instant::now() < deadline);
                     wait(agent.fd(), 50).unwrap();
-                    for event in agent.poll().unwrap() {
+                    for event in agent.poll() {
                         match event {
                             Event::Rewound { turn: id, error } => {
                                 assert_eq!(id, turn);
@@ -718,7 +713,7 @@ fn stopping_during_network_backoff_prevents_another_request_or_tool() {
     loop {
         assert!(Instant::now() < deadline, "retry notice never arrived");
         wait(agent.fd(), 100).unwrap();
-        let events = agent.poll().unwrap();
+        let events = agent.poll();
         assert!(
             events
                 .iter()
@@ -762,7 +757,7 @@ fn summary_network_recovery_is_bounded_and_keeps_the_request() {
     });
     let shared = Shared {
         state: Mutex::new(State::default()),
-        wake: crate::eventfd::new().unwrap(),
+        wake: Arc::new(crate::eventfd::new().unwrap()),
         notification: crate::eventfd::new().unwrap(),
     };
     let mut session = Session {
@@ -1449,8 +1444,12 @@ fn workspace_tools_route_explicit_panes_and_keep_committed_results() {
         .send("repair in another pane".into(), 17, json!({}))
         .unwrap();
     let mut calls = Vec::new();
+    let mut edit_id = String::new();
     let events = settled(worker.agent(), |request| {
         calls.push((request.tool, request.pane));
+        if request.tool == Tool::EditFile {
+            edit_id.clone_from(&request.id);
+        }
         let result = match request.tool {
             Tool::EditFile => json!({"path":"/project/source.rs","written":true}),
             Tool::OpenTerminal => json!({"created":true,"pane":32}),
@@ -1470,6 +1469,9 @@ fn workspace_tools_route_explicit_panes_and_keep_committed_results() {
         ]
     );
     assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!edit_id.is_empty());
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Tool { id, name, done: true, .. } if name == "edit_file" && id == &edit_id)));
     worker.finish();
     server.finish();
 }
@@ -1495,12 +1497,13 @@ fn tool_request(
     let (reply, receiver) = mpsc::sync_channel(1);
     (
         ToolRequest {
+            id: "test-edit".into(),
             tool,
             pane,
             input,
             canceled: Arc::new(AtomicBool::new(false)),
             reply,
-            wake: crate::eventfd::new().unwrap(),
+            wake: Arc::new(crate::eventfd::new().unwrap()),
         },
         receiver,
     )
@@ -1672,4 +1675,45 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
             assert!(value["observation_error"].is_string());
         }
     }
+}
+
+#[test]
+fn committed_file_diff_keeps_its_tool_identity_without_expanding_model_result() {
+    use crate::agent::{Agent, Operation, Stage};
+    use crate::workspace::{AgentChange, ClientEvent, FileResult};
+    let (mut client, _peer) = terminal_client();
+    let mut agent = Agent {
+        turn: 5,
+        ..Agent::default()
+    };
+    let (request, result) = tool_request(
+        Tool::EditFile,
+        7,
+        json!({"pane":7,"path":"a.rs","old_text":"old","new_text":"new"}),
+    );
+    agent.operation = Some(Operation {
+        request,
+        stage: Stage::File { id: 42 },
+    });
+    agent
+        .handle_event(
+            &mut ClientEvent::AgentFile {
+                request: 42,
+                result: Ok(FileResult::Edited {
+                    change: AgentChange {
+                        path: "a.rs".into(),
+                        added: 1,
+                        removed: 1,
+                        diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                        ..AgentChange::default()
+                    },
+                }),
+            },
+            &mut client,
+        )
+        .unwrap();
+    assert_eq!(agent.changes[0].tool_id, "test-edit");
+    assert_eq!(agent.changes[0].turn, 5);
+    let returned: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
+    assert_eq!(returned, json!({"path":"a.rs","written":true}));
 }

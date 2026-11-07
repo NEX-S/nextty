@@ -21,6 +21,7 @@ impl Rgb {
         }
     }
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) const fn packed(self) -> u32 {
         u32::from_be_bytes([0, self.r, self.g, self.b])
     }
@@ -246,10 +247,13 @@ struct Csi {
 
 impl Csi {
     fn start(&mut self) {
+        // Unused slots are never read; separators initialize them as they become active.
         *self = Self {
+            values: self.values,
             count: 1,
             ..Self::default()
         };
+        self.values[0] = 0;
     }
 
     fn byte(&mut self, byte: u8) {
@@ -272,6 +276,7 @@ impl Csi {
                     if byte == b':' {
                         self.colons |= 1 << self.count;
                     }
+                    self.values[self.count] = 0;
                     self.count += 1;
                 }
             }
@@ -393,7 +398,10 @@ impl Parser {
                 position = end;
             }
             if position < data.len() {
-                self.queued.push_front((data.into_owned(), position));
+                self.queued.push_front(match data {
+                    Cow::Borrowed(data) => (data[position..].to_vec(), 0),
+                    Cow::Owned(data) => (data, position),
+                });
             }
             if remaining == 0 || !core.history_read_ready() {
                 break;
@@ -1009,6 +1017,26 @@ mod tests {
             })
             .flatten()
             .collect()
+    }
+
+    #[test]
+    fn omitted_csi_parameters_do_not_inherit_previous_values() {
+        let dirty = format!("\x1b[{}m", ["31"; 32].join(";"));
+        let empty = ";".repeat(31);
+        for parameters in ["", ";", "1;;4", "1;;58:2::1:2:3;4", &empty] {
+            let clean = format!("\x1b[{parameters}mX");
+            let (mut expected, mut parser) = terminal();
+            parser.advance(&mut expected, clean.as_bytes());
+            for chunk in [1, 3, clean.len()] {
+                let (mut actual, mut parser) = terminal();
+                parser.advance(&mut actual, dirty.as_bytes());
+                for bytes in clean.as_bytes().chunks(chunk) {
+                    parser.advance(&mut actual, bytes);
+                }
+                assert_eq!(actual.row(0).cells, expected.row(0).cells);
+                assert_eq!(actual.row(0).extras(), expected.row(0).extras());
+            }
+        }
     }
 
     #[test]

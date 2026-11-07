@@ -1,9 +1,9 @@
 //! Length-prefixed, versioned messages on an owned Unix socket.
-use crate::agent_files::{FileMatch, FileOperation, FileResult};
+use crate::agent_files::{AgentChange, FileMatch, FileOperation, FileResult};
 use crate::core::{
     Cell, Extra, Flags, Mode, Point, Row, Scroll, SelectionRange, SelectionType, Side, WindowSize,
 };
-use crate::eventfd::{consume_notification, notify};
+use crate::eventfd::notify;
 use crate::screen::Update;
 use crate::terminal::{ProcessMetadata, Shell};
 use crate::vt::{Color, CursorShape, NamedColor, PALETTE_SIZE, Rgb};
@@ -23,7 +23,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 18;
+pub(crate) const VERSION: u8 = 21;
 
 pub(crate) enum Response {
     ScreenDirty,
@@ -79,7 +79,6 @@ impl Frame {
 }
 struct Packet {
     bytes: Vec<u8>,
-    offset: usize,
     file: Option<File>,
 }
 pub(crate) struct Peer {
@@ -90,8 +89,9 @@ pub(crate) struct Peer {
     receiver: Option<ClipboardReceiver>,
     input: Vec<u8>,
     consumed: usize,
-    files: VecDeque<OwnedFd>,
+    files: smallvec::SmallVec<[OwnedFd; 4]>,
     output: VecDeque<Packet>,
+    output_offset: usize,
     queued: usize,
     read_error: Option<io::Error>,
 }
@@ -147,12 +147,12 @@ impl ClipboardReceiver {
             return false;
         }
         state.work = Some(work());
+        drop(state);
         self.0.changed.notify_one();
         true
     }
-    fn take(&self) -> io::Result<Option<io::Result<File>>> {
-        consume_notification(self.fd())?;
-        Ok(self.0.state.lock().unwrap().ready.take())
+    fn take(&self) -> Option<io::Result<File>> {
+        self.0.state.lock().unwrap().ready.take()
     }
 }
 impl Drop for ClipboardReceiver {
@@ -251,8 +251,9 @@ impl Peer {
             receiver: None,
             input: Vec::new(),
             consumed: 0,
-            files: VecDeque::new(),
+            files: smallvec::SmallVec::new(),
             output: VecDeque::new(),
+            output_offset: 0,
             queued: 0,
             read_error: None,
         }
@@ -348,10 +349,11 @@ impl Peer {
         updates: &[(u64, &Update)],
         previous: &HashMap<u64, Arc<ProcessMetadata>>,
         request: u64,
-    ) -> io::Result<()> {
+    ) -> io::Result<bool> {
         let mut encoder = Encoder::with_capacity(256);
-        encoder.state(snapshot, updates.iter().copied(), previous, request);
-        self.queue(encoder.0, None)
+        let metadata_changed = encoder.state(snapshot, updates.iter().copied(), previous, request);
+        self.queue(encoder.0, None)?;
+        Ok(metadata_changed)
     }
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
         let mut encoder = Encoder::new();
@@ -362,6 +364,8 @@ impl Peer {
                 encoder.bool(result.is_ok());
                 match result {
                     Ok(page) => {
+                        // The length, cursor, flags and optional command take at most 48 bytes.
+                        encoder.0.reserve(page.text.len() + 48);
                         encoder.string(&page.text);
                         encoder.cursor(page.cursor);
                         encoder.bool(page.has_more);
@@ -509,11 +513,7 @@ impl Peer {
         }
         bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
         self.queued = queued;
-        self.output.push_back(Packet {
-            bytes,
-            offset: 0,
-            file,
-        });
+        self.output.push_back(Packet { bytes, file });
         Ok(())
     }
     pub fn flush(&mut self) -> io::Result<()> {
@@ -522,7 +522,7 @@ impl Peer {
         while budget > 0
             && let Some(packet) = self.output.front()
         {
-            let bytes = &packet.bytes[packet.offset..];
+            let bytes = &packet.bytes[self.output_offset..];
             let result = if let Some(file) = &packet.file {
                 send_with_fd(
                     output_fd,
@@ -537,11 +537,13 @@ impl Peer {
                     }; 64];
                     let mut remaining = budget;
                     let mut count = 0;
+                    let mut offset = self.output_offset;
                     for packet in self.output.iter().take(vectors.len()) {
                         if packet.file.is_some() {
                             break;
                         }
-                        let bytes = &packet.bytes[packet.offset..];
+                        let bytes = &packet.bytes[offset..];
+                        offset = 0;
                         let length = bytes.len().min(remaining);
                         vectors[count] = libc::iovec {
                             iov_base: bytes.as_ptr().cast_mut().cast(),
@@ -581,12 +583,13 @@ impl Peer {
             let mut remaining = count;
             while remaining != 0 {
                 let packet = self.output.front_mut().unwrap();
-                let sent = remaining.min(packet.bytes.len() - packet.offset);
-                packet.offset += sent;
+                let sent = remaining.min(packet.bytes.len() - self.output_offset);
+                self.output_offset += sent;
                 packet.file = None;
                 remaining -= sent;
-                if packet.offset == packet.bytes.len() {
+                if self.output_offset == packet.bytes.len() {
                     self.output.pop_front();
+                    self.output_offset = 0;
                 }
             }
         }
@@ -594,6 +597,7 @@ impl Peer {
     }
     pub fn cancel_output(&mut self) {
         self.output.clear();
+        self.output_offset = 0;
         self.queued = 0;
     }
     pub fn buffered_action(&self) -> bool {
@@ -633,7 +637,7 @@ impl Peer {
                 if count < 0 {
                     Err(io::Error::last_os_error())
                 } else {
-                    Ok((count as usize, Vec::new()))
+                    Ok((count as usize, smallvec::SmallVec::new()))
                 }
             } else {
                 receive(self.stream.as_raw_fd(), bytes)
@@ -716,11 +720,8 @@ impl Peer {
         let request = decoder.u64()?;
         let incomplete = decoder.bool()?;
         decoder.finish()?;
-        let file = self
-            .files
-            .pop_front()
-            .ok_or_else(|| invalid("clipboard response has no file descriptor"))?;
-        Ok((request, File::from(file), incomplete))
+        let file = take_clipboard_file(&mut self.files)?;
+        Ok((request, file, incomplete))
     }
     pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         self.receive_responses(previous).inspect_err(|_| {
@@ -731,7 +732,7 @@ impl Peer {
     fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
         let mut result = Vec::new();
         if let Some(receiver) = &self.receiver
-            && let Some(ready) = receiver.take()?
+            && let Some(ready) = receiver.take()
         {
             let file = ready?;
             let copy = self.copy.take().unwrap();
@@ -832,11 +833,7 @@ impl Peer {
                 3 => Some(Response::Clipboard {
                     request: d.u64()?,
                     incomplete: d.bool()?,
-                    file: self
-                        .files
-                        .pop_front()
-                        .map(File::from)
-                        .ok_or_else(|| invalid("clipboard response has no file descriptor"))?,
+                    file: take_clipboard_file(&mut self.files)?,
                 }),
                 4 => Some(Response::Error(d.string(65536)?)),
                 5 => {
@@ -923,6 +920,13 @@ impl Peer {
     }
 }
 
+fn take_clipboard_file(files: &mut smallvec::SmallVec<[OwnedFd; 4]>) -> io::Result<File> {
+    if files.is_empty() {
+        return Err(invalid("clipboard response has no file descriptor"));
+    }
+    Ok(File::from(files.remove(0)))
+}
+
 fn clipboard_file() -> io::Result<File> {
     let root = std::env::var_os("XDG_CACHE_HOME")
         .filter(|path| !path.is_empty())
@@ -1003,7 +1007,7 @@ fn send_with_fd(socket: RawFd, bytes: &[u8], file: RawFd) -> io::Result<usize> {
 fn receive(
     socket: RawFd,
     bytes: &mut [std::mem::MaybeUninit<u8>],
-) -> io::Result<(usize, Vec<OwnedFd>)> {
+) -> io::Result<(usize, smallvec::SmallVec<[OwnedFd; 4]>)> {
     let mut vector = libc::iovec {
         iov_base: bytes.as_mut_ptr().cast(),
         iov_len: bytes.len(),
@@ -1018,7 +1022,7 @@ fn receive(
     if result < 0 {
         return Err(io::Error::last_os_error());
     }
-    let mut files = Vec::new();
+    let mut files = smallvec::SmallVec::new();
     unsafe {
         let mut header = libc::CMSG_FIRSTHDR(&message);
         while !header.is_null() {
@@ -1086,15 +1090,16 @@ impl Encoder {
         updates: impl ExactSizeIterator<Item = (u64, &'a Update)>,
         previous: &HashMap<u64, Arc<ProcessMetadata>>,
         request: u64,
-    ) {
+    ) -> bool {
         self.u8(1);
         self.u64(request);
-        encode_snapshot(self, snapshot, previous);
+        let metadata_changed = encode_snapshot(self, snapshot, previous);
         self.u32(updates.len() as u32);
         for (id, update) in updates {
             self.u64(id);
             encode_update(self, update);
         }
+        metadata_changed
     }
     fn i32(&mut self, n: i32) {
         self.0.extend_from_slice(&n.to_le_bytes());
@@ -1267,6 +1272,28 @@ fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
         history_capacity: d.u64()?,
     })
 }
+fn encode_agent_change(e: &mut Encoder, change: &AgentChange) {
+    // Reserve before field headers can trigger an otherwise unnecessary growth.
+    e.0.reserve(29 + change.tool_id.len() + change.path.as_os_str().len() + change.diff.len());
+    e.u64(change.turn);
+    e.string(&change.tool_id);
+    e.bytes(change.path.as_os_str().as_bytes());
+    e.u32(change.added);
+    e.u32(change.removed);
+    e.string(&change.diff);
+    e.bool(change.truncated);
+}
+fn decode_agent_change(d: &mut Decoder<'_>) -> io::Result<AgentChange> {
+    Ok(AgentChange {
+        turn: d.u64()?,
+        tool_id: d.string(65536)?,
+        path: PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec())),
+        added: d.u32()?,
+        removed: d.u32()?,
+        diff: d.string(MAX_FRAME)?,
+        truncated: d.bool()?,
+    })
+}
 fn encode_agent_model(e: &mut Encoder, patch: &AgentModelPatch) {
     e.u64(patch.session);
     e.bool(patch.busy);
@@ -1281,6 +1308,13 @@ fn encode_agent_model(e: &mut Encoder, patch: &AgentModelPatch) {
         e.string(&message.text);
         e.optional(message.id.as_deref(), Encoder::string);
     }
+    e.u32(patch.changes_omitted);
+    e.optional(patch.changes.as_deref(), |e, changes| {
+        e.u32(changes.len() as u32);
+        for change in changes {
+            encode_agent_change(e, change);
+        }
+    });
     e.bytes(&patch.recovery);
 }
 fn decode_agent_model(d: &mut Decoder<'_>) -> io::Result<AgentModelPatch> {
@@ -1304,6 +1338,15 @@ fn decode_agent_model(d: &mut Decoder<'_>) -> io::Result<AgentModelPatch> {
             }
             messages
         },
+        changes_omitted: d.u32()?,
+        changes: d.optional(|d| {
+            let count = d.count(65536)?;
+            let mut changes = Vec::with_capacity(count);
+            for _ in 0..count {
+                changes.push(decode_agent_change(d)?);
+            }
+            Ok(Arc::new(changes))
+        })?,
         recovery: d.bytes(MAX_FRAME)?.to_vec(),
     })
 }
@@ -1380,6 +1423,7 @@ fn encode_file_result(e: &mut Encoder, result: &FileResult) {
             next_offset,
             has_more,
         } => {
+            e.0.reserve(26 + path.as_os_str().len() + text.len());
             e.u8(0);
             e.bytes(path.as_os_str().as_bytes());
             e.u64(*offset);
@@ -1392,6 +1436,13 @@ fn encode_file_result(e: &mut Encoder, result: &FileResult) {
             matches,
             truncated,
         } => {
+            e.0.reserve(
+                10 + path.as_os_str().len()
+                    + matches
+                        .iter()
+                        .map(|found| 16 + found.path.as_os_str().len() + found.text.len())
+                        .sum::<usize>(),
+            );
             e.u8(1);
             e.bytes(path.as_os_str().as_bytes());
             e.u32(matches.len() as u32);
@@ -1402,14 +1453,19 @@ fn encode_file_result(e: &mut Encoder, result: &FileResult) {
             }
             e.bool(*truncated);
         }
-        FileResult::Edited { path } => {
+        FileResult::Edited { change } => {
             e.u8(2);
-            e.bytes(path.as_os_str().as_bytes());
+            encode_agent_change(e, change);
         }
     }
 }
 fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
     let kind = d.u8()?;
+    if kind == 2 {
+        return Ok(FileResult::Edited {
+            change: decode_agent_change(d)?,
+        });
+    }
     let path = PathBuf::from(std::ffi::OsString::from_vec(d.bytes(65536)?.to_vec()));
     Ok(match kind {
         0 => FileResult::Read {
@@ -1435,7 +1491,6 @@ fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
                 truncated: d.bool()?,
             }
         }
-        2 => FileResult::Edited { path },
         _ => return Err(invalid("invalid file result")),
     })
 }
@@ -1856,6 +1911,7 @@ fn encode_command(e: &mut Encoder, command: &CommandBlock) {
     e.u64(command.id);
     e.bool(command.complete);
     e.bool(command.has_output);
+    e.optional(command.elapsed_ms, Encoder::u64);
     e.optional(command.status, Encoder::i32);
 }
 fn decode_command(d: &mut Decoder<'_>) -> io::Result<CommandBlock> {
@@ -1863,6 +1919,7 @@ fn decode_command(d: &mut Decoder<'_>) -> io::Result<CommandBlock> {
         id: d.u64()?,
         complete: d.bool()?,
         has_output: d.bool()?,
+        elapsed_ms: d.optional(Decoder::u64)?,
         status: d.optional(Decoder::i32)?,
     })
 }
@@ -1870,7 +1927,8 @@ fn encode_snapshot(
     e: &mut Encoder,
     snapshot: &Snapshot,
     previous: &HashMap<u64, Arc<ProcessMetadata>>,
-) {
+) -> bool {
+    let mut metadata_changed = previous.len() != snapshot.panes.len();
     e.string(&snapshot.name);
     e.bool(snapshot.controller);
     e.u64(snapshot.focused);
@@ -1893,11 +1951,12 @@ fn encode_snapshot(
         e.path(&pane.cwd);
         e.u64(pane.input_generation);
         e.optional(pane.shell_prompt, Encoder::u64);
+        let process_changed = previous
+            .get(&pane.id)
+            .is_none_or(|process| !Arc::ptr_eq(process, &pane.process));
+        metadata_changed |= process_changed;
         e.optional(
-            previous
-                .get(&pane.id)
-                .is_none_or(|process| !Arc::ptr_eq(process, &pane.process))
-                .then_some(pane.process.as_ref()),
+            process_changed.then_some(pane.process.as_ref()),
             encode_process,
         );
         e.u32(pane.blocks.len() as u32);
@@ -1916,6 +1975,7 @@ fn encode_snapshot(
             encode_command(e, block);
         }
     }
+    metadata_changed
 }
 fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Result<Snapshot> {
     let name = d.string(128)?;
@@ -1958,13 +2018,7 @@ fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Resu
             Arc::new(decode_process(d)?)
         } else {
             previous
-                .and_then(|snapshot| {
-                    snapshot
-                        .panes
-                        .get(panes.len())
-                        .filter(|pane| pane.id == id)
-                        .or_else(|| snapshot.pane(id))
-                })
+                .and_then(|snapshot| snapshot.matching_pane(panes.len(), id))
                 .map(|pane| Arc::clone(&pane.process))
                 .ok_or_else(|| invalid("pane process metadata has no prior snapshot"))?
         };
@@ -2029,6 +2083,12 @@ fn decode_color(d: &mut Decoder<'_>) -> io::Result<Color> {
         _ => Err(invalid("invalid color kind")),
     }
 }
+// Keep the bulk palette copy out of the hot row encoder.
+#[inline(never)]
+fn encode_palette(e: &mut Encoder, palette: &[Rgb; PALETTE_SIZE]) {
+    let bytes = palette.map(|rgb| [rgb.r, rgb.g, rgb.b]);
+    e.0.extend_from_slice(bytes.as_flattened());
+}
 fn encode_update(e: &mut Encoder, update: &Update) {
     e.u16(update.columns as u16);
     e.u16(update.lines as u16);
@@ -2041,12 +2101,7 @@ fn encode_update(e: &mut Encoder, update: &Update) {
         e.point(selection.start);
         e.point(selection.end);
     });
-    e.optional(update.palette.as_deref(), |e, palette| {
-        e.0.reserve(palette.len() * 3);
-        for rgb in palette.iter() {
-            e.0.extend_from_slice(&[rgb.r, rgb.g, rgb.b]);
-        }
-    });
+    e.optional(update.palette.as_deref(), encode_palette);
     e.u32(update.rows.len() as u32);
     for (index, row) in &update.rows {
         e.u16(*index as u16);
@@ -2055,6 +2110,7 @@ fn encode_update(e: &mut Encoder, update: &Update) {
         // The reflow text length does not cover every styled blank or wide-wrap cell.
         let stored = row.non_default_len();
         e.u16(stored as u16);
+        e.0.reserve(stored);
         let length_at = e.0.len();
         e.u16(0);
         for cell in &row.cells[..stored] {
@@ -2144,13 +2200,19 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
         if length < stored || length > stored * 4 {
             return Err(invalid("invalid screen text length"));
         }
-        let text = std::str::from_utf8(d.take(length)?)
-            .map_err(|_| invalid("invalid screen character encoding"))?;
+        let text = d.take(length)?;
         let ascii = stored != 0 && length == stored;
-        if ascii && !text.is_ascii() {
-            return Err(invalid("missing screen characters"));
-        }
-        let mut chars = text.chars();
+        // ASCII also proves UTF-8 validity; only other rows need scalar decoding.
+        let mut chars = if ascii && text.is_ascii() {
+            "".chars()
+        } else {
+            let text = std::str::from_utf8(text)
+                .map_err(|_| invalid("invalid screen character encoding"))?;
+            if ascii {
+                return Err(invalid("missing screen characters"));
+            }
+            text.chars()
+        };
         let mut cells = Vec::with_capacity(columns);
         while cells.len() < stored {
             let count = d.u16()? as usize;
@@ -2162,7 +2224,7 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
             let flags = Flags::from_bits(d.u16()?).ok_or_else(|| invalid("invalid cell flags"))?;
             if count == 1 {
                 let c = if ascii {
-                    char::from(text.as_bytes()[cells.len()])
+                    char::from(text[cells.len()])
                 } else {
                     chars
                         .next()
@@ -2171,7 +2233,7 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
                 cells.push(Cell { c, fg, bg, flags });
             } else if ascii {
                 let end = cells.len() + count;
-                cells.extend(text.as_bytes()[cells.len()..end].iter().map(|&c| Cell {
+                cells.extend(text[cells.len()..end].iter().map(|&c| Cell {
                     c: char::from(c),
                     fg,
                     bg,
@@ -2227,6 +2289,34 @@ fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_change_snapshot_roundtrips_with_native_file_paths() {
+        let mut patch = AgentModelPatch {
+            session: 3,
+            changes_omitted: 2,
+            changes: Some(
+                vec![AgentChange {
+                    turn: 9,
+                    tool_id: "9:0:0:edit-tool".into(),
+                    path: PathBuf::from("/tmp/中文.rs"),
+                    added: 2,
+                    removed: 1,
+                    diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
+                    truncated: true,
+                }]
+                .into(),
+            ),
+            ..AgentModelPatch::default()
+        };
+        for changes in [patch.changes.clone(), None, Some(Arc::default())] {
+            patch.changes = changes;
+            let mut encoder = Encoder::new();
+            encode_agent_model(&mut encoder, &patch);
+            let mut decoder = Decoder::new(&encoder.0[4..]).unwrap();
+            assert_eq!(decode_agent_model(&mut decoder).unwrap(), patch);
+        }
+    }
 
     #[test]
     fn agent_workspace_actions_roundtrip() {
@@ -2323,7 +2413,18 @@ mod tests {
                     truncated: true,
                 }),
             ),
-            (3, Ok(FileResult::Edited { path })),
+            (
+                3,
+                Ok(FileResult::Edited {
+                    change: AgentChange {
+                        path,
+                        added: 2,
+                        removed: 1,
+                        diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
+                        ..AgentChange::default()
+                    },
+                }),
+            ),
             (4, Err("file request cancelled".into())),
         ];
         for (request, result) in &expected {
@@ -2392,10 +2493,10 @@ mod tests {
             }],
         };
         let mut known = HashMap::new();
-        sender.send_state(&snapshot, &[], &known, 0).unwrap();
+        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
         let full_size = sender.queued;
         known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        sender.send_state(&snapshot, &[], &known, 0).unwrap();
+        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
         assert!(sender.queued - full_size < full_size);
         sender
             .send_response(Response::Error("marker".into()))
@@ -2405,9 +2506,9 @@ mod tests {
             foreground_argv: Some(vec!["new".into()]),
             ..ProcessMetadata::default()
         });
-        sender.send_state(&snapshot, &[], &known, 0).unwrap();
+        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
         known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        sender.send_state(&snapshot, &[], &known, 0).unwrap();
+        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
         sender.flush().unwrap();
         let responses = receiver.responses(None).unwrap();
         let [
@@ -2436,13 +2537,15 @@ mod tests {
             &changed.panes[0].process,
             &last.panes[0].process
         ));
-        sender.send_state(&snapshot, &[], &known, 0).unwrap();
+        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
         sender.flush().unwrap();
         let next = receiver.responses(Some(last)).unwrap();
         let Response::State(next, _, _) = &next[0] else {
             panic!("state not delivered")
         };
         assert!(Arc::ptr_eq(&last.panes[0].process, &next.panes[0].process));
+        known.insert(2, Arc::new(ProcessMetadata::default()));
+        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
     }
 
     #[test]
@@ -2465,12 +2568,14 @@ mod tests {
                 complete: false,
                 status: Some(7),
                 has_output: true,
+                elapsed_ms: Some(1250),
             },
             CommandBlock {
                 id: 43,
                 complete: false,
                 status: None,
                 has_output: false,
+                elapsed_ms: None,
             },
         ];
         let snapshot = Snapshot {
@@ -2535,6 +2640,7 @@ mod tests {
                             complete: true,
                             status: Some(7),
                             has_output: true,
+                            elapsed_ms: Some(1250),
                         }),
                     }),
                 })
@@ -2983,6 +3089,9 @@ mod tests {
             },
         ];
         assert!(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 5000) } > 0);
+        if fds[1].revents != 0 {
+            crate::eventfd::consume_notification(fds[1].fd).unwrap();
+        }
     }
     fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response>> {
         loop {

@@ -1,6 +1,6 @@
 //! Bounded, workspace-owned disk history. Only this worker performs archive I/O.
 use std::borrow::Cow;
-use std::collections::{HashSet, VecDeque};
+use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::os::fd::{AsRawFd, OwnedFd, RawFd};
@@ -27,6 +27,7 @@ pub struct HistoryBudget {
     notifications: Mutex<Vec<std::sync::Weak<OwnedFd>>>,
 }
 struct BudgetFiles {
+    // Registered entries and segments share their Arc, so identity avoids path scans.
     files: VecDeque<(Arc<Path>, u64, u64)>,
     used: u64,
 }
@@ -61,12 +62,12 @@ impl HistoryBudget {
             .files
             .lock()
             .map_err(|e| io::Error::other(e.to_string()))?;
-        let end = if files.files.back().is_some_and(|(_, _, age)| *age > order) {
-            files.files.partition_point(|(_, _, age)| *age <= order)
-        } else {
-            files.files.len()
-        };
         if create {
+            let end = if files.files.back().is_some_and(|(_, _, age)| *age > order) {
+                files.files.partition_point(|(_, _, age)| *age <= order)
+            } else {
+                files.files.len()
+            };
             files.files.insert(end, (path.clone(), bytes, order));
             files.used += bytes;
         } else {
@@ -74,19 +75,20 @@ impl HistoryBudget {
             // Another pane can evict this segment while its write is in progress.
             let Some((_, previous, _)) = files
                 .files
-                .range_mut(start..end)
-                .find(|(existing, _, _)| existing == path)
+                .range_mut(start..)
+                .take_while(|(_, _, age)| *age == order)
+                .find(|(existing, _, _)| Arc::ptr_eq(existing, path))
             else {
                 return Ok(false);
             };
             let previous = std::mem::replace(previous, bytes);
             files.used = files.used - previous + bytes;
         }
-        let mut evicted = Vec::new();
+        let mut evicted = smallvec::SmallVec::<[Arc<Path>; 4]>::new();
         let mut retained = true;
         while files.used > self.capacity {
             let (evicted_path, bytes, _) = files.files.pop_front().unwrap();
-            retained &= &evicted_path != path;
+            retained &= !Arc::ptr_eq(&evicted_path, path);
             files.used -= bytes;
             evicted.push(evicted_path);
         }
@@ -125,20 +127,20 @@ impl HistoryBudget {
                 .files
                 .range(first..)
                 .take_while(|(_, _, order)| *order == segment.order)
-                .position(|(path, _, _)| path == &segment.path)
+                .position(|(path, _, _)| Arc::ptr_eq(path, &segment.path))
             {
                 let (_, bytes, _) = files.files.remove(first + index).unwrap();
                 removed = bytes;
             }
         } else {
             // Batch clears avoid shifting the file table once per removed segment.
-            // Registered paths are shared verbatim with their segments.
-            let paths: HashSet<_> = segments
+            let mut paths: Vec<_> = segments
                 .iter()
-                .map(|segment| segment.path.as_os_str())
+                .map(|segment| Arc::as_ptr(&segment.path).cast::<()>())
                 .collect();
+            paths.sort_unstable();
             files.files.retain(|(path, bytes, _)| {
-                if paths.contains(path.as_os_str()) {
+                if paths.binary_search(&Arc::as_ptr(path).cast::<()>()).is_ok() {
                     removed += bytes;
                     false
                 } else {
@@ -224,7 +226,7 @@ struct SearchJob {
     sender: mpsc::Sender<io::Result<crate::search::SearchResult>>,
 }
 struct ReadJob {
-    read: HistoryRead,
+    read: Box<HistoryRead>,
     segments: Vec<(Arc<Path>, u64, u64)>,
     sender: mpsc::Sender<io::Result<HistoryPage>>,
     wake: Arc<OwnedFd>,
@@ -271,20 +273,20 @@ impl SearchWorker {
                         job if job.cancelled().load(Ordering::Relaxed) => drop(job),
                         SearchWork::Find(job) => {
                             let result = search_archive(&job);
-                            if !job.cancelled.load(Ordering::Relaxed) {
-                                let _ = job.sender.send(result);
-                                if let Err(error) = notify(job.wake.as_raw_fd()) {
-                                    eprintln!("notify pane search: {error}");
-                                }
+                            if !job.cancelled.load(Ordering::Relaxed)
+                                && job.sender.send(result).is_ok()
+                                && let Err(error) = notify(job.wake.as_raw_fd())
+                            {
+                                eprintln!("notify pane search: {error}");
                             }
                         }
                         SearchWork::Read(job) => {
                             let result = read_archive(&job.read, &job.segments);
-                            if !job.read.cancelled.load(Ordering::Relaxed) {
-                                let _ = job.sender.send(result);
-                                if let Err(error) = notify(job.wake.as_raw_fd()) {
-                                    eprintln!("notify history read: {error}");
-                                }
+                            if !job.read.cancelled.load(Ordering::Relaxed)
+                                && job.sender.send(result).is_ok()
+                                && let Err(error) = notify(job.wake.as_raw_fd())
+                            {
+                                eprintln!("notify history read: {error}");
                             }
                         }
                     }
@@ -297,12 +299,12 @@ impl SearchWorker {
     fn submit(&self, job: SearchWork) {
         let (lock, changed) = &*self.0;
         let mut state = lock.lock().unwrap();
+        let wake = state.active.is_none() && state.pending.is_empty();
         state
             .pending
             .retain(|job| !job.cancelled().load(Ordering::Relaxed));
         if !job.cancelled().load(Ordering::Relaxed) {
             state.pending.push_back(job);
-            let wake = state.active.is_none();
             drop(state);
             if wake {
                 changed.notify_one();
@@ -318,8 +320,10 @@ impl Drop for SearchWorker {
         if let Some(cancelled) = &state.active {
             cancelled.store(true, Ordering::Relaxed);
         }
-        state.pending.clear();
+        let pending = std::mem::take(&mut state.pending);
+        drop(state);
         changed.notify_one();
+        drop(pending);
     }
 }
 fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
@@ -345,7 +349,7 @@ fn search_archive(job: &SearchJob) -> io::Result<crate::search::SearchResult> {
             let (empty, line_break) = empty_row_headers(reader.buffer())
                 .take((end - id) as usize)
                 .fold((0, false), |(count, line_break), header| {
-                    (count + 1, line_break || header[6] == 0)
+                    (count + 1, line_break | (header[6] == 0))
                 });
             if empty != 0 {
                 if line_break {
@@ -514,7 +518,7 @@ impl History {
                                             let end = archive.segments.partition_point(|segment| {
                                                 segment.start <= job.read.end.0
                                             });
-                                            (&mut job.segments, begin..end.max(begin))
+                                            (&mut job.segments, begin..end)
                                         }
                                         SearchWork::Find(job) => {
                                             let end = if job.alternate {
@@ -714,7 +718,7 @@ impl History {
     pub fn read(&self, read: HistoryRead) -> io::Result<mpsc::Receiver<io::Result<HistoryPage>>> {
         let (sender, receiver) = mpsc::channel();
         self.send(Request::Search(SearchWork::Read(ReadJob {
-            read,
+            read: Box::new(read),
             segments: Vec::new(),
             sender,
             wake: Arc::clone(&self.notification),
@@ -794,6 +798,9 @@ impl ReadText<'_> {
         if id != self.read.end.0 && !row.wrapped {
             rendered.push('\n');
         }
+        self.text(id, rendered)
+    }
+    fn text(&mut self, id: u64, rendered: &str) -> io::Result<bool> {
         let offset = if id == self.cursor.row {
             self.cursor.offset as usize
         } else {
@@ -825,7 +832,13 @@ impl ReadText<'_> {
         });
         let finder = self.finder.as_ref().unwrap();
         let query_length = finder.needle().len();
-        if let Some(found) = finder.find(self.pending_text.as_bytes()) {
+        // Search new bytes plus the old suffix that could begin a cross-row match.
+        let search_start = self
+            .pending_text
+            .len()
+            .saturating_sub(input.len() + query_length.saturating_sub(1));
+        if let Some(found) = finder.find(&self.pending_text.as_bytes()[search_start..]) {
+            let found = search_start + found;
             let pending = std::mem::take(&mut self.pending_text);
             self.found = true;
             let mut row_start = 0;
@@ -867,20 +880,19 @@ impl ReadText<'_> {
                 .pending_text
                 .len()
                 .saturating_sub(query_length.saturating_sub(1));
+            let mut removed = 0;
             let mut skipped = 0;
             let mut rows = 0usize;
             for line in &self.pending {
                 if skipped + line.length > suffix_start {
                     break;
                 }
+                // Keep the last complete row before the query suffix as context.
+                removed = skipped;
                 skipped += line.length;
                 rows += 1;
             }
-            let removed: usize = self
-                .pending
-                .drain(..rows.saturating_sub(1))
-                .map(|line| line.length)
-                .sum();
+            self.pending.drain(..rows.saturating_sub(1));
             self.pending_text.drain(..removed);
         }
         Ok(false)
@@ -945,9 +957,23 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
             if id > read.end.0 {
                 break;
             }
-            let row = read_row::<false>(&mut file, cells)?;
-            full = output.row(id, &row, &mut rendered)?;
-            cells = row.cells;
+            if id > read.start.0
+                && id < read.end.0
+                && let Some((length, text)) = plain_row_text(file.fill_buf()?)
+                && !text.is_empty()
+            {
+                if read.cancelled.load(Ordering::Relaxed) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                std::str::from_utf8(text).unwrap().clone_into(&mut rendered);
+                rendered.push('\n');
+                full = output.text(id, &rendered)?;
+                file.consume(length);
+            } else {
+                let row = read_row::<false>(&mut file, cells)?;
+                full = output.row(id, &row, &mut rendered)?;
+                cells = row.cells;
+            }
             if full {
                 break;
             }
@@ -983,7 +1009,7 @@ fn read_archive(read: &HistoryRead, segments: &[(Arc<Path>, u64, u64)]) -> io::R
         has_more: output.has_more,
         matched: read.query.as_ref().map(|_| output.found),
         incomplete,
-        command: read.command.clone(),
+        command: read.command,
     })
 }
 
@@ -1018,10 +1044,9 @@ impl Archive {
     fn first(&mut self) -> io::Result<u64> {
         let generation = self.budget.generation.load(Ordering::Acquire);
         if generation != self.generation {
-            while let Some(segment) = self.segments.front() {
-                if segment.path.try_exists()? {
-                    break;
-                }
+            while let Some(segment) = self.segments.front()
+                && !segment.path.try_exists()?
+            {
                 self.segments.pop_front();
             }
             if self.segments.is_empty() {
@@ -1171,9 +1196,9 @@ impl Archive {
         file.rewind()?;
         Ok(HistoryCopy { file, incomplete })
     }
-    fn write_copy(
+    fn write_copy<W: Write>(
         &mut self,
-        file: &mut impl Write,
+        file: &mut W,
         start: (u64, usize),
         end: (u64, usize),
         hot: (u64, &[Row]),
@@ -1183,7 +1208,7 @@ impl Archive {
         let (hot_start, hot) = hot;
         let first = self.first()?.min(hot_start);
         incomplete |= start.0 < first;
-        let mut write = |id: u64, row: &Row| -> io::Result<()> {
+        let write = |file: &mut W, id: u64, row: &Row| -> io::Result<()> {
             let mut from = if id == start.0 { start.1 } else { 0 };
             if from < row.cells.len() {
                 from = row.leading_column(from);
@@ -1215,10 +1240,29 @@ impl Archive {
                 if id > end.0 {
                     break;
                 }
-                let row = read_row::<false>(&mut reader, cells)?;
-                write(id, &row)?;
+                if id > start.0
+                    && id < end.0
+                    && let Some((length, text)) = plain_row_text(reader.fill_buf()?)
+                    && !text.is_empty()
+                {
+                    file.write_all(text)?;
+                    file.write_all(b"\n")?;
+                    reader.consume(length);
+                } else if let Some(line_break) = {
+                    empty_row_headers(reader.fill_buf()?)
+                        .next()
+                        .map(|header| header[6] == 0)
+                } {
+                    if line_break && id != end.0 {
+                        file.write_all(b"\n")?;
+                    }
+                    reader.consume(9);
+                } else {
+                    let row = read_row::<false>(&mut reader, cells)?;
+                    write(file, id, &row)?;
+                    cells = row.cells;
+                }
                 next = id + 1;
-                cells = row.cells;
             }
         }
         if next < hot_start && next <= end.0 {
@@ -1231,7 +1275,7 @@ impl Archive {
             if next > end.0 {
                 break;
             }
-            write(next, row)?;
+            write(file, next, row)?;
             next += 1;
         }
         incomplete |= next <= end.0;
@@ -1499,13 +1543,13 @@ impl ReflowOutput {
         archive: &mut Archive,
         keep: usize,
     ) -> io::Result<()> {
-        tail.push_back(row);
-        if tail.len() > keep {
+        if tail.len() == keep {
             pending.push(tail.pop_front().unwrap());
-            if pending.len() == BATCH {
-                archive.append(archive.end, pending)?;
-                pending.clear();
-            }
+        }
+        tail.push_back(row);
+        if pending.len() == BATCH {
+            archive.append(archive.end, pending)?;
+            pending.clear();
         }
         Ok(())
     }
@@ -1607,6 +1651,7 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
     // Length, text length and run count are filled in once the row is written.
     let header = bytes.len();
     bytes.extend_from_slice(&[0; 10]);
+    bytes.reserve(stored);
     let cells = &row.cells[..stored];
     let pair = |column: usize| {
         cells[column].flags.contains(Flags::WIDE_CHAR)
@@ -1614,13 +1659,21 @@ fn write_row(bytes: &mut Vec<u8>, row: &Row) {
     };
     let mut column = 0;
     while column < stored {
-        let ch = cells[column].c;
-        if ch.is_ascii() {
-            bytes.push(ch as u8);
+        let cell = &cells[column];
+        if cell.c.is_ascii() && !cell.flags.contains(Flags::WIDE_CHAR) {
+            let start = column;
+            column += 1;
+            while column < stored
+                && cells[column].c.is_ascii()
+                && !cells[column].flags.contains(Flags::WIDE_CHAR)
+            {
+                column += 1;
+            }
+            bytes.extend(cells[start..column].iter().map(|cell| cell.c as u8));
         } else {
-            bytes.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
+            bytes.extend_from_slice(cell.c.encode_utf8(&mut [0; 4]).as_bytes());
+            column += 1 + usize::from(pair(column));
         }
-        column += 1 + usize::from(pair(column));
     }
     let text_bytes = bytes.len() - header - 10;
     let style = |column: usize| {
@@ -1694,10 +1747,31 @@ fn empty_row_headers(bytes: &[u8]) -> impl Iterator<Item = &[u8]> {
 }
 fn skip_rows(file: &mut BufReader<File>, mut count: u64) -> io::Result<()> {
     while count != 0 {
-        let empty = empty_row_headers(file.fill_buf()?)
-            .take(count as usize)
-            .count();
+        let buffer = file.fill_buf()?;
+        let empty = empty_row_headers(buffer).take(count as usize).count();
         if empty == 0 {
+            let mut consumed = 0;
+            let mut skipped = 0;
+            while skipped < count {
+                let remaining = &buffer[consumed..];
+                let Some(header) = remaining.get(..13) else {
+                    break;
+                };
+                if header[4..6] == [0; 2] && header[7..9] == [0; 2] {
+                    break;
+                }
+                let length = u32::from_le_bytes(header[9..13].try_into().unwrap()) as usize;
+                if length > remaining.len() - 13 {
+                    break;
+                }
+                consumed += 13 + length;
+                skipped += 1;
+            }
+            if skipped != 0 {
+                file.consume(consumed);
+                count -= skipped;
+                continue;
+            }
             let header = read_array::<9>(file)?;
             if header[4..6] != [0; 2] || header[7..9] != [0; 2] {
                 let length = u32::from_le_bytes(read_array(file)?);
@@ -1732,105 +1806,125 @@ fn read_row<const COLORS: bool>(file: &mut impl BufRead, mut cells: Vec<Cell>) -
     if stored == 0 && count == 0 {
         return Ok(Row::from_parts(cells, wrapped, used, Vec::new()).unwrap());
     }
-    let length = u32::from_le_bytes(read_array(file)?);
-    let mut file = file.take(u64::from(length));
-    let text_bytes = u32::from_le_bytes(read_array(&mut file)?) as usize;
-    let runs = u16::from_le_bytes(read_array(&mut file)?) as usize;
-    let mut text = smallvec::SmallVec::<[u8; 1024]>::from_elem(0, text_bytes);
-    file.read_exact(&mut text)?;
-    let text = std::str::from_utf8(&text)
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
-    let mut chars = text.chars();
-    let mut next = || chars.next().ok_or_else(|| invalid("short history text"));
-    let mut column = 0;
-    for _ in 0..runs {
-        let run = read_array::<14>(&mut file)?;
-        let start = u16::from_le_bytes(run[..2].try_into().unwrap()) as usize;
-        let end = u16::from_le_bytes(run[2..4].try_into().unwrap()) as usize;
-        let bits = u16::from_le_bytes(run[12..14].try_into().unwrap());
-        let pairs = bits & WIDE_PAIRS != 0;
-        let flags =
-            Flags::from_bits(bits & !WIDE_PAIRS).ok_or_else(|| invalid("invalid history flags"))?;
-        if start < column
-            || start > end
-            || end > stored
-            || pairs && !(end - start).is_multiple_of(2)
-        {
-            return Err(invalid("invalid history style range"));
+    let length = u32::from_le_bytes(read_array(file)?) as usize;
+    let decode = |mut file: &[u8]| {
+        let text_bytes = u32::from_le_bytes(read_array(&mut file)?) as usize;
+        let runs = u16::from_le_bytes(read_array(&mut file)?) as usize;
+        let text = file.get(..text_bytes).ok_or(io::ErrorKind::UnexpectedEof)?;
+        file = &file[text_bytes..];
+        let text = std::str::from_utf8(text)
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+        let mut chars = text.chars();
+        let mut next = || chars.next().ok_or_else(|| invalid("short history text"));
+        let mut column = 0;
+        for _ in 0..runs {
+            let run = read_array::<14>(&mut file)?;
+            let start = u16::from_le_bytes(run[..2].try_into().unwrap()) as usize;
+            let end = u16::from_le_bytes(run[2..4].try_into().unwrap()) as usize;
+            let bits = u16::from_le_bytes(run[12..14].try_into().unwrap());
+            let pairs = bits & WIDE_PAIRS != 0;
+            let flags = Flags::from_bits(bits & !WIDE_PAIRS)
+                .ok_or_else(|| invalid("invalid history flags"))?;
+            if start < column
+                || start > end
+                || end > stored
+                || pairs && !(end - start).is_multiple_of(2)
+            {
+                return Err(invalid("invalid history style range"));
+            }
+            for cell in &mut cells[column..start] {
+                cell.c = next()?;
+            }
+            let (fg, bg) = if COLORS {
+                (
+                    read_color(run[4..8].try_into().unwrap())?,
+                    read_color(run[8..12].try_into().unwrap())?,
+                )
+            } else {
+                (Cell::default().fg, Cell::default().bg)
+            };
+            if pairs {
+                for pair in cells[start..end].chunks_exact_mut(2) {
+                    pair[0] = Cell {
+                        c: next()?,
+                        fg,
+                        bg,
+                        flags,
+                    };
+                    pair[1] = pair[0].wide_spacer();
+                }
+            } else {
+                for cell in &mut cells[start..end] {
+                    *cell = Cell {
+                        c: next()?,
+                        fg,
+                        bg,
+                        flags,
+                    };
+                }
+            }
+            column = end;
         }
-        for cell in &mut cells[column..start] {
+        for cell in &mut cells[column..stored] {
             cell.c = next()?;
         }
-        let (fg, bg) = if COLORS {
-            (
-                read_color(run[4..8].try_into().unwrap())?,
-                read_color(run[8..12].try_into().unwrap())?,
-            )
-        } else {
-            (Cell::default().fg, Cell::default().bg)
-        };
-        if pairs {
-            for pair in cells[start..end].chunks_exact_mut(2) {
-                pair[0] = Cell {
-                    c: next()?,
-                    fg,
-                    bg,
-                    flags,
-                };
-                pair[1] = pair[0].wide_spacer();
-            }
-        } else {
-            for cell in &mut cells[start..end] {
-                *cell = Cell {
-                    c: next()?,
-                    fg,
-                    bg,
-                    flags,
-                };
-            }
+        if chars.next().is_some() {
+            return Err(invalid("long history text"));
         }
-        column = end;
-    }
-    for cell in &mut cells[column..stored] {
-        cell.c = next()?;
-    }
-    if chars.next().is_some() {
-        return Err(invalid("long history text"));
-    }
-    let mut extras = Vec::with_capacity(count);
-    for _ in 0..count {
-        let header = read_array::<6>(&mut file)?;
-        let column = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
-        let count = u32::from_le_bytes(header[2..].try_into().unwrap()) as usize;
-        let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
+        let mut extras = Vec::with_capacity(count);
         for _ in 0..count {
-            zerowidth.push(
-                char::from_u32(u32::from_le_bytes(read_array(&mut file)?))
-                    .ok_or_else(|| invalid("invalid history combining character"))?,
-            );
+            let header = read_array::<6>(&mut file)?;
+            let column = u16::from_le_bytes(header[..2].try_into().unwrap()) as usize;
+            let count = u32::from_le_bytes(header[2..].try_into().unwrap()) as usize;
+            let mut zerowidth = smallvec::SmallVec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                zerowidth.push(
+                    char::from_u32(u32::from_le_bytes(read_array(&mut file)?))
+                        .ok_or_else(|| invalid("invalid history combining character"))?,
+                );
+            }
+            let underline_color = if read_array::<1>(&mut file)?[0] == 0 {
+                None
+            } else {
+                Some(read_color(read_array(&mut file)?)?)
+            };
+            extras.push((
+                column,
+                Extra {
+                    zerowidth,
+                    underline_color,
+                },
+            ));
         }
-        let underline_color = if read_array::<1>(&mut file)?[0] == 0 {
-            None
-        } else {
-            Some(read_color(read_array(&mut file)?)?)
-        };
-        extras.push((
-            column,
-            Extra {
-                zerowidth,
-                underline_color,
-            },
-        ));
+        if !file.is_empty() {
+            return Err(invalid("invalid history row length"));
+        }
+        Row::from_parts(cells, wrapped, used, extras).ok_or_else(|| invalid("invalid history row"))
+    };
+    if file.fill_buf()?.len() >= length {
+        let row = decode(&file.fill_buf()?[..length])?;
+        file.consume(length);
+        Ok(row)
+    } else {
+        let mut bytes = smallvec::SmallVec::<[u8; 1024]>::with_capacity(length.min(8192));
+        let mut file = file.take(length as u64);
+        while bytes.len() < length {
+            let buffer = file.fill_buf()?;
+            if buffer.is_empty() {
+                return Err(io::ErrorKind::UnexpectedEof.into());
+            }
+            bytes.extend_from_slice(buffer);
+            let count = buffer.len();
+            file.consume(count);
+        }
+        decode(&bytes)
     }
-    if file.limit() != 0 {
-        return Err(invalid("invalid history row length"));
-    }
-    Row::from_parts(cells, wrapped, used, extras).ok_or_else(|| invalid("invalid history row"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::fd::FromRawFd;
 
     #[test]
     fn wide_character_runs_restore_every_cell() {
@@ -2083,6 +2177,10 @@ mod tests {
         for row in &rows {
             write_row(&mut bytes, row);
         }
+        let fd = unsafe { libc::memfd_create(c"history-skip".as_ptr(), libc::MFD_CLOEXEC) };
+        assert!(fd >= 0);
+        let mut file = unsafe { File::from_raw_fd(fd) };
+        file.write_all(&bytes).unwrap();
         for capacity in [7, 31, 257, 4096] {
             let mut reader = BufReader::with_capacity(capacity, bytes.as_slice());
             let mut cells = Vec::new();
@@ -2095,6 +2193,16 @@ mod tests {
                 cells = decoded.cells;
             }
             assert!(reader.fill_buf().unwrap().is_empty());
+            for (skip, expected) in rows.iter().enumerate() {
+                file.rewind().unwrap();
+                let mut reader = BufReader::with_capacity(capacity, file.try_clone().unwrap());
+                skip_rows(&mut reader, skip as u64).unwrap();
+                let decoded = read_row::<true>(&mut reader, Vec::new()).unwrap();
+                assert_eq!(decoded.cells, expected.cells);
+                assert_eq!(decoded.used(), expected.used());
+                assert_eq!(decoded.wrapped, expected.wrapped);
+                assert_eq!(decoded.extras(), expected.extras());
+            }
         }
     }
     #[test]

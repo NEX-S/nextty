@@ -108,24 +108,28 @@ pub(crate) enum KeyResult {
     Paste,
 }
 
+#[cfg(any(feature = "tui", test))]
 #[derive(Default)]
 pub(crate) struct TextDecoder {
     pending: Vec<u8>,
 }
 
+#[cfg(any(feature = "tui", test))]
 impl TextDecoder {
+    #[cfg(feature = "tui")]
     pub fn clear(&mut self) {
         self.pending.clear();
     }
 
     pub fn decode<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, str> {
-        if self.pending.is_empty()
-            && let Ok(text) = std::str::from_utf8(bytes)
-        {
-            return Cow::Borrowed(text);
+        let mut valid = 0;
+        if self.pending.is_empty() {
+            match std::str::from_utf8(bytes) {
+                Ok(text) => return Cow::Borrowed(text),
+                Err(error) => valid = error.valid_up_to(),
+            }
         }
         self.pending.extend_from_slice(bytes);
-        let mut valid = 0;
         while valid < self.pending.len() {
             match std::str::from_utf8(&self.pending[valid..]) {
                 Ok(_) => valid = self.pending.len(),
@@ -138,6 +142,9 @@ impl TextDecoder {
                 }
             }
         }
+        if valid == 0 {
+            return Cow::Owned(String::new());
+        }
         let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
         self.pending.drain(..valid);
         Cow::Owned(text)
@@ -145,16 +152,22 @@ impl TextDecoder {
 }
 
 pub(crate) fn without_controls(text: &str) -> Cow<'_, str> {
-    let mut chars = text.chars();
+    let mut chars = text[crate::width::printable_ascii_prefix(text.as_bytes())..].chars();
     let Some(control) = chars.find(|ch| ch.is_control()) else {
         return Cow::Borrowed(text);
     };
     let start = text.len() - chars.as_str().len() - control.len_utf8();
-    let mut filtered = text[..start].to_owned();
+    let Some(kept) = chars.find(|ch| !ch.is_control()) else {
+        return Cow::Borrowed(&text[..start]);
+    };
+    let mut filtered = String::with_capacity(text.len());
+    filtered.push_str(&text[..start]);
+    filtered.push(kept);
     filtered.extend(chars.filter(|ch| !ch.is_control()));
     Cow::Owned(filtered)
 }
 
+#[cfg(any(feature = "tui", test))]
 pub(crate) fn character_key(ch: char) -> (u32, u32) {
     match ch {
         '\0' => (32, CONTROL),
@@ -167,6 +180,7 @@ pub(crate) fn character_key(ch: char) -> (u32, u32) {
     }
 }
 
+#[cfg(any(feature = "tui", test))]
 pub(crate) fn sequence_key(bytes: &[u8]) -> Option<(u32, u32)> {
     Some(match bytes {
         b"\x1b" => (keysym::ESCAPE, 0),
@@ -329,6 +343,9 @@ pub fn symbol_char(symbol: u32) -> Option<char> {
 #[cfg(feature = "gui")]
 pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
     if !bracketed {
+        if !text.as_bytes().contains(&b'\n') {
+            return text.into_bytes();
+        }
         let mut data = text.into_bytes();
         let mut previous_cr = false;
         data.retain_mut(|byte| {
@@ -342,13 +359,7 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
         return data;
     }
 
-    // Control-heavy text stays on the scalar filter to avoid repeated searches.
-    const CHUNK: usize = 256;
-    let split = text
-        .as_bytes()
-        .chunks(CHUNK)
-        .position(|chunk| chunk.contains(&b'\r') || chunk.contains(&0x1b))
-        .map_or(text.len(), |chunk| chunk * CHUNK);
+    let split = memchr::memchr2(b'\r', 0x1b, text.as_bytes()).unwrap_or(text.len());
     if split == text.len() {
         return bracketed_plain(text.into_bytes());
     }
@@ -358,11 +369,26 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
     let (plain, text) = text.split_at(split);
     data.extend_from_slice(plain);
     let mut start = 0;
-    for (index, &byte) in text.iter().enumerate() {
+    let mut copy = |index: usize, byte: u8| {
         if (byte == b'\r' && text.get(index + 1) == Some(&b'\n')) || byte == 0x1b {
             data.extend_from_slice(&text[start..index]);
             start = index + 1;
         }
+    };
+    let (blocks, tail) = text.as_chunks::<32>();
+    for (block_index, block) in blocks.iter().enumerate() {
+        if matches!(block[0], b'\r' | 0x1b)
+            || block.iter().fold(false, |special, byte| {
+                special | matches!(byte, b'\r' | 0x1b)
+            })
+        {
+            for (index, &byte) in block.iter().enumerate() {
+                copy(block_index * 32 + index, byte);
+            }
+        }
+    }
+    for (index, &byte) in tail.iter().enumerate() {
+        copy(blocks.len() * 32 + index, byte);
     }
     data.extend_from_slice(&text[start..]);
     data.extend_from_slice(b"\x1b[201~");
@@ -384,18 +410,28 @@ fn bracketed_plain(mut data: Vec<u8>) -> Vec<u8> {
 
 pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> Option<Vec<u8>> {
     if mode.contains(Mode::SGR_MOUSE) {
-        use std::fmt::Write;
-        // Three-digit flags, a u16 column and an i32 row fit in 24 bytes.
-        let mut data = String::with_capacity(24);
-        write!(
-            data,
-            "\x1b[<{code};{};{}{}",
-            x + 1,
-            y + 1,
-            if release { 'm' } else { 'M' }
-        )
-        .unwrap();
-        return Some(data.into_bytes());
+        // A u16 code and two 64-bit coordinates need at most 51 bytes.
+        let mut bytes = [0; 51];
+        let mut start = bytes.len();
+        for (mut value, suffix) in [
+            (y + 1, if release { b'm' } else { b'M' }),
+            (x + 1, b';'),
+            (usize::from(code), b';'),
+        ] {
+            start -= 1;
+            bytes[start] = suffix;
+            loop {
+                start -= 1;
+                bytes[start] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+        }
+        start -= 3;
+        bytes[start..start + 3].copy_from_slice(b"\x1b[<");
+        return Some(bytes[start..].to_vec());
     }
     let utf8 = mode.contains(Mode::UTF8_MOUSE);
     let limit = if utf8 { 2015 } else { 223 };

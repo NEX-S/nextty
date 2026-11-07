@@ -248,6 +248,12 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
             fds.extend(frontend.ui.fds());
             let milliseconds = timeout.map_or(-1, crate::poll::timeout_millis);
             crate::poll::poll(&mut fds, milliseconds)?;
+            if fds[4].revents != 0 {
+                crate::eventfd::consume_notification(fds[4].fd)?;
+            }
+            if fds[5].revents != 0 {
+                crate::eventfd::consume_notification(fds[5].fd)?;
+            }
             output_ready |= fds[3].revents & libc::POLLOUT != 0;
             if fds[1].revents & libc::POLLOUT != 0 {
                 frontend.client.flush()?;
@@ -371,18 +377,12 @@ fn draw_text(
     background: u32,
 ) -> io::Result<()> {
     let text = fit_label(text, columns);
-    write!(
-        output,
-        "\x1b[{};{}H\x1b[38;2;{};{};{}m\x1b[48;2;{};{};{}m",
-        y + 1,
-        x + 1,
-        foreground >> 16 & 255,
-        foreground >> 8 & 255,
-        foreground & 255,
-        background >> 16 & 255,
-        background >> 8 & 255,
-        background & 255,
-    )?;
+    crate::panel::cursor_position(output, y + 1, x + 1)?;
+    output.extend_from_slice(b"\x1b[38;2");
+    crate::panel::sgr_rgb(output, Rgb::from_packed(foreground));
+    output.extend_from_slice(b";48;2");
+    crate::panel::sgr_rgb(output, Rgb::from_packed(background));
+    output.push(b'm');
     output.extend_from_slice(text.as_bytes());
     let padding = usize::from(columns) - text_width(&text);
     output.resize(output.len() + padding, b' ');
@@ -413,13 +413,20 @@ fn braille_trend(
             continue;
         }
         let (from_x, from_y) = previous.unwrap_or((x, y));
-        let count = from_x.abs_diff(x).max(from_y.abs_diff(y)).max(1);
-        for step in 0..=count {
-            let fraction = step as f32 / count as f32;
-            let px = (from_x as f32 + (x as f32 - from_x as f32) * fraction).round() as usize;
-            let py = (from_y as f32 + (y as f32 - from_y as f32) * fraction).round() as usize;
-            cells[py / 4 * columns + px / 2] |= bits[py % 4][px % 2];
+        let count = from_x.abs_diff(x).max(from_y.abs_diff(y));
+        if from_x == x {
+            for py in from_y.min(y) + 1..from_y.max(y) {
+                cells[py / 4 * columns + x / 2] |= bits[py % 4][x % 2];
+            }
+        } else {
+            for step in 1..count {
+                let fraction = step as f32 / count as f32;
+                let px = (from_x as f32 + (x as f32 - from_x as f32) * fraction).round() as usize;
+                let py = (from_y as f32 + (y as f32 - from_y as f32) * fraction).round() as usize;
+                cells[py / 4 * columns + px / 2] |= bits[py % 4][px % 2];
+            }
         }
+        cells[y / 4 * columns + x / 2] |= bits[y % 4][x % 2];
         previous = Some((x, y));
     }
     cells
@@ -536,9 +543,7 @@ impl Frontend {
         } else {
             available
         };
-        (self.size.num_cols / 3)
-            .clamp(12, 32)
-            .min(available.saturating_sub(2))
+        crate::file_panel::sidebar_width(available)
     }
 
     fn file_rect(&self) -> Rect {
@@ -555,7 +560,7 @@ impl Frontend {
             x: 0,
             y: 1,
             cols: self.size.num_cols,
-            rows: self.view_size().num_lines.saturating_sub(1),
+            rows: self.size.num_lines.saturating_sub(2),
         })
     }
 
@@ -633,18 +638,20 @@ impl Frontend {
             };
             viewport = (
                 usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(2)),
+                usize::from(rect.rows.saturating_sub(if self.ui.file_preview_open() {
+                    5
+                } else {
+                    0
+                })),
             );
-        } else {
-            if self.ui.agent.open && self.ui.focus.is_agent() {
-                let rect = editor(&self.ui, self.agent_rect()).0;
-                viewport = (
-                    usize::from(rect.cols)
-                        .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
-                        .max(1),
-                    usize::from(rect.rows),
-                );
-            }
+        } else if self.ui.agent.open && self.ui.focus.is_agent() {
+            let rect = editor(&self.ui, self.agent_rect()).0;
+            viewport = (
+                usize::from(rect.cols)
+                    .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
+                    .max(1),
+                usize::from(rect.rows),
+            );
         }
         let target = self.ui.input_target();
         let panels = self.ui.panel_state();
@@ -668,9 +675,7 @@ impl Frontend {
             KeyResult::Text | KeyResult::Handled => (),
         }
 
-        {
-            self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));
-        }
+        self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));
         self.resource_dirty |= matches!(target, Some(PasteTarget::Monitor));
         self.dirty = true;
         if panels != self.ui.panel_state() {
@@ -708,9 +713,7 @@ impl Frontend {
             self.dirty = true;
             self.resource_dirty = true;
 
-            {
-                self.agent.dirty = true;
-            }
+            self.agent.dirty = true;
         } else {
             let mut remaining = text.as_ref();
             while !remaining.is_empty() {
@@ -744,21 +747,16 @@ impl Frontend {
             draw_text(output, 0, row, self.size.num_cols, "", MUTED, BACKGROUND)?;
         }
         if self.ui.resources.open {
-            draw_text(
-                output,
-                0,
-                top,
-                self.size.num_cols,
-                &"─".repeat(usize::from(self.size.num_cols)),
-                crate::panel::BORDER,
-                BACKGROUND,
-            )?;
+            draw_text(output, 0, top, 0, "", crate::panel::BORDER, BACKGROUND)?;
+            draw_rule(output, usize::from(self.size.num_cols))?;
             let origin = i32::from(top) + 1;
             let height = last.saturating_sub(top + 1);
             let view = self.ui.resources.view(self.size.num_cols, height);
+            let mut cells = Vec::new();
+            let mut text = String::new();
             for plot in view.plots {
                 let width = usize::from(plot.width);
-                let graphs: Vec<Vec<u8>> = plot
+                let graphs: smallvec::SmallVec<[Vec<u8>; 2]> = plot
                     .series
                     .iter()
                     .map(|series| {
@@ -771,8 +769,6 @@ impl Frontend {
                         )
                     })
                     .collect();
-                let mut cells = Vec::new();
-                let mut text = String::new();
                 for row in 0..usize::from(plot.height) {
                     let y = origin + plot.y + row as i32;
                     if y < origin || y >= i32::from(last) {
@@ -927,6 +923,7 @@ impl Frontend {
                 {
                     let open = self.ui.resources.open;
                     self.ui.resources.action(hit.action);
+                    self.ui.monitor_jump(&mut self.client)?;
                     self.ui.focus = if self.ui.resources.open {
                         Focus::Monitor
                     } else {
@@ -950,6 +947,7 @@ impl Frontend {
                         && (hit.x..hit.x.saturating_add(hit.width)).contains(&mouse.column)
                 }) {
                     self.ui.resources.action(hit.action);
+                    self.ui.monitor_jump(&mut self.client)?;
                     if !self.ui.resources.open {
                         self.ui.focus = Focus::Terminal;
                         return self.resize();
@@ -965,16 +963,22 @@ impl Frontend {
         Ok(())
     }
 
-    fn draw_active_cursor(&self, output: &mut Vec<u8>) -> io::Result<()> {
+    fn draw_active_cursor(
+        &self,
+        output: &mut Vec<u8>,
+        ui_cursor: Option<(u16, u16)>,
+    ) -> io::Result<()> {
         if self.ui.close_prompt.is_some() {
             return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
         }
         if self.ui.search.open {
-            let (_, caret) = self
-                .ui
-                .search
-                .display("", usize::from(self.size.num_cols.saturating_sub(2)));
-            return write!(output, "\x1b[1;{}H\x1b[?1l\x1b>\x1b[?25h", caret + 2);
+            let (column, row) = ui_cursor.unwrap();
+            return write!(
+                output,
+                "\x1b[{};{}H\x1b[?1l\x1b>\x1b[?25h",
+                row + 1,
+                column + 1
+            );
         }
 
         if self.ui.resources.open && self.ui.focus == Focus::Monitor
@@ -993,21 +997,31 @@ impl Frontend {
                 return output.write_all(b"\x1b[?25l");
             }
             if self.ui.focus == Focus::Editor {
-                let (rect, layout) = editor(&self.ui, self.agent_rect());
-                if (layout.first..layout.first + usize::from(rect.rows)).contains(&layout.caret_row)
-                {
-                    return write!(
-                        output,
-                        "\x1b[{};{}H\x1b[?25h",
-                        rect.y + (layout.caret_row - layout.first) as u16 + 1,
-                        rect.x + layout.caret_column as u16 + 1
-                    );
+                let cursor = ui_cursor.or_else(|| {
+                    let (rect, layout) = editor(&self.ui, self.agent_rect());
+                    (layout.first..layout.first + usize::from(rect.rows))
+                        .contains(&layout.caret_row)
+                        .then(|| {
+                            (
+                                rect.x + layout.caret_column as u16,
+                                rect.y + (layout.caret_row - layout.first) as u16,
+                            )
+                        })
+                });
+                if let Some((column, row)) = cursor {
+                    return write!(output, "\x1b[{};{}H\x1b[?25h", row + 1, column + 1);
                 }
                 return output.write_all(b"\x1b[?25l");
             }
         }
         if let Some(snapshot) = self.client.snapshot() {
-            draw_cursor(output, &self.client, snapshot, self.view_size())?;
+            draw_cursor(
+                output,
+                &self.client,
+                snapshot,
+                self.view_size(),
+                self.file_width(),
+            )?;
         }
         Ok(())
     }
@@ -1026,9 +1040,9 @@ impl Frontend {
         self.dirty = true;
     }
 
-    fn send_input(&mut self, pane: PaneId, data: Vec<u8>) -> io::Result<()> {
+    fn send_input(&mut self, pane: PaneId, data: &[u8]) -> io::Result<()> {
         if self.controller() {
-            self.client.send(Action::Input { pane, data })
+            self.client.send_input(pane, data)
         } else {
             self.message("READ ONLY — attach again to take control; Alt+q detach");
             Ok(())
@@ -1040,9 +1054,10 @@ impl Frontend {
         for event in self.client.poll()? {
             self.event(event)?;
         }
-        if old_hover != self.hovered_block() {
+        let hovered = self.hovered_block();
+        if old_hover != hovered {
             self.damage_block(old_hover);
-            self.damage_block(self.hovered_block());
+            self.damage_block(hovered);
         }
         Ok(())
     }
@@ -1124,6 +1139,21 @@ impl Frontend {
 
     fn input(&mut self, event: Input) -> io::Result<()> {
         let close_rect = self.close_rect();
+        if self.ui.file_preview_open() {
+            match event {
+                Input::Escape => {
+                    self.panel_key(crate::input::keysym::ESCAPE, 0, "")?;
+                }
+                Input::Bytes(bytes) => {
+                    self.panel_bytes(&bytes, None)?;
+                }
+                Input::Mouse(mouse) => {
+                    self.file_mouse(mouse)?;
+                }
+                _ => (),
+            }
+            return Ok(());
+        }
         if let Some(prompt) = self.ui.close_prompt.as_mut() {
             let tab = prompt.tab.unwrap();
             match &event {
@@ -1133,7 +1163,7 @@ impl Frontend {
                 {
                     prompt.terminate = !prompt.terminate
                 }
-                Input::Bytes(bytes) if bytes == b"\r" => {
+                Input::Bytes(bytes) if bytes.as_slice() == b"\r" => {
                     if prompt.terminate {
                         self.client.send(Action::CloseTab(tab))?;
                     }
@@ -1160,12 +1190,10 @@ impl Frontend {
             return Ok(());
         }
 
-        {
-            if matches!(event, Input::Alt(_)) && self.ui.agent.active().rewind_target.is_some() {
+        if let Input::Alt(key) = event {
+            if self.ui.agent.active().rewind_target.is_some() {
                 self.ui.cancel_rewind();
             }
-        }
-        if let Input::Alt(key) = event {
             if key == b'q' {
                 self.running = false;
                 return Ok(());
@@ -1238,16 +1266,13 @@ impl Frontend {
         }
         match event {
             Input::Alt(key) => {
-                if self.ui.files_open {
-                    return Ok(());
-                }
                 if let Some(pane) = self.focused() {
-                    self.send_input(pane, vec![0x1b, key])?;
+                    self.send_input(pane, &[0x1b, key])?;
                 }
             }
             Input::Escape => {
                 if let Some(pane) = self.focused() {
-                    self.send_input(pane, vec![0x1b])?;
+                    self.send_input(pane, &[0x1b])?;
                 }
             }
             Input::Bytes(bytes) => {
@@ -1257,7 +1282,7 @@ impl Frontend {
                         .screens()
                         .get(&pane)
                         .map_or(Mode::NONE, Screen::mode);
-                    self.send_input(pane, cursor_bytes(bytes, mode))?;
+                    self.send_input(pane, &cursor_bytes(bytes, mode))?;
                 }
             }
             Input::Focus(focused) => {
@@ -1268,7 +1293,7 @@ impl Frontend {
                         .get(&pane)
                         .is_some_and(|screen| screen.mode().contains(Mode::FOCUS_IN_OUT))
                 {
-                    self.send_input(pane, if focused { b"\x1b[I" } else { b"\x1b[O" }.to_vec())?;
+                    self.send_input(pane, if focused { b"\x1b[I" } else { b"\x1b[O" })?;
                 }
             }
             Input::Mouse(mouse) => {
@@ -1302,17 +1327,16 @@ impl Frontend {
                     return Ok(());
                 }
 
-                if self.ui.files_open {
-                    self.ui.focus = Focus::Files;
-                    return self.file_mouse(mouse);
+                if self.ui.files_open && self.file_rect().contains(mouse.column, mouse.row) {
+                    if !mouse.release && mouse.code & 32 == 0 {
+                        self.ui.focus = Focus::Files;
+                        return self.file_mouse(mouse);
+                    }
+                    return Ok(());
                 }
                 self.mouse(mouse)?;
             }
             Input::PasteStart => {
-                if self.ui.files_open {
-                    self.paste = Some(PasteTarget::Files);
-                    return Ok(());
-                }
                 if let Some(pane) = self.focused() {
                     let bracketed = self
                         .client
@@ -1321,12 +1345,12 @@ impl Frontend {
                         .is_some_and(|screen| screen.mode().contains(Mode::BRACKETED_PASTE));
                     self.paste = Some(PasteTarget::Pane { pane, bracketed });
                     if bracketed {
-                        self.send_input(pane, b"\x1b[200~".to_vec())?;
+                        self.send_input(pane, b"\x1b[200~")?;
                     }
                 }
             }
             Input::PasteData(bytes) => match self.paste {
-                Some(PasteTarget::Pane { pane, .. }) => self.send_input(pane, bytes)?,
+                Some(PasteTarget::Pane { pane, .. }) => self.send_input(pane, &bytes)?,
                 Some(target) => self.panel_bytes(&bytes, Some(target))?,
                 None => (),
             },
@@ -1337,7 +1361,7 @@ impl Frontend {
                     bracketed: true,
                 }) = self.paste.take()
                 {
-                    self.send_input(pane, b"\x1b[201~".to_vec())?;
+                    self.send_input(pane, b"\x1b[201~")?;
                 }
             }
         }
@@ -1406,31 +1430,38 @@ impl Frontend {
     }
 
     fn mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let old_object = self.hovered_object();
-        let old_hover = self.hovered_block();
-        let previous = self.pointer.replace((mouse.column, mouse.row));
-        if previous != self.pointer && (mouse.row == 0 || previous.is_some_and(|(_, row)| row == 0))
-        {
-            self.dirty = true;
-        }
-        if old_hover != self.hovered_block() {
-            self.damage_block(old_hover);
-            self.damage_block(self.hovered_block());
-        }
-        let object = self.hovered_object();
-        if old_object != object {
-            for (pane, object) in old_object.iter().chain(object.iter()) {
-                let screen = &self.client.screens()[pane];
-                let view = self.client.snapshot().unwrap().pane(*pane).unwrap();
-                for line in object.range.start.line..=object.range.end.line {
-                    let row = line + screen.display_offset() as i32 + i32::from(view.rect.y);
-                    if let Some(damage) = self.damage.get_mut(row as usize) {
-                        *damage = true;
+        let previous = self.pointer;
+        if previous != Some((mouse.column, mouse.row)) {
+            let old_object = self.hovered_object();
+            let old_hover = self.hovered_block();
+            self.pointer = Some((mouse.column, mouse.row));
+            if mouse.row == 0 || previous.is_some_and(|(_, row)| row == 0) {
+                self.dirty = true;
+            }
+            let hovered = self.hovered_block();
+            if old_hover != hovered {
+                self.damage_block(old_hover);
+                self.damage_block(hovered);
+            }
+            let object = self.hovered_object();
+            if old_object != object {
+                for (pane, object) in old_object.iter().chain(object.iter()) {
+                    let screen = &self.client.screens()[pane];
+                    let view = self.client.snapshot().unwrap().pane(*pane).unwrap();
+                    for line in object.range.start.line..=object.range.end.line {
+                        let row = line + screen.display_offset() as i32 + i32::from(view.rect.y);
+                        if let Some(damage) = self.damage.get_mut(row as usize) {
+                            *damage = true;
+                        }
                     }
                 }
+                self.dirty = true;
             }
-            self.dirty = true;
         }
+        let left = if mouse.row == 0 { 0 } else { self.file_width() };
+        let mut mouse = mouse;
+        mouse.column = mouse.column.saturating_sub(left);
+        let previous = previous.map(|(column, row)| (column.saturating_sub(left), row));
         if let Some(drag) = self.split_drag {
             if mouse.release {
                 self.split_drag = None;
@@ -1588,13 +1619,13 @@ impl Frontend {
                 mouse.release,
                 mode,
             ) {
-                self.send_input(pane, data)?;
+                self.send_input(pane, &data)?;
             }
         } else if mouse.code & 64 != 0 && !mouse.release {
             let up = mouse.code & 1 == 0;
             if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && mouse.code & 8 == 0 {
-                let bytes = if up { b"\x1b[A" } else { b"\x1b[B" }.to_vec();
-                self.send_input(pane, cursor_bytes(bytes, mode))?;
+                let bytes = if up { *b"\x1b[A" } else { *b"\x1b[B" };
+                self.send_input(pane, &cursor_bytes(bytes, mode))?;
             } else {
                 self.client.send(Action::Scroll {
                     pane,
@@ -1648,7 +1679,8 @@ impl Frontend {
         let Some(screen) = screens.get_mut(&id) else {
             return;
         };
-        for row in 0..screen.screen_lines().min(usize::from(pane.rect.rows)) {
+        let range = screen.block_row_range(pane, block);
+        for row in range.start..range.end.min(usize::from(pane.rect.rows)) {
             if screen
                 .row_output(pane, row)
                 .is_some_and(|current| current.id == block)
@@ -1673,23 +1705,17 @@ impl Frontend {
     fn damage_overlays(&mut self) {
         self.damage.resize(usize::from(self.size.num_lines), false);
         let mut overlays = smallvec::SmallVec::new();
-        if self.ui.files_open
-            && self
-                .ui
-                .files
-                .as_ref()
-                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
-        {
+
+        if self.ui.file_preview_open() {
             overlays.push(self.file_preview_rect());
         }
-
         if self.ui.agent.active().context.preview.is_some() {
-            overlays.push(Rect {
+            overlays.push(crate::file_panel::preview_rect(Rect {
                 x: 0,
                 y: 1,
                 cols: self.size.num_cols,
                 rows: self.size.num_lines.saturating_sub(2),
-            });
+            }));
         }
         if self.ui.search.open {
             overlays.push(Rect {
@@ -1714,6 +1740,7 @@ impl Frontend {
 
     fn hovered_object(&self) -> Option<(PaneId, crate::context::Object)> {
         let (x, y) = self.pointer?;
+        let x = x.checked_sub(self.file_width())?;
         let pane = self.client.snapshot()?.pane_at(x, y)?;
         let screen = self.client.screens().get(&pane.id)?;
         let point = Point {
@@ -1725,6 +1752,7 @@ impl Frontend {
 
     fn hovered_block(&self) -> Option<(PaneId, u64)> {
         let (x, y) = self.pointer?;
+        let x = x.checked_sub(self.file_width())?;
         let pane = self.client.snapshot()?.pane_at(x, y)?;
         let screen = self.client.screens().get(&pane.id)?;
         screen
@@ -1826,18 +1854,28 @@ impl Frontend {
             self.resource_dirty = false;
         }
 
-        if self.ui.agent.open
-            && (self.full || self.agent.dirty || self.damage.iter().any(|dirty| *dirty))
-        {
-            self.draw_agent(output)?;
-            self.agent.dirty = false;
-        }
-
-        if self.ui.files_open {
+        if self.ui.files_open && !self.ui.file_preview_open() {
             self.draw_files(output)?;
         }
-        if self.ui.search.open {
-            let (label, _) = self
+
+        let agent_cursor = if self.ui.agent.open
+            && (self.full
+                || self.agent.dirty
+                || self.ui.agent.active().context.preview.is_some()
+                || self.damage.iter().any(|dirty| *dirty))
+        {
+            let cursor = self.draw_agent(output)?;
+            self.agent.dirty = false;
+            cursor
+        } else {
+            None
+        };
+
+        if self.ui.file_preview_open() {
+            self.draw_files(output)?;
+        }
+        let ui_cursor = if self.ui.search.open {
+            let (label, caret) = self
                 .ui
                 .search
                 .display("", usize::from(self.size.num_cols.saturating_sub(2)));
@@ -1859,7 +1897,10 @@ impl Frontend {
                 self.config.foreground,
                 crate::panel::CHROME,
             )?;
-        }
+            Some((caret as u16 + 1, 0))
+        } else {
+            agent_cursor
+        };
         if let Some(prompt) = self.ui.close_prompt {
             let rect = self.close_rect();
             let background = mix_color(self.config.foreground, self.config.background, 9);
@@ -1929,7 +1970,7 @@ impl Frontend {
             );
             grid.ansi(output, None, &[])?;
         }
-        self.draw_active_cursor(output)?;
+        self.draw_active_cursor(output, ui_cursor)?;
         let (snapshot, screens) = self.client.snapshot_and_screens_mut().unwrap();
         for pane in &snapshot.panes {
             if let Some(screen) = screens.get_mut(&pane.id) {
@@ -1970,30 +2011,40 @@ impl Frontend {
     }
 
     fn file_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let preview = self.ui.files.as_ref().unwrap().focus() == crate::files::FileFocus::Preview;
+        let preview = self.ui.file_preview_open();
         let rect = if preview {
             self.file_preview_rect()
         } else {
             self.file_rect()
         };
         let files = self.ui.files.as_mut().unwrap();
-        if rect.contains(mouse.column, mouse.row) {
-            if !mouse.release && mouse.code & 64 != 0 {
-                files.scroll(
-                    if mouse.code & 1 == 0 { -3 } else { 3 },
-                    usize::from(rect.rows.saturating_sub(2)),
-                );
-            } else if !preview
-                && !mouse.release
-                && mouse.code & 0b1100_0011 == 0
-                && let Some(index) = crate::file_panel::Layout::new(rect, files).entry_at(
-                    files,
-                    mouse.column,
-                    mouse.row,
-                )
-            {
-                files.move_selection(index as isize - files.selection() as isize);
+        if preview
+            && (!rect.contains(mouse.column, mouse.row)
+                || crate::panel::popup_close(rect).contains(mouse.column, mouse.row))
+        {
+            if !mouse.release && mouse.code & 0b1100_0011 == 0 {
+                files.focus_list();
+                self.dirty = true;
             }
+            return Ok(());
+        }
+        if !mouse.release && mouse.code & 64 != 0 {
+            files.scroll(
+                if mouse.code & 1 == 0 { -3 } else { 3 },
+                usize::from(if preview {
+                    crate::panel::popup_body(rect).rows
+                } else {
+                    rect.rows.saturating_sub(2)
+                }),
+            );
+        } else if !preview
+            && !mouse.release
+            && mouse.code & 0b1100_0011 == 0
+            && let Some(index) =
+                crate::file_panel::Layout::new(rect, files).entry_at(files, mouse.column, mouse.row)
+        {
+            files.move_selection(index as isize - files.selection() as isize);
+            files.focus_preview();
         }
         self.dirty = true;
         Ok(())
@@ -2013,34 +2064,6 @@ impl Frontend {
         }
         Ok(())
     }
-}
-
-fn draw_tab_icon(
-    output: &mut Vec<u8>,
-    rect: Rect,
-    label: &str,
-    colors: (u32, u32),
-    bg: u32,
-    hovered: bool,
-    active: bool,
-) -> io::Result<()> {
-    output.write_all(b"\x1b[24;59m")?;
-    if active {
-        output.write_all(b"\x1b[4;58;2;181;210;162m")?;
-    }
-    let fg = if hovered { colors.1 } else { colors.0 };
-    draw_text(output, rect.x, rect.y, rect.cols, "", fg, bg)?;
-    if hovered {
-        write!(
-            output,
-            "\x1b[4;58;2;{};{};{}m",
-            fg >> 16 & 255,
-            fg >> 8 & 255,
-            fg & 255
-        )?;
-    }
-    draw_text(output, rect.x + 1, rect.y, 1, label, fg, bg)?;
-    output.write_all(b"\x1b[24;59m")
 }
 
 fn draw_tabs(
@@ -2119,20 +2142,20 @@ fn draw_tabs(
         let hovered = pointer.is_some_and(|(column, row)| {
             row == 0 && (end.saturating_sub(1)..end + 2).contains(&column)
         });
-        draw_tab_icon(
-            output,
-            Rect {
-                x: end.saturating_sub(1),
-                y: 0,
-                cols: 3,
-                rows: 1,
-            },
-            "+",
-            (0x606060, 0xb5d2a2),
-            0x191919,
-            hovered,
-            false,
-        )?;
+        let x = end.saturating_sub(1);
+        let fg = if hovered { 0xb5d2a2 } else { 0x606060 };
+        output.write_all(b"\x1b[24;59m")?;
+        draw_text(output, x, 0, 3, "", fg, 0x191919)?;
+        if hovered {
+            write!(
+                output,
+                "\x1b[4;58;2;{};{};{}m",
+                fg >> 16 & 255,
+                fg >> 8 & 255,
+                fg & 255
+            )?;
+        }
+        write!(output, "\x1b[1;{}H+\x1b[24;59m", x + 2)?;
     }
     let max = columns.saturating_sub(end + 4);
     if max > 0 {
@@ -2153,12 +2176,12 @@ fn draw_tabs(
     output.write_all(b"\x1b[0m")
 }
 
-fn cursor_bytes(mut bytes: Vec<u8>, mode: Mode) -> Vec<u8> {
+fn cursor_bytes<T: AsMut<[u8]>>(mut bytes: T, mode: Mode) -> T {
     if let [
         0x1b,
         prefix @ (b'[' | b'O'),
         b'A' | b'B' | b'C' | b'D' | b'H' | b'F',
-    ] = bytes.as_mut_slice()
+    ] = bytes.as_mut()
     {
         *prefix = if mode.contains(Mode::APP_CURSOR) {
             b'O'
@@ -2205,14 +2228,12 @@ fn draw_row(
             .max(selection.map_or(0, |selection| selection.end.column + 1))
             .min(columns)
     };
-    write!(output, "\x1b[{};{}H", rect.y + row as u16 + 1, rect.x + 1)?;
+    crate::panel::cursor_position(output, rect.y + row as u16 + 1, rect.x + 1)?;
     if columns < physical_columns {
         let bg = screen.color(Color::Named(NamedColor::Background));
-        write!(
-            output,
-            "\x1b[0;48;2;{};{};{}m\x1b[{}X",
-            bg.r, bg.g, bg.b, physical_columns
-        )?;
+        output.extend_from_slice(b"\x1b[0;48;2");
+        crate::panel::sgr_rgb(output, bg);
+        write!(output, "m\x1b[{}X", physical_columns)?;
     }
     let mut previous = None;
     for (column, cell, extra) in data.cells_with_extras(0..columns) {
@@ -2245,11 +2266,10 @@ fn draw_row(
                     b: 38,
                 };
             }
-            write!(
-                output,
-                "\x1b[0;38;2;{};{};{};48;2;{};{};{}",
-                fg.r, fg.g, fg.b, bg.r, bg.g, bg.b
-            )?;
+            output.extend_from_slice(b"\x1b[0;38;2");
+            crate::panel::sgr_rgb(output, fg);
+            output.extend_from_slice(b";48;2");
+            crate::panel::sgr_rgb(output, bg);
             for (flag, sgr) in [
                 (Flags::BOLD, b'1'),
                 (Flags::DIM, b'2'),
@@ -2290,6 +2310,17 @@ fn draw_row(
     Ok(())
 }
 
+fn draw_rule(output: &mut impl Write, columns: usize) -> io::Result<()> {
+    const RULE: &[u8] = "────────────────────────────────".as_bytes();
+    let mut bytes = columns * "─".len();
+    while bytes != 0 {
+        let count = bytes.min(RULE.len());
+        output.write_all(&RULE[..count])?;
+        bytes -= count;
+    }
+    Ok(())
+}
+
 fn draw_separators(
     output: &mut impl Write,
     snapshot: &Snapshot,
@@ -2309,7 +2340,8 @@ fn draw_separators(
                     .min(size.num_lines)
             {
                 if full || damage[usize::from(row)] {
-                    write!(output, "\x1b[{};{}H│", row + 1, pane.rect.x + left)?;
+                    crate::panel::cursor_position(output, row + 1, pane.rect.x + left)?;
+                    output.write_all("│".as_bytes())?;
                 }
             }
         }
@@ -2317,18 +2349,15 @@ fn draw_separators(
             && pane.rect.y <= size.num_lines
             && (full || damage[usize::from(pane.rect.y - 1)])
         {
-            write!(output, "\x1b[{};{}H", pane.rect.y, pane.rect.x + left + 1)?;
-            let mut bytes = usize::from(
-                pane.rect
-                    .cols
-                    .min(size.num_cols.saturating_sub(pane.rect.x)),
-            ) * "─".len();
-            const RULE: &[u8] = "────────────────────────────────".as_bytes();
-            while bytes != 0 {
-                let count = bytes.min(RULE.len());
-                output.write_all(&RULE[..count])?;
-                bytes -= count;
-            }
+            crate::panel::cursor_position(output, pane.rect.y, pane.rect.x + left + 1)?;
+            draw_rule(
+                output,
+                usize::from(
+                    pane.rect
+                        .cols
+                        .min(size.num_cols.saturating_sub(pane.rect.x)),
+                ),
+            )?;
         }
     }
     Ok(())
@@ -2339,6 +2368,7 @@ fn draw_cursor(
     client: &Client,
     snapshot: &Snapshot,
     size: WindowSize,
+    left: u16,
 ) -> io::Result<()> {
     let Some(pane) = snapshot.focused_pane() else {
         return output.write_all(b"\x1b[?25l");
@@ -2379,7 +2409,7 @@ fn draw_cursor(
                 _ => 2,
             },
             y + 1,
-            x + 1
+            x + u32::from(left) + 1
         )
     }
 }
@@ -2460,6 +2490,7 @@ impl ClipboardTransfer {
                 };
                 file_chunk.as_slice()
             }
+            ClipboardSource::Memory(bytes) if bytes.is_empty() => &[],
             ClipboardSource::Memory(bytes) => {
                 let remaining = &bytes[self.bytes as usize..];
                 &remaining[..remaining.len().min(OSC52_CHUNK_SIZE)]
@@ -2479,6 +2510,12 @@ impl ClipboardTransfer {
         }
         self.bytes += chunk.len() as u64;
         crate::base64::encode(chunk, output);
+        if let ClipboardSource::Memory(bytes) = &mut self.reader
+            && self.bytes == bytes.len() as u64
+        {
+            // The final encoded chunk may remain blocked on stdout.
+            *bytes = Vec::new();
+        }
         Ok(None)
     }
 }

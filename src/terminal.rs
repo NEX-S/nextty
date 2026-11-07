@@ -511,7 +511,7 @@ impl PtyLoop {
         while self.receiver.recv().is_ok() {}
     }
 
-    fn sample_process(&self) {
+    fn sample_process(&self) -> bool {
         // Keep cloning and comparison outside the lock shared with workspace readers.
         let current = self.process_metadata.lock().unwrap().clone();
         let mut metadata = ProcessMetadata {
@@ -579,11 +579,13 @@ impl PtyLoop {
                 .unwrap()
                 .as_millis() as u64,
         );
+        let has_children = metadata.has_children == Some(true);
         let metadata = Arc::new(metadata);
         *self.process_metadata.lock().unwrap() = metadata;
         if changed {
             self.proxy.wakeup();
         }
+        has_children
     }
 
     fn io_loop(&mut self) -> io::Result<()> {
@@ -656,15 +658,10 @@ impl PtyLoop {
             }
 
             if process_deadline.is_some_and(|deadline| deadline <= Instant::now()) {
-                self.sample_process();
-                process_sampled = Some(Instant::now());
-                process_deadline = self
-                    .process_metadata
-                    .lock()
-                    .unwrap()
-                    .has_children
-                    .filter(|present| *present)
-                    .map(|_| Instant::now() + Duration::from_secs(1));
+                let has_children = self.sample_process();
+                let sampled = Instant::now();
+                process_sampled = Some(sampled);
+                process_deadline = has_children.then(|| sampled + Duration::from_secs(1));
             }
             let sync_deadline = parser.deadline();
             let deadline = sync_deadline.into_iter().chain(process_deadline).min();

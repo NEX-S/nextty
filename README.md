@@ -16,7 +16,7 @@ The implementation uses a small Rust terminal core, a native desktop backend, an
 - **Workspaces:** tabs, nested splits, draggable dividers, named sessions, detach/attach, and multiple viewers. The latest attachment controls input and size; earlier attachments remain read-only.
 - **SSH sessions:** the same workspace UI through system OpenSSH. Authentication, host keys, aliases, and jump hosts use your SSH configuration. The remote machine needs no display server or extra listening port.
 - **Command-aware output:** Bash/Zsh integration records prompts, command output, and exit status. Jump between prompts, copy a command's output, or search retained history without sending search text to the shell.
-- **Agent panel:** terminal context, direct file reading/search/editing, shell execution, foreground-program interaction, and verification in a separate visible terminal. Separate conversations stream Markdown and continue after the frontend detaches.
+- **Agent panel:** terminal context, direct file reading/search/editing, shell execution, foreground-program interaction, and verification in a separate visible terminal. Separate conversations stream Markdown, including nested bullet/numbered lists and aligned tables, and continue after the frontend detaches.
 - **Local tools:** an asynchronous file browser with fuzzy search and text preview, plus CPU, memory, network, process, and storage monitoring.
 
 ## Design philosophy
@@ -62,7 +62,7 @@ Shaders are compiled to SPIR-V by `glslangValidator` during the build. Wayland p
 
 ### Build only what you use
 
-Default features are `gui,tui`. Agent support, workspace services, monitor, and file browser are always included.
+Default features are `gui,tui`. Agent support, workspace services, system statistics, and file navigation are always included. Rendering and input code compile only with a frontend.
 
 - `gui`: Wayland window, input handling, font backend, and Vulkan renderer.
 - `tui`: ANSI frontend inside an existing terminal.
@@ -103,7 +103,7 @@ Set `tab_style = "angled"` (default) or `tab_style = "flat"` in the configuratio
 
 The footer shows the focused file browser's directory, or otherwise the focused terminal's directory, with its local Git branch. Remote directories are displayed as supplied by the remote terminal; local Git branches are never inferred for them.
 
-Click the footer's CPU, memory, disk, or swap counters to open the corresponding monitor page. The monitor also has Overview, Network, and Processes pages, resource trends, process filtering, and selectable `60s`, `5m`, `15m`, and `1h` history ranges. Network graphs cover hardware-backed interfaces. Filesystem capacity follows the focused directory and is separate from physical-disk I/O. Resource counters describe the local frontend machine.
+Click the footer's CPU, memory, disk, or swap counters to open the corresponding monitor page. The monitor also has Overview, Network, Processes, and Tasks pages, resource trends, process filtering, and selectable `60s`, `5m`, `15m`, and `1h` history ranges. The Tasks page shows the latest known command state for each pane; Enter or `l` jumps to its terminal. Command durations come from monotonic shell-integration start/end markers on the daemon host; missing command text or timing is displayed explicitly rather than inferred. Process details group CPU/memory, identity, state, directory, and command fields. Network graphs cover hardware-backed interfaces. Filesystem capacity follows the focused directory and is separate from physical-disk I/O. Resource counters describe the local frontend machine.
 
 `Alt+q` detaches without terminating the workspace. Closing a desktop window offers **Keep running** or **End session**. Session state lives in the daemon; it survives a frontend exit or disconnection, but not a reboot or daemon crash.
 
@@ -138,7 +138,7 @@ In the system monitor, j/k selects controls, l enters the selected control, and 
 
 In the desktop frontend, `Ctrl+Shift+C/V` copies/pastes and middle-click pastes the primary selection. Hold Alt to select or scroll locally when an application captures the mouse. Double-click a highlighted object to open it with `xdg-open`. Right-click copies the highlighted object; without a highlighted object it pastes. The ANSI frontend exports clipboard text using OSC 52 and uses the host terminal for paste.
 
-`Alt+f` opens a tree selector in the left sidebar and leaves the terminal visible beside it. Use `j`/`k` or arrows to select, `l` to expand a directory or open a centered file preview, and `h` to collapse or move to the parent. Enter inserts the selected absolute path into the terminal without executing it. `/` searches beneath the root directory. Esc closes the preview first, then search, then the sidebar. Directory scans and on-demand file previews run asynchronously.
+`Alt+f` opens a file tree beside the terminal. Press `l` or click a regular file to open its asynchronous preview in a centered floating window with rounded borders. Use `j`/`k` or arrows to select, `l` to expand a directory or open a centered file preview, and `h` to collapse or move to the parent. Enter inserts the selected absolute path into the terminal without executing it. `/` searches beneath the root directory. Esc dismisses the preview and returns to the tree, then exits search or closes the sidebar. Directory scans and on-demand file previews run asynchronously.
 
 ## Agent
 
@@ -154,6 +154,8 @@ model = "your-model"
 nextty appends `/v1/messages` to `base_url`; an empty URL uses `https://api.anthropic.com`. Agent turns enable automatic prompt caching with `cache_control`; custom endpoints must support this Messages API field. If the endpoint requires authentication, set `ANTHROPIC_AUTH_TOKEN` for Bearer authentication or `ANTHROPIC_API_KEY` for API-key authentication in the environment before starting nextty.
 
 Open the right-side panel with `Alt+a`. Enter sends, Shift+Enter inserts a newline, and Tab moves through the editor, output, and controls. Ctrl+C clears input; when input is already empty it stops the running Agent. Ctrl+h/j/k/l navigates input; Ctrl+k at the top recalls the previous prompt and Ctrl+j at the bottom recalls the next. Press Esc twice to enter history selection, use j/k to select a highlighted earlier user message, Enter to confirm rewind, or Esc to exit.
+
+Successful Agent `edit_file` operations appear in tool history with the file path and added/removed line counts; click a record to open that edit’s diff in a centered floating window with rounded borders. Above the input, a bar with the monitor’s expand/collapse icon shows cumulative totals with green additions and red deletions; click it or use Tab/Enter to expand the per-file list. Selecting a summary file shows all its recorded edits; Esc closes the diff. These are edit-operation records, not a net Git diff, and do not attribute shell/editor changes or pre-existing user changes to the Agent. Rewind does not remove these records because it does not undo file writes. Diff text and edit records are bounded; truncation and omitted earlier edits are marked.
 
 Each submission includes the focused pane's live screen and a workspace inventory: pane IDs, directories, foreground state, and recent commands. Selected text and screen attachments are historical snapshots. Reading terminal state does not move your viewport, change your selection, or issue commands to the foreground program.
 

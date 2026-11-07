@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct BlockMarker {
     pub id: u64,
     pub line: i32,
@@ -23,12 +23,13 @@ pub struct BlockMarker {
     pub status: Option<i32>,
     pub output: Option<(Point, Point)>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CommandBlock {
     pub id: u64,
     pub complete: bool,
     pub status: Option<i32>,
     pub has_output: bool,
+    pub elapsed_ms: Option<u64>,
 }
 
 struct Block {
@@ -39,6 +40,8 @@ struct Block {
     end: Option<BlockPoint>,
     status: Option<i32>,
     incomplete: bool,
+    started: Option<std::time::Instant>,
+    finished: Option<std::time::Instant>,
 }
 
 impl Block {
@@ -55,6 +58,12 @@ impl Block {
             complete: self.is_complete(first),
             status: self.status,
             has_output: self.output.is_some(),
+            elapsed_ms: self.started.map(|start| {
+                self.finished
+                    .unwrap_or_else(std::time::Instant::now)
+                    .duration_since(start)
+                    .as_millis() as u64
+            }),
         }
     }
 }
@@ -210,6 +219,7 @@ impl Flags {
             | Self::DOTTED_UNDERLINE.0
             | Self::DASHED_UNDERLINE.0,
     );
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) const TEXT_STYLE: Self = Self(
         Self::BOLD.0
             | Self::ITALIC.0
@@ -348,9 +358,11 @@ impl Row {
         {
             return None;
         }
-        extras.sort_unstable_by_key(|(column, _)| *column);
-        if extras.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return None;
+        if !extras.windows(2).all(|pair| pair[0].0 < pair[1].0) {
+            extras.sort_unstable_by_key(|(column, _)| *column);
+            if extras.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+                return None;
+            }
         }
         Some(Self {
             cells,
@@ -398,12 +410,16 @@ impl Row {
         } else {
             extras.partition_point(|(column, _)| *column < range.start)
         };
-        let mut extras = extras[first..].iter().peekable();
+        let mut extras = &extras[first..];
         let cells = &self.cells[range.start..];
         range.zip(cells).map(move |(column, cell)| {
-            let extra = extras
-                .next_if(|(index, _)| *index == column)
-                .map(|(_, extra)| extra);
+            let extra = match extras.split_first() {
+                Some(((index, extra), rest)) if *index == column => {
+                    extras = rest;
+                    Some(extra)
+                }
+                _ => None,
+            };
             (column, cell, extra)
         })
     }
@@ -416,18 +432,13 @@ impl Row {
             .filter(|(_, cell, _)| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
             .flat_map(|(column, cell, extra)| {
                 let hidden = cell.flags.contains(Flags::HIDDEN);
-                std::iter::once((column, if hidden { ' ' } else { cell.c }))
-                    .chain(
-                        (hidden && cell.flags.contains(Flags::WIDE_CHAR)).then_some((column, ' ')),
-                    )
-                    .chain(
-                        extra
-                            .filter(|_| !hidden)
-                            .into_iter()
-                            .flat_map(move |extra| {
-                                extra.zerowidth.iter().map(move |&ch| (column, ch))
-                            }),
-                    )
+                let zerowidth = extra
+                    .filter(|_| !hidden)
+                    .map_or(&[][..], |extra| extra.zerowidth.as_slice());
+                std::iter::once(if hidden { ' ' } else { cell.c })
+                    .chain((hidden && cell.flags.contains(Flags::WIDE_CHAR)).then_some(' '))
+                    .chain(zerowidth.iter().copied())
+                    .map(move |ch| (column, ch))
             })
     }
 
@@ -604,7 +615,10 @@ pub enum SelectionType {
 pub(crate) fn semantic_group(c: char) -> u8 {
     if c.is_whitespace() {
         0
-    } else if ",│`|:\"'()[]{}<>".contains(c) {
+    } else if matches!(
+        c,
+        ',' | '│' | '`' | '|' | ':' | '"' | '\'' | '(' | ')' | '[' | ']' | '{' | '}' | '<' | '>'
+    ) {
         1
     } else {
         2
@@ -776,14 +790,16 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
             && (index == 0 && before < LIMIT
                 || index > 0
                     && (cells[index - 1].0.is_whitespace()
-                        || "=([{,:".contains(cells[index - 1].0)))
+                        || matches!(cells[index - 1].0, '=' | '(' | '[' | '{' | ',' | ':')))
         {
             quote = Some((ch, index));
         }
     }
     let boundary = |ch: char| {
         ch.is_whitespace()
-            || ",|\"'`<>，。；！？、：（）【】《》".contains(ch)
+            || matches!(ch, ',' | '|' | '"' | '\'' | '`' | '<' | '>')
+            || matches!(ch, '，' | '。' | '；' | '！' | '？' | '、' | '：')
+            || matches!(ch, '（' | '）' | '【' | '】' | '《' | '》')
             || matches!(ch, '\u{2500}'..='\u{257f}')
     };
     if boundary(cells[anchor].0) {
@@ -813,14 +829,14 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
             return Ok(Some([cells[register_start].1, cells[register_end - 1].1]));
         }
     }
-    while start < end && "([{=".contains(cells[start].0) {
+    while start < end && matches!(cells[start].0, '(' | '[' | '{' | '=') {
         start += 1;
     }
     if let Some(equal) = (start..end).find(|&index| cells[index].0 == '=')
         && equal > start
         && cells[start..equal]
             .iter()
-            .all(|&(ch, _)| ch.is_ascii_alphanumeric() || "_-".contains(ch))
+            .all(|&(ch, _)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
     {
         if anchor > equal {
             start = equal + 1;
@@ -828,7 +844,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
             end = equal;
         }
     }
-    while end > start && ".;".contains(cells[end - 1].0) {
+    while end > start && matches!(cells[end - 1].0, '.' | ';') {
         end -= 1;
     }
     for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
@@ -904,9 +920,7 @@ struct Screen {
 impl Screen {
     fn new(columns: usize, lines: usize) -> Self {
         Self {
-            rows: (0..lines)
-                .map(|_| Row::new(columns, Cell::default()))
-                .collect(),
+            rows: vec![Row::new(columns, Cell::default()); lines].into(),
             cursor: Cursor::default(),
             saved: Cursor::default(),
             offset: 0,
@@ -977,7 +991,7 @@ pub struct Core {
     palette_dirty: bool,
     events: Vec<Event>,
     title: Option<String>,
-    titles: Vec<Option<String>>,
+    titles: Vec<Option<Box<str>>>,
 
     history: Option<DiskHistory>,
 
@@ -1510,7 +1524,8 @@ impl Core {
             .extend((self.tabs.len()..columns).map(|column| column != 0 && column % 8 == 0));
         self.scroll_top = 0;
         self.scroll_bottom = lines;
-        self.dirty = vec![true; lines];
+        self.dirty.clear();
+        self.dirty.resize(lines, true);
         // A resized frontend screen is rebuilt and needs the palette again.
         self.palette_dirty = true;
     }
@@ -2359,8 +2374,10 @@ impl Core {
             && *slot != color
         {
             *slot = color;
-            self.palette_dirty = true;
-            self.damage_all();
+            if !self.palette_dirty {
+                self.palette_dirty = true;
+                self.damage_all();
+            }
         }
     }
     pub(crate) fn dynamic_color_sequence(
@@ -2371,10 +2388,10 @@ impl Core {
     ) {
         let color = self.palette_color(index);
         self.write_reply(format_args!(
-            "\x1b]{prefix};rgb:{r:02x}{r:02x}/{g:02x}{g:02x}/{b:02x}{b:02x}{terminator}",
-            r = color.r,
-            g = color.g,
-            b = color.b,
+            "\x1b]{prefix};rgb:{r:04x}/{g:04x}/{b:04x}{terminator}",
+            r = u16::from_be_bytes([color.r; 2]),
+            g = u16::from_be_bytes([color.g; 2]),
+            b = u16::from_be_bytes([color.b; 2]),
         ));
     }
     pub(crate) fn clipboard_store(&mut self, primary: bool, data: &[u8]) {
@@ -2398,12 +2415,12 @@ impl Core {
     }
     pub(crate) fn push_title(&mut self) {
         if self.titles.len() < 4096 {
-            self.titles.push(self.title.clone());
+            self.titles.push(self.title.as_deref().map(Into::into));
         }
     }
     pub(crate) fn pop_title(&mut self) {
         if let Some(title) = self.titles.pop() {
-            self.set_title(title.map(Cow::Owned));
+            self.set_title(title.map(|title| Cow::Owned(title.into_string())));
         }
     }
     pub(crate) fn text_area_size_pixels(&mut self) {
@@ -2861,7 +2878,7 @@ impl Core {
         self.directory.as_deref()
     }
     pub(crate) fn set_directory_uri(&mut self, uri: &[u8]) {
-        use std::os::unix::ffi::OsStringExt;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
         let Some(uri) = uri.strip_prefix(b"file://") else {
             return;
         };
@@ -2882,8 +2899,21 @@ impl Core {
                 return;
             }
         }
-        let mut decoded = Vec::new();
-        let mut bytes = uri[slash..].iter().copied();
+        let path = &uri[slash..];
+        let escapes = memchr::memchr_iter(b'%', path).count();
+        if escapes == 0 {
+            if !path.contains(&0)
+                && self
+                    .directory
+                    .as_ref()
+                    .is_none_or(|directory| directory.as_os_str().as_bytes() != path)
+            {
+                self.directory = Some(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())));
+            }
+            return;
+        }
+        let mut decoded = Vec::with_capacity(path.len().saturating_sub(escapes * 2));
+        let mut bytes = path.iter().copied();
         while let Some(byte) = bytes.next() {
             let byte = if byte == b'%' {
                 let Some(high) = bytes.next().and_then(|b| (b as char).to_digit(16)) else {
@@ -2969,6 +2999,8 @@ impl Core {
                     end: None,
                     status: None,
                     incomplete: false,
+                    started: None,
+                    finished: None,
                 });
                 self.prompt_dirty = false;
                 self.next_block += 1;
@@ -2984,6 +3016,7 @@ impl Core {
                 if let Some(block) = self.blocks.back_mut()
                     && block.end.is_none()
                 {
+                    block.started.get_or_insert_with(std::time::Instant::now);
                     block.output = Some(point);
                     self.prompt_dirty = false;
                 }
@@ -2993,6 +3026,7 @@ impl Core {
                     && block.end.is_none()
                 {
                     block.end = Some(point);
+                    block.finished = Some(std::time::Instant::now());
                     block.status = status
                         .and_then(|s| std::str::from_utf8(s).ok())
                         .and_then(|s| s.parse().ok());
@@ -3052,8 +3086,7 @@ impl Core {
             |history| history.first,
         );
         self.blocks
-            .iter()
-            .skip(self.blocks.len().saturating_sub(4))
+            .range(self.blocks.len().saturating_sub(4)..)
             .map(|block| block.metadata(first))
             .collect()
     }

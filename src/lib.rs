@@ -15,6 +15,7 @@ mod worker;
 
 pub mod history;
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod monitor;
 
 pub mod screen;
@@ -34,6 +35,7 @@ mod bridge;
 
 mod clipboard_reader;
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod input;
 #[cfg(feature = "gui")]
 mod native;
@@ -46,10 +48,14 @@ pub use workspace_view::WorkspaceView;
 
 mod search;
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod file_panel;
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod panel;
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod ui;
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 mod context;
 
 pub mod agent;

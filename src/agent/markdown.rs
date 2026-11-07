@@ -1,4 +1,4 @@
-use pulldown_cmark::{Event, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, Event, Options, Parser, Tag, TagEnd};
 use std::fmt::Write;
 use std::ops::Range;
 
@@ -24,14 +24,14 @@ pub(crate) fn color(style: u8, foreground: u32) -> u32 {
 #[derive(Default)]
 pub(crate) struct Markdown {
     pub text: String,
-    spans: Vec<(Range<usize>, u8)>,
+    // Each span starts at the previous end.
+    spans: Vec<(usize, u8)>,
     prefix: Option<(usize, usize, usize)>,
 }
 
 impl Markdown {
     fn push(&mut self, text: &str, style: u8) {
-        let start = self.text.len();
-        let mut chars = text.chars();
+        let mut chars = text[crate::width::printable_ascii_prefix(text.as_bytes())..].chars();
         if let Some(control) = chars.find(|ch| ch.is_control() && *ch != '\n') {
             let prefix = text.len() - chars.as_str().len() - control.len_utf8();
             self.text.push_str(&text[..prefix]);
@@ -46,12 +46,12 @@ impl Markdown {
         } else {
             self.text.push_str(text);
         }
-        if let Some((range, previous)) = self.spans.last_mut()
+        if let Some((end, previous)) = self.spans.last_mut()
             && *previous == style
         {
-            range.end = self.text.len();
+            *end = self.text.len();
         } else if !text.is_empty() {
-            self.spans.push((start..self.text.len(), style));
+            self.spans.push((self.text.len(), style));
         }
     }
 
@@ -71,16 +71,14 @@ impl Markdown {
     }
 
     pub fn spans(&self, range: Range<usize>) -> impl Iterator<Item = (Range<usize>, u8)> + '_ {
-        let first = self
-            .spans
-            .partition_point(|(span, _)| span.end <= range.start);
+        let first = self.spans.partition_point(|(end, _)| *end <= range.start);
         self.spans[first..]
             .iter()
-            .take_while(move |(span, _)| span.start < range.end)
-            .filter_map(move |(span, style)| {
-                let start = range.start.max(span.start);
-                let end = range.end.min(span.end);
-                (start < end).then_some((start..end, *style))
+            .scan(range.start, move |start, &(end, style)| {
+                let from = *start;
+                *start = end;
+                let to = range.end.min(end);
+                (from < to).then_some((from..to, style))
             })
     }
 
@@ -97,6 +95,121 @@ impl Markdown {
             }
             self.push(part, style);
         }
+    }
+
+    fn table<'a>(
+        &mut self,
+        alignments: &[Alignment],
+        events: &mut impl Iterator<Item = (Event<'a>, Range<usize>)>,
+        quote_depth: usize,
+    ) {
+        let mut rows: Vec<Vec<Self>> = Vec::new();
+        let mut styles: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![0];
+        let mut links = Vec::new();
+        for (event, _) in events {
+            match event {
+                Event::End(TagEnd::Table) => break,
+                Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(Vec::new()),
+                Event::Start(Tag::TableCell) => {
+                    rows.last_mut().unwrap().push(Self::default());
+                    styles.truncate(1);
+                }
+                Event::End(TagEnd::TableHead | TagEnd::TableRow | TagEnd::TableCell) => (),
+                event => {
+                    let cell = rows.last_mut().unwrap().last_mut().unwrap();
+                    let style = *styles.last().unwrap();
+                    match event {
+                        Event::Start(tag) => {
+                            let next = match tag {
+                                Tag::Strong => style | BOLD,
+                                Tag::Emphasis => style | ITALIC,
+                                Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
+                                    links.push((cell.text.len(), dest_url));
+                                    style | LINK
+                                }
+                                _ => style,
+                            };
+                            styles.push(next);
+                        }
+                        Event::End(tag) => {
+                            styles.pop();
+                            if matches!(tag, TagEnd::Link | TagEnd::Image) {
+                                let (start, destination) = links.pop().unwrap();
+                                if cell.text[start..] != *destination {
+                                    cell.push(" (", LINK);
+                                    cell.push(&destination, LINK);
+                                    cell.push(")", LINK);
+                                }
+                            }
+                        }
+                        Event::Text(text) | Event::Html(text) | Event::InlineHtml(text) => {
+                            cell.push(&text, style);
+                        }
+                        Event::Code(text) => cell.push(&text, style | CODE),
+                        Event::SoftBreak | Event::HardBreak => cell.push(" ", style),
+                        _ => (),
+                    }
+                }
+            }
+        }
+        let widths: Vec<_> = (0..alignments.len())
+            .map(|column| {
+                let mut width = 1;
+                for row in &rows {
+                    width = width.max(crate::width::text_width(&row[column].text));
+                    if width >= 48 {
+                        return 48;
+                    }
+                }
+                width
+            })
+            .collect();
+        let spaces = " ".repeat(widths.iter().max().unwrap() + 1);
+        self.newline(2);
+        for (row_index, row) in rows.iter().enumerate() {
+            for _ in 0..quote_depth {
+                self.push("│ ", QUOTE);
+            }
+            self.push("│", QUOTE);
+            for (column, cell) in row.iter().enumerate() {
+                let padding = widths[column].saturating_sub(crate::width::text_width(&cell.text));
+                let left = match alignments[column] {
+                    Alignment::Right => padding,
+                    Alignment::Center => padding / 2,
+                    _ => 0,
+                };
+                self.push(&spaces[..left + 1], 0);
+                for (range, style) in cell.spans(0..cell.text.len()) {
+                    self.push(
+                        &cell.text[range],
+                        style | if row_index == 0 { BOLD } else { 0 },
+                    );
+                }
+                self.push(&spaces[..padding - left + 1], 0);
+                self.push("│", QUOTE);
+            }
+            self.push("\n", 0);
+            if row_index == 0 {
+                for _ in 0..quote_depth {
+                    self.push("│ ", QUOTE);
+                }
+                self.push("├", QUOTE);
+                let border = "─".repeat(spaces.len() + 1);
+                for (column, width) in widths.iter().enumerate() {
+                    self.push(&border[..(width + 2) * "─".len()], QUOTE);
+                    self.push(
+                        if column + 1 == widths.len() {
+                            "┤"
+                        } else {
+                            "┼"
+                        },
+                        QUOTE,
+                    );
+                }
+                self.push("\n", 0);
+            }
+        }
+        self.newline(2);
     }
 
     pub fn render(source: &str, previous: Option<(&str, &Self)>) -> Self {
@@ -118,21 +231,23 @@ impl Markdown {
                 prefix: None,
             };
             output.text.push_str(&previous.text[..text_end]);
-            if let Some((range, _)) = output.spans.last_mut() {
-                range.end = text_end;
+            if let Some((end, _)) = output.spans.last_mut() {
+                *end = text_end;
             }
             (output, source_end)
         } else {
             (Self::default(), 0)
         };
-        let mut styles = Vec::with_capacity(8);
-        styles.push(0);
+        let mut styles: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![0];
         let mut lists = Vec::new();
         let mut number_text = String::new();
         let mut links = Vec::new();
         let mut quote_depth = 0;
         let mut pending_prefix = None;
-        for (event, range) in Parser::new(&source[offset..]).into_offset_iter() {
+        let mut table_tail = false;
+        let mut events =
+            Parser::new_ext(&source[offset..], Options::ENABLE_TABLES).into_offset_iter();
+        while let Some((event, range)) = events.next() {
             if reusable && styles.len() == 1 && !matches!(&event, Event::End(_)) {
                 let start = offset + range.start;
                 let start = source[..start]
@@ -141,7 +256,8 @@ impl Markdown {
                 pending_prefix = Some((start, output.text.len(), output.spans.len()));
             }
             // An unfinished block marker can still merge into the preceding paragraph.
-            if matches!(&event, Event::Text(_) | Event::Code(_))
+            if !table_tail
+                && matches!(&event, Event::Text(_) | Event::Code(_))
                 && let Some(prefix) = pending_prefix.take()
             {
                 output.prefix = Some(prefix);
@@ -151,6 +267,13 @@ impl Markdown {
                 Event::Start(tag) => {
                     let mut next = style;
                     match tag {
+                        Tag::Table(alignments) => {
+                            // A partial following line can still become another table row.
+                            output.prefix = pending_prefix.take();
+                            table_tail = true;
+                            output.table(&alignments, &mut events, quote_depth);
+                            continue;
+                        }
                         Tag::Heading { .. } => {
                             output.newline(2);
                             next |= BOLD;
@@ -261,6 +384,10 @@ mod tests {
             "[old][ref]\n\nplain\n\n[ref]: https://example.com\n",
             "intro\n\n[old][ref]\n\n[ref]: https://example.com\n",
             "intro\n\n<div>\nhtml\n</div>\n\nlast\n",
+            "intro\n\n| Name | Size |\n| :--- | ---: |\n| 中 | `12` |\n| **long name** | 3 |\n\nafter\n",
+            "| A | B |\n| :-: | -: |\n| one | [link][ref] |\n| two | |\n\n[ref]: https://example.com\n",
+            "> | A | B |\n> | - | - |\n> | 中文 | value |\n\nafter\n",
+            "- first\n  - nested **bold**\n  - nested `code`\n- last\n\n3. third\n4. fourth\n",
         ];
         for source in sources.into_iter().flat_map(|source| {
             [
@@ -314,6 +441,56 @@ mod tests {
         );
         let code = document.text.find("  x").unwrap();
         assert_eq!(document.spans(code..code + 7).next().unwrap().1, CODE);
+    }
+
+    #[test]
+    fn tables_align_unicode_columns_and_preserve_inline_styles() {
+        let document = Markdown::render(
+            "| 名称 | 值 | 说明 |\n| :--- | ---: | :---: |\n| **中文** | `12` | *ok* |\n| x | 3 | wide |",
+            None,
+        );
+        assert_eq!(
+            document.text,
+            "│ 名称 │ 值 │ 说明 │\n├──────┼────┼──────┤\n│ 中文 │ 12 │  ok  │\n│ x    │  3 │ wide │"
+        );
+        let rows: Vec<_> = document.text.lines().collect();
+        assert!(rows.iter().all(|row| crate::width::text_width(row) == 20));
+        let start = document.text.find("中文").unwrap();
+        assert_eq!(
+            document
+                .spans(start..start + "中文".len())
+                .next()
+                .unwrap()
+                .1,
+            BOLD
+        );
+        let start = document.text.find("12").unwrap();
+        assert_eq!(document.spans(start..start + 2).next().unwrap().1, CODE);
+        let start = document.text.find("ok").unwrap();
+        assert_eq!(document.spans(start..start + 2).next().unwrap().1, ITALIC);
+    }
+
+    #[test]
+    fn long_table_cells_keep_text_without_padding_every_row_to_their_width() {
+        let long = "x".repeat(4096);
+        let document = Markdown::render(
+            &format!("| A | B |\n| - | - |\n| {long} | value |\n| short | value |"),
+            None,
+        );
+        assert!(document.text.contains(&long));
+        assert!(crate::width::text_width(document.text.lines().last().unwrap()) < 64);
+    }
+
+    #[test]
+    fn nested_lists_use_dots_and_keep_ordered_start_numbers() {
+        let document = Markdown::render(
+            "- first\n  - child\n  - **second**\n- last\n\n3. third\n4. fourth",
+            None,
+        );
+        assert_eq!(
+            document.text,
+            "• first\n  • child\n  • second\n• last\n\n3. third\n4. fourth"
+        );
     }
 
     #[test]

@@ -213,7 +213,7 @@ impl Frontend {
                     0
                 }
             }
-            AgentLine::Blank => return None,
+            AgentLine::Blank | AgentLine::Edit(_) => return None,
         };
         session.point(
             line,
@@ -266,7 +266,7 @@ impl Frontend {
         Ok(())
     }
 
-    pub(super) fn draw_agent(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+    pub(super) fn draw_agent(&mut self, output: &mut Vec<u8>) -> io::Result<Option<(u16, u16)>> {
         let side = self.agent_rect();
         let panel = crate::agent::panel::draw(
             &mut self.ui,
@@ -276,7 +276,10 @@ impl Frontend {
             self.pointer,
             "",
         )?;
-        let previous = if self.full {
+        if let Some(backdrop) = &panel.backdrop {
+            backdrop.ansi(output, None, &self.damage)?;
+        }
+        let previous = if self.full || panel.backdrop.is_some() {
             None
         } else {
             self.agent.frame.as_ref()
@@ -286,6 +289,6 @@ impl Frontend {
         self.agent.chat = panel.chat;
         self.agent.first = panel.first;
         self.ui.agent.spare_grid = self.agent.frame.replace(panel.grid);
-        Ok(())
+        Ok(panel.cursor)
     }
 }

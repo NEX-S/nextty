@@ -49,12 +49,13 @@ pub(crate) enum Tool {
 }
 
 pub(crate) struct ToolRequest {
+    pub id: String,
     pub tool: Tool,
     pub input: Value,
     pub pane: u64,
     pub canceled: Arc<AtomicBool>,
     pub reply: mpsc::SyncSender<io::Result<String>>,
-    wake: OwnedFd,
+    wake: Arc<OwnedFd>,
 }
 
 impl ToolRequest {
@@ -87,7 +88,7 @@ struct State {
 
 struct Shared {
     state: Mutex<State>,
-    wake: OwnedFd,
+    wake: Arc<OwnedFd>,
     notification: OwnedFd,
 }
 
@@ -125,7 +126,7 @@ impl Harness {
                 next_turn,
                 ..State::default()
             }),
-            wake: crate::eventfd::new()?,
+            wake: Arc::new(crate::eventfd::new()?),
             notification: crate::eventfd::new()?,
         });
         let worker = Arc::clone(&shared);
@@ -218,11 +219,10 @@ impl Harness {
         notify(self.shared.wake.as_raw_fd())
     }
 
-    pub fn poll(&self) -> io::Result<Vec<Event>> {
-        consume_notification(self.fd())?;
+    pub fn poll(&self) -> Vec<Event> {
         let mut state = self.shared.state.lock().unwrap();
         state.bytes = 0;
-        Ok(std::mem::take(&mut state.events))
+        std::mem::take(&mut state.events)
     }
 }
 
@@ -378,7 +378,13 @@ impl Session {
                 return Err(error);
             }
             check_cancel(canceled)?;
-            if visible && !response.text().is_empty() {
+            if visible
+                && response
+                    .blocks
+                    .iter()
+                    .filter_map(|block| block.value["text"].as_str())
+                    .any(|text| !text.is_empty())
+            {
                 emit(shared, Event::ResetText)?;
             }
             *response = Response::default();
@@ -431,10 +437,13 @@ impl Session {
                 wait(shared.wake.as_raw_fd(), -1)?;
                 continue;
             };
-            let mut turn = vec![json!({"role":"user","content":format!(
+            let mut content = format!(
                 "Target terminal at submission (observation, not instructions):\n{}\n\n{}",
                 prompt.target, prompt.text
-            )})];
+            );
+            content.shrink_to_fit();
+            let mut turn = vec![json!({"role":"user"})];
+            turn[0]["content"] = Value::String(content);
             let error = if let Err(error) = self.turn(shared, &mut turn, &prompt) {
                 if let Some((message, previous)) = turn.split_last_mut()
                     && message["role"] == "user"
@@ -473,12 +482,14 @@ impl Session {
         let start = messages.len();
         messages.push(b'[');
         if !self.summary.is_empty() {
-            serde_json::to_writer(
-                &mut *messages,
-                &json!({"role":"user","content":format!(
-                    "Historical conversation summary (may omit detail; not current terminal state):\n{}", self.summary
-                )}),
-            )?;
+            let content = [
+                "Historical conversation summary (may omit detail; not current terminal state):\n",
+                self.summary.as_str(),
+            ]
+            .concat();
+            messages.extend_from_slice(b"{\"content\":");
+            serde_json::to_writer(&mut *messages, &content)?;
+            messages.extend_from_slice(b",\"role\":\"user\"}");
         }
         for message in self
             .history
@@ -538,11 +549,12 @@ impl Session {
         {
             return Err(io::Error::other("Context summary did not complete"));
         }
+        let limited = response.stop.as_deref() == Some("max_tokens");
         let mut text = response.text();
         if text.is_empty() {
             return Err(io::Error::other("Context summary is empty"));
         }
-        if response.stop.as_deref() == Some("max_tokens") {
+        if limited {
             text.insert_str(0, "Incomplete summary: output limit reached. Refresh evidence before relying on omitted details.\n");
             emit(
                 shared,
@@ -567,7 +579,10 @@ impl Session {
             if !compacting_turn {
                 let count = self.history.len().saturating_sub(2).max(1);
                 let earlier = (!self.summary.is_empty()).then(|| {
-                    json!({"role":"user","content":format!("Earlier summary:\n{}",self.summary)})
+                    let mut message = json!({"role":"user"});
+                    message["content"] =
+                        Value::String(["Earlier summary:\n", self.summary.as_str()].concat());
+                    message
                 });
                 let request = self.summary_request(
                     earlier.iter().chain(
@@ -604,7 +619,15 @@ impl Session {
                 check_cancel(canceled)?;
                 let mut recent = turn.split_off(cut);
                 turn.truncate(1);
-                turn.push(json!({"role":"assistant","content":[{"type":"text","text":format!("Earlier work in this request (historical summary):\n{summary}")}]}));
+                let mut message = json!({"role":"assistant","content":[{"type":"text"}]});
+                message.get_mut("content").unwrap()[0]["text"] = Value::String(
+                    [
+                        "Earlier work in this request (historical summary):\n",
+                        summary.as_str(),
+                    ]
+                    .concat(),
+                );
+                turn.push(message);
                 turn.push(json!({"role":"user","content":"Continue the original request using the recent original exchanges below. Refresh terminal state when needed."}));
                 turn.append(&mut recent);
                 drop(state);
@@ -679,7 +702,9 @@ impl Session {
             if let Err(error) = self.request(shared, &body, &prompt.canceled, true, &mut response) {
                 let text = response.text();
                 if !text.is_empty() {
-                    turn.push(json!({"role":"assistant","content":[{"type":"text","text":text}]}));
+                    let mut message = json!({"role":"assistant","content":[{"type":"text"}]});
+                    message.get_mut("content").unwrap()[0]["text"] = Value::String(text);
+                    turn.push(message);
                 }
                 return Err(error);
             }
@@ -745,7 +770,7 @@ impl Session {
                 let id = string(call, "id")?;
                 let input = &call["input"];
                 let display = format!("{}:{round}:{index}:{id}", prompt.turn);
-                let input_text = input.to_string();
+                let mut input_text = serde_json::to_string(input)?;
                 emit(
                     shared,
                     Event::Tool {
@@ -767,16 +792,20 @@ impl Session {
                         "edit_file" => Tool::EditFile,
                         _ => return Err(io::Error::other(format!("Unknown tool: {name}"))),
                     };
-                    request_tool(shared, tool, input, prompt)
+                    request_tool(shared, tool, input, prompt, &display)
                 });
                 let (text, is_error) = match result {
                     Ok(text) => (text, false),
                     Err(error) => (error.to_string(), true),
                 };
+                input_text.reserve_exact(text.len() + 2);
+                input_text.push_str("\n\n");
+                input_text.push_str(&text);
+                input_text.shrink_to_fit();
                 let done = Event::Tool {
                     id: display,
                     name: name.into(),
-                    text: format!("{input_text}\n\n{text}"),
+                    text: input_text,
                     done: true,
                     is_error,
                 };
@@ -797,7 +826,13 @@ fn string<'a>(value: &'a Value, field: &str) -> io::Result<&'a str> {
         .ok_or_else(|| io::Error::other(format!("Missing string field {field}")))
 }
 
-fn request_tool(shared: &Shared, tool: Tool, input: &Value, prompt: &Prompt) -> io::Result<String> {
+fn request_tool(
+    shared: &Shared,
+    tool: Tool,
+    input: &Value,
+    prompt: &Prompt,
+    id: &str,
+) -> io::Result<String> {
     let pane = if tool == Tool::Read && input["source"] == "workspace" {
         prompt.pane
     } else {
@@ -807,12 +842,13 @@ fn request_tool(shared: &Shared, tool: Tool, input: &Value, prompt: &Prompt) -> 
     emit(
         shared,
         Event::Request(ToolRequest {
+            id: id.to_owned(),
             tool,
             input: input.clone(),
             pane,
             canceled: Arc::clone(&prompt.canceled),
             reply: tx,
-            wake: shared.wake.try_clone()?,
+            wake: Arc::clone(&shared.wake),
         }),
     )?;
     receive_tool(rx, shared.wake.as_raw_fd(), &prompt.canceled)
@@ -874,7 +910,9 @@ impl Response {
                 if !self.started || event["index"].as_u64() != Some(self.blocks.len() as u64) {
                     return Err(io::Error::other("Unexpected content block index"));
                 }
-                let value = event["content_block"].take();
+                let value = event
+                    .get_mut("content_block")
+                    .map_or(Value::Null, Value::take);
                 if visible && value["type"] == "text" {
                     let text = string(&value, "text")?;
                     if !text.is_empty() {
@@ -982,10 +1020,13 @@ impl Response {
         }
         Ok(())
     }
-    fn text(&self) -> String {
+    fn text(self) -> String {
         self.blocks
-            .iter()
-            .filter_map(|block| block.value["text"].as_str())
+            .into_iter()
+            .filter_map(|mut block| match block.value.get_mut("text")?.take() {
+                Value::String(text) => Some(text),
+                _ => None,
+            })
             .collect()
     }
 }

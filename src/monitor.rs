@@ -1,6 +1,7 @@
 use crate::input::keysym;
 use crate::system_stats::{Process, ResourceTrend, SystemStats};
 use crate::width::{fit_label, scalar_width, text_width};
+use crate::workspace::{PaneId, Snapshot};
 use std::{borrow::Cow, io};
 
 #[cfg(feature = "tui")]
@@ -16,14 +17,14 @@ pub(crate) fn series_color(name: &str) -> u32 {
     }
 }
 
-fn trend_value(value: Option<f32>, unit: &str) -> String {
+fn trend_value(value: Option<f32>, unit: &str) -> Cow<'static, str> {
     value.map_or_else(
         || "—".into(),
         |v| {
             if unit == "MiB/s" && v < 1. {
-                format!("{:.0}KiB/s", v * 1024.)
+                format!("{:.0}KiB/s", v * 1024.).into()
             } else {
-                format!("{v:.1}{unit}")
+                format!("{v:.1}{unit}").into()
             }
         },
     )
@@ -37,6 +38,7 @@ pub(crate) enum Action {
     Sort(u8),
     Search,
     Process(u32),
+    Task(PaneId),
 }
 
 pub(crate) struct Text {
@@ -105,12 +107,15 @@ impl View {
         })
     }
     fn button(&mut self, x: u16, y: i32, width: u16, text: &str, action: Action, selected: bool) {
-        let width = if matches!(action, Action::Process(_) | Action::Search | Action::Tab(_)) {
+        let width = if matches!(
+            action,
+            Action::Process(_) | Action::Task(_) | Action::Search | Action::Tab(_)
+        ) {
             width
         } else {
             width.min(text_width(text) as u16 + 2)
         };
-        let label = format!(" {} ", fit_label(text, width.saturating_sub(2)));
+        let label = [" ", fit_label(text, width.saturating_sub(2)).as_ref(), " "].concat();
         let text = self.text(x, y, width, label, if selected { GREEN } else { MUTED });
         if selected {
             text.emphasis = Emphasis::Highlighted;
@@ -128,22 +133,30 @@ impl View {
         }
         let mut line = String::new();
         let mut columns = 0;
-        for ch in text.chars() {
+        let mut start = 0;
+        for (index, ch) in text.char_indices() {
             if ch.is_control() && ch != '\n' {
+                if index > start {
+                    line.push_str(&text[start..index]);
+                }
+                start = index + ch.len_utf8();
                 continue;
             }
             let advance = u16::from(scalar_width(ch).min(2));
-            if ch == '\n' || columns + advance > width && !line.is_empty() {
+            if ch == '\n' || columns + advance > width && (index > start || !line.is_empty()) {
+                line.push_str(&text[start..index]);
                 self.text(x, y, width, std::mem::take(&mut line), color);
                 y += 1;
                 columns = 0;
+                start = index;
                 if ch == '\n' {
+                    start += 1;
                     continue;
                 }
             }
-            line.push(ch);
             columns += advance;
         }
+        line.push_str(&text[start..]);
         if !line.is_empty() {
             self.text(x, y, width, line, color);
             y += 1;
@@ -175,8 +188,22 @@ impl View {
     }
 }
 
+struct Task {
+    pane: PaneId,
+    tab: String,
+    command: String,
+    directory: String,
+    state: &'static str,
+    exit: Option<i32>,
+    command_id: Option<u64>,
+    elapsed_ms: Option<u64>,
+    sampled: std::time::Instant,
+}
+
 pub(crate) struct Monitor {
     pub stats: SystemStats,
+    pub jump: Option<PaneId>,
+    tasks: Vec<Task>,
     pub open: bool,
     pub height: u16,
     pub focus: Action,
@@ -202,6 +229,8 @@ impl Monitor {
     pub fn new() -> io::Result<Self> {
         Ok(Self {
             stats: SystemStats::new()?,
+            jump: None,
+            tasks: Vec::new(),
             open: false,
             height: 18,
             focus: Action::Tab(0),
@@ -224,6 +253,109 @@ impl Monitor {
             width: 80,
         })
     }
+    pub fn set_workspace(&mut self, snapshot: &Snapshot) {
+        use std::fmt::Write;
+        self.tasks
+            .reserve_exact(snapshot.panes.len().saturating_sub(self.tasks.len()));
+        for (index, pane) in snapshot.panes.iter().enumerate() {
+            let command = pane
+                .command_blocks
+                .iter()
+                .rev()
+                .find(|block| block.has_output || block.status.is_some());
+            let command_id = command.map(|block| block.id);
+            let elapsed_ms = command.and_then(|block| block.elapsed_ms);
+            let running = command.is_some_and(|block| !block.complete && block.status.is_none())
+                && pane.shell_prompt.is_none();
+            let state = match command {
+                Some(block) if block.status.is_some_and(|status| status != 0) => "Failed",
+                Some(block) if block.status == Some(0) => "Completed",
+                _ if running => "Running",
+                _ if pane.shell_prompt.is_some() => "Idle",
+                _ => "Unknown",
+            };
+            if self
+                .tasks
+                .get(index)
+                .is_none_or(|task| task.pane != pane.id)
+            {
+                if let Some(offset) = self.tasks[index..]
+                    .iter()
+                    .position(|task| task.pane == pane.id)
+                {
+                    self.tasks.swap(index, index + offset);
+                } else {
+                    if self.tasks.len() > index {
+                        self.tasks
+                            .retain(|task| snapshot.panes.iter().any(|pane| pane.id == task.pane));
+                    }
+                    let last = self.tasks.len();
+                    self.tasks.push(Task {
+                        pane: pane.id,
+                        tab: String::new(),
+                        command: String::new(),
+                        directory: String::new(),
+                        state,
+                        exit: command.and_then(|block| block.status),
+                        command_id,
+                        elapsed_ms,
+                        sampled: std::time::Instant::now(),
+                    });
+                    self.tasks.swap(index, last);
+                }
+            }
+            let task = &mut self.tasks[index];
+            let reset_sample = task.command_id != command_id || task.elapsed_ms != elapsed_ms;
+            task.tab.clear();
+            if let Some(view) = snapshot.tabs.iter().find(|tab| tab.id == pane.tab) {
+                task.tab.push_str(&view.title);
+            } else {
+                write!(task.tab, "{}", pane.tab).unwrap();
+            }
+            task.command.clear();
+            if let Some(args) = pane
+                .process
+                .foreground_argv
+                .as_ref()
+                .filter(|_| running || command.is_none())
+            {
+                task.command.reserve(
+                    args.iter().map(String::len).sum::<usize>() + args.len().saturating_sub(1),
+                );
+                for (index, arg) in args.iter().enumerate() {
+                    if index > 0 {
+                        task.command.push(' ');
+                    }
+                    task.command.push_str(arg);
+                }
+            } else if let Some(block) = command {
+                write!(task.command, "Command #{}", block.id).unwrap();
+            } else {
+                task.command.push_str(&pane.title);
+            }
+            match pane.cwd.as_deref().map_or_else(
+                || Cow::Borrowed("unavailable"),
+                std::path::Path::to_string_lossy,
+            ) {
+                Cow::Borrowed(text) => text.clone_into(&mut task.directory),
+                Cow::Owned(text) => task.directory = text,
+            }
+            task.state = state;
+            task.exit = command.and_then(|block| block.status);
+            task.command_id = command_id;
+            task.elapsed_ms = elapsed_ms;
+            if reset_sample {
+                task.sampled = std::time::Instant::now();
+            }
+        }
+        self.tasks.truncate(snapshot.panes.len());
+        self.tasks.shrink_to_fit();
+        if matches!(self.focus, Action::Task(pane) if !self.tasks.iter().any(|task| task.pane == pane))
+        {
+            self.focus = Action::Tab(7);
+        }
+    }
+
     pub fn footer(&self, width: u16, controller: bool, remote: bool) -> View {
         let mut view = View::default();
         let arrow = width.saturating_sub(4);
@@ -231,7 +363,7 @@ impl Monitor {
             arrow,
             0,
             3,
-            if self.open { "" } else { "" },
+            crate::panel::expand_icon(self.open),
             if self.open {
                 Action::Close
             } else {
@@ -327,6 +459,10 @@ impl Monitor {
         self.selecting_control = false;
         self.reveal = true;
         match action {
+            Action::Task(pane) => {
+                self.jump = Some(pane);
+                self.open = false;
+            }
             Action::Close => {
                 self.open = false;
                 self.pointer = None;
@@ -351,11 +487,11 @@ impl Monitor {
                 self.selected = if self.selected.is_some_and(|selected| selected.0 == pid) {
                     None
                 } else {
-                    self.stats
-                        .processes()
-                        .iter()
-                        .find(|p| p.pid == pid)
-                        .map(|p| (p.pid, p.start))
+                    let processes = self.stats.processes();
+                    processes
+                        .binary_search_by_key(&pid, |p| p.pid)
+                        .ok()
+                        .map(|index| (pid, processes[index].start))
                 };
             }
         }
@@ -389,7 +525,6 @@ impl Monitor {
         let query = self.query.to_lowercase();
         let ascii_query = query.is_ascii();
         let numeric = query.bytes().all(|byte| byte.is_ascii_digit());
-        let mut number = String::new();
         self.process_order.clear();
         self.process_order.extend(
             processes
@@ -407,7 +542,7 @@ impl Monitor {
                         } else {
                             p.name.to_lowercase().contains(&query)
                         }
-                        || numeric && matches_process_number(p, &query, &mut number)
+                        || numeric && matches_process_number(p, &query)
                 })
                 .map(|(index, _)| index),
         );
@@ -435,8 +570,8 @@ impl Monitor {
             .iter()
             .map(|&index| &self.stats.processes()[index])
     }
-    fn controls(&mut self) -> Vec<Action> {
-        let mut controls: Vec<_> = (0..7).map(Action::Tab).collect();
+    fn controls(&mut self) -> smallvec::SmallVec<[Action; 17]> {
+        let mut controls: smallvec::SmallVec<_> = (0..8).map(Action::Tab).collect();
         if self.width >= 24 {
             controls.extend([60, 300, 900, 3600].map(Action::Range));
         }
@@ -468,6 +603,15 @@ impl Monitor {
                 controls.push(Action::Process(pid));
             }
         }
+        if self.tab == 7 {
+            let pane = match self.focus {
+                Action::Task(pane) => Some(pane),
+                _ => self.tasks.first().map(|task| task.pane),
+            };
+            if let Some(pane) = pane {
+                controls.push(Action::Task(pane));
+            }
+        }
         controls
     }
     fn cycle(&mut self, backwards: bool) {
@@ -489,7 +633,7 @@ impl Monitor {
     fn move_process(&mut self, delta: isize) {
         self.rebuild_processes();
         let pid = {
-            let mut rows = self.processes();
+            let rows = self.processes();
             let current = if let Action::Process(pid) = self.focus {
                 rows.clone().position(|p| p.pid == pid).unwrap_or(0)
             } else {
@@ -498,7 +642,10 @@ impl Monitor {
             let index = current
                 .saturating_add_signed(delta)
                 .min(rows.len().saturating_sub(1));
-            rows.nth(index).map(|p| (p.pid, p.start))
+            self.process_order.get(index).map(|&index| {
+                let process = &self.stats.processes()[index];
+                (process.pid, process.start)
+            })
         };
         if let Some((pid, start)) = pid {
             self.focus = Action::Process(pid);
@@ -592,13 +739,21 @@ impl Monitor {
                 match self.focus {
                     Action::Tab(tab) if delta.abs() == 1 => {
                         let tab = if delta > 0 {
-                            (tab + 1) % 7
+                            (tab + 1) % 8
                         } else {
-                            (tab + 6) % 7
+                            (tab + 7) % 8
                         };
                         self.action(Action::Tab(tab));
                     }
                     Action::Process(_) => self.move_process(delta),
+                    Action::Task(pane) => {
+                        if let Some(index) = self.tasks.iter().position(|task| task.pane == pane) {
+                            let index =
+                                index.saturating_add_signed(delta).min(self.tasks.len() - 1);
+                            self.focus = Action::Task(self.tasks[index].pane);
+                            self.reveal = true;
+                        }
+                    }
                     _ => self.scroll = self.scroll.saturating_add_signed(delta),
                 }
             }
@@ -637,13 +792,14 @@ impl Monitor {
         y: i32,
         width: u16,
         height: u16,
-        series: Vec<ResourceTrend>,
+        mut series: Vec<ResourceTrend>,
     ) {
         if width < 10 || series.is_empty() {
             return;
         }
         let first = &series[0];
         let maximum = series.iter().map(|s| s.maximum).fold(0., f32::max);
+        let unit = first.unit;
         let title = match (series.len(), first.name) {
             (2, "RX") => first.summary.split('·').next().unwrap().trim(),
             (2, "READ") => "DISK I/O",
@@ -661,7 +817,13 @@ impl Monitor {
                 value,
                 series_color(first.name),
             );
-            view.text(x, y + 1, width, &first.summary, MUTED);
+            view.text(
+                x,
+                y + 1,
+                width,
+                std::mem::take(&mut series[0].summary),
+                MUTED,
+            );
         } else {
             view.text(x, y, width, title, INK);
             let columns = width / series.len() as u16;
@@ -670,12 +832,17 @@ impl Monitor {
                     x + i as u16 * columns,
                     y + 1,
                     columns,
-                    format!("{} {}", trend.name, trend_value(trend.value, trend.unit)),
+                    [
+                        trend.name,
+                        " ",
+                        trend_value(trend.value, trend.unit).as_ref(),
+                    ]
+                    .concat(),
                     series_color(trend.name),
                 );
             }
         }
-        let scale = if first.unit == "%" {
+        let scale = if unit == "%" {
             format!("{maximum:.0}%")
         } else if maximum < 1. {
             format!("{:.0}K", maximum * 1024.)
@@ -780,12 +947,16 @@ impl Monitor {
                 "Network",
                 "Swap",
                 "Processes",
+                "Tasks",
             ]
         } else {
-            ["System", "CPU", "Mem", "Disk", "Net", "Swap", "Tasks"]
+            [
+                "System", "CPU", "Mem", "Disk", "Net", "Swap", "Procs", "Tasks",
+            ]
         };
         let spacing = if height >= 13 { 2 } else { 1 };
-        let first = usize::from(self.tab).saturating_sub(usize::from(height.saturating_sub(1)));
+        let first =
+            usize::from(self.tab).saturating_sub(usize::from(height.saturating_sub(1) / spacing));
         for (i, label) in labels.into_iter().enumerate().skip(first) {
             let y = (i - first) as u16 * spacing;
             if y < height {
@@ -803,6 +974,7 @@ impl Monitor {
             }
         }
         let mut body = View::default();
+        let mut cpu_rows = None;
         match self.tab {
             0 => {
                 let mut trends = self.stats.system_trends(self.range, 0..5).into_iter();
@@ -850,44 +1022,13 @@ impl Monitor {
                     7
                 };
                 let columns = (w / 24).clamp(1, 4);
-                let cw = w / columns;
-                let mut bottom = y;
-                for (i, (name, value)) in self.stats.cpu_cores().iter().enumerate() {
-                    let column = x + (i as u16 % columns) * cw;
-                    let row = y + 1 + i as i32 / i32::from(columns);
-                    bottom = row + 2;
-                    let bar_width = cw.saturating_sub(13).min(20);
-                    let filled =
-                        value.map_or(0, |v| (v * f32::from(bar_width) / 100.).round() as u16);
-                    body.text(
-                        column,
-                        row,
-                        11.min(cw),
-                        format!(
-                            "{name:<6} {:>4}",
-                            value.map_or_else(|| "—".into(), |v| format!("{v:.0}%"))
-                        ),
-                        INK,
-                    );
-                    if bar_width > 0 {
-                        body.text(
-                            column + 12,
-                            row,
-                            bar_width,
-                            "─".repeat(usize::from(bar_width)),
-                            0x46524a,
-                        );
-                        if filled > 0 {
-                            body.text(
-                                column + 12,
-                                row,
-                                filled,
-                                "━".repeat(usize::from(filled)),
-                                GREEN,
-                            );
-                        }
-                    }
-                }
+                let count = self.stats.cpu_cores().len();
+                let bottom = if count == 0 {
+                    y
+                } else {
+                    y + 3 + (count - 1) as i32 / i32::from(columns)
+                };
+                cpu_rows = Some((y, if count == 0 { 0 } else { bottom - 1 }));
                 if graph_width == w {
                     body.details(x, bottom, w, self.stats.cpu_details());
                 }
@@ -939,11 +1080,13 @@ impl Monitor {
                         [
                             (
                                 "Read",
-                                trend_value(disk.rates[0].map(|v| (v / 1048576.) as f32), "MiB/s"),
+                                trend_value(disk.rates[0].map(|v| (v / 1048576.) as f32), "MiB/s")
+                                    .into_owned(),
                             ),
                             (
                                 "Write",
-                                trend_value(disk.rates[1].map(|v| (v / 1048576.) as f32), "MiB/s"),
+                                trend_value(disk.rates[1].map(|v| (v / 1048576.) as f32), "MiB/s")
+                                    .into_owned(),
                             ),
                             (
                                 "Busy",
@@ -968,14 +1111,17 @@ impl Monitor {
                 let graph_width = if w >= 72 { w * 3 / 5 } else { w };
                 let mut y = 0;
                 for network in self.stats.networks() {
-                    self.graph(
-                        &mut body,
-                        x,
-                        y,
-                        graph_width,
-                        graph_height,
-                        self.stats.network_trends(self.range, network),
-                    );
+                    // Scroll clamping can only move the viewport upward.
+                    if y < self.scroll as i32 + i32::from(height) {
+                        self.graph(
+                            &mut body,
+                            x,
+                            y,
+                            graph_width,
+                            graph_height,
+                            self.stats.network_trends(self.range, network),
+                        );
+                    }
                     let details = network.details();
                     let end = if graph_width < w {
                         body.details(x + graph_width + 3, y, w - graph_width - 3, details)
@@ -1005,15 +1151,36 @@ impl Monitor {
                 }
             }
             6 => self.process_view(&mut body, x, w),
+            7 => {
+                body.text(x, 0, w, "Terminal tasks · Enter jumps to pane", INK);
+                body.text(x, 1, w, "Latest observed command per pane", MUTED);
+                if self.tasks.is_empty() {
+                    body.text(x, 3, w, "No terminal panes", MUTED);
+                }
+                body.hits
+                    .extend(self.tasks.iter().enumerate().map(|(index, task)| Hit {
+                        x,
+                        y: 3 + index as i32 * 4,
+                        width: w,
+                        action: Action::Task(task.pane),
+                    }));
+            }
             _ => unreachable!(),
         }
         let content_height = body
             .texts
             .iter()
             .map(|t| t.y + 1)
-            .chain(body.hits.iter().map(|hit| hit.y + 1))
+            .chain(body.hits.iter().map(|hit| {
+                hit.y
+                    + if matches!(hit.action, Action::Task(_)) {
+                        3
+                    } else {
+                        1
+                    }
+            }))
             .chain(body.plots.iter().map(|p| p.y + i32::from(p.height)))
-            .fold(0, i32::max);
+            .fold(cpu_rows.map_or(0, |(_, bottom)| bottom), i32::max);
         if let Action::Process(pid) = self.focus
             && !body.hits.iter().any(|hit| hit.action == self.focus)
         {
@@ -1067,6 +1234,9 @@ impl Monitor {
             }
         }
         for mut hit in body.hits {
+            if matches!(hit.action, Action::Task(_)) {
+                continue;
+            }
             let fixed = hit.y < pinned;
             if !fixed {
                 hit.y += offset;
@@ -1074,6 +1244,12 @@ impl Monitor {
             if hit.y >= if fixed { 0 } else { pinned } && hit.y < i32::from(height) {
                 view.hits.push(hit);
             }
+        }
+        if let Some((y, _)) = cpu_rows {
+            self.cpu_view(&mut view, x, w, height, y);
+        }
+        if self.tab == 7 {
+            self.task_view(&mut view, x, w, height);
         }
         if self.scroll > 0 {
             view.text(width - 1, pinned, 1, "↑", MUTED);
@@ -1093,6 +1269,7 @@ impl Monitor {
         if self.tab == 6 {
             let (columns, count) = process_columns(w, self.sort);
             let columns = &columns[..count];
+            let mut number = String::new();
             for hit in &view.hits {
                 if let Action::Process(pid) = hit.action {
                     let processes = self.stats.processes();
@@ -1103,7 +1280,7 @@ impl Monitor {
                         x: hit.x,
                         y: hit.y,
                         width: hit.width,
-                        text: process_row(process, w, columns),
+                        text: process_row(process, w, columns, &mut number),
                         color: if selected { GREEN } else { INK },
                         emphasis: if selected {
                             Emphasis::Selected
@@ -1144,6 +1321,113 @@ impl Monitor {
         }
         view
     }
+    fn cpu_view(&self, body: &mut View, x: u16, width: u16, height: u16, y: i32) {
+        let columns = (width / 24).clamp(1, 4);
+        let cw = width / columns;
+        for (i, (name, value)) in self
+            .stats
+            .cpu_cores()
+            .iter()
+            .enumerate()
+            .skip(self.scroll.saturating_sub((y + 1) as usize) * usize::from(columns))
+        {
+            let column = x + (i as u16 % columns) * cw;
+            let row = y + 1 + i as i32 / i32::from(columns) - self.scroll as i32;
+            if row >= i32::from(height) {
+                break;
+            }
+            let bar_width = cw.saturating_sub(13).min(20);
+            let filled = value.map_or(0, |v| (v * f32::from(bar_width) / 100.).round() as u16);
+            body.text(
+                column,
+                row,
+                11.min(cw),
+                match value {
+                    Some(value) => format!("{name:<6} {value:>3.0}%"),
+                    None => format!("{name:<6}    —"),
+                },
+                INK,
+            );
+            if bar_width > 0 {
+                body.text(
+                    column + 12,
+                    row,
+                    bar_width,
+                    "─".repeat(usize::from(bar_width)),
+                    0x46524a,
+                );
+                if filled > 0 {
+                    body.text(
+                        column + 12,
+                        row,
+                        filled,
+                        "━".repeat(usize::from(filled)),
+                        GREEN,
+                    );
+                }
+            }
+        }
+    }
+    fn task_view(&self, body: &mut View, x: u16, width: u16, height: u16) {
+        for (index, task) in self
+            .tasks
+            .iter()
+            .enumerate()
+            .skip(self.scroll.saturating_sub(2) / 4)
+        {
+            let y = 3 + index as i32 * 4 - self.scroll as i32;
+            if y >= i32::from(height) {
+                break;
+            }
+            if y >= 0 {
+                body.button(
+                    x,
+                    y,
+                    width,
+                    &format!("{} · {}", task.state, task.command),
+                    Action::Task(task.pane),
+                    self.focus == Action::Task(task.pane),
+                );
+            }
+            if (0..i32::from(height)).contains(&(y + 1)) {
+                body.text(
+                    x + 1,
+                    y + 1,
+                    width.saturating_sub(1),
+                    format!(
+                        "Tab {} · Pane {} · exit {} · {}",
+                        task.tab,
+                        task.pane,
+                        task.exit
+                            .map_or_else(|| "—".into(), |status| status.to_string()),
+                        task.elapsed_ms.map_or_else(
+                            || "elapsed —".into(),
+                            |elapsed| {
+                                let elapsed = elapsed
+                                    + if task.state == "Running" {
+                                        task.sampled.elapsed().as_millis() as u64
+                                    } else {
+                                        0
+                                    };
+                                format!("{:.1}s", elapsed as f64 / 1000.0)
+                            }
+                        )
+                    ),
+                    MUTED,
+                );
+            }
+            if (0..i32::from(height)).contains(&(y + 2)) {
+                body.text(
+                    x + 1,
+                    y + 2,
+                    width.saturating_sub(1),
+                    &task.directory,
+                    MUTED,
+                );
+            }
+        }
+    }
+
     fn process_view(&self, body: &mut View, x: u16, width: u16) {
         let filter = if self.searching {
             let before = &self.query[..self.cursor];
@@ -1230,25 +1514,39 @@ impl Monitor {
                     x + 1,
                     y,
                     width.saturating_sub(2),
-                    &format!(
-                        "PID {} · PPID {} · UID {} · {} · {} threads",
-                        p.pid, p.parent, p.uid, p.state, p.threads
-                    ),
+                    &format!("Selected process · {}", p.name),
                     GREEN,
                 );
-                y = body.lines(x + 1, y, width.saturating_sub(2), &p.command, INK);
-                y = body.lines(
+                y = body.details(
                     x + 1,
                     y,
                     width.saturating_sub(2),
-                    &format!(
-                        "cwd {}",
-                        p.directory.as_deref().map_or(
-                            Cow::Borrowed("unavailable"),
-                            std::path::Path::to_string_lossy
-                        )
-                    ),
-                    MUTED,
+                    [
+                        (
+                            "CPU / RSS",
+                            format!(
+                                "{} / {:.1} MiB",
+                                p.cpu.map_or_else(|| "—".into(), |cpu| format!("{cpu:.1}%")),
+                                p.rss as f64 / 1048576.
+                            ),
+                        ),
+                        (
+                            "PID / parent / user",
+                            format!("{} / {} / {}", p.pid, p.parent, p.uid),
+                        ),
+                        ("State / threads", format!("{} / {}", p.state, p.threads)),
+                        (
+                            "Directory",
+                            p.directory
+                                .as_deref()
+                                .map_or(
+                                    Cow::Borrowed("unavailable"),
+                                    std::path::Path::to_string_lossy,
+                                )
+                                .into_owned(),
+                        ),
+                        ("Command", p.command.to_string()),
+                    ],
                 );
                 if !show_io {
                     y = body.lines(
@@ -1288,27 +1586,48 @@ fn process_columns(width: u16, sort: u8) -> ([(u8, &'static str, u16); 5], usize
     (columns, 3 + usize::from(show_rss) + usize::from(show_io))
 }
 
-fn process_row(p: &Process, width: u16, columns: &[(u8, &str, u16)]) -> String {
+fn process_row(
+    p: &Process,
+    width: u16,
+    columns: &[(u8, &str, u16)],
+    number: &mut String,
+) -> String {
+    use std::fmt::Write;
+    number.clear();
+    write!(number, "{}", p.pid).unwrap();
     let mut row = String::with_capacity(usize::from(width));
     row.push(' ');
     for (index, &(id, _, cells)) in columns.iter().enumerate() {
         if index > 0 {
             row.push(' ');
         }
-        let field: Cow<'_, str> = match id {
-            0 => p.pid.to_string().into(),
-            1 => p.name.as_str().into(),
-            2 => p
-                .cpu
-                .map_or_else(|| "—".into(), |n| format!("{n:.1}").into()),
-            3 => format!("{:.1}", p.rss as f64 / 1048576.).into(),
-            4 => p.read.zip(p.write).map_or_else(
-                || "—".into(),
-                |(a, b)| format!("{:.2}", (a + b) / 1048576.).into(),
-            ),
+        let field = match id {
+            0 => number.as_str(),
+            1 => &p.name,
+            2 => match p.cpu {
+                Some(n) => {
+                    number.clear();
+                    write!(number, "{n:.1}").unwrap();
+                    number.as_str()
+                }
+                None => "—",
+            },
+            3 => {
+                number.clear();
+                write!(number, "{:.1}", p.rss as f64 / 1048576.).unwrap();
+                number.as_str()
+            }
+            4 => match p.read.zip(p.write) {
+                Some((a, b)) => {
+                    number.clear();
+                    write!(number, "{:.2}", (a + b) / 1048576.).unwrap();
+                    number.as_str()
+                }
+                None => "—",
+            },
             _ => unreachable!(),
         };
-        let value = fit_label(&field, cells);
+        let value = fit_label(field, cells);
         row.push_str(&value);
         row.extend(std::iter::repeat_n(
             ' ',
@@ -1322,12 +1641,19 @@ fn process_row(p: &Process, width: u16, columns: &[(u8, &str, u16)]) -> String {
 
 // Keep numeric formatting out of the text-filtering loop.
 #[inline(never)]
-fn matches_process_number(process: &Process, query: &str, number: &mut String) -> bool {
-    use std::fmt::Write;
-    [process.pid, process.uid].into_iter().any(|id| {
-        number.clear();
-        write!(number, "{id}").unwrap();
-        number.contains(query)
+fn matches_process_number(process: &Process, query: &str) -> bool {
+    [process.pid, process.uid].into_iter().any(|mut id| {
+        let mut digits = [0; 10];
+        let mut start = digits.len();
+        loop {
+            start -= 1;
+            digits[start] = b'0' + (id % 10) as u8;
+            id /= 10;
+            if id == 0 {
+                break;
+            }
+        }
+        memchr::memmem::find(&digits[start..], query.as_bytes()).is_some()
     })
 }
 
@@ -1485,9 +1811,70 @@ mod tests {
         assert!(!monitor.descending);
         let view = monitor.view(60, 12);
         assert!(view.texts.iter().any(|text| text.focused));
-        assert!(view.texts.iter().any(|text| text.text == " Tasks "));
+        assert!(view.texts.iter().any(|text| text.text == " Procs "));
         assert!(!view.hits.iter().any(|hit| hit.action == Action::Sort(2)));
     }
+    #[test]
+    fn terminal_tasks_keep_unknown_state_and_jump_to_selected_pane() {
+        use crate::core::CommandBlock;
+        use crate::workspace::{PaneView, TabActivity, TabView};
+        use std::sync::Arc;
+        let pane = |id, command_blocks| PaneView {
+            id,
+            tab: 1,
+            rect: Default::default(),
+            title: format!("pane {id}"),
+            cwd: Some("/project".into()),
+            process: Arc::new(crate::terminal::ProcessMetadata::default()),
+            blocks: Vec::new(),
+            command_blocks,
+            input_generation: 0,
+            shell_prompt: None,
+        };
+        let mut snapshot = Snapshot {
+            name: "test".into(),
+            controller: true,
+            focused: 1,
+            active_tab: 1,
+            tabs: vec![TabView {
+                id: 1,
+                title: "build".into(),
+                activity: TabActivity::Unknown,
+            }],
+            panes: vec![
+                pane(
+                    1,
+                    vec![CommandBlock {
+                        id: 12,
+                        complete: false,
+                        status: None,
+                        has_output: true,
+                        elapsed_ms: Some(1200),
+                    }],
+                ),
+                pane(2, Vec::new()),
+            ],
+        };
+        let mut monitor = Monitor::new().unwrap();
+        monitor.set_workspace(&snapshot);
+        assert_eq!(monitor.tasks[0].state, "Running");
+        assert_eq!(monitor.tasks[1].state, "Unknown");
+        snapshot.panes[0].command_blocks[0].status = Some(3);
+        monitor.set_workspace(&snapshot);
+        assert_eq!(monitor.tasks[0].state, "Failed");
+        assert_eq!(monitor.tasks[0].exit, Some(3));
+        monitor.toggle();
+        monitor.action(Action::Tab(7));
+        monitor.focus = Action::Task(1);
+        monitor.key(keysym::DOWN, "", false);
+        assert_eq!(monitor.focus, Action::Task(2));
+        let view = monitor.view(100, 18);
+        assert!(view.hits.iter().any(|hit| hit.action == Action::Task(2)));
+        monitor.key(keysym::RETURN, "", false);
+        assert_eq!(monitor.jump.take(), Some(2));
+        assert!(!monitor.open);
+    }
+
     #[test]
     fn process_reading_anchor_tracks_pid_when_live_sort_moves_it() {
         let mut monitor = Monitor::new().unwrap();

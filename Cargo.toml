@@ -8,14 +8,14 @@ description = "A small GPU-accelerated Linux terminal"
 
 [features]
 default = ["gui", "tui"]
-gui = []
-tui = []
+gui = ["dep:pulldown-cmark"]
+tui = ["dep:pulldown-cmark"]
 
 [dependencies]
 memchr = "2"
 curl = { version = "0.4", default-features = false }
 libc = "0.2"
-pulldown-cmark = { version = "0.13", default-features = false }
+pulldown-cmark = { version = "0.13", default-features = false, optional = true }
 serde_json = "1"
 smallvec = { version = "1.16", features = ["union"] }
 

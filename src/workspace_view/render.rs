@@ -542,16 +542,16 @@ impl WorkspaceView {
         )?;
         let message = if prompt.tab.is_some() {
             Cow::Borrowed("Closing terminates all panes in this tab")
-        } else {
-            let name = if name
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || "_-.".contains(c))
-            {
-                Cow::Borrowed(name)
-            } else {
-                Cow::Owned(format!("'{}'", name.replace('\'', "'\\''")))
-            };
+        } else if name
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+        {
             Cow::Owned(format!("Resume with: nextty attach {name}"))
+        } else {
+            Cow::Owned(format!(
+                "Resume with: nextty attach '{}'",
+                name.replace('\'', "'\\''")
+            ))
         };
         self.text.draw(
             &self.renderer,
@@ -628,7 +628,11 @@ impl WorkspaceView {
 
 fn fit(text: &str, limit: usize) -> Cow<'_, str> {
     // With widths capped at two columns, UTF-8 byte length is an upper bound.
-    if text.len() <= limit && !text.chars().any(char::is_control) {
+    if text.len() <= limit
+        && !text[crate::width::printable_ascii_prefix(text.as_bytes())..]
+            .chars()
+            .any(char::is_control)
+    {
         return Cow::Borrowed(text);
     }
     let mut result = String::with_capacity(text.len().min(limit));
@@ -656,7 +660,7 @@ fn fit(text: &str, limit: usize) -> Cow<'_, str> {
 impl WorkspaceView {
     pub(super) fn draw_panel(&mut self, grid: &crate::panel::Grid) -> Result<()> {
         self.renderer.clip(0., 0., 0., 0.)?;
-        for run in grid.runs(None, &[]) {
+        grid.for_each_run(None, &[], |run| {
             let x = f32::from(run.x) * self.cell.0;
             let y = f32::from(run.y) * self.cell.1;
             let width = f32::from(run.columns) * self.cell.0;
@@ -674,14 +678,14 @@ impl WorkspaceView {
             }
             self.text.draw_flags(
                 &self.renderer,
-                &run.text,
+                run.text,
                 x,
                 y,
                 (run.foreground << 8) | 255,
                 u32::from((run.flags & (Flags::BOLD | Flags::ITALIC)).bits()),
             )?;
-        }
-        Ok(())
+            Ok(())
+        })
     }
 
     pub(super) fn draw_files(&mut self, layout: GuiLayout) -> Result<()> {
@@ -695,8 +699,8 @@ impl WorkspaceView {
         let preview = (files.focus() == FileFocus::Preview)
             .then(|| crate::file_panel::preview(files, preview_rect, &self.config));
         self.draw_panel(&grid)?;
-        if let Some(grid) = preview {
-            self.draw_panel(&grid)?;
+        if let Some(preview) = preview {
+            self.draw_panel(&preview)?;
         }
         Ok(())
     }

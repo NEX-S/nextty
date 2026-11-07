@@ -2,6 +2,7 @@ use crate::core::{Cell, Flags, Row};
 use crate::vt::{Color, Rgb};
 use crate::width::{fit_label, scalar_width};
 use crate::workspace::Rect;
+#[cfg(any(feature = "tui", test))]
 use std::io::{self, Write};
 
 pub(crate) const BACKGROUND: u32 = 0x202020;
@@ -22,17 +23,47 @@ pub(crate) fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
     })
 }
 
+pub(crate) fn expand_icon(expanded: bool) -> &'static str {
+    if expanded { "" } else { "" }
+}
+
+pub(crate) fn diff_colors(foreground: u32) -> (u32, u32) {
+    if (foreground >> 16 & 255) + (foreground >> 8 & 255) + (foreground & 255) < 384 {
+        (0x35552a, 0xa32e36)
+    } else {
+        (0xb5d2a2, 0xe87575)
+    }
+}
+
+pub(crate) fn popup_close(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + rect.cols.saturating_sub(5),
+        y: rect.y + 1,
+        cols: 3,
+        rows: 1,
+    }
+}
+
+pub(crate) fn popup_body(rect: Rect) -> Rect {
+    Rect {
+        x: rect.x + 2,
+        y: rect.y + 3,
+        cols: rect.cols.saturating_sub(4),
+        rows: rect.rows.saturating_sub(5),
+    }
+}
+
 pub(crate) struct Grid {
     pub rect: Rect,
     pub rows: Vec<Row>,
     pub flags: Flags,
 }
 
-pub(crate) struct TextRun {
+pub(crate) struct TextRun<'a> {
     pub x: u16,
     pub y: u16,
     pub columns: u16,
-    pub text: String,
+    pub text: &'a str,
     pub foreground: u32,
     pub background: u32,
     pub flags: Flags,
@@ -50,6 +81,49 @@ fn packed(color: Color) -> u32 {
     color.packed()
 }
 
+#[cfg(any(feature = "tui", test))]
+pub(crate) fn sgr_rgb(output: &mut Vec<u8>, color: Rgb) {
+    let mut bytes = [0; 12];
+    let mut end = 0;
+    for value in [color.r, color.g, color.b] {
+        bytes[end] = b';';
+        end += 1;
+        if value >= 100 {
+            bytes[end] = b'0' + value / 100;
+            end += 1;
+        }
+        if value >= 10 {
+            bytes[end] = b'0' + value / 10 % 10;
+            end += 1;
+        }
+        bytes[end] = b'0' + value % 10;
+        end += 1;
+    }
+    output.extend_from_slice(&bytes[..end]);
+}
+
+#[cfg(any(feature = "tui", test))]
+pub(crate) fn cursor_position(output: &mut impl Write, row: u16, column: u16) -> io::Result<()> {
+    let mut bytes = [0; 14];
+    bytes[..2].copy_from_slice(b"\x1b[");
+    let mut end = 2;
+    for (mut value, suffix) in [(row, b';'), (column, b'H')] {
+        let start = end;
+        loop {
+            bytes[end] = b'0' + (value % 10) as u8;
+            end += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        bytes[start..end].reverse();
+        bytes[end] = suffix;
+        end += 1;
+    }
+    output.write_all(&bytes[..end])
+}
+
 impl Grid {
     pub fn new(rect: Rect, foreground: u32, background: u32) -> Self {
         let blank = Cell {
@@ -64,6 +138,51 @@ impl Grid {
                 .collect(),
             flags: Flags::empty(),
         }
+    }
+
+    pub fn popup(rect: Rect, foreground: u32, background: u32, title: &str) -> Self {
+        let background = mix_color(foreground, background, 9);
+        let border = mix_color(foreground, background, 64);
+        let muted = mix_color(foreground, background, 176);
+        let mut grid = Self::new(rect, foreground, background);
+        let edge = Cell {
+            c: '─',
+            fg: rgb(border),
+            bg: rgb(background),
+            ..Cell::default()
+        };
+        let bottom = grid.rows.len().saturating_sub(1);
+        for (index, row) in grid.rows.iter_mut().enumerate() {
+            if index == 0 || index == bottom {
+                row.cells.fill(edge);
+            }
+            let (left, right) = if index == bottom {
+                ('╰', '╯')
+            } else if index == 0 {
+                ('╭', '╮')
+            } else {
+                ('│', '│')
+            };
+            if let Some((first, rest)) = row.cells.split_first_mut() {
+                *first = Cell { c: left, ..edge };
+                if let Some(last) = rest.last_mut() {
+                    *last = Cell { c: right, ..edge };
+                }
+            }
+            row.used = row.cells.len();
+        }
+        let close = popup_close(rect);
+        let columns = close.x.saturating_sub(rect.x + 3);
+        grid.text(
+            rect.x + 2,
+            rect.y + 1,
+            columns,
+            &crate::width::fit_middle(title, columns),
+            foreground,
+            background,
+        );
+        grid.text(close.x, close.y, close.cols, " × ", muted, background);
+        grid
     }
 
     /// Clears a recycled grid in place, reallocating only when its size changed.
@@ -145,7 +264,8 @@ impl Grid {
         row.used = row.used.max(end);
     }
 
-    fn edit_region(&mut self, rect: Rect, mut edit: impl FnMut(&mut Row, std::ops::Range<usize>)) {
+    pub fn recolor(&mut self, rect: Rect, background: u32) {
+        let background = rgb(background);
         let start = usize::from(rect.x.saturating_sub(self.rect.x).min(self.rect.cols));
         let end = usize::from(
             (rect.x + rect.cols)
@@ -154,81 +274,74 @@ impl Grid {
         );
         for y in rect.y.max(self.rect.y)..(rect.y + rect.rows).min(self.rect.y + self.rect.rows) {
             let row = &mut self.rows[usize::from(y - self.rect.y)];
-            edit(row, start..end);
+            for cell in &mut row.cells[start..end] {
+                cell.bg = background;
+            }
         }
     }
 
-    pub fn recolor(&mut self, rect: Rect, background: u32) {
-        let background = rgb(background);
-        self.edit_region(rect, |row, columns| {
-            for cell in &mut row.cells[columns] {
-                cell.bg = background;
-            }
-        });
-    }
-
-    pub fn runs<'a>(
-        &'a self,
-        previous: Option<&'a Self>,
-        damage: &'a [bool],
-    ) -> impl Iterator<Item = TextRun> + 'a {
-        self.rows
-            .iter()
-            .enumerate()
-            .filter(move |(index, row)| {
-                damage
-                    .get(usize::from(self.rect.y) + index)
-                    .copied()
-                    .unwrap_or(false)
-                    || previous.is_none_or(|previous| {
-                        previous.rect != self.rect
-                            || previous.rows.get(*index).is_none_or(|old| {
-                                old.cells != row.cells || old.extras() != row.extras()
-                            })
-                    })
-            })
-            .flat_map(move |(index, row)| {
-                let mut cells = row.cells_with_extras(0..row.cells.len()).peekable();
-                std::iter::from_fn(move || {
-                    let &(start, cell, extra) = cells.peek()?;
-                    let style = cell.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
-                    let underline_color = if style.contains(Flags::UNDERLINE) {
-                        extra.and_then(|extra| extra.underline_color)
-                    } else {
-                        None
-                    };
-                    let mut text = String::with_capacity(row.cells.len() - start);
-                    while let Some((_, next, extra)) = cells.next_if(|(_, next, extra)| {
-                        next.fg == cell.fg
-                            && next.bg == cell.bg
-                            && next.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) == style
-                            && (!style.contains(Flags::UNDERLINE)
-                                || extra.and_then(|extra| extra.underline_color) == underline_color)
-                    }) {
-                        if !next.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                            text.push(next.c);
-                            if let Some(extra) = extra {
-                                text.extend(extra.zerowidth.iter());
-                            }
+    pub fn for_each_run<E>(
+        &self,
+        previous: Option<&Self>,
+        damage: &[bool],
+        mut emit: impl FnMut(TextRun<'_>) -> Result<(), E>,
+    ) -> Result<(), E> {
+        let mut text = String::new();
+        for (index, row) in self.rows.iter().enumerate().filter(|(index, row)| {
+            damage
+                .get(usize::from(self.rect.y) + index)
+                .copied()
+                .unwrap_or(false)
+                || previous.is_none_or(|previous| {
+                    previous.rect != self.rect
+                        || previous.rows.get(*index).is_none_or(|old| {
+                            old.cells != row.cells || old.extras() != row.extras()
+                        })
+                })
+        }) {
+            text.reserve(row.cells.len().saturating_sub(text.len()));
+            let mut cells = row.cells_with_extras(0..row.cells.len()).peekable();
+            while let Some(&(start, cell, extra)) = cells.peek() {
+                let style = cell.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
+                let underline_color = if style.contains(Flags::UNDERLINE) {
+                    extra.and_then(|extra| extra.underline_color)
+                } else {
+                    None
+                };
+                text.clear();
+                while let Some((_, next, extra)) = cells.next_if(|(_, next, extra)| {
+                    next.fg == cell.fg
+                        && next.bg == cell.bg
+                        && next.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER) == style
+                        && (!style.contains(Flags::UNDERLINE)
+                            || extra.and_then(|extra| extra.underline_color) == underline_color)
+                }) {
+                    if !next.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                        text.push(next.c);
+                        if let Some(extra) = extra {
+                            text.extend(extra.zerowidth.iter());
                         }
                     }
-                    let end = cells
-                        .peek()
-                        .map_or(row.cells.len(), |(column, _, _)| *column);
-                    Some(TextRun {
-                        x: self.rect.x + start as u16,
-                        y: self.rect.y + index as u16,
-                        columns: (end - start) as u16,
-                        text,
-                        foreground: packed(cell.fg),
-                        background: packed(cell.bg),
-                        flags: style,
-                        underline_color: underline_color.map(packed),
-                    })
-                })
-            })
+                }
+                let end = cells
+                    .peek()
+                    .map_or(row.cells.len(), |(column, _, _)| *column);
+                emit(TextRun {
+                    x: self.rect.x + start as u16,
+                    y: self.rect.y + index as u16,
+                    columns: (end - start) as u16,
+                    text: &text,
+                    foreground: packed(cell.fg),
+                    background: packed(cell.bg),
+                    flags: style,
+                    underline_color: underline_color.map(packed),
+                })?;
+            }
+        }
+        Ok(())
     }
 
+    #[cfg(any(feature = "tui", test))]
     pub fn ansi(
         &self,
         output: &mut Vec<u8>,
@@ -237,9 +350,9 @@ impl Grid {
     ) -> io::Result<()> {
         let mut cursor = None;
         let mut style = None;
-        for run in self.runs(previous, damage) {
+        self.for_each_run::<io::Error>(previous, damage, |run| {
             if cursor != Some((run.x, run.y)) {
-                write!(output, "\x1b[{};{}H", run.y + 1, run.x + 1)?;
+                cursor_position(output, run.y + 1, run.x + 1)?;
             }
             cursor = Some((run.x + run.columns, run.y));
             let next_style = (
@@ -250,16 +363,11 @@ impl Grid {
             );
             if style != Some(next_style) {
                 style = Some(next_style);
-                write!(
-                    output,
-                    "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
-                    run.foreground >> 16 & 255,
-                    run.foreground >> 8 & 255,
-                    run.foreground & 255,
-                    run.background >> 16 & 255,
-                    run.background >> 8 & 255,
-                    run.background & 255
-                )?;
+                output.extend_from_slice(b"\x1b[0;38;2");
+                sgr_rgb(output, Rgb::from_packed(run.foreground));
+                output.extend_from_slice(b";48;2");
+                sgr_rgb(output, Rgb::from_packed(run.background));
+                output.push(b'm');
                 if run.flags.contains(Flags::BOLD) {
                     output.extend_from_slice(b"\x1b[1m");
                 }
@@ -268,17 +376,14 @@ impl Grid {
                 }
                 if run.flags.contains(Flags::UNDERLINE) {
                     let color = run.underline_color.unwrap_or(run.foreground);
-                    write!(
-                        output,
-                        "\x1b[4;58;2;{};{};{}m",
-                        color >> 16 & 255,
-                        color >> 8 & 255,
-                        color & 255
-                    )?;
+                    output.extend_from_slice(b"\x1b[4;58;2");
+                    sgr_rgb(output, Rgb::from_packed(color));
+                    output.push(b'm');
                 }
             }
             output.extend_from_slice(run.text.as_bytes());
-        }
+            Ok(())
+        })?;
         output.extend_from_slice(b"\x1b[0m");
         Ok(())
     }

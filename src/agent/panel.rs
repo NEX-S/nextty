@@ -1,4 +1,3 @@
-use crate::agent::AgentView;
 use crate::config::Config;
 use crate::context::{self, Snapshot as ContextSnapshot};
 use crate::core::Mode;
@@ -10,15 +9,154 @@ use crate::width::scalar_width;
 use crate::width::text_width;
 use crate::worker::Worker;
 use crate::workspace::Rect;
-use crate::workspace::{AgentEvent, AgentModelPatch, Client, PaneId};
-use std::collections::HashSet;
+use crate::workspace::{AgentChange, AgentEvent, AgentMessage, AgentModelPatch, Client, PaneId};
+use std::collections::{HashMap, HashSet};
+use std::fmt::Write;
 use std::io;
 use std::ops::Range;
 use std::os::fd::RawFd;
 use std::sync::Arc;
 
+const INPUT_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+pub(crate) struct AgentView {
+    pub input: String,
+    pub cursor: usize,
+    pub anchor: Option<usize>,
+    pub busy: bool,
+    pub messages: Vec<AgentMessage>,
+    pub changes: Arc<Vec<AgentChange>>,
+    pub changes_omitted: u32,
+    pub scroll: usize,
+    pub revision: u64,
+    pub pending: Vec<serde_json::Value>,
+}
+
+impl AgentView {
+    pub fn restore_patch(&mut self, patch: &AgentModelPatch) -> io::Result<bool> {
+        let start = patch.start as usize;
+        let busy = patch.busy
+            || self
+                .pending
+                .iter()
+                .any(|request| request["action"] == "send");
+        let changes_changed = self.changes_omitted != patch.changes_omitted
+            || patch
+                .changes
+                .as_ref()
+                .is_some_and(|changes| changes != &self.changes);
+        let redraw = changes_changed
+            || self.busy != busy
+            || self.messages.len() != start + patch.messages.len()
+            || patch.messages.iter().enumerate().any(|(index, new)| {
+                self.messages.get(start + index).is_none_or(|old| {
+                    old.turn != new.turn
+                        || old.role != new.role
+                        || old.id != new.id
+                        || if index == 0 && patch.prefix_bytes != 0 {
+                            new.role != "Agent"
+                                || new.id.is_some()
+                                || patch.prefix_bytes as usize != old.text.len()
+                        } else {
+                            old.text != new.text
+                                && (new.role != "Agent"
+                                    || new.id.is_some()
+                                    || !new.text.starts_with(&old.text))
+                        }
+                })
+            });
+        patch.apply_messages(&mut self.messages)?;
+        if changes_changed && let Some(changes) = &patch.changes {
+            self.changes.clone_from(changes);
+        }
+        self.changes_omitted = patch.changes_omitted;
+        self.busy = busy;
+        self.revision = patch.revision;
+        Ok(redraw)
+    }
+
+    pub fn selection(&self) -> Option<Range<usize>> {
+        let anchor = self.anchor?;
+        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
+    }
+
+    pub fn select_all(&mut self) {
+        self.anchor = Some(0);
+        self.cursor = self.input.len();
+    }
+
+    pub fn clear_input(&mut self) {
+        self.input.clear();
+        self.set_cursor(0, false);
+    }
+
+    pub fn set_cursor(&mut self, offset: usize, extend: bool) {
+        if extend {
+            self.anchor.get_or_insert(self.cursor);
+        } else {
+            self.anchor = None;
+        }
+        self.cursor = offset;
+    }
+
+    pub fn insert(&mut self, text: &str) -> Result<(), String> {
+        let range = self.selection().unwrap_or(self.cursor..self.cursor);
+        if self.input.len() - range.len() + text.len() > INPUT_LIMIT {
+            return Err("Agent input exceeds 64 KiB".into());
+        }
+        self.set_cursor(range.start + text.len(), false);
+        self.input.replace_range(range, text);
+        Ok(())
+    }
+
+    pub fn key(&mut self, symbol: u32, shift: bool) {
+        let before = || {
+            self.input
+                .floor_char_boundary(self.cursor.saturating_sub(1))
+        };
+        let after = || self.input.ceil_char_boundary(self.cursor + 1);
+        let selection = self.selection();
+        let offset = match symbol {
+            keysym::LEFT => {
+                if !shift && let Some(range) = selection {
+                    range.start
+                } else {
+                    before()
+                }
+            }
+            keysym::RIGHT => {
+                if !shift && let Some(range) = selection {
+                    range.end
+                } else {
+                    after()
+                }
+            }
+            keysym::HOME => self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1),
+            keysym::END => self.input[self.cursor..]
+                .find('\n')
+                .map_or(self.input.len(), |offset| self.cursor + offset),
+            keysym::BACKSPACE | keysym::DELETE => {
+                let range = selection.unwrap_or_else(|| {
+                    if symbol == keysym::BACKSPACE {
+                        before()..self.cursor
+                    } else {
+                        self.cursor..after()
+                    }
+                });
+                self.set_cursor(range.start, false);
+                self.input.replace_range(range, "");
+                return;
+            }
+            _ => return,
+        };
+        self.set_cursor(offset, shift);
+    }
+}
+
 pub(crate) struct Panel {
     pub grid: Grid,
+    pub backdrop: Option<Grid>,
     pub hits: Vec<(Rect, AgentAction)>,
     pub chat: Rect,
     pub first: usize,
@@ -73,18 +211,26 @@ pub(crate) fn draw(
     pointer: Option<(u16, u16)>,
     preedit: &str,
 ) -> io::Result<Panel> {
+    let backdrop = if let Some(preview) = ui.agent.active_mut().context.preview.take() {
+        let base = draw(ui, config, side, size, None, "");
+        ui.agent.active_mut().context.preview = Some(preview);
+        Some(base?.grid)
+    } else {
+        None
+    };
     let (editor, editor_layout) = editor(ui, side);
     let rect = if ui.agent.active().context.preview.is_some() {
-        Rect {
+        crate::file_panel::preview_rect(Rect {
             x: 0,
             y: 1,
             cols: size.num_cols,
             rows: size.num_lines.saturating_sub(2),
-        }
+        })
     } else {
         side
     };
     let frame = Panel {
+        backdrop,
         grid: match ui.agent.spare_grid.take() {
             Some(mut grid) => {
                 grid.reset(rect, config.foreground, config.background);
@@ -105,7 +251,6 @@ pub(crate) fn draw(
         ui,
         config,
         side,
-        size,
         pointer,
         frame,
         preedit,
@@ -118,7 +263,6 @@ struct AgentPainter<'a> {
     ui: &'a mut Ui,
     config: &'a Config,
     side: Rect,
-    size: WindowSize,
     pointer: Option<(u16, u16)>,
     frame: Panel,
     preedit: &'a str,
@@ -132,6 +276,36 @@ struct Palette {
     user_bg: u32,
     selection_bg: u32,
     error: u32,
+}
+
+fn draw_edit_row(grid: &mut Grid, rect: Rect, path: &str, counts: (u32, u32), palette: Palette) {
+    let (added, removed) = counts;
+    let (added_color, removed_color) = crate::panel::diff_colors(palette.foreground);
+    let mut text = String::with_capacity(24);
+    write!(&mut text, " +{added}").unwrap();
+    let plus_end = text.len();
+    write!(&mut text, " -{removed}").unwrap();
+    let (plus, minus) = text.split_at(plus_end);
+    let count_width = (plus.len() + minus.len()).min(usize::from(rect.cols)) as u16;
+    grid.text(
+        rect.x,
+        rect.y,
+        rect.cols.saturating_sub(count_width),
+        &crate::width::fit_middle(path, rect.cols.saturating_sub(count_width)),
+        palette.foreground,
+        palette.bg,
+    );
+    let plus_width = (plus.len() as u16).min(count_width);
+    let x = rect.x + rect.cols.saturating_sub(count_width);
+    grid.text(x, rect.y, plus_width, plus, added_color, palette.bg);
+    grid.text(
+        x + plus_width,
+        rect.y,
+        count_width.saturating_sub(plus_width),
+        minus,
+        removed_color,
+        palette.bg,
+    );
 }
 
 impl AgentPainter<'_> {
@@ -157,19 +331,17 @@ impl AgentPainter<'_> {
             error: mix_color(0xe87575, self.config.foreground, 128),
         };
         let Palette {
-            bg,
-            muted,
-            user_bg,
-            error,
-            ..
+            bg, user_bg, error, ..
         } = palette;
         let chat_top = side.y + 1;
         if self.ui.agent.active().context.preview.is_some() {
-            self.draw_preview(bg, muted);
+            self.draw_preview(bg);
         } else {
             let divider = mix_color(self.config.foreground, bg, 24);
-            for row in side.y..side.y + side.rows {
-                self.frame.grid.text(side.x, row, 1, "│", divider, bg);
+            for row in &mut self.frame.grid.rows[1..] {
+                row.cells[0].c = '│';
+                row.cells[0].fg = rgb(divider);
+                row.used = 1;
             }
             self.frame.hits.push((side, AgentAction::Output));
             self.draw_agent_tabs(side, editor, bg);
@@ -185,7 +357,20 @@ impl AgentPainter<'_> {
             };
             let rewind = self.ui.agent.active().rewind_target.is_some();
             let hint_rows = if rewind { 3 } else { 0 };
-            let chat_end = editor.y.saturating_sub(1 + attachment_rows + hint_rows);
+            let changes = self.ui.agent.active().changed_files();
+            let change_rows = if self.ui.agent.active().changes_expanded {
+                (changes.len() as u16).min(4).min(
+                    editor
+                        .y
+                        .saturating_sub(side.y + 9 + attachment_rows + hint_rows),
+                )
+            } else {
+                0
+            };
+            let change_height = change_rows + u16::from(!changes.is_empty());
+            let chat_end = editor
+                .y
+                .saturating_sub(1 + attachment_rows + hint_rows + change_height);
             self.draw_transcript(palette, editor, chat_top, chat_end)?;
             if rewind {
                 self.draw_rewind(
@@ -197,14 +382,25 @@ impl AgentPainter<'_> {
                 );
             }
             self.draw_attachments(palette, editor, chat_end, attachment_rows, attachment_first);
-            self.frame.grid.text(
-                side.x,
-                editor.y.saturating_sub(1),
-                side.cols,
-                &format!("├{}", "─".repeat(usize::from(side.cols.saturating_sub(1)))),
-                divider,
-                bg,
-            );
+            if !changes.is_empty() {
+                self.draw_changes(
+                    palette,
+                    editor,
+                    chat_end + attachment_rows,
+                    change_rows,
+                    &changes,
+                );
+            }
+            let row = &mut self.frame.grid.rows[usize::from(editor.y - side.y - 1)];
+            let edge = crate::core::Cell {
+                c: '─',
+                fg: rgb(divider),
+                bg: rgb(bg),
+                flags: Flags::empty(),
+            };
+            row.cells.fill(edge);
+            row.cells[0].c = '├';
+            row.used = row.cells.len();
             self.draw_editor(palette, editor, editor_layout);
         }
         let hovered = self.pointer.and_then(|(x, y)| {
@@ -258,6 +454,77 @@ impl AgentPainter<'_> {
             }
         }
         Ok(())
+    }
+
+    fn draw_changes(
+        &mut self,
+        palette: Palette,
+        editor: Rect,
+        top: u16,
+        rows: u16,
+        files: &[(usize, u32, u32)],
+    ) {
+        let (added, removed) = files
+            .iter()
+            .fold((0, 0), |(a, r), entry| (a + entry.1, r + entry.2));
+        let session = self.ui.agent.active();
+        let marker = crate::panel::expand_icon(session.changes_expanded);
+        let omitted = if session.model.changes_omitted == 0 {
+            String::new()
+        } else {
+            format!(" · {} earlier edits omitted", session.model.changes_omitted)
+        };
+        draw_edit_row(
+            &mut self.frame.grid,
+            Rect {
+                x: editor.x + 3,
+                y: top,
+                cols: editor.cols.saturating_sub(3),
+                rows: 1,
+            },
+            &format!("{} files{omitted}", files.len()),
+            (added, removed),
+            palette,
+        );
+        self.frame.grid.text(
+            editor.x,
+            top,
+            3,
+            &format!(" {marker} "),
+            palette.muted,
+            palette.bg,
+        );
+        self.frame
+            .hit(editor.x, top, editor.cols, AgentAction::ToggleChanges);
+        let first = match self.ui.agent.keyboard {
+            AgentAction::ChangedFile(index) => files
+                .iter()
+                .position(|entry| entry.0 == index)
+                .unwrap_or(0)
+                .saturating_sub(usize::from(rows.saturating_sub(1))),
+            _ => files.len().saturating_sub(usize::from(rows)),
+        };
+        for (row, &(index, added, removed)) in
+            files.iter().skip(first).take(usize::from(rows)).enumerate()
+        {
+            let y = top + 1 + row as u16;
+            let path = self.ui.agent.active().model.changes[index]
+                .path
+                .to_string_lossy();
+            draw_edit_row(
+                &mut self.frame.grid,
+                Rect {
+                    y,
+                    rows: 1,
+                    ..editor
+                },
+                &path,
+                (added, removed),
+                palette,
+            );
+            self.frame
+                .hit(editor.x, y, editor.cols, AgentAction::ChangedFile(index));
+        }
     }
 
     fn draw_transcript(
@@ -329,7 +596,7 @@ impl AgentPainter<'_> {
                         0
                     })
                 }
-                AgentLine::Blank => None,
+                AgentLine::Blank | AgentLine::Edit(_) => None,
             };
             if let Some(indent) = indent {
                 self.frame.chat_rows.push((
@@ -344,6 +611,27 @@ impl AgentPainter<'_> {
             }
             match line {
                 AgentLine::Blank => (),
+                AgentLine::Edit(index) => {
+                    let change = &self.ui.agent.active().model.changes[*index as usize];
+                    draw_edit_row(
+                        &mut self.frame.grid,
+                        Rect {
+                            x: editor.x + 2,
+                            y,
+                            cols: editor.cols.saturating_sub(2),
+                            rows: 1,
+                        },
+                        &change.path.to_string_lossy(),
+                        (change.added, change.removed),
+                        palette,
+                    );
+                    self.frame.hit(
+                        editor.x,
+                        y,
+                        editor.cols,
+                        AgentAction::EditDiff(*index as usize),
+                    );
+                }
                 AgentLine::Role(index) => {
                     let message = &self.ui.agent.active().model.messages[*index as usize];
                     let marker = if message
@@ -359,7 +647,7 @@ impl AgentPainter<'_> {
                         editor.x,
                         y,
                         editor.cols,
-                        &format!(" {marker} {} ", message.role),
+                        &[" ", marker, " ", message.role.as_str(), " "].concat(),
                         muted,
                         bg,
                     );
@@ -632,12 +920,9 @@ impl AgentPainter<'_> {
         if self.ui.focus == Focus::Editor && !self.preedit.is_empty() {
             let input = &self.ui.agent.active().model.input;
             let cursor = self.ui.agent.active().model.cursor;
-            display = std::borrow::Cow::Owned(format!(
-                "{}{}{}",
-                &input[..cursor],
-                self.preedit,
-                &input[cursor..]
-            ));
+            display = std::borrow::Cow::Owned(
+                [&input[..cursor], self.preedit, &input[cursor..]].concat(),
+            );
             let columns = usize::from(editor.cols)
                 .saturating_sub(3 * usize::from(self.ui.agent.active().model.busy))
                 .max(1);
@@ -746,13 +1031,15 @@ impl AgentPainter<'_> {
         }
     }
 
-    fn draw_preview(&mut self, bg: u32, muted: u32) {
+    fn draw_preview(&mut self, bg: u32) {
+        let rect = self.frame.grid.rect;
         let Some(preview) = &mut self.ui.agent.active_mut().context.preview else {
             return;
         };
-        let columns = self.size.num_cols.saturating_sub(4);
-        let rows = usize::from(self.size.num_lines.saturating_sub(5));
-        preview.prepare(usize::from(columns));
+        let body = crate::panel::popup_body(rect);
+        let columns = body.cols;
+        let rows = usize::from(body.rows);
+        preview.prepare(usize::from(columns.max(1)));
         let ContextPreview {
             item,
             scroll,
@@ -760,48 +1047,48 @@ impl AgentPainter<'_> {
             ..
         } = preview;
         *scroll = (*scroll).min(lines.len().saturating_sub(rows));
-        self.frame
-            .grid
-            .text(2, 1, columns, &item.label, self.config.foreground, bg);
-        self.frame
-            .grid
-            .text(self.size.num_cols.saturating_sub(4), 1, 3, " × ", muted, bg);
+        self.frame.grid = Grid::popup(rect, self.config.foreground, bg, &item.label);
+        let bg = mix_color(self.config.foreground, bg, 9);
+        let muted = mix_color(self.config.foreground, bg, 176);
+        let close = crate::panel::popup_close(rect);
+        let x = body.x;
+        let (added_color, removed_color) = crate::panel::diff_colors(self.config.foreground);
         for (row, range) in lines.iter().skip(*scroll).take(rows).enumerate() {
             self.frame.grid.text(
-                2,
-                row as u16 + 3,
+                x,
+                body.y + row as u16,
                 columns,
                 &item.snapshot.text[range.clone()],
-                self.config.foreground,
+                if item.kind == "diff" {
+                    match item.snapshot.text.as_bytes().get(
+                        item.snapshot.text[..range.start]
+                            .rfind('\n')
+                            .map_or(0, |offset| offset + 1),
+                    ) {
+                        Some(b'+') => added_color,
+                        Some(b'-') => removed_color,
+                        Some(b'@') => mix_color(0x83b9d6, self.config.foreground, 128),
+                        _ => self.config.foreground,
+                    }
+                } else {
+                    self.config.foreground
+                },
                 bg,
             );
         }
-        self.frame.grid.text(
-            2,
-            self.size.num_lines.saturating_sub(2),
-            columns,
-            " ⧉   Esc close",
-            muted,
-            bg,
-        );
+        let footer = rect.y + rect.rows.saturating_sub(2);
+        self.frame
+            .grid
+            .text(x, footer, columns, " ⧉   Esc close", muted, bg);
+        self.frame
+            .hit(close.x, close.y, close.cols, AgentAction::ClosePreview);
         self.frame.hit(
-            self.size.num_cols.saturating_sub(4),
-            1,
-            3,
-            AgentAction::ClosePreview,
-        );
-        self.frame.hit(
-            2,
-            self.size.num_lines.saturating_sub(2),
+            x,
+            footer,
             text_width(" ⧉ ") as u16,
             AgentAction::CopyPreview,
         );
-        self.frame.preview = Some(Rect {
-            x: 2,
-            y: 3,
-            cols: columns,
-            rows: rows as u16,
-        });
+        self.frame.preview = Some(body);
     }
 
     fn tab_icon(
@@ -822,32 +1109,19 @@ impl AgentPainter<'_> {
     }
 
     fn draw_agent_tabs(&mut self, side: Rect, editor: Rect, bg: u32) {
-        let muted = mix_color(self.config.foreground, bg, 180);
-        let mut line_bg = 0;
-        for shift in [16, 8, 0] {
-            line_bg |= ((bg >> shift & 255) * 4 / 5) << shift;
-        }
-        self.frame.grid.text(
-            side.x,
-            side.y,
-            side.cols,
-            "",
-            self.config.foreground,
-            line_bg,
-        );
+        let muted = 0x606060;
+        let line_bg = 0x111111;
+        self.frame
+            .grid
+            .text(side.x, side.y, side.cols, "", 0xcccccc, line_bg);
         self.frame.grid.text(
             side.x,
             side.y,
             1,
             "│",
             mix_color(self.config.foreground, bg, 24),
-            line_bg,
+            bg,
         );
-        let active_fg = if (bg >> 16 & 255) + (bg >> 8 & 255) + (bg & 255) > 384 {
-            self.config.foreground
-        } else {
-            0xffffff
-        };
         let mut x = editor.x;
         for (index, column, columns) in self.ui.agent.tabs(usize::from(side.cols.saturating_sub(1)))
         {
@@ -872,50 +1146,55 @@ impl AgentPainter<'_> {
             } else {
                 0xb5d2a2
             };
-            self.frame.grid.text(x, side.y, width, "", muted, line_bg);
-            self.frame.grid.text(x, side.y, 1, "•", status, line_bg);
-            self.frame.grid.flags.set(Flags::BOLD, active);
+            let tab_bg = if active { 0x363636 } else { 0x1b1b1b };
+            self.frame.grid.flags.set(Flags::UNDERLINE, active);
+            self.frame.grid.text(x, side.y, width, "", muted, tab_bg);
+            self.frame.grid.text(x + 1, side.y, 1, "•", status, tab_bg);
             self.frame.grid.text(
-                x + 2,
+                x + 3,
                 side.y,
-                width.saturating_sub(7),
+                width.saturating_sub(6),
                 self.ui.agent.sessions[index].title(),
                 if active {
-                    active_fg
+                    0xdddddd
                 } else if hovered {
-                    self.config.foreground
+                    0xcccccc
                 } else {
                     muted
                 },
-                line_bg,
+                tab_bg,
             );
-            self.frame.grid.flags.remove(Flags::BOLD);
             self.frame
                 .hit(x, side.y, width, AgentAction::Session(index));
             let close = Rect {
-                x: x + width.saturating_sub(5),
+                x: x + width.saturating_sub(3),
                 y: side.y,
                 cols: 3,
                 rows: 1,
             };
             let close_hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
-            self.tab_icon(close, "×", (muted, 0xef5350), line_bg, close_hovered);
+            self.tab_icon(
+                close,
+                "×",
+                (if active { 0xdddddd } else { muted }, 0xef5350),
+                tab_bg,
+                close_hovered,
+            );
             self.frame
                 .hits
                 .push((close, AgentAction::CloseSession(index)));
-            self.frame.grid.text(
-                x + width - 2,
-                side.y,
-                1,
-                "╱",
-                mix_color(self.config.foreground, bg, 96),
-                line_bg,
-            );
+            if active {
+                let row = &mut self.frame.grid.rows[usize::from(side.y - self.frame.grid.rect.y)];
+                for column in x..x + width {
+                    row.extra_mut(usize::from(column - self.frame.grid.rect.x))
+                        .underline_color = Some(rgb(0xcccccc));
+                }
+            }
+            self.frame.grid.flags.remove(Flags::UNDERLINE);
             x += width;
         }
-        self.frame
-            .grid
-            .text(x, side.y, 2, "+", self.config.foreground, line_bg);
+        x += 1;
+        self.frame.grid.text(x, side.y, 2, "+", 0xcccccc, line_bg);
         self.frame.hit(x, side.y, 2, AgentAction::NewSession);
         let close = Rect {
             x: side.x + side.cols.saturating_sub(3),
@@ -924,13 +1203,7 @@ impl AgentPainter<'_> {
             rows: 1,
         };
         let hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
-        self.tab_icon(
-            close,
-            "›",
-            (muted, self.config.foreground),
-            line_bg,
-            hovered,
-        );
+        self.tab_icon(close, "›", (muted, 0xcccccc), line_bg, hovered);
         self.frame.hits.push((close, AgentAction::ClosePanel));
     }
 }
@@ -986,7 +1259,10 @@ impl ContextPreview {
     pub fn prepare(&mut self, columns: usize) {
         let columns = columns.max(1);
         if self.columns != columns {
-            self.lines = wrap_context(&self.item.snapshot.text, columns);
+            let mut lines = std::mem::take(&mut self.lines);
+            lines.clear();
+            wrap_context_into(&self.item.snapshot.text, columns, |line| lines.push(line));
+            self.lines = lines;
             self.columns = columns;
         }
     }
@@ -1021,11 +1297,15 @@ pub(crate) enum AgentAction {
     CloseSession(usize),
     ClosePanel,
     Rewind(usize),
+    ChangedFile(usize),
+    EditDiff(usize),
+    ToggleChanges,
 }
 
 // Agent bounds retained text at 256 KiB, so cached offsets fit in u32.
 pub(crate) enum AgentLine {
     Role(u32),
+    Edit(u32),
     Text { message: u32, range: Range<u32> },
     Blank,
 }
@@ -1232,7 +1512,7 @@ impl AgentPanel {
         let mut changed = false;
         let mut messages = false;
         let mut models_changed = false;
-        for event in client.take_agent_events() {
+        while let Some(event) = client.next_agent_event() {
             match event {
                 AgentEvent::Draft(payload) => {
                     self.view_dirty = false;
@@ -1314,6 +1594,7 @@ impl AgentPanel {
         let values: Vec<serde_json::Value> = serde_json::from_value(value["sessions"].take())?;
         let current = self.active().id;
         let mut previous = std::mem::take(&mut self.sessions);
+        self.sessions.reserve_exact(values.len());
         for mut value in values {
             let id = serde_json::from_value(value["id"].take())?;
             let mut session = previous
@@ -1434,7 +1715,7 @@ impl AgentPanel {
                 messages,
             };
             self.active_mut().render_request = Some(job.request);
-            self.markdown_worker.as_ref().unwrap().submit(job);
+            self.markdown_worker.as_ref().unwrap().submit(|_| job);
         }
         Ok(())
     }
@@ -1615,8 +1896,31 @@ impl AgentPanel {
             actions.push(AgentAction::Stop);
         }
         actions.push(AgentAction::ContextMenu);
+        if !session.model.changes.is_empty() {
+            actions.push(AgentAction::ToggleChanges);
+            if session.changes_expanded {
+                actions.extend(
+                    session
+                        .changed_files()
+                        .iter()
+                        .map(|entry| AgentAction::ChangedFile(entry.0)),
+                );
+            }
+        }
         for index in 0..session.context.basket.len() {
             actions.extend([AgentAction::Inspect(index), AgentAction::Remove(index)]);
+        }
+        let mut edits: HashMap<&str, smallvec::SmallVec<[usize; 1]>> = HashMap::new();
+        if !session.model.changes.is_empty()
+            && session
+                .model
+                .messages
+                .iter()
+                .any(|message| message.id.is_some())
+        {
+            for (index, change) in session.model.changes.iter().enumerate() {
+                edits.entry(&change.tool_id).or_default().push(index);
+            }
         }
         for (index, message) in session.model.messages.iter().enumerate().rev() {
             if message.role == "You" {
@@ -1627,6 +1931,9 @@ impl AgentPanel {
             } else {
                 AgentAction::Copy(index)
             });
+            if let Some(indices) = message.id.as_deref().and_then(|id| edits.get(id)) {
+                actions.extend(indices.iter().copied().map(AgentAction::EditDiff));
+            }
         }
         actions.push(AgentAction::NewSession);
         actions.extend((0..self.sessions.len()).map(AgentAction::Session));
@@ -1638,11 +1945,11 @@ impl AgentPanel {
     }
 
     pub fn tabs(&self, columns: usize) -> Vec<(usize, usize, usize)> {
-        let available = columns.saturating_sub(6);
+        let available = columns.saturating_sub(7);
         if available == 0 {
             return Vec::new();
         }
-        let count = self.sessions.len().min((available / 10).max(1));
+        let count = self.sessions.len().min((available / 7).max(1));
         let start = self
             .current
             .saturating_sub(count - 1)
@@ -1650,25 +1957,32 @@ impl AgentPanel {
         // Reuse the column slot for desired widths while fitting the tabs.
         let mut tabs: Vec<_> = (start..start + count)
             .map(|index| {
-                (
-                    index,
-                    (crate::width::text_width(self.sessions[index].title()) + 7).max(10),
-                    0,
-                )
+                let title = self.sessions[index].title();
+                let desired = if title.len() <= available {
+                    text_width(title) + 6
+                } else {
+                    let mut width = 6;
+                    for ch in title.chars() {
+                        width += usize::from(scalar_width(ch).min(2));
+                        if width >= available {
+                            break;
+                        }
+                    }
+                    width
+                };
+                (index, desired.max(7), 0)
             })
             .collect();
         let mut remaining = available;
-        loop {
-            let pending = tabs.iter().filter(|(_, _, width)| *width == 0).count();
-            if pending == 0 {
-                break;
-            }
+        let mut pending = tabs.len();
+        while pending != 0 {
             let share = remaining / pending;
             let mut fitted = false;
             for (_, desired, width) in &mut tabs {
                 if *width == 0 && *desired <= share {
                     *width = *desired;
                     remaining -= *desired;
+                    pending -= 1;
                     fitted = true;
                 }
             }
@@ -1717,9 +2031,16 @@ fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usiz
                 start += columns;
             }
         } else {
+            let ascii_end = offset + crate::width::printable_ascii_prefix(line.as_bytes());
+            // Leave the last full row for any following zero-width scalars.
+            while ascii_end - start > columns {
+                push(start..start + columns);
+                start += columns;
+            }
+            let begin = start;
             let mut width = 0;
-            for (index, c) in line.char_indices() {
-                let index = offset + index;
+            for (index, c) in line[begin - offset..].char_indices() {
+                let index = begin + index;
                 let c = if c.is_control() { ' ' } else { c };
                 let next = usize::from(scalar_width(c).min(2));
                 if width + next > columns && index > start {
@@ -1739,8 +2060,14 @@ fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usiz
 }
 
 fn column_offset(text: &str, range: Range<usize>, column: f32) -> usize {
+    let line = &text[range.clone()];
+    let end = column.round().min(line.len() as f32) as usize;
+    // A zero-width scalar at the boundary still belongs to this column.
+    if line.as_bytes().get(end).is_none_or(u8::is_ascii) && line.as_bytes()[..end].is_ascii() {
+        return range.start + end;
+    }
     let mut used = 0.;
-    for (index, c) in text[range.clone()].char_indices() {
+    for (index, c) in line.char_indices() {
         let width = f32::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2));
         if column < used + width * 0.5 {
             return range.start + index;
@@ -1763,6 +2090,7 @@ pub(crate) struct AgentSession {
     pub model: AgentView,
     pub context: ChatContext,
     pub expanded_tools: HashSet<String>,
+    changes_expanded: bool,
     pub lines: Vec<AgentLine>,
     pub columns: usize,
     append_from: Option<(usize, usize)>,
@@ -1779,6 +2107,23 @@ pub(crate) struct AgentSession {
 }
 
 impl AgentSession {
+    fn changed_files(&self) -> Vec<(usize, u32, u32)> {
+        let mut positions = HashMap::new();
+        let mut files: Vec<(usize, u32, u32)> = Vec::new();
+        let mut position = 0;
+        for (index, change) in self.model.changes.iter().enumerate() {
+            if files.is_empty() || self.model.changes[files[position].0].path != change.path {
+                position = *positions.entry(&change.path).or_insert_with(|| {
+                    files.push((index, 0, 0));
+                    files.len() - 1
+                });
+            }
+            files[position].1 += change.added;
+            files[position].2 += change.removed;
+        }
+        files
+    }
+
     fn restore_draft(&mut self, mut input: String, mut items: Vec<ContextItem>) {
         if self.model.input.is_empty() {
             self.model.cursor = input.len();
@@ -1863,13 +2208,13 @@ impl AgentSession {
                     TranscriptPoint {
                         message: *message as usize,
                         part: 1,
-                        offset: 0,
+                        offset: range.start,
                     },
                     range,
                     text,
                 ))
             }
-            AgentLine::Blank => None,
+            AgentLine::Blank | AgentLine::Edit(_) => None,
         }
     }
 
@@ -1953,14 +2298,13 @@ impl AgentSession {
 
     fn selected_range(
         selection: &ChatSelection,
-        mut first: TranscriptPoint,
+        first: TranscriptPoint,
         range: Range<usize>,
     ) -> Option<Range<usize>> {
         let (start, end) = (
             selection.anchor.min(selection.head),
             selection.anchor.max(selection.head),
         );
-        first.offset = range.start;
         let mut last = first;
         last.offset = range.end;
         if start >= last || end <= first {
@@ -1989,6 +2333,23 @@ impl AgentSession {
 
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection.as_ref()?;
+        let (anchor, head) = (selection.anchor, selection.head);
+        if (anchor.message, anchor.part) == (head.message, head.part)
+            && let Some(message) = self.model.messages.get(anchor.message)
+        {
+            let text = if anchor.part == 0 {
+                &message.role
+            } else {
+                self.message_text(anchor.message)
+            };
+            // Hard-line gaps are only copied between nonempty selected rows.
+            if let Some(text) =
+                text.get(anchor.offset.min(head.offset)..anchor.offset.max(head.offset))
+                && memchr::memchr2(b'\r', b'\n', text.as_bytes()).is_none()
+            {
+                return (!text.is_empty()).then(|| text.to_owned());
+            }
+        }
         let mut output = String::new();
         let mut previous: Option<TranscriptPoint> = None;
         for index in 0..self.lines.len() {
@@ -2047,9 +2408,6 @@ impl AgentSession {
                 .sum::<usize>()
         };
         let caret_row = caret_lines.saturating_sub(1) + usize::from(width >= columns);
-        if lines.is_empty() {
-            lines.push(0..0);
-        }
         if caret_row >= lines.len() {
             lines.push(self.model.input.len()..self.model.input.len());
         }
@@ -2218,10 +2576,8 @@ impl AgentSession {
             .then(|| {
                 let last = self.lines.len().saturating_sub(self.model.scroll + 1);
                 (0..=last).rev().find_map(|index| {
-                    self.line_text(index).map(|(mut point, range, _)| {
-                        point.offset = range.start;
-                        (point, last - index)
-                    })
+                    self.line_text(index)
+                        .map(|(point, _, _)| (point, last - index))
                 })
             })
             .flatten();
@@ -2230,13 +2586,13 @@ impl AgentSession {
             lines.truncate(line);
         } else {
             lines.clear();
+            self.expanded_tools.retain(|id| {
+                self.model
+                    .messages
+                    .iter()
+                    .any(|message| message.id.as_ref() == Some(id))
+            });
         }
-        self.expanded_tools.retain(|id| {
-            self.model
-                .messages
-                .iter()
-                .any(|message| message.id.as_ref() == Some(id))
-        });
         let first = append.map_or(0, |_| self.model.messages.len() - 1);
         let offset = append.map_or(0, |(_, offset)| offset);
         for (index, message) in self.model.messages.iter().enumerate().skip(first) {
@@ -2270,6 +2626,16 @@ impl AgentSession {
                     },
                 );
             }
+            if let Some(id) = &message.id {
+                lines.extend(
+                    self.model
+                        .changes
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, change)| &change.tool_id == id)
+                        .map(|(index, _)| AgentLine::Edit(index as u32)),
+                );
+            }
             lines.push(AgentLine::Blank);
         }
         self.lines = lines;
@@ -2282,7 +2648,7 @@ impl AgentSession {
                         && (range.contains(&(anchor.offset as u32))
                             || range.is_empty() && range.start as usize == anchor.offset)
                 }
-                AgentLine::Blank => false,
+                AgentLine::Blank | AgentLine::Edit(_) => false,
             }) {
                 self.model.scroll = self.lines.len().saturating_sub(index + gap + 1);
             }
@@ -2339,7 +2705,7 @@ impl Ui {
                 .iter()
                 .rposition(|line| match line {
                     AgentLine::Role(i) | AgentLine::Text { message: i, .. } => *i as usize == index,
-                    AgentLine::Blank => false,
+                    AgentLine::Blank | AgentLine::Edit(_) => false,
                 })
         {
             self.agent.sessions[self.agent.current].model.scroll = self.agent.sessions
@@ -2347,6 +2713,17 @@ impl Ui {
                 .lines
                 .len()
                 .saturating_sub(line + 1);
+        }
+        if let AgentAction::EditDiff(index) = self.agent.keyboard
+            && let Some(line) = self
+                .agent
+                .active()
+                .lines
+                .iter()
+                .position(|line| matches!(line, AgentLine::Edit(at) if *at as usize == index))
+        {
+            self.agent.active_mut().model.scroll =
+                self.agent.active().lines.len().saturating_sub(line + 1);
         }
         let hint = match self.agent.keyboard {
             AgentAction::Editor => "Agent input · Enter sends · Shift+Enter newline",
@@ -2365,6 +2742,9 @@ impl Ui {
             AgentAction::Session(_) => "Switch conversation · Enter",
             AgentAction::CloseSession(_) => "Close conversation · Enter",
             AgentAction::ClosePanel => "Collapse Agent panel · Enter",
+            AgentAction::ChangedFile(_) => "Open recorded file diff · Enter",
+            AgentAction::EditDiff(_) => "Open this edit diff · Enter",
+            AgentAction::ToggleChanges => "Expand/collapse changed files · Enter",
             AgentAction::Rewind(_) => "History · j/k selects · Esc exits · Enter confirms",
         };
         self.message(hint);
@@ -2477,6 +2857,53 @@ impl Ui {
                     self.toggle_agent();
                 }
                 self.focus = Focus::Editor;
+            }
+            AgentAction::ToggleChanges => {
+                self.agent.active_mut().changes_expanded = !self.agent.active().changes_expanded;
+                self.agent.keyboard = AgentAction::ToggleChanges;
+                self.focus = Focus::Controls;
+            }
+            AgentAction::EditDiff(index) | AgentAction::ChangedFile(index) => {
+                let single = matches!(action, AgentAction::EditDiff(_));
+                let session = self.agent.active_mut();
+                if let Some(change) = session.model.changes.get(index) {
+                    let path = change.path.clone();
+                    let mut text = String::with_capacity(64);
+                    let mut incomplete = false;
+                    let changes = if single {
+                        std::slice::from_ref(change)
+                    } else {
+                        &session.model.changes
+                    };
+                    for change in changes
+                        .iter()
+                        .filter(|change| single || change.path == path)
+                    {
+                        writeln!(
+                            text,
+                            "Turn {} · +{} -{}",
+                            change.turn, change.added, change.removed
+                        )
+                        .unwrap();
+                        text.push_str(&change.diff);
+                        if change.truncated {
+                            text.push_str("\n[Diff truncated]\n");
+                            incomplete = true;
+                        }
+                        text.push('\n');
+                    }
+                    session.context.preview = Some(ContextPreview::new(
+                        ContextItem {
+                            label: format!("{} · recorded Agent edits", path.display()),
+                            source: "Agent edit_file".into(),
+                            kind: "diff".into(),
+                            snapshot: ContextSnapshot { text, incomplete },
+                        },
+                        0,
+                    ));
+                    self.agent.keyboard = AgentAction::CopyPreview;
+                    self.focus = Focus::Controls;
+                }
             }
             AgentAction::Inspect(index) => {
                 if let Some(item) = self.agent.sessions[self.agent.current]
@@ -2784,7 +3211,6 @@ impl Ui {
                                 .messages
                                 .iter()
                                 .filter(|message| message.role == "You")
-                                .map(|message| message.text.clone())
                                 .collect();
                             let current = session.prompt_index.unwrap_or(prompts.len());
                             if session.prompt_index.is_none() {
@@ -2797,7 +3223,7 @@ impl Ui {
                             };
                             session.model.input = prompts
                                 .get(index)
-                                .cloned()
+                                .map(|message| message.text.clone())
                                 .unwrap_or_else(|| session.prompt_draft.clone());
                             session.prompt_index = (index < prompts.len()).then_some(index);
                             session
@@ -2879,6 +3305,322 @@ mod tests {
     use super::*;
 
     #[test]
+    fn mirror_restores_canonical_messages_without_overwriting_next_draft() {
+        let patch = AgentModelPatch {
+            busy: true,
+            revision: 9,
+            turn: 3,
+            messages: vec![AgentMessage {
+                role: "You".into(),
+                text: "first request".into(),
+                turn: 3,
+                id: None,
+            }],
+            ..AgentModelPatch::default()
+        };
+        let mut mirror = AgentView::default();
+        mirror.insert("下一条🙂").unwrap();
+        mirror.anchor = Some(3);
+        mirror.scroll = 7;
+        let cursor = mirror.cursor;
+        assert!(mirror.restore_patch(&patch).unwrap());
+        assert_eq!(mirror.input, "下一条🙂");
+        assert_eq!(mirror.cursor, cursor);
+        assert_eq!(mirror.anchor, Some(3));
+        assert_eq!(mirror.scroll, 7);
+        assert_eq!(mirror.messages[0].turn, 3);
+        assert_eq!(mirror.revision, 9);
+        assert!(mirror.busy);
+    }
+
+    #[test]
+    fn selection_replacement_and_deletion_preserve_unicode_boundaries() {
+        let mut agent = AgentView::default();
+        agent.insert("a中文z").unwrap();
+        agent.set_cursor(1, false);
+        agent.set_cursor(7, true);
+        assert_eq!(&agent.input[agent.selection().unwrap()], "中文");
+        agent.insert("新").unwrap();
+        assert_eq!(agent.input, "a新z");
+        assert_eq!(agent.cursor, 4);
+        assert_eq!(agent.selection(), None);
+        agent.key(keysym::BACKSPACE, false);
+        assert_eq!(agent.input, "az");
+        agent.select_all();
+        agent.key(keysym::DELETE, false);
+        assert!(agent.input.is_empty());
+        assert_eq!(agent.cursor, 0);
+        assert_eq!(agent.anchor, None);
+    }
+
+    #[test]
+    fn shift_navigation_extends_from_anchor_and_arrows_collapse_selection() {
+        let mut agent = AgentView::default();
+        agent.insert("ab\n中文").unwrap();
+        agent.key(keysym::LEFT, true);
+        agent.key(keysym::LEFT, true);
+        assert_eq!(agent.selection(), Some(3..9));
+        agent.key(keysym::RIGHT, false);
+        assert_eq!(agent.cursor, 9);
+        assert_eq!(agent.selection(), None);
+        agent.key(keysym::HOME, true);
+        assert_eq!(agent.selection(), Some(3..9));
+        agent.key(keysym::LEFT, false);
+        assert_eq!(agent.cursor, 3);
+        agent.key(keysym::END, true);
+        assert_eq!(agent.selection(), Some(3..9));
+        agent.clear_input();
+        assert!(agent.input.is_empty());
+        assert_eq!(agent.anchor, None);
+    }
+
+    #[test]
+    fn replacing_selected_text_can_reuse_the_input_budget() {
+        let mut agent = AgentView::default();
+        agent.insert(&"x".repeat(INPUT_LIMIT)).unwrap();
+        agent.select_all();
+        agent.insert("short draft").unwrap();
+        assert_eq!(agent.input, "short draft");
+    }
+
+    #[test]
+    fn wrapped_diff_keeps_its_line_color_in_dark_and_light_themes() {
+        for (foreground, background) in [(0xcccccc, 0x202020), (0x202020, 0xf5f5f5)] {
+            let mut ui = Ui::new().unwrap();
+            ui.agent.open = true;
+            ui.agent.active_mut().context.preview = Some(ContextPreview::new(
+                ContextItem {
+                    label: "long.rs".into(),
+                    source: "Agent edit_file".into(),
+                    kind: "diff".into(),
+                    snapshot: ContextSnapshot {
+                        text: format!("+{}\n-{}\n", "a".repeat(150), "b".repeat(150)),
+                        incomplete: false,
+                    },
+                },
+                0,
+            ));
+            let config = Config {
+                foreground,
+                background,
+                ..Config::default()
+            };
+            let size = WindowSize {
+                num_cols: 80,
+                num_lines: 40,
+                cell_width: 0,
+                cell_height: 0,
+            };
+            let panel = draw(
+                &mut ui,
+                &config,
+                Rect {
+                    x: 40,
+                    y: 1,
+                    cols: 40,
+                    rows: 38,
+                },
+                size,
+                None,
+                "",
+            )
+            .unwrap();
+            let body = panel.preview.unwrap();
+            let (added, removed) = crate::panel::diff_colors(foreground);
+            let mut continuations = 0;
+            for row in &panel.grid.rows {
+                let cell = &row.cells[usize::from(body.x - panel.grid.rect.x)];
+                match cell.c {
+                    '+' | 'a' => {
+                        assert_eq!(cell.fg, rgb(added));
+                        continuations += usize::from(cell.c == 'a');
+                    }
+                    '-' | 'b' => {
+                        assert_eq!(cell.fg, rgb(removed));
+                        continuations += usize::from(cell.c == 'b');
+                    }
+                    _ => (),
+                }
+            }
+            assert!(continuations >= 4);
+            assert_eq!(panel.grid.rows[0].cells[0].c, '╭');
+            assert_eq!(panel.grid.rows.last().unwrap().cells[0].c, '╰');
+        }
+    }
+
+    #[test]
+    fn recorded_file_edits_group_counts_and_open_colored_diff() {
+        let mut ui = Ui::new().unwrap();
+        ui.agent.open = true;
+        ui.agent.active_mut().model.changes = vec![
+            crate::workspace::AgentChange {
+                turn: 1,
+                tool_id: "edit-one".into(),
+                path: "/project/a.rs".into(),
+                added: 1,
+                removed: 1,
+                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                truncated: false,
+            },
+            crate::workspace::AgentChange {
+                turn: 2,
+                tool_id: "edit-two".into(),
+                path: "/project/a.rs".into(),
+                added: 2,
+                removed: 0,
+                diff: "@@ -1 +1,3 @@\n new\n+second\n+third\n".into(),
+                truncated: false,
+            },
+        ]
+        .into();
+        assert_eq!(ui.agent.active().changed_files(), vec![(0, 3, 1)]);
+        assert!(ui.agent.controls().contains(&AgentAction::ToggleChanges));
+        ui.agent.active_mut().model.messages = vec![
+            crate::workspace::AgentMessage {
+                turn: 1,
+                role: "edit_file · done".into(),
+                text: "written".into(),
+                id: Some("edit-one".into()),
+            },
+            crate::workspace::AgentMessage {
+                turn: 2,
+                role: "edit_file · done".into(),
+                text: "written".into(),
+                id: Some("edit-two".into()),
+            },
+        ];
+        let size = WindowSize {
+            num_cols: 100,
+            num_lines: 30,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let side = Rect {
+            x: 50,
+            y: 1,
+            cols: 50,
+            rows: 28,
+        };
+        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
+        assert!(
+            panel
+                .hits
+                .iter()
+                .any(|(_, action)| *action == AgentAction::ToggleChanges)
+        );
+        assert!(
+            !panel
+                .hits
+                .iter()
+                .any(|(_, action)| *action == AgentAction::ChangedFile(0))
+        );
+        assert!(
+            panel
+                .hits
+                .iter()
+                .any(|(_, action)| *action == AgentAction::EditDiff(0))
+        );
+        assert!(
+            panel
+                .hits
+                .iter()
+                .any(|(_, action)| *action == AgentAction::EditDiff(1))
+        );
+        assert!(matches!(
+            ui.agent.active().lines.as_slice(),
+            [
+                AgentLine::Role(0),
+                AgentLine::Edit(0),
+                AgentLine::Blank,
+                AgentLine::Role(1),
+                AgentLine::Edit(1),
+                AgentLine::Blank
+            ]
+        ));
+        let header = panel
+            .hits
+            .iter()
+            .find(|(_, action)| *action == AgentAction::ToggleChanges)
+            .unwrap()
+            .0;
+        let row = &panel.grid.rows[usize::from(header.y - panel.grid.rect.y)];
+        assert!(row.cells.iter().any(|cell| cell.c == ''));
+        assert!(
+            row.cells
+                .iter()
+                .any(|cell| cell.c == '+' && cell.fg == rgb(0xb5d2a2))
+        );
+        assert!(
+            row.cells
+                .iter()
+                .any(|cell| cell.c == '-' && cell.fg == rgb(0xe87575))
+        );
+        let path =
+            std::env::temp_dir().join(format!("nextty-file-diff-ui-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client = Client::connect(&path).unwrap();
+        let (_stream, _) = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        ui.activate_agent(AgentAction::EditDiff(0), &client)
+            .unwrap();
+        assert!(
+            !ui.agent
+                .active()
+                .context
+                .preview
+                .as_ref()
+                .unwrap()
+                .item
+                .snapshot
+                .text
+                .contains("+second")
+        );
+        ui.activate_agent(AgentAction::ClosePreview, &client)
+            .unwrap();
+        ui.activate_agent(AgentAction::ToggleChanges, &client)
+            .unwrap();
+        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
+        assert!(
+            panel
+                .hits
+                .iter()
+                .any(|(_, action)| *action == AgentAction::ChangedFile(0))
+        );
+        ui.activate_agent(AgentAction::ChangedFile(0), &client)
+            .unwrap();
+        let preview = ui.agent.active().context.preview.as_ref().unwrap();
+        assert_eq!(preview.item.kind, "diff");
+        assert!(preview.item.snapshot.text.contains("+second"));
+        assert!(preview.item.snapshot.text.contains("-old"));
+        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
+        let backdrop = panel.backdrop.as_ref().unwrap();
+        assert_eq!(backdrop.rect, side);
+        assert!(
+            backdrop
+                .rows
+                .iter()
+                .any(|row| row.cells.iter().any(|cell| cell.c == '' || cell.c == ''))
+        );
+        assert!(panel.hits.iter().all(|(_, action)| matches!(
+            action,
+            AgentAction::ClosePreview | AgentAction::CopyPreview
+        )));
+        assert!(panel.grid.rect.x > 0 && panel.grid.rect.y > 1);
+        assert!(panel.grid.rect.cols < size.num_cols && panel.grid.rect.rows < size.num_lines);
+        let added = panel
+            .grid
+            .rows
+            .iter()
+            .find_map(|row| row.cells.get(2).filter(|cell| cell.c == '+'))
+            .unwrap();
+        assert_eq!(added.fg, rgb(0xb5d2a2));
+        ui.activate_agent(AgentAction::ClosePreview, &client)
+            .unwrap();
+        assert!(ui.agent.active().context.preview.is_none());
+        assert_eq!(ui.agent.active().model.changes.len(), 2);
+    }
+
+    #[test]
     fn tab_dot_tracks_agent_outcome_without_treating_tool_errors_as_failure() {
         let mut ui = Ui::new().unwrap();
         ui.agent.open = true;
@@ -2912,17 +3654,27 @@ mod tests {
             }];
             let panel = draw(&mut ui, &config, side, size, None, "").unwrap();
             let row = &panel.grid.rows[0];
-            assert_eq!(row.cells[1].c, '•');
-            assert_eq!(row.cells[1].fg, rgb(expected));
-            assert!(row.cells[3].flags.contains(Flags::BOLD));
-            assert_eq!(row.cells[3].fg, rgb(0xffffff));
-            assert!(
-                row.cells
+            assert_eq!(row.cells[0].bg, panel.grid.rows[1].cells[0].bg);
+            assert_eq!(row.cells[2].c, '•');
+            assert_eq!(row.cells[2].fg, rgb(expected));
+            assert!(row.cells[4].flags.contains(Flags::UNDERLINE));
+            assert_eq!(row.cells[4].fg, rgb(0xdddddd));
+            let width = ui.agent.tabs(39)[0].2;
+            assert_eq!(
+                row.cells[1..1 + width]
                     .iter()
-                    .all(|cell| !cell.flags.contains(Flags::UNDERLINE))
+                    .map(|cell| cell.c)
+                    .collect::<String>(),
+                " • New chat × "
             );
-            assert!(row.cells[1..].iter().all(|cell| cell.bg == rgb(0x191919)));
-            assert!(row.cells.iter().any(|cell| cell.c == '╱'));
+            assert!(
+                row.cells[1..1 + width].iter().all(|cell| {
+                    cell.bg == rgb(0x363636) && cell.flags.contains(Flags::UNDERLINE)
+                })
+            );
+            assert_eq!(row.extra(2).unwrap().underline_color, Some(rgb(0xcccccc)));
+            assert_eq!(row.cells[1 + width].bg, rgb(0x111111));
+            assert!(!row.cells.iter().any(|cell| cell.c == '╱'));
         }
     }
 
@@ -2946,17 +3698,23 @@ mod tests {
             rows: 22,
         };
         let first = draw(&mut ui, &config, side, size, None, "").unwrap();
-        assert_eq!(first.grid.runs(Some(&first.grid), &[]).count(), 0);
+        first
+            .grid
+            .for_each_run::<io::Error>(Some(&first.grid), &[], |_| {
+                panic!("unchanged grid emitted a run")
+            })
+            .unwrap();
         let composing = draw(&mut ui, &config, side, size, None, "文").unwrap();
         assert_eq!(ui.agent.active().model.input, "e\u{301}中");
         let editor = editor(&ui, side).0;
         assert_eq!(composing.cursor, Some((editor.x + 5, editor.y)));
-        assert!(
-            composing
-                .grid
-                .runs(Some(&first.grid), &[])
-                .all(|run| run.y >= editor.y)
-        );
+        composing
+            .grid
+            .for_each_run::<io::Error>(Some(&first.grid), &[], |run| {
+                assert!(run.y >= editor.y);
+                Ok(())
+            })
+            .unwrap();
         let mut output = Vec::new();
         composing.grid.ansi(&mut output, None, &[]).unwrap();
         let mut terminal = crate::core::Core::new(size, config.foreground, config.background);
@@ -3501,6 +4259,7 @@ mod tests {
                     AgentLine::Role(message) => ('r', *message, 0..0),
                     AgentLine::Text { message, range } => ('t', *message, range.clone()),
                     AgentLine::Blank => ('b', 0, 0..0),
+                    AgentLine::Edit(index) => ('e', *index, 0..0),
                 })
                 .collect::<Vec<_>>()
         };
@@ -3607,6 +4366,35 @@ mod tests {
         assert!(panel.active().rendered.is_empty());
         assert!(panel.active().lines.is_empty());
         assert_eq!(panel.active().model.input, "restored draft");
+    }
+
+    #[test]
+    fn transcript_copy_preserves_unselected_hard_line_gaps() {
+        let mut session = AgentSession::default();
+        session.model.messages.push(crate::workspace::AgentMessage {
+            turn: 1,
+            role: "You".into(),
+            text: "ab\r\ncd\n\nef".into(),
+            id: None,
+        });
+        session.layout(80);
+        for (from, to, expected) in [
+            ((0, 0), (0, 0), None),
+            ((0, 2), (1, 0), None),
+            ((0, 2), (1, 1), Some("c")),
+            ((0, 0), (1, 0), Some("ab")),
+            ((0, 1), (1, 1), Some("b\r\nc")),
+            ((1, 2), (3, 0), None),
+            ((1, 1), (3, 1), Some("d\n\ne")),
+        ] {
+            let from = session.point(from.0, from.1).unwrap();
+            let to = session.point(to.0, to.1).unwrap();
+            for (anchor, head) in [(from, to), (to, from)] {
+                session.begin_selection(anchor, false);
+                session.extend_selection(head);
+                assert_eq!(session.selected_text().as_deref(), expected);
+            }
+        }
     }
 
     #[test]
@@ -4000,10 +4788,10 @@ mod tests {
                 id: None,
             });
         let wide = panel.tabs(100);
-        assert_eq!(wide[0].2, crate::width::text_width(title) + 7);
+        assert_eq!(wide[0].2, crate::width::text_width(title) + 6);
         assert!(wide[0].2 > 18);
         let narrow = panel.tabs(24);
-        assert_eq!(narrow[0].2, 18);
+        assert_eq!(narrow[0].2, 17);
         assert!(wide[0].2 > narrow[0].2);
         panel.new_session();
         panel
@@ -4029,9 +4817,9 @@ mod tests {
             });
         let tabs = panel.tabs(80);
         assert_eq!(tabs.len(), 3);
-        assert_eq!(tabs[2].2, 10);
+        assert_eq!(tabs[2].2, 7);
         assert!(tabs[0].2 > 18 && tabs[1].2 > 18);
-        assert_eq!(tabs.iter().map(|tab| tab.2).sum::<usize>(), 74);
+        assert_eq!(tabs.iter().map(|tab| tab.2).sum::<usize>(), 73);
         let tiny = panel.tabs(12);
         assert!(tiny.iter().any(|tab| tab.0 == panel.current));
         assert!(tiny.iter().all(|tab| tab.1 + tab.2 <= 6));

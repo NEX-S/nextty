@@ -82,44 +82,14 @@ fn classify(text: &str, row: &crate::core::Row, enclosed_symbol: bool) -> Option
             lowercase.make_ascii_lowercase();
             matches!(
                 &*lowercase,
-                b"rax"
-                    | b"rbx"
-                    | b"rcx"
-                    | b"rdx"
-                    | b"rsi"
-                    | b"rdi"
-                    | b"rbp"
-                    | b"rsp"
-                    | b"rip"
-                    | b"eax"
-                    | b"ebx"
-                    | b"ecx"
-                    | b"edx"
-                    | b"esi"
-                    | b"edi"
-                    | b"ebp"
-                    | b"esp"
-                    | b"eip"
-                    | b"ax"
-                    | b"bx"
-                    | b"cx"
-                    | b"dx"
-                    | b"al"
-                    | b"ah"
-                    | b"bl"
-                    | b"bh"
-                    | b"cl"
-                    | b"ch"
-                    | b"dl"
-                    | b"dh"
+                [b'r' | b'e', b'a'..=b'd', b'x']
+                    | [b'r' | b'e', b's', b'i' | b'p']
+                    | [b'r' | b'e', b'd', b'i']
+                    | [b'r' | b'e', b'b' | b'i', b'p']
+                    | [b'a'..=b'd', b'x' | b'l' | b'h']
+                    | [b'c'..=b'g' | b's', b's']
                     | b"eflags"
                     | b"rflags"
-                    | b"cs"
-                    | b"ds"
-                    | b"es"
-                    | b"fs"
-                    | b"gs"
-                    | b"ss"
             )
         })
         || register.strip_prefix(['r', 'R']).is_some_and(|index| {

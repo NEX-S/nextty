@@ -56,6 +56,7 @@ fn main() {
     sources(Path::new("native"), &mut files);
     files.sort();
     let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
+    let debug = env::var("DEBUG").expect("Cargo DEBUG") == "true";
     let archive_path = out.join("libnextty_native.a");
     let mut archive = Command::new("ar");
     archive.arg("crs").arg(&archive_path);
@@ -65,7 +66,6 @@ fn main() {
         cc.args([
             "-std=c11",
             "-O2",
-            "-g",
             "-fPIC",
             "-Wall",
             "-Wextra",
@@ -73,6 +73,7 @@ fn main() {
             "-Werror",
             "-Inative",
         ])
+        .args(debug.then_some("-g"))
         .arg("-I")
         .arg(out)
         .args(flags.split_whitespace())

@@ -3,7 +3,7 @@
 use crate::worker::Worker;
 use std::borrow::Cow;
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::fs::{self, OpenOptions, ReadDir};
 use std::io::{self, Read};
@@ -42,7 +42,7 @@ impl FileEntry {
 
 pub struct FileNav {
     directory: PathBuf,
-    expanded: BTreeSet<PathBuf>,
+    expanded: Arc<HashSet<PathBuf>>,
     query: Option<String>,
     scan: Scan,
     selection: usize,
@@ -51,7 +51,7 @@ pub struct FileNav {
     scan_pending: bool,
     worker: Worker<ScanRequest, (u64, Scan, bool)>,
     restore_selection: Option<PathBuf>,
-    directory_selection: BTreeMap<PathBuf, PathBuf>,
+    directory_selection: HashMap<PathBuf, PathBuf>,
     focus: FileFocus,
     preview_path: Option<PathBuf>,
     preview: Preview,
@@ -79,8 +79,8 @@ impl Preview {
         }
     }
 
-    fn lines(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.line_offsets
+    fn lines(&self, from: usize) -> impl ExactSizeIterator<Item = &str> {
+        self.line_offsets[from.min(self.line_offsets.len())..]
             .windows(2)
             .map(|range| &self.text[range[0] as usize..range[1] as usize])
     }
@@ -94,8 +94,8 @@ struct ScanRequest {
 }
 
 enum ScanMode {
-    Browse(BTreeSet<PathBuf>),
-    Search(String),
+    Browse(Arc<HashSet<PathBuf>>),
+    Search(Box<str>),
 }
 
 #[derive(Default)]
@@ -126,6 +126,8 @@ impl FileNav {
                 let result = scan(&request.directory, &request.mode, &cancelled, &|scan| {
                     publish_scan(scan, false);
                 });
+                // The frontend may mutate the expanded set as soon as it receives this result.
+                drop(request.mode);
                 publish_scan(result, true);
             },
         )?;
@@ -134,12 +136,12 @@ impl FileNav {
             "nextty-preview",
             wakeup,
             move |(generation, path, previous): (u64, PathBuf, Preview), publish| {
-                drop(previous);
                 let cancelled = || cancellation.load(Ordering::Relaxed) != generation;
-                let result = read_preview(&path, &cancelled).unwrap_or_else(|error| Preview {
-                    error: Some(error),
-                    ..Preview::default()
-                });
+                let result =
+                    read_preview(&path, &cancelled, previous).unwrap_or_else(|error| Preview {
+                        error: Some(error),
+                        ..Preview::default()
+                    });
                 if !cancelled() {
                     publish((generation, result));
                 }
@@ -147,7 +149,7 @@ impl FileNav {
         )?;
         let mut nav = Self {
             directory: PathBuf::new(),
-            expanded: BTreeSet::new(),
+            expanded: Arc::default(),
             query: None,
             scan: Scan::default(),
             selection: 0,
@@ -156,7 +158,7 @@ impl FileNav {
             scan_pending: false,
             worker,
             restore_selection: None,
-            directory_selection: BTreeMap::new(),
+            directory_selection: HashMap::new(),
             focus: FileFocus::List,
             preview_path: None,
             preview: Preview::default(),
@@ -198,7 +200,8 @@ impl FileNav {
     }
 
     pub fn follow_selection(&mut self, rows: usize) -> usize {
-        let margin = (rows / 2).min(2);
+        let rows = rows.max(1);
+        let margin = ((rows - 1) / 2).min(2);
         if self.selection < self.scroll + margin {
             self.scroll = self.selection.saturating_sub(margin);
         } else if self.selection >= (self.scroll + rows).saturating_sub(margin) {
@@ -226,7 +229,6 @@ impl FileNav {
     pub fn focus_preview(&mut self) -> bool {
         if self.selected().is_some_and(|entry| !entry.is_dir) {
             self.focus = FileFocus::Preview;
-            self.update_preview();
             true
         } else {
             false
@@ -235,11 +237,10 @@ impl FileNav {
 
     pub fn focus_list(&mut self) {
         self.focus = FileFocus::List;
-        self.update_preview();
     }
 
-    pub fn preview_lines(&self) -> impl ExactSizeIterator<Item = &str> {
-        self.preview.lines()
+    pub fn preview_lines(&self, from: usize) -> impl ExactSizeIterator<Item = &str> {
+        self.preview.lines(from)
     }
 
     pub fn preview_scroll(&self) -> usize {
@@ -277,13 +278,14 @@ impl FileNav {
         self.update_preview();
     }
 
+    #[cfg(any(feature = "gui", feature = "tui", test))]
     pub(crate) fn scroll(&mut self, delta: isize, visible_rows: usize) {
         match self.focus {
             FileFocus::List => self.move_selection(delta),
             FileFocus::Preview => {
                 self.preview_scroll = self.preview_scroll.saturating_add_signed(delta).min(
                     self.preview
-                        .lines()
+                        .lines(0)
                         .len()
                         .saturating_sub(visible_rows.max(1)),
                 );
@@ -304,6 +306,7 @@ impl FileNav {
         }
     }
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) fn insert_query(&mut self, text: &str) {
         self.focus_list();
         match &mut self.query {
@@ -317,6 +320,7 @@ impl FileNav {
         }
     }
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) fn backspace_query(&mut self) {
         if self.query.as_mut().unwrap().pop().is_some() {
             self.restore_selection = None;
@@ -344,7 +348,7 @@ impl FileNav {
             std::env::current_dir()?.join(directory)
         };
         self.query = None;
-        self.expanded.clear();
+        self.expanded = Arc::default();
         self.restore_selection = self.directory_selection.get(&self.directory).cloned();
         self.request_scan();
         Ok(())
@@ -353,7 +357,7 @@ impl FileNav {
     pub fn parent(&mut self) -> bool {
         if let Some(entry) = self.scan.entries.get(self.selection) {
             let path = &entry.path;
-            if self.expanded.remove(path) {
+            if Arc::make_mut(&mut self.expanded).remove(path) {
                 self.restore_selection = Some(path.clone());
                 self.request_scan();
                 return true;
@@ -366,6 +370,7 @@ impl FileNav {
                     .position(|entry| entry.path == parent)
             {
                 self.selection = index;
+                self.update_preview();
                 return true;
             }
         }
@@ -373,7 +378,7 @@ impl FileNav {
             return false;
         };
         self.restore_selection = Some(std::mem::replace(&mut self.directory, parent));
-        self.expanded.clear();
+        self.expanded = Arc::default();
         self.query = None;
         self.request_scan();
         true
@@ -396,11 +401,12 @@ impl FileNav {
             return true;
         }
         let path = path.clone();
+        let expanded = Arc::make_mut(&mut self.expanded);
         for directory in path
             .ancestors()
             .take_while(|directory| *directory != self.directory)
         {
-            self.expanded.insert(directory.to_path_buf());
+            expanded.insert(directory.to_path_buf());
         }
         self.query = None;
         self.restore_selection = Some(path);
@@ -408,21 +414,12 @@ impl FileNav {
         true
     }
 
-    pub fn entry_label<'a>(&self, entry: &'a FileEntry) -> Cow<'a, str> {
+    pub fn entry_label<'a>(&self, entry: &'a FileEntry, label: &'a mut String) -> Cow<'a, str> {
+        let relative = entry.path.strip_prefix(&self.directory);
         if self.is_search() {
-            return entry
-                .path
-                .strip_prefix(&self.directory)
-                .unwrap_or(&entry.path)
-                .to_string_lossy();
+            return relative.unwrap_or(&entry.path).to_string_lossy();
         }
-        let depth = entry
-            .path
-            .strip_prefix(&self.directory)
-            .unwrap()
-            .components()
-            .count()
-            .saturating_sub(1);
+        let depth = relative.unwrap().components().count().saturating_sub(1);
         let marker = if entry.is_dir {
             if self.expanded.contains(&entry.path) {
                 ""
@@ -432,12 +429,14 @@ impl FileNav {
         } else {
             " "
         };
-        Cow::Owned(format!(
-            "{:indent$}{marker} {}",
-            "",
-            entry.display_name(),
-            indent = depth * 2,
-        ))
+        let name = entry.display_name();
+        label.clear();
+        label.reserve(depth * 2 + marker.len() + 1 + name.len());
+        label.extend(std::iter::repeat_n(' ', depth * 2));
+        label.push_str(marker);
+        label.push(' ');
+        label.push_str(&name);
+        Cow::Borrowed(label)
     }
 
     /// Receives the latest available results without waiting for filesystem work.
@@ -453,7 +452,6 @@ impl FileNav {
             }
             changed = true;
         }
-        self.update_preview();
         if let Some((generation, preview)) = self.preview_worker.take()
             && generation == self.preview_generation.load(Ordering::Relaxed)
         {
@@ -466,10 +464,12 @@ impl FileNav {
 
     fn remember_selection(&mut self) {
         if !self.is_search()
-            && let Some(entry) = self.selected()
+            && let Some(entry) = self.scan.entries.get(self.selection)
         {
             self.directory_selection
-                .insert(self.directory.clone(), entry.path.clone());
+                .entry(self.directory.clone())
+                .and_modify(|path| path.clone_from(&entry.path))
+                .or_insert_with(|| entry.path.clone());
         }
     }
 
@@ -482,23 +482,35 @@ impl FileNav {
             .and_then(|path| scan.entries.iter().position(|entry| entry.path == path))
             .unwrap_or_else(|| self.selection.min(scan.entries.len().saturating_sub(1)));
         self.scan = scan;
+        self.update_preview();
     }
 
     fn update_preview(&mut self) {
         let path = self
-            .selected()
-            .filter(|_| self.focus == FileFocus::Preview)
+            .scan
+            .entries
+            .get(self.selection)
+            .filter(|entry| !entry.is_dir)
             .map(|entry| &entry.path);
         if self.preview_path.as_ref() == path {
             return;
         }
-        self.preview_path = path.cloned();
+        match (&mut self.preview_path, path) {
+            (Some(previous), Some(path)) => previous.clone_from(path),
+            (slot, path) => *slot = path.cloned(),
+        }
         let previous = std::mem::take(&mut self.preview);
         self.preview_scroll = 0;
         let generation = self.preview_generation.fetch_add(1, Ordering::Relaxed) + 1;
         self.preview_pending = self.preview_path.is_some();
         if let Some(path) = self.preview_path.clone() {
-            self.preview_worker.submit((generation, path, previous));
+            let mut request = (generation, path, previous);
+            self.preview_worker.submit(|pending| {
+                if let Some(pending) = pending {
+                    std::mem::swap(&mut request.2, &mut pending.2);
+                }
+                request
+            });
         }
     }
 
@@ -512,14 +524,20 @@ impl FileNav {
         self.focus = FileFocus::List;
         self.update_preview();
         self.scan_pending = true;
-        self.worker.submit(ScanRequest {
+        let mut request = ScanRequest {
             generation,
             directory: self.directory.clone(),
             mode: match &self.query {
-                Some(query) => ScanMode::Search(query.clone()),
+                Some(query) => ScanMode::Search(query.as_str().into()),
                 None => ScanMode::Browse(self.expanded.clone()),
             },
             previous,
+        };
+        self.worker.submit(|pending| {
+            if let Some(pending) = pending {
+                std::mem::swap(&mut request.previous, &mut pending.previous);
+            }
+            request
         });
     }
 }
@@ -533,7 +551,11 @@ impl Drop for FileNav {
     }
 }
 
-fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Preview> {
+fn read_preview(
+    path: &Path,
+    cancelled: &impl Fn() -> bool,
+    previous: Preview,
+) -> io::Result<Preview> {
     if cancelled() {
         return Ok(Preview::default());
     }
@@ -580,13 +602,16 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
         ));
     };
     let mut source = text.split_terminator('\n');
-    let mut rendered = String::new();
-    let mut line_offsets = vec![0];
+    let mut rendered = previous.text.into_string();
+    rendered.clear();
+    let mut line_offsets = previous.line_offsets.into_vec();
+    line_offsets.clear();
+    line_offsets.push(0);
     for line in source.by_ref().take(PREVIEW_LINE_LIMIT) {
         preview_text(line.strip_suffix('\r').unwrap_or(line), &mut rendered);
         line_offsets.push(rendered.len() as u32);
     }
-    truncated |= source.next().is_some();
+    truncated = truncated || source.next().is_some();
     Ok(Preview {
         text: rendered.into_boxed_str(),
         line_offsets: line_offsets.into_boxed_slice(),
@@ -596,10 +621,11 @@ fn read_preview(path: &Path, cancelled: &impl Fn() -> bool) -> io::Result<Previe
 }
 
 fn preview_text(text: &str, result: &mut String) {
-    let Some(first) = text.bytes().position(|byte| !(b' '..=b'~').contains(&byte)) else {
+    let first = crate::width::printable_ascii_prefix(text.as_bytes());
+    if first == text.len() {
         result.push_str(text);
         return;
-    };
+    }
     let mut start = 0;
     // The printable ASCII prefix makes first a UTF-8 boundary.
     for (index, ch) in text[first..]
@@ -638,27 +664,38 @@ fn scan(
     match mode {
         ScanMode::Browse(expanded) if expanded.is_empty() => list_directory(root, cancelled),
         ScanMode::Browse(expanded) => {
-            let Scan { entries, error, .. } = list_directory(root, cancelled);
-            let mut result = Scan {
-                error,
-                ..Scan::default()
-            };
-            for entry in entries {
-                if entry.is_dir && expanded.contains(&entry.path) {
-                    let mut children = scan(&entry.path, mode, cancelled, publish);
-                    result.entries.push(entry);
-                    result.entries.append(&mut children.entries);
-                    result.error = result.error.or(children.error);
-                } else {
-                    result.entries.push(entry);
-                }
-                if cancelled() {
-                    return Scan::default();
-                }
-            }
-            result
+            let mut result = Scan::default();
+            browse_directory(root, expanded, cancelled, &mut result);
+            if cancelled() { Scan::default() } else { result }
         }
         ScanMode::Search(query) => search_directory(root, directory, query, cancelled, publish),
+    }
+}
+
+fn browse_directory(
+    directory: ReadDir,
+    expanded: &HashSet<PathBuf>,
+    cancelled: &impl Fn() -> bool,
+    result: &mut Scan,
+) {
+    let Scan { entries, error, .. } = list_directory(directory, cancelled);
+    result.error = result.error.take().or(error);
+    result.entries.reserve(entries.len());
+    for entry in entries {
+        if cancelled() {
+            return;
+        }
+        let children =
+            (entry.is_dir && expanded.contains(&entry.path)).then(|| fs::read_dir(&entry.path));
+        result.entries.push(entry);
+        if let Some(children) = children {
+            match children {
+                Ok(children) => browse_directory(children, expanded, cancelled, result),
+                Err(error) => {
+                    result.error.get_or_insert(error);
+                }
+            }
+        }
     }
 }
 
@@ -703,17 +740,19 @@ fn search_directory(
     cancelled: &impl Fn() -> bool,
     publish: &impl Fn(Scan),
 ) -> Scan {
-    let pattern: Vec<char> = query.to_lowercase().chars().collect();
+    let pattern: smallvec::SmallVec<[char; 16]> = query.to_lowercase().chars().collect();
     let ascii_pattern = pattern.iter().all(|ch| ch.is_ascii());
-    // DirEntry paths retain this root verbatim and append a separator when needed.
+    // Keep the root verbatim, including trailing separators and `.` components.
     let relative_start = directory.as_os_str().len()
         + usize::from(!directory.as_os_str().as_bytes().ends_with(b"/"));
-    let mut directories = vec![root];
+    let mut path = directory.as_os_str().as_bytes().to_vec();
+    let mut directories = vec![(root, path.len())];
     let mut matches: Vec<(Reverse<i64>, PathBuf)> = Vec::new();
     let mut scan = Scan::default();
     let mut last_update = Instant::now();
     let mut dirty = false;
-    while let Some(current) = directories.last_mut() {
+    while let Some((current, length)) = directories.last_mut() {
+        path.truncate(*length);
         if cancelled() {
             return Scan::default();
         }
@@ -721,16 +760,22 @@ fn search_directory(
             directories.pop();
             continue;
         };
-        let (path, kind) = match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
+        let (name, kind) = match entry.and_then(|entry| Ok((entry.file_name(), entry.file_type()?)))
+        {
             Ok(entry) => entry,
             Err(error) => {
                 scan.error.get_or_insert(error);
                 continue;
             }
         };
+        if !path.ends_with(b"/") {
+            path.push(b'/');
+        }
+        path.extend_from_slice(name.as_bytes());
+        let path = Path::new(OsStr::from_bytes(&path));
         if kind.is_dir() {
-            match fs::read_dir(&path) {
-                Ok(children) => directories.push(children),
+            match fs::read_dir(path) {
+                Ok(children) => directories.push((children, path.as_os_str().len())),
                 Err(error) => {
                     scan.error.get_or_insert(error);
                 }
@@ -738,7 +783,7 @@ fn search_directory(
         } else {
             // Explicit browsing may enter directory links; recursion never follows them.
             if kind.is_symlink() {
-                match fs::metadata(&path) {
+                match fs::metadata(path) {
                     Ok(metadata) if metadata.is_dir() => continue,
                     Ok(_) => {}
                     Err(error) => {
@@ -748,7 +793,8 @@ fn search_directory(
             }
             let relative = OsStr::from_bytes(&path.as_os_str().as_bytes()[relative_start..]);
             if (ascii_pattern || !relative.as_bytes().is_ascii())
-                && let Some(score) = fuzzy_score(&pattern, &relative.to_string_lossy())
+                && let Some(score) =
+                    fuzzy_score(&pattern, ascii_pattern, &relative.to_string_lossy())
             {
                 let score = Reverse(score);
                 let relative = Path::new(relative);
@@ -771,8 +817,8 @@ fn search_directory(
                     dirty = true;
                 }
                 if position < SEARCH_LIMIT {
-                    matches.insert(position, (score, path));
-                    matches.truncate(SEARCH_LIMIT);
+                    matches.truncate(SEARCH_LIMIT - 1);
+                    matches.insert(position, (score, path.to_path_buf()));
                     dirty = true;
                 }
             }
@@ -804,7 +850,7 @@ fn search_directory(
     scan
 }
 
-fn fuzzy_score(pattern: &[char], candidate: &str) -> Option<i64> {
+fn fuzzy_score(pattern: &[char], ascii_pattern: bool, candidate: &str) -> Option<i64> {
     if candidate.is_ascii() {
         fuzzy_score_chars(
             pattern,
@@ -812,10 +858,10 @@ fn fuzzy_score(pattern: &[char], candidate: &str) -> Option<i64> {
                 .bytes()
                 .map(|ch| char::from(ch.to_ascii_lowercase())),
         )
-    } else if pattern.is_empty() {
-        Some(-(candidate.chars().flat_map(char::to_lowercase).count() as i64))
+    } else if ascii_pattern {
+        // ASCII queries cannot distinguish contextual sigma forms.
+        fuzzy_score_chars(pattern, candidate.chars().flat_map(char::to_lowercase))
     } else {
-        // Whole-string lowercasing preserves contextual mappings such as Greek sigma.
         fuzzy_score_chars(pattern, candidate.to_lowercase().chars())
     }
 }
@@ -926,6 +972,26 @@ mod tests {
     }
 
     #[test]
+    fn tiny_file_viewports_keep_the_selection_stable_and_visible() {
+        let fixture = Fixture::new();
+        for index in 0..10 {
+            fixture.file(format!("{index:02}.txt"));
+        }
+        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
+        finish(&mut nav);
+        nav.move_selection(3);
+        for rows in [2, 4, 0] {
+            let first = nav.follow_selection(rows);
+            for _ in 0..3 {
+                assert_eq!(nav.follow_selection(rows), first, "{rows} rows");
+            }
+            if rows != 0 {
+                assert!((first..first + rows).contains(&nav.selection()));
+            }
+        }
+    }
+
+    #[test]
     fn directory_navigation_sorts_directories_first_and_preserves_names() {
         let fixture = Fixture::new();
         fixture.file("z-dir/child");
@@ -944,7 +1010,10 @@ mod tests {
         assert!(nav.enter_selected());
         finish(&mut nav);
         assert_eq!(nav.entries()[2].display_name(), "child");
-        assert!(nav.entry_label(&nav.entries()[2]).starts_with("    "));
+        assert!(
+            nav.entry_label(&nav.entries()[2], &mut String::new())
+                .starts_with("    ")
+        );
         assert!(nav.parent());
         finish(&mut nav);
         assert_eq!(nav.directory(), fixture.0);
@@ -991,6 +1060,10 @@ mod tests {
         assert!(nav.error().is_none());
         assert_eq!(nav.entries().len(), 1);
         assert_eq!(nav.entries()[0].path, wanted);
+        nav.set_query("ifile".into());
+        finish(&mut nav);
+        assert_eq!(nav.entries().len(), 1);
+        assert_eq!(nav.entries()[0].path, wanted);
         nav.set_query("K".into());
         finish(&mut nav);
         assert_eq!(nav.entries().len(), 1);
@@ -1013,6 +1086,51 @@ mod tests {
         assert!(nav.error().is_none());
         assert_eq!(nav.entries().len(), 1);
         assert_eq!(nav.entries()[0].path, wanted);
+    }
+
+    #[test]
+    fn superseded_scans_carry_old_buffers_to_the_worker() {
+        let fixture = Fixture::new();
+        for index in 0..200 {
+            fixture.file(format!("{index:03}-file"));
+        }
+        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
+        finish(&mut nav);
+        let (entered, started) = mpsc::channel();
+        let (release, blocked) = mpsc::channel();
+        let (sent, received) = mpsc::channel();
+        let mut first = true;
+        nav.worker = Worker::new(
+            "scan-retirement-test",
+            Arc::new(crate::eventfd::new().unwrap()),
+            move |request: ScanRequest, _| {
+                if first {
+                    first = false;
+                    entered.send(()).unwrap();
+                    blocked.recv().unwrap();
+                } else {
+                    sent.send((request.generation, request.previous.0.entries.len()))
+                        .unwrap();
+                }
+            },
+        )
+        .unwrap();
+        nav.worker.submit(|_| ScanRequest {
+            generation: 0,
+            directory: fixture.0.clone(),
+            mode: ScanMode::Search("".into()),
+            previous: Default::default(),
+        });
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        for index in 0..100 {
+            nav.set_query(format!("needle-{index}"));
+        }
+        release.send(()).unwrap();
+        assert_eq!(
+            received.recv_timeout(Duration::from_secs(5)).unwrap(),
+            (nav.generation.load(Ordering::Relaxed), 200)
+        );
+        assert!(received.try_recv().is_err());
     }
 
     #[test]
@@ -1116,7 +1234,7 @@ mod tests {
         fixture.file("b-dir/other");
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
-        assert!(nav.preview_lines().len() == 0);
+        assert!(nav.preview_lines(0).len() == 0);
         assert!(!nav.preview_loading());
         assert!(nav.enter_selected());
         finish(&mut nav);
@@ -1149,11 +1267,12 @@ mod tests {
         nav.refresh();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
-        assert!(nav.preview_lines().len() == 0);
+        assert_eq!(nav.focus(), FileFocus::List);
+        assert!(nav.preview_lines(0).len() > 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
         assert_eq!(
-            nav.preview_lines().collect::<Vec<_>>(),
+            nav.preview_lines(0).collect::<Vec<_>>(),
             ["selected contents"]
         );
         nav.focus_list();
@@ -1186,7 +1305,7 @@ mod tests {
         assert_eq!(nav.preview_scroll(), 3);
         nav.focus_list();
         assert_eq!(nav.selected().unwrap().path, path);
-        assert_eq!(nav.preview_scroll(), 0);
+        assert_eq!(nav.preview_scroll(), 3);
         assert!(nav.focus_preview());
         nav.scroll(-200, 2);
         assert_eq!(nav.preview_scroll(), 0);
@@ -1199,22 +1318,22 @@ mod tests {
         let fixture = Fixture::new();
         let path = fixture.file("preview");
         fs::write(&path, "\t你好\u{85}\x1b[31m\r\nline\n").unwrap();
-        let preview = read_preview(&path, &|| false).unwrap();
+        let preview = read_preview(&path, &|| false, Preview::default()).unwrap();
         assert_eq!(
-            preview.lines().collect::<Vec<_>>(),
+            preview.lines(0).collect::<Vec<_>>(),
             ["    你好\\u{85}\\u{1b}[31m", "line"]
         );
         assert!(!preview.truncated);
         let many_lines = "line\n".repeat(PREVIEW_LINE_LIMIT + 1);
         fs::write(&path, many_lines).unwrap();
-        let preview = read_preview(&path, &|| false).unwrap();
-        assert_eq!(preview.lines().len(), PREVIEW_LINE_LIMIT);
+        let preview = read_preview(&path, &|| false, preview).unwrap();
+        assert_eq!(preview.lines(0).len(), PREVIEW_LINE_LIMIT);
         assert!(preview.truncated);
         let bytes = format!("{}你好", "a".repeat(PREVIEW_BYTE_LIMIT - 1));
         fs::write(&path, bytes).unwrap();
-        let preview = read_preview(&path, &|| false).unwrap();
+        let preview = read_preview(&path, &|| false, preview).unwrap();
         assert_eq!(
-            preview.lines().next().unwrap().len(),
+            preview.lines(0).next().unwrap().len(),
             PREVIEW_BYTE_LIMIT - 1
         );
         assert!(preview.truncated);
@@ -1234,17 +1353,17 @@ mod tests {
         assert!(nav.focus_preview());
         finish(&mut nav);
         assert_eq!(
-            nav.preview_lines().collect::<Vec<_>>(),
+            nav.preview_lines(0).collect::<Vec<_>>(),
             ["Special file; preview unavailable"]
         );
         assert!(nav.preview_error().is_none());
         nav.move_selection(1);
         finish(&mut nav);
         assert_eq!(
-            nav.preview_lines().collect::<Vec<_>>(),
+            nav.preview_lines(0).collect::<Vec<_>>(),
             ["Binary or non-UTF-8 file; preview unavailable"]
         );
-        let missing = read_preview(&fixture.0.join("missing"), &|| false)
+        let missing = read_preview(&fixture.0.join("missing"), &|| false, Preview::default())
             .err()
             .unwrap();
         assert_eq!(missing.kind(), io::ErrorKind::NotFound);
@@ -1264,10 +1383,11 @@ mod tests {
         nav.set_query("中needle".into());
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
-        assert!(nav.preview_lines().len() == 0);
+        assert_eq!(nav.focus(), FileFocus::List);
+        assert!(nav.preview_lines(0).len() > 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
-        assert_eq!(nav.preview_lines().collect::<Vec<_>>(), ["new contents"]);
+        assert_eq!(nav.preview_lines(0).collect::<Vec<_>>(), ["new contents"]);
         assert_eq!(nav.preview_scroll(), 0);
         assert!(nav.preview_error().is_none());
     }

@@ -1,21 +1,26 @@
 use crate::agent::Agent;
 use crate::config::Config;
-use crate::workspace::{Action, AgentEvent, AgentModelPatch, Client, ClientEndpoint, ClientEvent};
-use serde_json::{Value, json};
+use crate::workspace::{Action, AgentEvent, AgentModelPatch, Client, ClientEvent};
+use serde_json::Value;
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::process::CommandExt;
+use std::os::unix::ffi::OsStringExt;
 use std::path::PathBuf;
-use std::process::{Command, Stdio};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 fn os(value: Value) -> io::Result<OsString> {
     Ok(OsString::from_vec(serde_json::from_value(value)?))
 }
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Result<()> {
+    use crate::workspace::ClientEndpoint;
+    use serde_json::json;
+    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    use std::process::Stdio;
+
     let endpoint = match client.endpoint() {
         ClientEndpoint::Local(path) => json!({"local": path.as_os_str().as_bytes()}),
         ClientEndpoint::Remote {
@@ -155,7 +160,8 @@ impl Session {
     }
 
     fn patch(&mut self) -> io::Result<AgentModelPatch> {
-        let (start, prefix_bytes) = if self.published_revision == Some(self.model.revision) {
+        let reset = self.published_revision != Some(self.model.revision);
+        let (start, prefix_bytes) = if !reset {
             let start = self
                 .published
                 .iter()
@@ -192,15 +198,21 @@ impl Session {
                     text: message.text[if index == 0 { prefix_bytes } else { 0 }..].to_owned(),
                 })
                 .collect(),
-            recovery: serde_json::to_vec(
-                &[
-                    ("rewind_restore", &self.rewind_restore),
-                    ("failed_send", &self.failed_send),
-                ]
-                .into_iter()
-                .filter(|(_, value)| value.is_some())
-                .collect::<BTreeMap<_, _>>(),
-            )?,
+            changes: reset.then(|| self.model.changes.clone()),
+            changes_omitted: self.model.changes_omitted,
+            recovery: if self.rewind_restore.is_none() && self.failed_send.is_none() {
+                b"{}".to_vec()
+            } else {
+                serde_json::to_vec(
+                    &[
+                        ("rewind_restore", &self.rewind_restore),
+                        ("failed_send", &self.failed_send),
+                    ]
+                    .into_iter()
+                    .filter(|(_, value)| value.is_some())
+                    .collect::<BTreeMap<_, _>>(),
+                )?
+            },
         };
         self.published
             .resize_with(self.model.messages.len(), Default::default);
@@ -286,6 +298,12 @@ pub fn run() -> io::Result<()> {
                 })
         };
         crate::poll::poll(&mut fds, timeout)?;
+        if fds[1].revents != 0 {
+            crate::eventfd::consume_notification(fds[1].fd)?;
+        }
+        for fd in fds[2..].iter().filter(|fd| fd.revents != 0) {
+            crate::eventfd::consume_notification(fd.fd)?;
+        }
         client.flush()?;
         if fds[0].revents != 0 || fds[1].revents != 0 || client.needs_poll() {
             for mut event in client.poll()? {
@@ -302,7 +320,7 @@ pub fn run() -> io::Result<()> {
         if client.snapshot().is_none() {
             continue;
         }
-        for event in client.take_agent_events() {
+        while let Some(event) = client.next_agent_event() {
             match event {
                 AgentEvent::Draft(payload) => {
                     let view: Value = serde_json::from_slice(&payload)?;
@@ -374,8 +392,10 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
+    #[cfg(any(feature = "gui", feature = "tui"))]
     fn streaming_patches_only_append_new_bytes_and_reset_after_trim() {
         let mut session = Session::default();
         session.model.messages = vec![
@@ -392,12 +412,15 @@ mod tests {
                 text: "x".repeat(128 * 1024),
             },
         ];
-        let mut mirror = crate::agent::AgentView::default();
-        mirror.restore_patch(&session.patch().unwrap()).unwrap();
+        let mut mirror = crate::agent::panel::AgentView::default();
+        let initial = session.patch().unwrap();
+        assert!(initial.changes.is_some());
+        mirror.restore_patch(&initial).unwrap();
         let before = session.model.messages[1].text.len();
         session.model.messages[1].text.push_str("中文🙂");
         let patch = session.patch().unwrap();
         assert_eq!(patch.recovery, b"{}");
+        assert!(patch.changes.is_none());
         assert_eq!(patch.start, 1);
         assert_eq!(patch.prefix_bytes as usize, before);
         assert_eq!(patch.messages.len(), 1);
@@ -412,8 +435,43 @@ mod tests {
         let patch = session.patch().unwrap();
         assert_eq!(patch.start, 0);
         assert_eq!(patch.prefix_bytes, 0);
+        assert!(patch.changes.is_some());
         mirror.restore_patch(&patch).unwrap();
         assert_eq!(mirror.messages, session.model.messages);
+    }
+
+    #[test]
+    #[cfg(any(feature = "gui", feature = "tui"))]
+    fn file_evidence_survives_changes_only_patches_and_transcript_rewind() {
+        let mut session = Session::default();
+        let mut mirror = crate::agent::panel::AgentView::default();
+        mirror.restore_patch(&session.patch().unwrap()).unwrap();
+        std::sync::Arc::make_mut(&mut session.model.changes).push(crate::workspace::AgentChange {
+            turn: 1,
+            tool_id: "1:0:0:edit-tool".into(),
+            path: PathBuf::from("project/a.rs"),
+            added: 2,
+            removed: 1,
+            diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
+            truncated: false,
+        });
+        session.model.revision += 1;
+        let patch = session.patch().unwrap();
+        assert!(patch.messages.is_empty());
+        assert!(mirror.restore_patch(&patch).unwrap());
+        assert_eq!(mirror.changes, session.model.changes);
+        session.model.messages.clear();
+        session.model.revision += 1;
+        mirror.restore_patch(&session.patch().unwrap()).unwrap();
+        assert_eq!(mirror.changes, session.model.changes);
+        session.model.changes_omitted = 1;
+        assert!(mirror.restore_patch(&session.patch().unwrap()).unwrap());
+        assert_eq!(mirror.changes_omitted, 1);
+        session.model = Agent::default();
+        let reset = session.patch().unwrap();
+        assert!(reset.changes.as_ref().unwrap().is_empty());
+        assert!(mirror.restore_patch(&reset).unwrap());
+        assert!(mirror.changes.is_empty());
     }
 
     #[test]

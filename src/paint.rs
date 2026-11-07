@@ -10,22 +10,23 @@ use std::num::NonZeroU32;
 
 pub fn text_columns(text: &str) -> Vec<u16> {
     // Printable ASCII columns already match the native shaper's byte offsets.
-    let Some(prefix) = text.bytes().position(|byte| !(b' '..=b'~').contains(&byte)) else {
+    let prefix = crate::width::printable_ascii_prefix(text.as_bytes());
+    if prefix == text.len() {
         return Vec::new();
-    };
+    }
     let mut result = Vec::with_capacity(text.len());
     result.extend((0..prefix).map(|column| column as u16));
     let (mut column, mut previous) = (prefix, prefix.saturating_sub(1));
     for ch in text[prefix..].chars() {
         let width = usize::from(scalar_width(ch).min(2));
-        result.extend(std::iter::repeat_n(
+        result.resize(
+            result.len() + ch.len_utf8(),
             if width == 0 {
                 previous as u16
             } else {
                 column as u16
             },
-            ch.len_utf8(),
-        ));
+        );
         if width != 0 {
             previous = column;
         }
@@ -39,8 +40,8 @@ struct StyleRun {
     start: u16,
     end: u16,
     background: Option<NonZeroU32>,
-    underline: Option<(u32, bool)>,
-    strike: bool,
+    underline: Option<NonZeroU32>,
+    decorations: Flags,
 }
 
 fn text_runs(runs: &[StyleRun]) -> impl Iterator<Item = Run> + '_ {
@@ -204,27 +205,25 @@ impl Frame {
                     continue;
                 }
                 previous_style = Some(style);
-                let mut fg = term.color(cell.fg);
-                if flags.contains(Flags::DIM) {
-                    fg = fg.dimmed();
-                }
-                let mut fg = fg.rgba();
-                let mut bg = term.color(cell.bg).rgba();
-                let mut default_bg = cell.bg == Color::Named(NamedColor::Background);
-                if flags.contains(Flags::INVERSE) {
-                    std::mem::swap(&mut fg, &mut bg);
-                    default_bg = false;
-                }
-                if selected {
-                    bg = 0x303030ff;
-                    fg = 0xccccccff;
-                    default_bg = false;
-                }
-                if block_cursor {
-                    bg = cursor_color;
-                    fg = background;
-                    default_bg = false;
-                }
+                let (fg, bg, default_bg) = if selected || block_cursor {
+                    if block_cursor {
+                        (background, cursor_color, false)
+                    } else {
+                        (0xccccccff, 0x303030ff, false)
+                    }
+                } else {
+                    let mut fg = term.color(cell.fg);
+                    if flags.contains(Flags::DIM) {
+                        fg = fg.dimmed();
+                    }
+                    let fg = fg.rgba();
+                    let bg = term.color(cell.bg).rgba();
+                    if flags.contains(Flags::INVERSE) {
+                        (bg, fg, false)
+                    } else {
+                        (fg, bg, cell.bg == Color::Named(NamedColor::Background))
+                    }
+                };
                 runs.push(StyleRun {
                     text: Run {
                         start: start as u32,
@@ -235,19 +234,18 @@ impl Frame {
                     start: column as u16,
                     end: (column + width) as u16,
                     background: NonZeroU32::new(if default_bg { 0 } else { bg }),
-                    underline: flags.intersects(Flags::ALL_UNDERLINES).then(|| {
-                        (
-                            underline_color.map_or(fg, |c| term.color(c).rgba()),
-                            flags.contains(Flags::UNDERCURL),
-                        )
+                    underline: NonZeroU32::new(if flags.intersects(Flags::ALL_UNDERLINES) {
+                        underline_color.map_or(fg, |c| term.color(c).rgba())
+                    } else {
+                        0
                     }),
-                    strike: flags.contains(Flags::STRIKEOUT),
+                    decorations: flags & (Flags::UNDERCURL | Flags::STRIKEOUT),
                 });
             }
             while let Some(run) = runs.last_mut()
                 && run.background.is_none()
                 && run.underline.is_none()
-                && !run.strike
+                && !run.decorations.contains(Flags::STRIKEOUT)
             {
                 let start = run.text.start as usize;
                 let trimmed = text[start..].trim_end_matches(' ').len();
@@ -328,7 +326,7 @@ impl Frame {
     ) -> Result<()> {
         self.align_cache(cache);
         cache.rows.truncate(self.row_count);
-        let mut native_runs = Vec::new();
+        let mut native_runs = smallvec::SmallVec::<[Run; 4]>::new();
         for row in self.rows {
             if let Some(cached) = cache.rows.get_mut(row.index)
                 && cached.matches(&row)
@@ -382,17 +380,18 @@ impl Frame {
             for run in &data.runs {
                 let x = origin.0 + cell.0 * run.start as f32;
                 let width = cell.0 * (run.end - run.start) as f32;
-                if let Some((color, wave)) = run.underline {
+                if let Some(color) = run.underline {
+                    let wave = run.decorations.contains(Flags::UNDERCURL);
                     renderer.rect(
                         x,
                         y + cell.1 - if wave { 4. } else { 2. },
                         width,
                         if wave { 3. } else { 1. },
-                        color,
+                        color.get(),
                         wave,
                     );
                 }
-                if run.strike {
+                if run.decorations.contains(Flags::STRIKEOUT) {
                     renderer.rect(x, y + cell.1 * 0.55, width, 1., run.text.color, false);
                 }
             }
@@ -664,7 +663,3 @@ mod tests {
         assert_eq!(frame.cursor.unwrap().0, 3);
     }
 }
-
-// NEXTTY_EMPTY_FRAME_TEMPORARY_PROBE
-#[cfg(test)]
-mod empty_frame_probe {include!("/home/nex/GitHub/next-terminal/target/nextty-empty-frame.2bhyx8jw/probe.rs");}

@@ -1,5 +1,5 @@
 //! A workspace owns its PTYs independently of any particular frontend.
-pub use crate::agent_files::{FileMatch, FileOperation, FileResult};
+pub use crate::agent_files::{AgentChange, FileMatch, FileOperation, FileResult};
 pub use crate::core::{BlockMarker, CommandBlock};
 use crate::core::{Core, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryConfig, HistoryCopy};
@@ -10,6 +10,7 @@ use crate::wire::{Peer, Response};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 use std::ffi::OsString;
 use std::fs::{self, File, OpenOptions};
 use std::io;
@@ -72,6 +73,7 @@ pub struct CreateOptions {
 }
 impl Default for CreateOptions {
     fn default() -> Self {
+        let config = crate::config::Config::default();
         Self {
             size: WindowSize {
                 num_cols: 80,
@@ -79,11 +81,11 @@ impl Default for CreateOptions {
                 cell_width: 0,
                 cell_height: 0,
             },
-            foreground: 0xcccccc,
-            background: 0x202020,
+            foreground: config.foreground,
+            background: config.background,
             directory: None,
             program: None,
-            history_capacity: crate::config::DEFAULT_HISTORY_LIMIT,
+            history_capacity: config.history_limit_bytes,
         }
     }
 }
@@ -105,6 +107,8 @@ pub struct AgentModelPatch {
     pub prefix_bytes: u32,
     pub messages: Vec<AgentMessage>,
     pub recovery: Vec<u8>,
+    pub changes: Option<Arc<Vec<AgentChange>>>,
+    pub changes_omitted: u32,
 }
 impl AgentModelPatch {
     pub(crate) fn apply_messages(&self, messages: &mut Vec<AgentMessage>) -> io::Result<()> {
@@ -345,12 +349,21 @@ impl Snapshot {
         self.panes.iter().find(|pane| pane.id == id)
     }
 
+    pub(crate) fn matching_pane(&self, index: usize, id: PaneId) -> Option<&PaneView> {
+        self.panes
+            .get(index)
+            .filter(|pane| pane.id == id)
+            .or_else(|| self.pane(id))
+    }
+
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) fn pane_at(&self, column: u16, row: u16) -> Option<&PaneView> {
         self.panes
             .iter()
             .find(|pane| pane.rect.contains(column, row))
     }
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) fn focused_pane(&self) -> Option<&PaneView> {
         self.pane(self.focused)
     }
@@ -390,8 +403,11 @@ pub type TabLayout = Vec<(usize, u16, u16)>;
 
 pub fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout {
     let text_width = |text: &str, limit: u16| {
-        let mut width = 0u16;
-        for ch in text.chars() {
+        let prefix = crate::width::printable_ascii_prefix(
+            &text.as_bytes()[..text.len().min(usize::from(limit))],
+        );
+        let mut width = prefix as u16;
+        for ch in text[prefix..].chars() {
             let ch = if ch.is_control() { ' ' } else { ch };
             width = width.saturating_add(u16::from(crate::width::scalar_width(ch).min(2)));
             if width >= limit {
@@ -469,12 +485,19 @@ pub fn tab_chrome<'a>(
         }
         Cow::Owned(label)
     };
-    let (before, after) = counts(&tabs);
-    if before > 0 || after > 0 {
-        tabs = tab_layout(snapshot, columns, &label(before, after));
+    let initial = counts(&tabs);
+    let text = label(initial.0, initial.1);
+    if initial != (0, 0) {
+        tabs = tab_layout(snapshot, columns, &text);
     }
     let (before, after) = counts(&tabs);
-    (tabs, label(before, after), before, after)
+    let text = if (before, after) == initial {
+        text
+    } else {
+        drop(text);
+        label(before, after)
+    };
+    (tabs, text, before, after)
 }
 
 pub enum ClientEvent {
@@ -519,6 +542,7 @@ pub enum ClientEvent {
     Detached,
 }
 
+#[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) enum ClientEndpoint {
     Local(PathBuf),
     Remote {
@@ -529,12 +553,13 @@ pub(crate) enum ClientEndpoint {
     },
 }
 pub struct Client {
-    screen_wait: Option<bool>,
+    screen_pending: bool,
     screen_request: u64,
     screen_dirty: bool,
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     endpoint: ClientEndpoint,
-    agent_events: Vec<AgentEvent>,
+    agent_events: VecDeque<AgentEvent>,
     agent_delegate: bool,
     peer: Peer,
     snapshot: Option<Snapshot>,
@@ -543,16 +568,21 @@ pub struct Client {
     ssh: Option<(Child, String)>,
 }
 impl Client {
-    fn new(peer: Peer, ssh: Option<(Child, String)>, endpoint: ClientEndpoint) -> Self {
+    fn new(
+        peer: Peer,
+        ssh: Option<(Child, String)>,
+        #[cfg(any(feature = "gui", feature = "tui"))] endpoint: ClientEndpoint,
+    ) -> Self {
         Self {
             peer,
             ssh,
 
+            #[cfg(any(feature = "gui", feature = "tui"))]
             endpoint,
-            screen_wait: None,
+            screen_pending: false,
             screen_request: 0,
             screen_dirty: true,
-            agent_events: Vec::new(),
+            agent_events: VecDeque::new(),
             agent_delegate: false,
             snapshot: None,
             screens: HashMap::new(),
@@ -566,10 +596,12 @@ impl Client {
         Ok(Self::new(
             Peer::new(stream)?,
             None,
+            #[cfg(any(feature = "gui", feature = "tui"))]
             ClientEndpoint::Local(path.to_path_buf()),
         ))
     }
     pub fn connect_remote(mut command: Command, target: String) -> io::Result<Self> {
+        #[cfg(any(feature = "gui", feature = "tui"))]
         let endpoint = ClientEndpoint::Remote {
             program: command.get_program().to_owned(),
             args: command.get_args().map(ToOwned::to_owned).collect(),
@@ -585,7 +617,12 @@ impl Client {
         command.stdout(OwnedFd::from(ssh));
         let child = command.spawn()?;
         drop(command);
-        let mut client = Self::new(peer, Some((child, target)), endpoint);
+        let mut client = Self::new(
+            peer,
+            Some((child, target)),
+            #[cfg(any(feature = "gui", feature = "tui"))]
+            endpoint,
+        );
         loop {
             match client.peer.hello() {
                 Ok(Some(BRIDGE_VERSION)) => return Ok(client),
@@ -647,12 +684,7 @@ impl Client {
                 | Action::CopySelection { .. }
         );
         match action {
-            Action::Input { pane, data } => {
-                // An older response may already be in flight; keep a fresh request
-                // ahead of input, including chunks that PTY backpressure may block.
-                self.send_screen_request(true)?;
-                self.peer.send_input(pane, &data)?;
-            }
+            Action::Input { pane, data } => return self.send_input(pane, &data),
             action => self.peer.send_action(&action)?,
         }
         if screen {
@@ -660,8 +692,14 @@ impl Client {
         }
         Ok(())
     }
+    pub(crate) fn send_input(&mut self, pane: PaneId, data: &[u8]) -> io::Result<()> {
+        // An older response may already be in flight; keep a fresh request
+        // ahead of input, including chunks that PTY backpressure may block.
+        self.send_screen_request(true)?;
+        self.peer.send_input(pane, data)
+    }
     fn send_screen_request(&mut self, wait: bool) -> io::Result<()> {
-        self.screen_wait = Some(wait);
+        self.screen_pending = true;
         self.screen_request += 1;
         self.peer.send_action(&Action::ScreenRequest {
             request: self.screen_request,
@@ -669,7 +707,7 @@ impl Client {
         })
     }
     pub fn request_screen(&mut self) -> io::Result<()> {
-        if self.screen_wait.is_none() {
+        if !self.screen_pending {
             self.send_screen_request(true)?;
         }
         Ok(())
@@ -758,7 +796,8 @@ impl Client {
                 return Err(self.ssh_error(error)?);
             }
         };
-        let mut events = Vec::with_capacity(responses.len().min(4));
+        let capacity = responses.len().min(4);
+        let mut events = Vec::new();
         for response in responses {
             let event = match response {
                 Response::State(snapshot, updates, request) => {
@@ -771,14 +810,14 @@ impl Client {
                         }
                         screen.apply(update)?;
                     }
-                    for pane in &snapshot.panes {
+                    for (index, pane) in snapshot.panes.iter().enumerate() {
                         let Some(screen) = self.screens.get_mut(&pane.id) else {
                             continue;
                         };
                         let previous = self
                             .snapshot
                             .as_ref()
-                            .and_then(|snapshot| snapshot.pane(pane.id));
+                            .and_then(|snapshot| snapshot.matching_pane(index, pane.id));
                         if self.agent_delegate
                             && previous.is_none_or(|old| {
                                 old.input_generation != pane.input_generation
@@ -800,7 +839,7 @@ impl Client {
                     }
                     self.snapshot = Some(snapshot);
                     if request == self.screen_request {
-                        self.screen_wait = None;
+                        self.screen_pending = false;
                         self.screen_dirty = false;
                     }
                     ClientEvent::Updated
@@ -813,7 +852,7 @@ impl Client {
                     if event == AgentEvent::Attached {
                         self.agent_delegate = true;
                     }
-                    self.agent_events.push(event);
+                    self.agent_events.push_back(event);
                     continue;
                 }
                 Response::List(list) => ClientEvent::List(list),
@@ -853,7 +892,7 @@ impl Client {
                 },
                 Response::Error(error) => {
                     if self.snapshot.is_none() {
-                        self.screen_wait = None;
+                        self.screen_pending = false;
                     }
                     ClientEvent::Error(error)
                 }
@@ -869,6 +908,9 @@ impl Client {
             if !matches!(event, ClientEvent::Updated)
                 || !matches!(events.last(), Some(ClientEvent::Updated))
             {
+                if events.is_empty() {
+                    events = Vec::with_capacity(capacity);
+                }
                 events.push(event);
             }
         }
@@ -1018,6 +1060,8 @@ enum Node {
     Split {
         axis: Axis,
         ratio: f64,
+        // Keep layout linear even for deeply nested splits.
+        minimum: (u16, u16),
         first: Box<Node>,
         second: Box<Node>,
     },
@@ -1040,6 +1084,7 @@ impl Node {
                 ratio,
                 first,
                 second,
+                ..
             } => {
                 let (a, b) =
                     Self::partition(rect, *axis, *ratio, first.minimum(), second.minimum());
@@ -1087,6 +1132,7 @@ impl Node {
             ratio,
             first,
             second,
+            ..
         } = self
         else {
             return false;
@@ -1094,7 +1140,8 @@ impl Node {
         let min_a = first.minimum();
         let min_b = second.minimum();
         let (a, b) = Self::partition(rect, *axis, *ratio, min_a, min_b);
-        if first.contains(left) && second.contains(right) {
+        let in_first = first.contains(left);
+        if in_first && second.contains(right) {
             let (origin, available, low, high, current) = match axis {
                 Axis::LeftRight => (rect.x, rect.cols - 1, min_a.0, min_b.0, a.cols),
                 Axis::TopBottom => (rect.y, rect.rows - 1, min_a.1, min_b.1, a.rows),
@@ -1106,9 +1153,10 @@ impl Node {
             // Bias inside the cell so floating point rounding keeps the requested boundary.
             *ratio = (f64::from(size) + 0.5) / f64::from(available);
             true
-        } else {
+        } else if in_first {
             first.resize_split(a, left, right, position)
-                || second.resize_split(b, left, right, position)
+        } else {
+            second.resize_split(b, left, right, position)
         }
     }
     fn split(&mut self, target: PaneId, new: PaneId, axis: Axis) -> bool {
@@ -1117,38 +1165,51 @@ impl Node {
                 *self = Self::Split {
                     axis,
                     ratio: 0.5,
+                    minimum: Self::split_minimum(axis, (2, 1), (2, 1)),
                     first: Box::new(Self::Pane(target)),
                     second: Box::new(Self::Pane(new)),
                 };
                 true
             }
             Self::Pane(_) => false,
-            Self::Split { first, second, .. } => {
-                first.split(target, new, axis) || second.split(target, new, axis)
+            Self::Split {
+                axis: split_axis,
+                minimum,
+                first,
+                second,
+                ..
+            } => {
+                let changed = first.split(target, new, axis) || second.split(target, new, axis);
+                if changed {
+                    *minimum = Self::split_minimum(*split_axis, first.minimum(), second.minimum());
+                }
+                changed
             }
         }
     }
-    fn remove(self, target: PaneId) -> Option<Self> {
-        match self {
-            Self::Pane(id) => (id != target).then_some(Self::Pane(id)),
-            Self::Split {
-                axis,
-                ratio,
-                mut first,
-                mut second,
-            } => match ((*first).remove(target), (*second).remove(target)) {
-                (Some(a), Some(b)) => {
-                    *first = a;
-                    *second = b;
-                    Some(Self::Split {
-                        axis,
-                        ratio,
-                        first,
-                        second,
-                    })
-                }
-                (one, None) | (None, one) => one,
-            },
+    fn remove_child(&mut self, target: PaneId) -> bool {
+        let Self::Split {
+            axis,
+            minimum,
+            first,
+            second,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        if matches!(**first, Self::Pane(id) if id == target) {
+            // Move out the sibling without allocating a replacement box.
+            *self = std::mem::replace(&mut **second, Self::Pane(0));
+            true
+        } else if matches!(**second, Self::Pane(id) if id == target) {
+            *self = std::mem::replace(&mut **first, Self::Pane(0));
+            true
+        } else if first.remove_child(target) || second.remove_child(target) {
+            *minimum = Self::split_minimum(*axis, first.minimum(), second.minimum());
+            true
+        } else {
+            false
         }
     }
     fn first(&self) -> PaneId {
@@ -1160,19 +1221,13 @@ impl Node {
     fn minimum(&self) -> (u16, u16) {
         match self {
             Self::Pane(_) => (2, 1),
-            Self::Split {
-                axis,
-                first,
-                second,
-                ..
-            } => {
-                let a = first.minimum();
-                let b = second.minimum();
-                match axis {
-                    Axis::LeftRight => (a.0 + b.0 + 1, a.1.max(b.1)),
-                    Axis::TopBottom => (a.0.max(b.0), a.1 + b.1 + 1),
-                }
-            }
+            Self::Split { minimum, .. } => *minimum,
+        }
+    }
+    fn split_minimum(axis: Axis, a: (u16, u16), b: (u16, u16)) -> (u16, u16) {
+        match axis {
+            Axis::LeftRight => (a.0 + b.0 + 1, a.1.max(b.1)),
+            Axis::TopBottom => (a.0.max(b.0), a.1 + b.1 + 1),
         }
     }
 }
@@ -1223,7 +1278,7 @@ impl Workspace {
         result
     }
     fn all_layouts(&self) -> Vec<(PaneId, Rect)> {
-        let mut result = Vec::new();
+        let mut result = Vec::with_capacity(self.panes.len());
         for tab in &self.tabs {
             tab.root.layout(self.area(), &mut result);
         }
@@ -1289,20 +1344,15 @@ impl Workspace {
     fn remove_pane(&mut self, id: PaneId) -> Option<Terminal> {
         let active_tab = self.tabs[self.active].id;
         let terminal = self.panes.remove(&id).map(|pane| pane.terminal);
-        self.tabs = std::mem::take(&mut self.tabs)
-            .into_iter()
-            .filter_map(|tab| {
-                tab.root.remove(id).map(|root| Tab {
-                    focused: if tab.focused == id {
-                        root.first()
-                    } else {
-                        tab.focused
-                    },
-                    root,
-                    id: tab.id,
-                })
-            })
-            .collect();
+        self.tabs.retain_mut(|tab| {
+            if matches!(tab.root, Node::Pane(pane) if pane == id) {
+                return false;
+            }
+            if tab.root.remove_child(id) && tab.focused == id {
+                tab.focused = tab.root.first();
+            }
+            true
+        });
         self.active = self
             .tabs
             .iter()
@@ -1347,39 +1397,42 @@ impl Workspace {
     fn tab_activity(&self, node: &Node) -> io::Result<TabActivity> {
         let mut activity = TabActivity::Idle;
         node.for_each_pane(&mut |id| {
+            if activity == TabActivity::Running {
+                return Ok(());
+            }
             let terminal = &self.panes[&id].terminal;
             let process = terminal.process_metadata();
+            if process
+                .foreground_pgid
+                .is_some_and(|pgid| pgid != process.child_pid)
+            {
+                activity = TabActivity::Running;
+                return Ok(());
+            }
             let core = terminal
                 .core
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
             let latest = core.latest_command_status();
-            let state = if process
-                .foreground_pgid
-                .is_some_and(|pgid| pgid != process.child_pid)
-                || latest.is_none() && process.has_children == Some(true)
-                || latest == Some(None)
+            let state =
+                if latest.is_none() && process.has_children == Some(true) || latest == Some(None) {
+                    TabActivity::Running
+                } else if matches!(latest, Some(Some(status)) if status != 0) {
+                    TabActivity::Failed
+                } else if latest.is_some() {
+                    TabActivity::Finished
+                } else if process.has_children.is_none()
+                    || core.shell_prompt().is_none() && !core.shell_editing()
+                {
+                    TabActivity::Unknown
+                } else {
+                    TabActivity::Idle
+                };
+            if state == TabActivity::Running
+                || state == TabActivity::Unknown
+                || activity == TabActivity::Idle
+                || state == TabActivity::Failed && activity == TabActivity::Finished
             {
-                TabActivity::Running
-            } else if matches!(latest, Some(Some(status)) if status != 0) {
-                TabActivity::Failed
-            } else if latest.is_some() {
-                TabActivity::Finished
-            } else if process.has_children.is_none()
-                || core.shell_prompt().is_none() && !core.shell_editing()
-            {
-                TabActivity::Unknown
-            } else {
-                TabActivity::Idle
-            };
-            let priority = |state| match state {
-                TabActivity::Idle => 0,
-                TabActivity::Finished => 1,
-                TabActivity::Failed => 2,
-                TabActivity::Unknown => 3,
-                TabActivity::Running => 4,
-            };
-            if priority(state) > priority(activity) {
                 activity = state;
             }
             Ok(())
@@ -1520,15 +1573,22 @@ impl FileWorker {
         })
     }
 
-    fn cancel(&self, matches: impl Fn(&FileSource) -> bool) {
-        for source in self
-            .queued
-            .iter()
-            .map(|job| &job.source)
-            .chain(self.active.iter())
-            .filter(|source| matches(source))
-        {
+    fn cancel(&mut self, matches: impl Fn(&FileSource) -> bool) {
+        if let Some(source) = self.active.as_ref().filter(|source| matches(source)) {
             source.cancelled.store(true, Ordering::Relaxed);
+        }
+        for job in self.queued.iter_mut().filter(|job| matches(&job.source)) {
+            job.source.cancelled.store(true, Ordering::Relaxed);
+            // Retain its FIFO error reply without keeping the unused payload.
+            job.path = PathBuf::new();
+            match &mut job.operation {
+                FileOperation::Read { .. } => {}
+                FileOperation::Search { query } => *query = String::new(),
+                FileOperation::Edit { old_text, new_text } => {
+                    *old_text = None;
+                    *new_text = String::new();
+                }
+            }
         }
     }
 }
@@ -1821,6 +1881,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
             }
         }
         terminals.truncate(terminal_count);
+        let file_start = fds.len();
         // A late notification may outlive the last result; idle workers need no polling.
         for files in clients
             .iter()
@@ -1849,6 +1910,20 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
             -1
         };
         crate::poll::poll(&mut fds, timeout)?;
+        let file_clients = clients.iter_mut().filter(|client| {
+            client
+                .files
+                .as_ref()
+                .is_some_and(|files| files.active.is_some())
+        });
+        for (fd, client) in fds[file_start..].iter().zip(file_clients) {
+            if fd.revents != 0
+                && let Err(error) = crate::eventfd::consume_notification(fd.fd)
+            {
+                eprintln!("agent file worker: {error}");
+                client.failed = true;
+            }
+        }
         // Both client passes use this poll's order; remove failed clients next iteration.
         let client_count = clients.len();
         for index in 0..client_count {
@@ -1927,6 +2002,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
                 }
             }
         }
+        let mut marked_workspace = None;
         for (index, (name, id)) in terminals.iter().enumerate() {
             if fds[1 + client_count + index].revents == 0 {
                 continue;
@@ -1975,7 +2051,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
             }
             pane.terminal.acknowledge_wakeup();
             if exit {
-                cancel_pane_files(&clients, *id);
+                cancel_pane_files(&mut clients, *id);
                 closing
                     .0
                     .extend(workspace.remove_pane(*id).map(Terminal::shutdown));
@@ -1983,7 +2059,10 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
                     workspace.resize(workspace.size)?;
                 }
             }
-            dirty.insert(name.clone());
+            if marked_workspace != Some(name) {
+                dirty.insert(name.clone());
+                marked_workspace = Some(name);
+            }
         }
         for (_, workspace) in workspaces.extract_if(|_, workspace| workspace.tabs.is_empty()) {
             terminate_workspace(workspace, &mut clients, &mut closing);
@@ -2037,13 +2116,10 @@ fn complete_requests(
     for client in clients.iter_mut() {
         if client.failed {
             client.files = None;
+            continue;
         }
         let file_result = client.files.as_mut().and_then(|files| {
             files.active.as_ref()?;
-            if let Err(error) = crate::eventfd::consume_notification(files.worker.fd()) {
-                eprintln!("agent file worker: {error}");
-                client.failed = true;
-            }
             files.worker.take().map(|result| {
                 let source = files.active.take().unwrap();
                 (source.request, result.map_err(|error| error.to_string()))
@@ -2054,18 +2130,16 @@ fn complete_requests(
         }
         if client.failed {
             client.files = None;
-        } else if let Some(files) = &mut client.files
+            continue;
+        }
+        if let Some(files) = &mut client.files
             && files.active.is_none()
             && let Some(job) = files.queued.pop_front()
         {
             // Worker replaces pending work and results, so submit only after taking the result.
             files.active = Some(job.source.clone());
-            files.worker.submit(job);
+            files.worker.submit(|_| job);
         }
-        let workspace = client
-            .workspace
-            .as_ref()
-            .and_then(|name| workspaces.get(name));
         if let Some(result) = client
             .copy
             .as_ref()
@@ -2136,6 +2210,10 @@ fn complete_requests(
         let Some(search) = client.search.as_mut() else {
             continue;
         };
+        let workspace = client
+            .workspace
+            .as_ref()
+            .and_then(|name| workspaces.get(name));
         let Some(terminal) = workspace
             .and_then(|workspace| workspace.panes.get(&search.pane))
             .map(|pane| &pane.terminal)
@@ -2199,8 +2277,11 @@ fn worker_result<T>(
     }
 }
 
-fn cancel_pane_files(clients: &[Connection], pane: PaneId) {
-    for files in clients.iter().filter_map(|client| client.files.as_ref()) {
+fn cancel_pane_files(clients: &mut [Connection], pane: PaneId) {
+    for files in clients
+        .iter_mut()
+        .filter_map(|client| client.files.as_mut())
+    {
         files.cancel(|source| source.pane == pane);
     }
 }
@@ -2232,82 +2313,87 @@ fn broadcast(
             && client.workspace.as_deref() == Some(&workspace.name)
     });
     let all_tabs = has_agent && workspace.tabs.len() > 1;
-    let visible = if all_tabs {
-        workspace.all_layouts()
+    let tabs = if all_tabs {
+        workspace.tabs.as_slice()
     } else {
-        workspace.layout()
+        std::slice::from_ref(&workspace.tabs[workspace.active])
     };
-    let active = &workspace.tabs[workspace.active].root;
-    let mut frames = Vec::with_capacity(visible.len());
-    let mut panes = Vec::with_capacity(visible.len());
-    for &(id, rect) in &visible {
-        let pane = &workspace.panes[&id];
-        let process = pane.terminal.process_metadata();
-        let mut core = pane
-            .terminal
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
-        let blocks = core.visible_blocks();
-        let command_blocks = core.recent_command_blocks();
-        let input_generation = core.input_generation();
-        let shell_prompt = core.shell_prompt();
-        let cwd = core.current_directory().map(Path::to_path_buf);
-        let synchronized = core.mode().contains(Mode::SYNC_UPDATE);
-        if !synchronized || has_agent {
-            let offset = core.display_offset();
-            let mut needs_full = false;
-            let mut needs_delta = false;
-            for client in clients.iter().filter(|client| {
-                client.workspace.as_deref() == Some(&workspace.name)
-                    && client.screen_eligible()
-                    && (client.agent || !all_tabs || active.contains(id))
-                    && (!client.agent || offset == 0)
-            }) {
-                let full = client.full || !client.known.contains_key(&id);
-                needs_full |= full;
-                needs_delta |= !full;
-                if needs_full && needs_delta {
-                    break;
+    let mut visible = Vec::new();
+    tabs[0].root.layout(workspace.area(), &mut visible);
+    let active = &workspace.tabs[workspace.active];
+    let capacity = if all_tabs {
+        workspace.panes.len()
+    } else {
+        visible.len()
+    };
+    let mut frames = Vec::with_capacity(capacity);
+    let mut panes = Vec::with_capacity(capacity);
+    for (index, tab) in tabs.iter().enumerate() {
+        if index != 0 {
+            visible.clear();
+            tab.root.layout(workspace.area(), &mut visible);
+        }
+        for &(id, rect) in &visible {
+            let pane = &workspace.panes[&id];
+            let process = pane.terminal.process_metadata();
+            let mut core = pane
+                .terminal
+                .core
+                .lock()
+                .map_err(|error| io::Error::other(error.to_string()))?;
+            let blocks = core.visible_blocks();
+            let command_blocks = core.recent_command_blocks();
+            let input_generation = core.input_generation();
+            let shell_prompt = core.shell_prompt();
+            let cwd = core.current_directory().map(Path::to_path_buf);
+            let synchronized = core.mode().contains(Mode::SYNC_UPDATE);
+            if !synchronized || has_agent {
+                let offset = core.display_offset();
+                let mut needs_full = false;
+                let mut needs_delta = false;
+                for client in clients.iter().filter(|client| {
+                    client.workspace.as_deref() == Some(&workspace.name)
+                        && client.screen_eligible()
+                        && (client.agent || !all_tabs || tab.id == active.id)
+                        && (!client.agent || offset == 0)
+                }) {
+                    let full = client.full || !client.known.contains_key(&id);
+                    needs_full |= full;
+                    needs_delta |= !full;
+                    if needs_full && needs_delta {
+                        break;
+                    }
+                }
+                let full = needs_full.then(|| Update::capture(&core, true));
+                let delta = (needs_delta
+                    && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
+                .then(|| Update::capture(&core, false));
+                let live = (offset != 0 && has_agent).then(|| Update::capture_live(&core));
+                let hidden = synchronized || tab.id != active.id;
+                frames.push((id, full, delta, live, hidden));
+                if !synchronized {
+                    core.reset_damage();
                 }
             }
-            let full = needs_full.then(|| Update::capture(&core, true));
-            let delta = (needs_delta
-                && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
-            .then(|| Update::capture(&core, false));
-            let live = (offset != 0 && has_agent).then(|| Update::capture_live(&core));
-            frames.push((id, full, delta, live, synchronized));
-            if !synchronized {
-                core.reset_damage();
-            }
+            drop(core);
+            panes.push(PaneView {
+                id,
+                tab: tab.id,
+                rect,
+                title: pane.title.clone(),
+                cwd: match cwd {
+                    Some(directory) => Some(directory),
+                    None => pane_directory(&pane.terminal)?,
+                },
+                process,
+                blocks,
+                command_blocks,
+                input_generation,
+                shell_prompt,
+            });
         }
-        drop(core);
-        panes.push(PaneView {
-            id,
-            tab: if all_tabs {
-                workspace
-                    .tabs
-                    .iter()
-                    .find(|tab| tab.root.contains(id))
-                    .unwrap()
-                    .id
-            } else {
-                workspace.tabs[workspace.active].id
-            },
-            rect,
-            title: pane.title.clone(),
-            cwd: match cwd {
-                Some(directory) => Some(directory),
-                None => pane_directory(&pane.terminal)?,
-            },
-            process,
-            blocks,
-            command_blocks,
-            input_generation,
-            shell_prompt,
-        });
     }
-    let all_frames = frames.len() == visible.len();
+    let all_frames = frames.len() == panes.len();
     let mut all_snapshot = workspace.snapshot(panes)?;
     let mut active_snapshot = None;
     let mut updates = Vec::with_capacity(frames.len());
@@ -2331,55 +2417,55 @@ fn broadcast(
                 panes: all_snapshot
                     .panes
                     .iter()
-                    .filter(|pane| active.contains(pane.id))
+                    .filter(|pane| pane.tab == active.id)
                     .cloned()
                     .collect(),
             })
         };
         updates.clear();
-        updates.extend(
-            frames
-                .iter()
-                .filter_map(|(id, full, delta, live, synchronized)| {
-                    if !client.agent && (*synchronized || all_tabs && !active.contains(*id)) {
-                        return None;
-                    }
-                    let update = if client.agent
-                        && let Some(live) = live
-                    {
-                        live
-                    } else if !client.known.contains_key(id) || client.full {
-                        full.as_ref()?
-                    } else {
-                        delta.as_ref().or(full.as_ref())?
-                    };
-                    Some((*id, update))
-                }),
-        );
+        updates.extend(frames.iter().filter_map(|(id, full, delta, live, hidden)| {
+            if !client.agent && *hidden {
+                return None;
+            }
+            let update = if client.agent
+                && let Some(live) = live
+            {
+                live
+            } else if !client.known.contains_key(id) || client.full {
+                full.as_ref()?
+            } else {
+                delta.as_ref().or(full.as_ref())?
+            };
+            Some((*id, update))
+        }));
         snapshot.controller = workspace.controller == Some(client.id);
-        if let Err(error) = client.peer.send_state(
+        match client.peer.send_state(
             snapshot,
             &updates,
             &client.known,
             client.screen_request.unwrap(),
         ) {
-            eprintln!("workspace client {}: {error}", client.id);
-            client.failed = true;
-        } else {
-            if all_frames {
-                client.known.clear();
-            } else {
-                client.known.retain(|id, _| snapshot.pane(*id).is_some());
+            Err(error) => {
+                eprintln!("workspace client {}: {error}", client.id);
+                client.failed = true;
             }
-            client.known.extend(
-                snapshot
-                    .panes
-                    .iter()
-                    .filter(|pane| {
-                        all_frames || frames.iter().any(|(id, _, _, _, _)| *id == pane.id)
-                    })
-                    .map(|pane| (pane.id, Arc::clone(&pane.process))),
-            );
+            Ok(metadata_changed) if !all_frames || metadata_changed => {
+                if all_frames {
+                    client.known.clear();
+                } else {
+                    client.known.retain(|id, _| snapshot.pane(*id).is_some());
+                }
+                client.known.extend(
+                    snapshot
+                        .panes
+                        .iter()
+                        .filter(|pane| {
+                            all_frames || frames.iter().any(|(id, _, _, _, _)| *id == pane.id)
+                        })
+                        .map(|pane| (pane.id, Arc::clone(&pane.process))),
+                );
+            }
+            Ok(_) => (),
         }
         client.full = client.full && updates.len() < snapshot.panes.len();
         client.screen_request = None;
@@ -2980,7 +3066,7 @@ fn apply_session_action(
     let client_id = clients[index].id;
     match action {
         Action::CancelAgentFile { request } => {
-            if let Some(files) = &clients[index].files {
+            if let Some(files) = &mut clients[index].files {
                 files.cancel(|source| source.request == request);
             }
             Ok(None)
@@ -3042,7 +3128,7 @@ fn apply_session_action(
                         .count(),
                 })
                 .collect();
-            list.sort_by(|a, b| a.name.cmp(&b.name));
+            list.sort_unstable_by(|a, b| a.name.cmp(&b.name));
             clients[index].respond(Response::List(list));
             Ok(None)
         }
@@ -3213,11 +3299,15 @@ fn apply_agent_action(
         Action::AgentUpdate(patch) if clients[index].agent => {
             let model = workspace.agent.models.entry(patch.session).or_default();
             patch.apply_messages(&mut model.messages)?;
+            if patch.changes.is_some() {
+                model.changes.clone_from(&patch.changes);
+            }
             model.session = patch.session;
             model.busy = patch.busy;
             model.revision = patch.revision;
             model.turn = patch.turn;
             model.recovery.clone_from(&patch.recovery);
+            model.changes_omitted = patch.changes_omitted;
             let mut subscribers = clients.iter_mut().filter(|client| {
                 client.agent_open && client.workspace.as_deref() == Some(&workspace.name)
             });
@@ -3358,14 +3448,15 @@ impl Client {
         self.screen_dirty
     }
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) fn endpoint(&self) -> &ClientEndpoint {
         &self.endpoint
     }
 }
 
 impl Client {
-    pub(crate) fn take_agent_events(&mut self) -> Vec<AgentEvent> {
-        std::mem::take(&mut self.agent_events)
+    pub(crate) fn next_agent_event(&mut self) -> Option<AgentEvent> {
+        self.agent_events.pop_front()
     }
 
     pub(crate) fn can_agent_input(&self) -> bool {

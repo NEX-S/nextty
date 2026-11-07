@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::{io::ErrorKind, path::PathBuf};
+use std::{borrow::Cow, io::ErrorKind, path::PathBuf};
 
 pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
 
@@ -12,7 +12,7 @@ pub enum TabStyle {
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Config {
-    pub font_family: String,
+    pub font_family: Cow<'static, str>,
     pub font_size_px: f32,
     pub foreground: u32,
     pub background: u32,
@@ -76,7 +76,7 @@ impl Config {
 
     pub fn parse(text: &str) -> Result<Self> {
         let mut config = Self::default();
-        let mut seen = Vec::new();
+        let mut seen = smallvec::SmallVec::<[&str; 10]>::new();
         for line in text.trim_start_matches('\u{feff}').lines() {
             let line = line.trim();
             if line.is_empty() || line.starts_with('#') {
@@ -120,7 +120,7 @@ impl Config {
                     .map_err(|error| Error::context(key, error))
             };
             match key {
-                "font_family" => config.font_family = string()?.to_owned(),
+                "font_family" => config.font_family = string()?.to_owned().into(),
                 "base_url" => config.base_url = string()?.to_owned(),
                 "model" => config.model = string()?.to_owned(),
                 "font_size_px" => config.font_size_px = number()?,

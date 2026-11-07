@@ -184,6 +184,9 @@ impl WorkspaceView {
             pointer,
             &self.preedit,
         )?;
+        if let Some(backdrop) = &panel.backdrop {
+            self.draw_panel(backdrop)?;
+        }
         self.draw_panel(&panel.grid)?;
         self.agent.chat_rows = panel.chat_rows;
         for (rect, action) in panel.hits {

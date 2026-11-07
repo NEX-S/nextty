@@ -40,11 +40,15 @@ impl Layout {
     }
 }
 
+pub(crate) fn sidebar_width(columns: u16) -> u16 {
+    32.min(columns.saturating_sub(12))
+}
+
 pub(crate) fn preview_rect(canvas: Rect) -> Rect {
     let cols = (canvas.cols.saturating_mul(7) / 10)
         .max(12)
         .min(canvas.cols);
-    let rows = (canvas.rows.saturating_mul(7) / 10).max(5).min(canvas.rows);
+    let rows = (canvas.rows.saturating_mul(7) / 10).max(6).min(canvas.rows);
     Rect {
         x: canvas.x + (canvas.cols - cols) / 2,
         y: canvas.y + (canvas.rows - rows) / 2,
@@ -66,27 +70,24 @@ pub(crate) fn list(
     if rect.cols == 0 {
         return grid;
     }
-    let divider = mix_color(config.foreground, config.background, 24);
-    for row in rect.y..rect.y + rect.rows {
-        grid.text(
-            rect.x + rect.cols - 1,
-            row,
-            1,
-            "│",
-            divider,
-            config.background,
-        );
+    let divider = crate::panel::rgb(mix_color(config.foreground, config.background, 24));
+    for row in &mut grid.rows {
+        let cell = row.cells.last_mut().unwrap();
+        cell.c = '│';
+        cell.fg = divider;
+        row.used = row.cells.len();
     }
     if let Some(search) = layout.search {
         grid.text(
             search.x,
             search.y,
             search.cols,
-            &format!("⌕ {}{preedit}", files.query()),
+            &["⌕ ", files.query(), preedit].concat(),
             0xb5d2a2,
             config.background,
         );
     }
+    let mut label = String::new();
     for (row, entry) in files
         .entries()
         .iter()
@@ -100,7 +101,10 @@ pub(crate) fn list(
             rect.x + 1,
             y,
             rect.cols.saturating_sub(2),
-            &crate::width::fit_middle(&files.entry_label(entry), rect.cols.saturating_sub(2)),
+            &crate::width::fit_middle(
+                &files.entry_label(entry, &mut label),
+                rect.cols.saturating_sub(2),
+            ),
             if selected && focused {
                 config.foreground
             } else {
@@ -172,45 +176,35 @@ pub(crate) fn list(
 pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
     let background = mix_color(config.foreground, config.background, 9);
     let muted = mix_color(config.foreground, config.background, 176);
-    let mut grid = Grid::new(rect, config.foreground, background);
-    let columns = rect.cols.saturating_sub(2);
     let title = files
         .selected()
         .map(|entry| entry.display_name())
         .unwrap_or_default();
-    grid.text(
-        rect.x + 1,
-        rect.y,
-        columns,
-        &crate::width::fit_middle(&title, columns),
-        config.foreground,
-        background,
-    );
+    let mut grid = Grid::popup(rect, config.foreground, config.background, &title);
+    let body = crate::panel::popup_body(rect);
+    let columns = body.cols;
     let error = files.preview_error().map(ToString::to_string);
-    let mut lines = files.preview_lines().skip(files.preview_scroll());
-    for row in 0..rect.rows.saturating_sub(2) {
+    let mut lines = files.preview_lines(files.preview_scroll());
+    for row in 0..body.rows {
         let line = lines.next();
         let (text, color) = match (row, files.preview_loading(), error.as_deref()) {
             (0, true, _) => ("Loading…", muted),
-            (0, _, Some(error)) => (error, 0xe87575),
-            (0, false, None) if files.preview_lines().len() == 0 => ("Empty file", muted),
+            (0, _, Some(error)) => (error, crate::panel::diff_colors(config.foreground).1),
+            (0, false, None) if files.selected().is_some_and(|entry| entry.is_dir) => {
+                ("Directory", muted)
+            }
+            (0, false, None) if files.selected().is_none() => ("Select a file", muted),
+            (0, false, None) if files.preview_lines(0).len() == 0 => ("Empty file", muted),
             _ => match line {
                 Some(text) => (text, config.foreground),
                 None => break,
             },
         };
-        grid.text(
-            rect.x + 1,
-            rect.y + row + 1,
-            columns,
-            text,
-            color,
-            background,
-        );
+        grid.text(rect.x + 2, body.y + row, columns, text, color, background);
     }
     grid.text(
-        rect.x + 1,
-        rect.y + rect.rows.saturating_sub(1),
+        rect.x + 2,
+        rect.y + rect.rows.saturating_sub(2),
         columns,
         if files.preview_truncated() {
             "Preview truncated · Esc close · Enter insert path"
@@ -282,8 +276,11 @@ mod tests {
                 .iter()
                 .any(|cell| cell.c == '文')
         );
-        assert!(files.focus_preview());
-        finish(&mut files);
+        assert_eq!(files.focus(), crate::files::FileFocus::List);
+        assert_eq!(
+            files.preview_lines(0).collect::<Vec<_>>(),
+            ["hello 中文", "second", "third"]
+        );
         let canvas = Rect {
             x: 0,
             y: 1,
@@ -292,7 +289,7 @@ mod tests {
         };
         let preview = preview(&files, preview_rect(canvas), &config);
         assert_eq!(
-            preview.rows[0].cells[0].fg,
+            preview.rows[1].cells[2].fg,
             crate::panel::rgb(config.foreground)
         );
         let mut bytes = Vec::new();
@@ -308,7 +305,7 @@ mod tests {
             0x202020,
         );
         crate::vt::Parser::new().advance(&mut terminal, &bytes);
-        let row = terminal.row(usize::from(preview.rect.y + 1));
+        let row = terminal.row(usize::from(crate::panel::popup_body(preview.rect).y));
         assert!(
             row.cells
                 .iter()
@@ -316,17 +313,18 @@ mod tests {
                 .collect::<String>()
                 .contains("hello")
         );
+        files.focus_preview();
         files.scroll(1, 1);
         let scrolled = super::preview(
             &files,
             Rect {
-                rows: 3,
+                rows: 6,
                 ..preview.rect
             },
             &config,
         );
         assert!(
-            scrolled.rows[1]
+            scrolled.rows[3]
                 .cells
                 .iter()
                 .map(|cell| cell.c)

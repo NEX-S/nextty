@@ -14,12 +14,13 @@
 #include <utf8proc.h>
 
 enum { FONT_CHOICE_BITS = 11 };
+enum { COLOR_PAINT = 1, COLOR_LAYERS = 2, COLOR_PNG = 4, COLOR_SVG = 8 };
 
 typedef struct {
     cairo_scaled_font_t *cairo;
     hb_font_t *hb;
     FcCharSet *charset; /* Borrowed from the style's font set; NULL excludes a candidate. */
-    int color;
+    unsigned color_formats;
     hb_codepoint_t blank_glyph;
 } Font;
 
@@ -41,7 +42,8 @@ struct NtFonts {
     hb_buffer_t *buffer;
     void *scratch; /* Per-line itemization arrays, reused across shaping calls. */
     size_t scratch_size;
-    struct { uint32_t key; Font *font; } choices[1u << FONT_CHOICE_BITS]; /* Borrowed from styles. */
+    uint32_t choice_keys[1u << FONT_CHOICE_BITS];
+    Font *choices[1u << FONT_CHOICE_BITS]; /* Borrowed from styles. */
 };
 
 typedef struct {
@@ -180,8 +182,10 @@ static Font *load_font(NtFonts *f, Style *s, int index) {
     /* OT metrics avoid FreeType's hinted advances; Cairo still owns rasterization. */
     hb_ot_font_set_funcs(font->hb);
     hb_face_t *hb_face = hb_font_get_face(font->hb);
-    font->color = hb_ot_color_has_paint(hb_face) || hb_ot_color_has_layers(hb_face) ||
-                  hb_ot_color_has_png(hb_face) || hb_ot_color_has_svg(hb_face);
+    font->color_formats = (hb_ot_color_has_paint(hb_face) ? COLOR_PAINT : 0) |
+                         (hb_ot_color_has_layers(hb_face) ? COLOR_LAYERS : 0) |
+                         (hb_ot_color_has_png(hb_face) ? COLOR_PNG : 0) |
+                         (hb_ot_color_has_svg(hb_face) ? COLOR_SVG : 0);
     double xscale = hypot(transform.xx, transform.yx);
     double yscale = fabs(transform.xx * transform.yy - transform.xy * transform.yx) / xscale;
     double slant = (transform.xy * transform.xx + transform.yy * transform.yx) /
@@ -279,7 +283,7 @@ static Font *find_cluster_font(NtFonts *f, const FriBidiChar *codes, Character *
         chars[j].ignorable = codes[j] >= 0x80 && utf8proc_get_property((int32_t)codes[j])->ignorable;
     int emoji = 0;
     for (size_t j = start; j < end; ++j) {
-        if (emoji_presentation(codes[j])) emoji = 1;
+        if (!emoji && emoji_presentation(codes[j])) emoji = 1;
         if (codes[j] == 0xfe0e) { emoji = 0; break; }
         if (codes[j] == 0xfe0f) emoji = 1;
     }
@@ -310,26 +314,27 @@ static inline Font *cluster_font(NtFonts *f, const FriBidiChar *codes, Character
         return find_cluster_font(f, codes, chars, start, end, flags);
     uint32_t key = (codes[start] << 2) | flags;
     size_t slot = (key * 2654435761u) >> (32 - FONT_CHOICE_BITS);
-    if (f->choices[slot].font && f->choices[slot].key == key)
-        return f->choices[slot].font;
+    if (f->choices[slot] && f->choice_keys[slot] == key)
+        return f->choices[slot];
     Font *font = find_cluster_font(f, codes, chars, start, end, flags);
-    f->choices[slot].key = key;
-    f->choices[slot].font = font;
+    f->choice_keys[slot] = key;
+    f->choices[slot] = font;
     return font;
 }
 
 static unsigned color_glyph(Font *font, uint32_t glyph) {
-    if (!font->color) return 0;
+    if (!font->color_formats) return 0;
     hb_face_t *face = hb_font_get_face(font->hb);
-    if (hb_ot_color_glyph_has_paint(face, glyph) ||
-        hb_ot_color_glyph_get_layers(face, glyph, 0, NULL, NULL)) return 1;
-    if (hb_ot_color_has_png(face)) {
+    if (((font->color_formats & COLOR_PAINT) && hb_ot_color_glyph_has_paint(face, glyph)) ||
+        ((font->color_formats & COLOR_LAYERS) &&
+         hb_ot_color_glyph_get_layers(face, glyph, 0, NULL, NULL))) return 1;
+    if (font->color_formats & COLOR_PNG) {
         hb_blob_t *blob = hb_ot_color_glyph_reference_png(font->hb, glyph);
         unsigned length = hb_blob_get_length(blob);
         hb_blob_destroy(blob);
         if (length) return 1;
     }
-    if (hb_ot_color_has_svg(face)) {
+    if (font->color_formats & COLOR_SVG) {
         hb_blob_t *blob = hb_ot_color_glyph_reference_svg(face, glyph);
         unsigned length = hb_blob_get_length(blob);
         hb_blob_destroy(blob);
@@ -354,10 +359,9 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     while (ascii_end < length && (unsigned char)text[ascii_end] >= 0x20 &&
            (unsigned char)text[ascii_end] <= 0x7e) ++ascii_end;
     int printable_ascii = ascii_end == length;
-    size_t characters = length;
+    size_t characters = ascii_end;
     if (!printable_ascii) {
-        characters = 0;
-        for (size_t i = 0; i < length; ++i)
+        for (size_t i = ascii_end; i < length; ++i)
             characters += ((unsigned char)text[i] & 0xc0) != 0x80;
     }
     size_t item_size = sizeof(Character) + sizeof(FriBidiChar) + sizeof(FriBidiLevel) +
@@ -441,7 +445,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         }
         i = end;
     }
-    hb_feature_t features[] = {{ HB_TAG('l','i','g','a'), 0, 0, UINT_MAX }, { HB_TAG('c','a','l','t'), 0, 0, UINT_MAX }};
+    static const hb_feature_t features[] = {{ HB_TAG('l','i','g','a'), 0, 0, UINT_MAX }, { HB_TAG('c','a','l','t'), 0, 0, UINT_MAX }};
     hb_language_t language = hb_language_get_default();
     double pen = 0, anchor = 0;
     size_t previous_column = SIZE_MAX;
@@ -470,18 +474,21 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
             size_t offset = info[j].cluster;
             size_t column = columns ? columns[offset] : offset;
             if (column != previous_column) { anchor = pen; previous_column = column; }
-            unsigned straight = 0;
+            unsigned cell_shape = 0;
             size_t cluster_end = end_byte;
             if (levels[start] & 1) {
                 if (j) cluster_end = info[j - 1].cluster;
             } else if (j + 1 < shaped) cluster_end = info[j + 1].cluster;
             if ((unsigned char)text[offset] == 0xe2 && offset + 3 <= length &&
-                (unsigned char)text[offset + 1] == 0x94 &&
-                ((unsigned char)text[offset + 2] == 0x80 || (unsigned char)text[offset + 2] == 0x82) &&
                 cluster_end == offset + 3 &&
                 (!j || info[j - 1].cluster != offset) && (j + 1 == shaped || info[j + 1].cluster != offset) &&
-                (!columns || offset + 3 == length || columns[offset + 3] != column))
-                straight = (unsigned char)text[offset + 2] == 0x80 ? 0x2500 : 0x2502;
+                (!columns || offset + 3 == length || columns[offset + 3] != column)) {
+                unsigned code = 0x2000 | (((unsigned char)text[offset + 1] & 63) << 6) |
+                                ((unsigned char)text[offset + 2] & 63);
+                if (code == 0x2500 || code == 0x2502 ||
+                    (code >= 0x2580 && code <= 0x259f && !(code >= 0x2591 && code <= 0x2593)))
+                    cell_shape = code;
+            }
             hb_glyph_extents_t extents;
             int blank = text[offset] == ' ' && (info[j].codepoint == blank_glyph ||
                         (hb_font_get_glyph_extents(font->hb, info[j].codepoint, &extents) &&
@@ -497,15 +504,20 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
                 }
                 if (!used || out[used - 1].font != font->cairo) cairo_scaled_font_reference(font->cairo);
                 out[used++] = (NtFontGlyph){ .font = font->cairo, .glyph = info[j].codepoint,
-                    .x = (float)(column * f->width + (straight ? 0 :
+                    .x = (float)(column * f->width + (cell_shape ? 0 :
                          (pen - anchor + positions[j].x_offset / 1024.0) / f->scale)),
-                    .y = f->baseline - (float)(positions[j].y_offset / (1024.0 * f->scale)),
-                    .color = chars[start].color, .color_glyph = color_glyph(font, info[j].codepoint), .straight = straight };
+                    .y = cell_shape ? 0 : f->baseline - (float)(positions[j].y_offset / (1024.0 * f->scale)),
+                    .color = chars[start].color, .color_glyph = cell_shape ? 0 : color_glyph(font, info[j].codepoint), .cell_shape = cell_shape };
             }
             pen += positions[j].x_advance / 1024.0;
         }
         font->blank_glyph = blank_glyph;
         start = end;
+    }
+    if (used < capacity / 2) {
+        NtFontGlyph *trimmed = realloc(out, used * sizeof *out);
+        if (!trimmed) { fail(f, "Cannot allocate line glyphs"); goto failed; }
+        out = trimmed;
     }
     *glyphs = out;
     *count = used;

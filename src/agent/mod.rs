@@ -1,153 +1,33 @@
 pub(crate) mod context;
 pub(crate) mod harness;
 pub(crate) mod http;
+#[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) mod markdown;
 pub mod owner;
+#[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) mod panel;
 
 use crate::agent::harness::{Event, Harness, MAX_READ_WAIT, TOOL_OUTPUT_LIMIT, Tool, ToolRequest};
-use crate::input::keysym;
 use crate::workspace::{
-    Action, AgentMessage, AgentModelPatch, Client, ClientEvent, FileOperation, FileResult, PaneView,
+    Action, AgentChange, AgentMessage, Client, ClientEvent, FileOperation, FileResult, PaneView,
 };
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::io;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
-use std::{io, ops::Range};
 
-const INPUT_LIMIT: usize = 64 * 1024;
 const TRANSCRIPT_LIMIT: usize = 256 * 1024;
 const INPUT_OBSERVE: Duration = Duration::from_millis(100);
-
-#[derive(Default)]
-pub(crate) struct AgentView {
-    pub input: String,
-    pub cursor: usize,
-    pub anchor: Option<usize>,
-    pub busy: bool,
-    pub messages: Vec<AgentMessage>,
-    pub scroll: usize,
-    pub revision: u64,
-    pub pending: Vec<serde_json::Value>,
-}
-
-impl AgentView {
-    pub fn restore_patch(&mut self, patch: &AgentModelPatch) -> io::Result<bool> {
-        let start = patch.start as usize;
-        let busy = patch.busy
-            || self
-                .pending
-                .iter()
-                .any(|request| request["action"] == "send");
-        let redraw = self.busy != busy
-            || self.messages.len() != start + patch.messages.len()
-            || patch.messages.iter().enumerate().any(|(index, new)| {
-                self.messages.get(start + index).is_none_or(|old| {
-                    old.turn != new.turn
-                        || old.role != new.role
-                        || old.id != new.id
-                        || if index == 0 && patch.prefix_bytes != 0 {
-                            new.role != "Agent"
-                                || new.id.is_some()
-                                || patch.prefix_bytes as usize != old.text.len()
-                        } else {
-                            old.text != new.text
-                                && (new.role != "Agent"
-                                    || new.id.is_some()
-                                    || !new.text.starts_with(&old.text))
-                        }
-                })
-            });
-        patch.apply_messages(&mut self.messages)?;
-        self.busy = busy;
-        self.revision = patch.revision;
-        Ok(redraw)
-    }
-
-    pub fn selection(&self) -> Option<Range<usize>> {
-        let anchor = self.anchor?;
-        (anchor != self.cursor).then(|| anchor.min(self.cursor)..anchor.max(self.cursor))
-    }
-
-    pub fn select_all(&mut self) {
-        self.anchor = Some(0);
-        self.cursor = self.input.len();
-    }
-
-    pub fn clear_input(&mut self) {
-        self.input.clear();
-        self.set_cursor(0, false);
-    }
-
-    pub fn set_cursor(&mut self, offset: usize, extend: bool) {
-        if extend {
-            self.anchor.get_or_insert(self.cursor);
-        } else {
-            self.anchor = None;
-        }
-        self.cursor = offset;
-    }
-
-    pub fn insert(&mut self, text: &str) -> Result<(), String> {
-        let range = self.selection().unwrap_or(self.cursor..self.cursor);
-        if self.input.len() - range.len() + text.len() > INPUT_LIMIT {
-            return Err("Agent input exceeds 64 KiB".into());
-        }
-        self.set_cursor(range.start + text.len(), false);
-        self.input.replace_range(range, text);
-        Ok(())
-    }
-
-    pub fn key(&mut self, symbol: u32, shift: bool) {
-        let before = || {
-            self.input
-                .floor_char_boundary(self.cursor.saturating_sub(1))
-        };
-        let after = || self.input.ceil_char_boundary(self.cursor + 1);
-        let selection = self.selection();
-        let offset = match symbol {
-            keysym::LEFT => {
-                if !shift && let Some(range) = selection {
-                    range.start
-                } else {
-                    before()
-                }
-            }
-            keysym::RIGHT => {
-                if !shift && let Some(range) = selection {
-                    range.end
-                } else {
-                    after()
-                }
-            }
-            keysym::HOME => self.input[..self.cursor].rfind('\n').map_or(0, |i| i + 1),
-            keysym::END => self.input[self.cursor..]
-                .find('\n')
-                .map_or(self.input.len(), |offset| self.cursor + offset),
-            keysym::BACKSPACE | keysym::DELETE => {
-                let range = selection.unwrap_or_else(|| {
-                    if symbol == keysym::BACKSPACE {
-                        before()..self.cursor
-                    } else {
-                        self.cursor..after()
-                    }
-                });
-                self.set_cursor(range.start, false);
-                self.input.replace_range(range, "");
-                return;
-            }
-            _ => return,
-        };
-        self.set_cursor(offset, shift);
-    }
-}
 
 #[derive(Default)]
 pub(crate) struct Agent {
     pub busy: bool,
     pub messages: Vec<AgentMessage>,
+    pub changes: Arc<Vec<AgentChange>>,
+    pub changes_omitted: u32,
     pub revision: u64,
     pub rewound: Option<(u64, String)>,
     pub(crate) turn: u64,
@@ -265,7 +145,7 @@ impl Agent {
         let Some(runtime) = &self.runtime else {
             return Ok(false);
         };
-        let events = runtime.poll()?;
+        let events = runtime.poll();
         let mut changed = false;
         for event in events {
             changed |= !matches!(event, Event::Request(_));
@@ -292,17 +172,18 @@ impl Agent {
                     is_error,
                 } => {
                     self.response = None;
-                    let role = format!(
-                        "{} · {}",
-                        name,
+                    let role = [
+                        name.as_str(),
+                        " · ",
                         if is_error {
                             "error"
                         } else if done {
                             "done"
                         } else {
                             "running"
-                        }
-                    );
+                        },
+                    ]
+                    .concat();
                     if let Some(message) = self
                         .messages
                         .iter_mut()
@@ -449,7 +330,7 @@ fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::
 }
 
 fn pane_context(view: &PaneView) -> Value {
-    json!({
+    let mut context = json!({
         "pane":view.id,"tab":view.tab,"title":view.title,"cwd":view.cwd,
         "input_generation":view.input_generation,"shell_prompt":view.shell_prompt,
         "process":{
@@ -462,22 +343,24 @@ fn pane_context(view: &PaneView) -> Value {
             "sampled_at_ms":view.process.sampled_at_ms,
             "unavailable":view.process.unavailable,
         },
-        "command_blocks":view.command_blocks.iter().rev().map(|b| json!({
-            "id":b.id,"has_output":b.has_output,"exit_code":b.status,"output_incomplete":!b.complete,
-        })).collect::<Vec<_>>(),
-    })
+    });
+    context["command_blocks"] = Value::Array(view.command_blocks.iter().rev().map(|b| json!({
+        "id":b.id,"has_output":b.has_output,"exit_code":b.status,"output_incomplete":!b.complete,
+    })).collect());
+    context
 }
 
 fn workspace_context(client: &Client) -> io::Result<Value> {
     let snapshot = client
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?;
-    Ok(json!({
+    let mut context = json!({
         "workspace":snapshot.name,"active_tab":snapshot.active_tab,
         "connection":if client.is_remote() {"ssh"} else {"local"},
         "ssh_target":client.remote_target(),
-        "panes":snapshot.panes.iter().map(pane_context).collect::<Vec<_>>(),
-    }))
+    });
+    context["panes"] = Value::Array(snapshot.panes.iter().map(pane_context).collect());
+    Ok(context)
 }
 
 static NEXT_REQUEST: AtomicU64 = AtomicU64::new(1);
@@ -604,7 +487,7 @@ impl Agent {
             let result = if request.canceled.load(Ordering::Acquire) {
                 Err(io::ErrorKind::Interrupted.into())
             } else {
-                workspace_context(client).map(|context| context.to_string())
+                workspace_context(client).and_then(|context| Ok(serde_json::to_string(&context)?))
             };
             return request.respond(result);
         }
@@ -746,13 +629,45 @@ impl Agent {
         let event = std::mem::replace(event, ClientEvent::Updated);
         match event {
             ClientEvent::AgentFile { result, .. } => {
-                operation.request.respond(result.map_err(io::Error::other).map(|result| {
-                    match result {
-                        FileResult::Read { path, offset, text, next_offset, has_more } => json!({"path":path,"offset":offset,"text":text,"next_offset":next_offset,"has_more":has_more}),
-                        FileResult::Search { path, matches, truncated } => json!({"path":path,"matches":matches.into_iter().map(|found|json!({"path":found.path,"line":found.line,"text":found.text})).collect::<Vec<_>>(),"truncated":truncated}),
-                        FileResult::Edited { path } => json!({"path":path,"written":true}),
-                    }.to_string()
-                }))?;
+                let result = result.map_err(io::Error::other).and_then(|result| {
+                    let result = match result {
+                        FileResult::Read { path, offset, text, next_offset, has_more } => {
+                            let mut result = json!({"path":path,"offset":offset,"next_offset":next_offset,"has_more":has_more});
+                            result["text"] = Value::String(text);
+                            result
+                        },
+                        FileResult::Search { path, matches, truncated } => {
+                            let mut result = json!({"path":path,"truncated":truncated});
+                            result["matches"] = Value::Array(matches.into_iter().map(|found| {
+                                let mut result = json!({"path":found.path,"line":found.line});
+                                result["text"] = Value::String(found.text);
+                                result
+                            }).collect());
+                            result
+                        },
+                        FileResult::Edited { mut change } => {
+                            let result = json!({"path":change.path,"written":true});
+                            if change.added != 0 || change.removed != 0 {
+                                change.turn = self.turn;
+                                change.tool_id = std::mem::take(&mut operation.request.id);
+                                let changes = Arc::make_mut(&mut self.changes);
+                                if changes.len() == 1024 {
+                                    changes.remove(0);
+                                    self.changes_omitted += 1;
+                                }
+                                let used: usize = changes.iter().map(|change| change.diff.len()).sum();
+                                let end = change.diff.floor_char_boundary(change.diff.len().min(TRANSCRIPT_LIMIT.saturating_sub(used)));
+                                change.truncated |= end != change.diff.len();
+                                change.diff.truncate(end);
+                                changes.push(change);
+                                self.revision += 1;
+                            }
+                            result
+                        },
+                    };
+                    Ok(serde_json::to_string(&result)?)
+                });
+                operation.request.respond(result)?;
             }
             ClientEvent::AgentNewTab { result, .. } => match result {
                 Ok(pane) => {
@@ -874,7 +789,7 @@ impl Agent {
                 let result = if operation.request.tool == Tool::Shell {
                     Ok(queued_input(result, command))
                 } else {
-                    result.map(|result| result.to_string())
+                    result.and_then(|result| Ok(serde_json::to_string(&result)?))
                 };
                 operation.request.respond(result)?;
             }
@@ -989,7 +904,7 @@ impl Agent {
                                 .insert(pane, context["input_generation"].as_u64().unwrap());
                             self.observed_activity.insert(pane, activity);
                             context["outcome"] = json!(outcome);
-                            return Ok(Some(context.to_string()));
+                            return Ok(Some(serde_json::to_string(&context)?));
                         }
                         operation.stage = read_output(client, &operation.request, None, outcome)?;
                     }
@@ -1030,7 +945,7 @@ fn created_terminal(pane: u64, observation: io::Result<Value>) -> String {
         observation.unwrap_or_else(|error| json!({"observation_error":error.to_string()}));
     result["created"] = json!(true);
     result["pane"] = json!(pane);
-    let text = result.to_string();
+    let text = serde_json::to_string(&result).unwrap();
     if text.len() <= TOOL_OUTPUT_LIMIT {
         text
     } else {
@@ -1048,7 +963,7 @@ fn queued_input(observation: io::Result<Value>, command: Option<u64>) -> String 
     if let Some(command) = command {
         result["command"] = json!(command);
     }
-    let text = result.to_string();
+    let text = serde_json::to_string(&result).unwrap();
     if text.len() <= TOOL_OUTPUT_LIMIT {
         return text;
     }
@@ -1140,35 +1055,6 @@ mod tests {
     }
 
     #[test]
-    fn mirror_restores_canonical_messages_without_overwriting_next_draft() {
-        let patch = AgentModelPatch {
-            busy: true,
-            revision: 9,
-            turn: 3,
-            messages: vec![AgentMessage {
-                role: "You".into(),
-                text: "first request".into(),
-                turn: 3,
-                id: None,
-            }],
-            ..AgentModelPatch::default()
-        };
-        let mut mirror = AgentView::default();
-        mirror.insert("下一条🙂").unwrap();
-        mirror.anchor = Some(3);
-        mirror.scroll = 7;
-        let cursor = mirror.cursor;
-        assert!(mirror.restore_patch(&patch).unwrap());
-        assert_eq!(mirror.input, "下一条🙂");
-        assert_eq!(mirror.cursor, cursor);
-        assert_eq!(mirror.anchor, Some(3));
-        assert_eq!(mirror.scroll, 7);
-        assert_eq!(mirror.messages[0].turn, 3);
-        assert_eq!(mirror.revision, 9);
-        assert!(mirror.busy);
-    }
-
-    #[test]
     fn rewind_identity_survives_independent_transcript_trimming() {
         let mut owner = Agent::default();
         for turn in [2, 7] {
@@ -1196,55 +1082,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn selection_replacement_and_deletion_preserve_unicode_boundaries() {
-        let mut agent = AgentView::default();
-        agent.insert("a中文z").unwrap();
-        agent.set_cursor(1, false);
-        agent.set_cursor(7, true);
-        assert_eq!(&agent.input[agent.selection().unwrap()], "中文");
-        agent.insert("新").unwrap();
-        assert_eq!(agent.input, "a新z");
-        assert_eq!(agent.cursor, 4);
-        assert_eq!(agent.selection(), None);
-        agent.key(keysym::BACKSPACE, false);
-        assert_eq!(agent.input, "az");
-        agent.select_all();
-        agent.key(keysym::DELETE, false);
-        assert!(agent.input.is_empty());
-        assert_eq!(agent.cursor, 0);
-        assert_eq!(agent.anchor, None);
-    }
-
-    #[test]
-    fn shift_navigation_extends_from_anchor_and_arrows_collapse_selection() {
-        let mut agent = AgentView::default();
-        agent.insert("ab\n中文").unwrap();
-        agent.key(keysym::LEFT, true);
-        agent.key(keysym::LEFT, true);
-        assert_eq!(agent.selection(), Some(3..9));
-        agent.key(keysym::RIGHT, false);
-        assert_eq!(agent.cursor, 9);
-        assert_eq!(agent.selection(), None);
-        agent.key(keysym::HOME, true);
-        assert_eq!(agent.selection(), Some(3..9));
-        agent.key(keysym::LEFT, false);
-        assert_eq!(agent.cursor, 3);
-        agent.key(keysym::END, true);
-        assert_eq!(agent.selection(), Some(3..9));
-        agent.clear_input();
-        assert!(agent.input.is_empty());
-        assert_eq!(agent.anchor, None);
-    }
-
-    #[test]
-    fn replacing_selected_text_can_reuse_the_input_budget() {
-        let mut agent = AgentView::default();
-        agent.insert(&"x".repeat(INPUT_LIMIT)).unwrap();
-        agent.select_all();
-        agent.insert("short draft").unwrap();
-        assert_eq!(agent.input, "short draft");
-    }
     #[test]
     fn long_tool_loops_keep_the_current_user_message_and_reply() {
         let mut agent = Agent {

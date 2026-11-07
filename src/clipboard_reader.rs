@@ -1,4 +1,4 @@
-use crate::eventfd::{consume_notification, notify};
+use crate::eventfd::notify;
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read};
@@ -9,6 +9,7 @@ use std::sync::{Arc, mpsc};
 enum Command {
     Queue(File),
     ReadNext,
+    #[cfg(feature = "tui")]
     Discard(File),
 }
 
@@ -48,6 +49,7 @@ impl ClipboardReader {
         self.command(Command::Queue(file))
     }
 
+    #[cfg(feature = "tui")]
     pub(crate) fn discard(&self, file: File) -> io::Result<()> {
         self.command(Command::Discard(file))
     }
@@ -67,9 +69,6 @@ impl ClipboardReader {
     }
 
     pub(crate) fn read(&mut self) -> io::Result<Option<Vec<u8>>> {
-        if self.pending {
-            consume_notification(self.fd())?;
-        }
         match self.chunks.try_recv() {
             Ok(chunk) => {
                 self.pending = false;
@@ -103,11 +102,11 @@ fn run(
     let mut files = VecDeque::new();
     'commands: while let Ok(command) = commands.recv() {
         if shared.cancelled.load(Ordering::Acquire) {
-            drop(command);
             break;
         }
         match command {
             Command::Queue(file) => files.push_back(file),
+            #[cfg(feature = "tui")]
             Command::Discard(file) => drop(file),
             Command::ReadNext => {
                 let mut bytes = vec![0; chunk_size];
@@ -150,7 +149,7 @@ fn run(
             }
         }
     }
-    files.clear();
+    drop(files);
     // The sole sender cannot enqueue after cancellation. Drain File payloads here
     // before dropping the receiver, since mpsc storage can outlive its receiver.
     for command in commands.try_iter() {
@@ -193,6 +192,7 @@ mod tests {
                     revents: 0,
                 };
                 assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+                crate::eventfd::consume_notification(fd.fd).unwrap();
             }
         }
     }

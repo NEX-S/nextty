@@ -11,7 +11,7 @@ typedef struct {
     uint32_t glyph;
     float x, y;
     uint32_t color;
-    unsigned color_glyph, straight;
+    unsigned color_glyph, cell_shape;
 } NtFontGlyph;
 
 /* All calls run on the renderer worker. Error storage outlives the font owner. */

@@ -143,7 +143,8 @@ impl Screen {
                 ));
             }
             self.rows = update.rows.into_iter().map(|(_, row)| row).collect();
-            self.dirty = vec![true; update.lines];
+            self.dirty.clear();
+            self.dirty.resize(update.lines, true);
             self.columns = update.columns;
         } else {
             for (index, row) in update.rows {
@@ -170,7 +171,20 @@ impl Screen {
                     (start <= end).then_some((start, end))
                 })
             };
-            for (row, dirty) in self.dirty.iter_mut().enumerate() {
+            let (first, last) = [self.selection, update.selection]
+                .into_iter()
+                .flatten()
+                .fold((i32::MAX, i32::MIN), |(first, last), selection| {
+                    (
+                        first.min(selection.start.line),
+                        last.max(selection.end.line),
+                    )
+                });
+            let visible =
+                |line: i64| (line + self.offset as i64).clamp(0, self.dirty.len() as i64) as usize;
+            let first = visible(i64::from(first));
+            let last = visible(i64::from(last) + 1);
+            for (row, dirty) in self.dirty.iter_mut().enumerate().take(last).skip(first) {
                 let line = row as i32 - self.offset as i32;
                 *dirty = *dirty || span(self.selection, line) != span(update.selection, line);
             }
@@ -188,6 +202,28 @@ impl Screen {
         self.offset = update.offset;
         self.history = update.history;
         Ok(())
+    }
+
+    // Prompts and partial boundary rows still need row_output's check.
+    #[cfg(any(feature = "gui", feature = "tui"))]
+    pub(crate) fn block_row_range(
+        &self,
+        pane: &crate::workspace::PaneView,
+        block: u64,
+    ) -> std::ops::Range<usize> {
+        let Some((start, end)) = pane
+            .blocks
+            .iter()
+            .find(|current| current.id == block)
+            .and_then(|current| current.output)
+        else {
+            return 0..0;
+        };
+        let rows = self.screen_lines() as i64;
+        let offset = self.display_offset() as i64;
+        let first = (i64::from(start.line) + offset).clamp(0, rows) as usize;
+        let last = (i64::from(end.line) + offset + 1).clamp(0, rows) as usize;
+        first..last
     }
 
     pub fn row_output<'a>(

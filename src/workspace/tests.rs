@@ -4,11 +4,13 @@ fn test_client(stream: UnixStream) -> Client {
     Client::new(
         Peer::new(stream).unwrap(),
         None,
+        #[cfg(any(feature = "gui", feature = "tui"))]
         ClientEndpoint::Local(PathBuf::new()),
     )
 }
 
-fn finish_search(client: &mut Client, search: &mut crate::search::Search) {
+#[cfg(any(feature = "gui", feature = "tui"))]
+fn finish_search(client: &mut Client, search: &mut crate::ui::Search) {
     while search.pending {
         let mut found = None;
         wait(client, |_, events| {
@@ -36,6 +38,7 @@ fn finish_search(client: &mut Client, search: &mut crate::search::Search) {
 }
 
 #[test]
+#[cfg(any(feature = "gui", feature = "tui"))]
 fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
     let server = TestServer::start();
     let mut client = Client::connect(&server.socket()).unwrap();
@@ -191,12 +194,16 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
     assert!(ui.search.open);
     assert_eq!(ui.search.query, "abc");
     let pasted = "中a".repeat(1024);
-    ui.paste(&mut client, crate::input::PasteTarget::Search, &pasted)
-        .unwrap();
+    ui.paste(
+        &mut client,
+        crate::input::PasteTarget::Search,
+        &format!("{pasted}\n\r\t\u{85}"),
+    )
+    .unwrap();
     assert_eq!(ui.search.query, format!("a{pasted}bc"));
     assert_eq!(ui.search.cursor, 1 + pasted.len());
     let mut decoder = crate::input::TextDecoder::default();
-    for bytes in [&[0xe7, 0x95][..], &[0x8c], b"x\n\t\x7fy"] {
+    for bytes in [b"prefix \xe7\x95".as_slice(), &[0x8c], b"x\n\t\x7fy"] {
         ui.paste(
             &mut client,
             crate::input::PasteTarget::Search,
@@ -204,12 +211,13 @@ fn pane_search_roundtrip_reads_cold_history_and_restores_view_and_selection() {
         )
         .unwrap();
     }
-    assert_eq!(ui.search.query, format!("a{pasted}界xybc"));
-    assert_eq!(ui.search.cursor, 1 + pasted.len() + "界xy".len());
+    assert_eq!(ui.search.query, format!("a{pasted}prefix 界xybc"));
+    assert_eq!(ui.search.cursor, 1 + pasted.len() + "prefix 界xy".len());
     ui.search.close(&mut client).unwrap();
 }
 
 #[test]
+#[cfg(any(feature = "gui", feature = "tui"))]
 fn independent_clients_search_without_cancelling_each_other_or_selecting_read_only() {
     let server = TestServer::start();
     let mut viewer = Client::connect(&server.socket()).unwrap();
@@ -511,7 +519,7 @@ fn split_layout_and_removal_preserve_remaining_leaf() {
             )
         ]
     );
-    let root = root.remove(2).unwrap();
+    assert!(root.remove_child(2));
     let mut layout = Vec::new();
     root.layout(
         Rect {
@@ -713,8 +721,8 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         .unwrap();
     wait(&mut frontend, |client, _| !client.agent_events.is_empty());
     let token = frontend
-        .take_agent_events()
-        .into_iter()
+        .agent_events
+        .drain(..)
         .find_map(|event| match event {
             AgentEvent::Start(token) => Some(token),
             _ => None,
@@ -729,7 +737,7 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         .unwrap();
     wait(&mut owner, |client, _| client.snapshot().is_some());
     assert_eq!(
-        owner.take_agent_events(),
+        owner.agent_events.drain(..).collect::<Vec<_>>(),
         vec![
             AgentEvent::Attached,
             AgentEvent::Draft(b"draft-view".to_vec()),
@@ -763,7 +771,7 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     frontend.flush().unwrap();
     wait(&mut owner, |client, _| client.agent_events.len() == 2);
     assert_eq!(
-        owner.take_agent_events(),
+        owner.agent_events.drain(..).collect::<Vec<_>>(),
         vec![
             AgentEvent::Draft(b"edited-view".to_vec()),
             AgentEvent::Request(b"next-command".to_vec())
@@ -791,6 +799,19 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     wait(&mut terminal_only, |client, _| client.snapshot().is_some());
     let initial = AgentModelPatch {
         session: 1,
+        revision: 1,
+        changes: Some(
+            vec![AgentChange {
+                turn: 1,
+                tool_id: "1:0:0:edit".into(),
+                path: "project/a.rs".into(),
+                added: 1,
+                removed: 1,
+                diff: "-old\n+new\n".into(),
+                ..AgentChange::default()
+            }]
+            .into(),
+        ),
         messages: vec![AgentMessage {
             turn: 1,
             role: "Agent".into(),
@@ -801,6 +822,7 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     };
     let tail = AgentModelPatch {
         session: 1,
+        revision: 1,
         prefix_bytes: 5,
         messages: vec![AgentMessage {
             turn: 1,
@@ -814,10 +836,10 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     owner.send(Action::AgentUpdate(tail.clone())).unwrap();
     owner.flush().unwrap();
     wait(&mut frontend, |client, _| {
-        client.agent_events.last() == Some(&AgentEvent::Model(tail.clone()))
+        client.agent_events.back() == Some(&AgentEvent::Model(tail.clone()))
     });
     assert_eq!(
-        frontend.take_agent_events(),
+        frontend.agent_events.drain(..).collect::<Vec<_>>(),
         vec![
             AgentEvent::Model(initial.clone()),
             AgentEvent::Model(tail.clone())
@@ -831,13 +853,13 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
             .iter()
             .any(|event| matches!(event, ClientEvent::List(_)))
     });
-    assert!(terminal_only.take_agent_events().is_empty());
+    assert!(terminal_only.agent_events.is_empty());
     terminal_only.send(Action::AgentOpen).unwrap();
     wait(&mut terminal_only, |client, _| {
         client.agent_events.contains(&AgentEvent::Ready)
     });
     assert_eq!(
-        terminal_only.take_agent_events(),
+        terminal_only.agent_events.drain(..).collect::<Vec<_>>(),
         vec![
             AgentEvent::Draft(b"edited-view".to_vec()),
             AgentEvent::Model(full_model.clone()),
@@ -907,7 +929,7 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         client.agent_events.contains(&AgentEvent::Ready)
     });
     assert_eq!(
-        frontend.take_agent_events(),
+        frontend.agent_events.drain(..).collect::<Vec<_>>(),
         vec![
             AgentEvent::Draft(b"edited-view".to_vec()),
             AgentEvent::Model(full_model.clone()),
@@ -966,7 +988,10 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     wait(&mut fresh, |client, _| client.snapshot().is_some());
     fresh.send(Action::AgentOpen).unwrap();
     wait(&mut fresh, |client, _| !client.agent_events.is_empty());
-    assert_eq!(fresh.take_agent_events(), vec![AgentEvent::Ready]);
+    assert_eq!(
+        fresh.agent_events.drain(..).collect::<Vec<_>>(),
+        vec![AgentEvent::Ready]
+    );
     let mut impostor = Client::connect(&server.socket()).unwrap();
     impostor
         .send(Action::AgentAttach {
@@ -1519,6 +1544,7 @@ fn agent_broadcast_reads_live_screen_without_moving_scrollback_or_selection() {
         .map(|row| row.cells.clone())
         .collect();
 
+    #[cfg(any(feature = "gui", feature = "tui"))]
     {
         let mut session = crate::agent::panel::AgentSession::default();
         session.model.input = "describe current screen".into();
@@ -3307,7 +3333,7 @@ fn initial_pull_attach_error_reports_without_a_snapshot() {
             .any(|event| matches!(event, ClientEvent::Error(_)))
     });
     assert!(client.snapshot().is_none());
-    assert!(client.screen_wait.is_none());
+    assert!(!client.screen_pending);
 }
 
 #[test]
@@ -4027,8 +4053,8 @@ fn attach_agent_owner(server: &TestServer, frontend: &mut Client, name: &str) ->
         .unwrap();
     wait(frontend, |client, _| !client.agent_events.is_empty());
     let token = frontend
-        .take_agent_events()
-        .into_iter()
+        .agent_events
+        .drain(..)
         .find_map(|event| {
             if let AgentEvent::Start(token) = event {
                 Some(token)
@@ -4181,8 +4207,10 @@ fn agent_workspace_files_and_new_tab_use_selected_pane_without_changing_user_vie
                         assert_eq!(matches[0].line, 1);
                         assert_eq!(matches[0].text, "selected needle");
                     }
-                    (43, FileResult::Edited { path }) => {
-                        assert_eq!(path, &project.join("value.txt"))
+                    (43, FileResult::Edited { change }) => {
+                        assert_eq!(change.path, project.join("value.txt"));
+                        assert_eq!((change.added, change.removed), (1, 1));
+                        assert!(change.diff.contains("+edited needle"));
                     }
                     (44, FileResult::Read { text, .. }) => assert_eq!(text, "edited needle\n"),
                     _ => panic!("unexpected file result: {request} {result:?}"),
@@ -4270,6 +4298,36 @@ fn agent_workspace_files_and_new_tab_use_selected_pane_without_changing_user_vie
         after.rows.iter().map(|row| &row.cells).collect::<Vec<_>>(),
         before.rows.iter().map(|row| &row.cells).collect::<Vec<_>>()
     );
+}
+
+#[test]
+fn failed_connection_does_not_reply_to_queued_history_requests() {
+    let (left, right) = UnixStream::pair().unwrap();
+    let mut client = Connection::new(1, left).unwrap();
+    client.failed = true;
+    client.copy_requests.push_back((
+        "gone".into(),
+        CopyRequest {
+            pane: 1,
+            request: 1,
+            block: None,
+        },
+    ));
+    client.read_requests.push_back((
+        "gone".into(),
+        ReadRequest {
+            pane: 1,
+            request: 2,
+            block: None,
+            cursor: None,
+            query: None,
+        },
+    ));
+    let mut clients = vec![client];
+    complete_requests(&mut clients, &HashMap::new(), &mut HashSet::new());
+    clients[0].peer.flush().unwrap();
+    let mut peer = Peer::new(right).unwrap();
+    assert!(peer.responses(None).unwrap().is_empty());
 }
 
 #[test]
@@ -4449,15 +4507,36 @@ fn agent_file_inflight_cancellation_and_lifecycle_preserve_received_commits() {
         &mut workspaces,
     );
     assert!(cancelled.load(Ordering::Relaxed));
+    apply(
+        1,
+        edit(5, "queued cancelled"),
+        &mut clients,
+        &mut workspaces,
+    );
+    apply(
+        1,
+        Action::CancelAgentFile { request: 5 },
+        &mut clients,
+        &mut workspaces,
+    );
+    release.send(()).unwrap();
     release.send(()).unwrap();
     let deadline = Instant::now() + Duration::from_secs(2);
-    loop {
+    let mut cancelled_replies = Vec::new();
+    while cancelled_replies.len() < 2 {
         complete_requests(&mut clients, &workspaces, &mut dirty);
         clients[1].peer.flush().unwrap();
-        if client.poll().unwrap().iter().any(|event| matches!(event, ClientEvent::AgentFile { request: 1, result: Err(error) } if error.contains("cancel"))) { break; }
+        for event in client.poll().unwrap() {
+            if let ClientEvent::AgentFile { request, result } = event {
+                assert!(result.unwrap_err().contains("cancel"));
+                cancelled_replies.push(request);
+            }
+        }
         assert!(Instant::now() < deadline);
         std::thread::sleep(Duration::from_millis(1));
     }
+    assert_eq!(cancelled_replies, [1, 5]);
+    assert_eq!(starts.recv_timeout(Duration::from_secs(2)).unwrap(), 5);
     assert_eq!(fs::read_to_string(&path).unwrap(), "original");
     apply(1, edit(2, "committed"), &mut clients, &mut workspaces);
     complete_requests(&mut clients, &workspaces, &mut dirty);
@@ -4523,4 +4602,48 @@ fn agent_file_inflight_cancellation_and_lifecycle_preserve_received_commits() {
     dropper.join().unwrap();
     drop_result.unwrap();
     assert_eq!(fs::read_to_string(&path).unwrap(), "committed");
+}
+
+#[test]
+fn input_queues_a_fresh_screen_request_before_each_payload() {
+    let (left, right) = UnixStream::pair().unwrap();
+    let mut client = Client::new(
+        Peer::new(left).unwrap(),
+        None,
+        #[cfg(any(feature = "gui", feature = "tui"))]
+        ClientEndpoint::Local(PathBuf::new()),
+    );
+    let mut peer = Peer::new(right).unwrap();
+    client.request_screen().unwrap();
+    client.send_input(7, b"\x1b[I").unwrap();
+    client
+        .send(Action::Input {
+            pane: 7,
+            data: b"z".to_vec(),
+        })
+        .unwrap();
+    client.flush().unwrap();
+    let payloads: [Option<&[u8]>; 3] = [None, Some(b"\x1b[I"), Some(b"z")];
+    let mut previous = 0;
+    for payload in payloads {
+        let request = match peer.next_action().unwrap().unwrap() {
+            Action::ScreenRequest {
+                request,
+                wait: true,
+            } => request,
+            _ => panic!("expected a fresh screen request before input"),
+        };
+        assert!(request > previous);
+        previous = request;
+        if let Some(payload) = payload {
+            match peer.next_action().unwrap().unwrap() {
+                Action::Input { pane, data } => {
+                    assert_eq!(pane, 7);
+                    assert_eq!(data, payload);
+                }
+                _ => panic!("expected input after its screen request"),
+            }
+        }
+    }
+    assert!(peer.next_action().unwrap().is_none());
 }

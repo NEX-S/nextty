@@ -22,14 +22,14 @@ struct PendingFrame {
 }
 const TRACE_BLOCK: usize = 8192;
 pub(crate) struct TraceWriter {
-    sender: Option<SyncSender<Vec<u8>>>,
+    sender: Option<SyncSender<Box<[u8]>>>,
     worker: Option<JoinHandle<io::Result<()>>>,
     pub(crate) draining: bool,
 }
 impl TraceWriter {
     fn new(path: OsString) -> io::Result<Self> {
         let mut file = File::create(path)?;
-        let (sender, receiver) = sync_channel::<Vec<u8>>(8);
+        let (sender, receiver) = sync_channel::<Box<[u8]>>(8);
         let worker = thread::Builder::new()
             .name("nextty-trace".into())
             .spawn(move || {
@@ -58,7 +58,7 @@ impl Write for TraceWriter {
             .as_ref()
             .ok_or_else(|| io::Error::new(io::ErrorKind::BrokenPipe, "trace writer stopped"))?;
         let count = bytes.len().min(TRACE_BLOCK);
-        let block = bytes[..count].to_vec();
+        let block = bytes[..count].into();
         if self.draining {
             sender
                 .send(block)

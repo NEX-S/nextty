@@ -59,11 +59,14 @@ struct CachedText {
 
 #[derive(Default)]
 struct TextCache {
-    lines: HashMap<String, Vec<CachedText>>,
+    lines: HashMap<Box<str>, Vec<CachedText>>,
 }
 
 impl TextCache {
     fn draw(&mut self, renderer: &Renderer, text: &str, x: f32, y: f32, color: u32) -> Result<()> {
+        if text.is_empty() {
+            return Ok(());
+        }
         self.draw_flags(renderer, text, x, y, color, 0)
     }
 
@@ -94,7 +97,7 @@ impl TextCache {
                 &text_columns(text),
             )?;
             self.lines
-                .entry(text.to_owned())
+                .entry(text.into())
                 .or_default()
                 .push_mut(CachedText {
                     color,
@@ -419,6 +422,9 @@ impl WorkspaceView {
             ]);
             pollfds.extend(self.ui.fds());
             self.window.wait(&mut pollfds, timeout, &mut events)?;
+            if pollfds[2].revents != 0 {
+                crate::eventfd::consume_notification(pollfds[2].fd)?;
+            }
             if pollfds[0].revents & libc::POLLOUT != 0 {
                 self.client.flush()?;
             }
@@ -559,11 +565,9 @@ impl WorkspaceView {
             self.ui.search.close(&mut self.client)?;
             self.ui.focus = Focus::Terminal;
 
-            {
-                self.ui.cancel_rewind();
-            }
+            self.ui.cancel_rewind();
 
-            if std::mem::take(&mut self.ui.files_open) {
+            if !matches!(action, Action::Focus(_)) && std::mem::take(&mut self.ui.files_open) {
                 self.resize()?;
             }
             self.dirty = true;
@@ -599,12 +603,6 @@ impl WorkspaceView {
     }
     fn resize(&mut self) -> Result<()> {
         self.ui.search.close(&mut self.client)?;
-        let (_, _, scale) = self.window.size();
-        if scale != self.scale {
-            self.caches.clear();
-            self.text.lines.clear();
-            self.scale = scale;
-        }
         self.hover_cell = None;
         self.hovered = None;
 
@@ -628,7 +626,10 @@ impl WorkspaceView {
             }
             native::KEY => self.key(event.code, event.modifiers, &event.text)?,
             native::TEXT => {
-                if self.ui.close_prompt.is_some() || self.preview_open() {
+                if self.ui.close_prompt.is_some()
+                    || self.preview_open()
+                    || self.ui.file_preview_open()
+                {
                     return Ok(());
                 }
                 let marked = !self.preedit.is_empty();
@@ -665,7 +666,10 @@ impl WorkspaceView {
                     self.preedit.clear();
                     return Ok(());
                 }
-                if self.ui.close_prompt.is_some() || self.preview_open() {
+                if self.ui.close_prompt.is_some()
+                    || self.preview_open()
+                    || self.ui.file_preview_open()
+                {
                     return Ok(());
                 }
                 let start = if event.start < 0 {
@@ -789,6 +793,10 @@ impl WorkspaceView {
         Ok(true)
     }
     fn key(&mut self, symbol: u32, modifiers: u32, text: &str) -> Result<()> {
+        if self.ui.file_preview_open() {
+            self.panel_key(symbol, modifiers, "")?;
+            return Ok(());
+        }
         if let Some(prompt) = self.ui.close_prompt.as_mut() {
             let terminate = prompt.terminate;
             match symbol {
@@ -899,12 +907,14 @@ impl WorkspaceView {
             };
             viewport = (
                 usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(2)),
+                usize::from(rect.rows.saturating_sub(if self.ui.file_preview_open() {
+                    5
+                } else {
+                    0
+                })),
             );
-        } else {
-            if let Some(layout) = self.editor_viewport() {
-                viewport = (layout.columns, layout.rows);
-            }
+        } else if let Some(layout) = self.editor_viewport() {
+            viewport = (layout.columns, layout.rows);
         }
 
         let panels = self.ui.panel_state();
@@ -982,7 +992,7 @@ impl WorkspaceView {
         if !self.composition_finished() {
             return;
         }
-        let target = if self.ui.files_open {
+        let target = if self.ui.files_open && self.ui.focus == Focus::Files {
             if let Some(files) = &mut self.ui.files {
                 files.focus_list();
                 if !files.is_search() {
@@ -1046,7 +1056,9 @@ impl WorkspaceView {
         let mut layout = GuiLayout::new(width as f32, height as f32, self.cell, agent_width);
 
         if self.ui.files_open {
-            layout.left = (self.cell.0 * 32.).min(layout.side / 3.);
+            layout.left = f32::from(crate::file_panel::sidebar_width(
+                (layout.side / self.cell.0).floor() as u16,
+            )) * self.cell.0;
         }
         if self.ui.resources.open {
             let total = ((layout.height - layout.top - 12.) / self.cell.1).max(0.) as u16;
@@ -1066,7 +1078,10 @@ impl WorkspaceView {
         let pane = if let Some(id) = captured {
             snapshot.pane(id)?
         } else {
-            if self.preview_open() || !layout.terminal_contains(self.pointer) {
+            if self.preview_open()
+                || self.ui.file_preview_open()
+                || !layout.terminal_contains(self.pointer)
+            {
                 return None;
             }
             let (x, y) = layout.pointer_cell(self.cell, self.pointer);
@@ -1195,6 +1210,7 @@ impl WorkspaceView {
                 let files_open = std::mem::take(&mut self.ui.files_open);
                 let open = self.ui.resources.open;
                 self.ui.resources.action(action);
+                self.ui.monitor_jump(&mut self.client)?;
                 self.ui.focus = if self.ui.resources.open {
                     Focus::Monitor
                 } else {
@@ -1262,9 +1278,6 @@ impl WorkspaceView {
             return None;
         }
 
-        if self.ui.files_open {
-            return None;
-        }
         let pane = self.client.snapshot()?.pane(id)?;
         let screen = self.client.screens().get(&id)?;
         let row = (point.line + screen.display_offset() as i32) as usize;
@@ -1292,6 +1305,20 @@ impl WorkspaceView {
         Ok(())
     }
     fn button(&mut self, button: u32, pressed: bool, modifiers: u32) -> Result<()> {
+        if self.ui.file_preview_open() {
+            if pressed && button == 1 {
+                let rect = self.file_preview_layout(self.layout());
+                let column = (self.pointer.0 / self.cell.0) as u16;
+                let row = (self.pointer.1 / self.cell.1) as u16;
+                if !rect.contains(column, row)
+                    || crate::panel::popup_close(rect).contains(column, row)
+                {
+                    self.ui.files.as_mut().unwrap().focus_list();
+                    self.dirty = true;
+                }
+            }
+            return Ok(());
+        }
         if !pressed {
             return self.button_release(button, modifiers);
         }
@@ -1368,19 +1395,11 @@ impl WorkspaceView {
             return Ok(());
         }
 
-        if self.ui.files_open
-            && (self.pointer.0 < layout.left
-                || self
-                    .ui
-                    .files
-                    .as_ref()
-                    .is_some_and(|files| files.focus() == FileFocus::Preview))
-        {
+        if self.ui.files_open && self.pointer.0 < layout.left {
             self.ui.focus = Focus::Files;
             let rect = self.file_rect(layout);
             if button == 1
                 && let Some(files) = &mut self.ui.files
-                && files.focus() == FileFocus::List
                 && let Some(index) = crate::file_panel::Layout::new(rect, files).entry_at(
                     files,
                     (self.pointer.0 / self.cell.0) as u16,
@@ -1388,6 +1407,7 @@ impl WorkspaceView {
                 )
             {
                 files.move_selection(index as isize - files.selection() as isize);
+                files.focus_preview();
                 self.dirty = true;
             }
             return Ok(());
@@ -1643,19 +1663,12 @@ impl WorkspaceView {
             self.drag_scrollbar(pointer.1)?;
             return Ok(());
         }
-        if self.preview_open() {
+        if self.preview_open() || self.ui.file_preview_open() {
             self.refresh_hover();
             return Ok(());
         }
 
-        if self.ui.files_open
-            && (self.pointer.0 < layout.left
-                || self
-                    .ui
-                    .files
-                    .as_ref()
-                    .is_some_and(|files| files.focus() == FileFocus::Preview))
-        {
+        if self.ui.files_open && self.pointer.0 < layout.left {
             return Ok(());
         }
         if let Some(drag) = self.split_drag {
@@ -1741,6 +1754,15 @@ impl WorkspaceView {
         Ok(())
     }
     fn scroll(&mut self, amount: f32, modifiers: u32) -> Result<()> {
+        if self.ui.file_preview_open() {
+            let rect = self.file_preview_layout(self.layout());
+            self.ui.files.as_mut().unwrap().scroll(
+                -amount.round() as isize,
+                usize::from(crate::panel::popup_body(rect).rows),
+            );
+            self.dirty = true;
+            return Ok(());
+        }
         if self.scrollbar_drag.is_some() {
             return Ok(());
         }
@@ -1762,13 +1784,10 @@ impl WorkspaceView {
             return Ok(());
         }
 
-        if self.ui.files_open {
-            let rect = self.file_preview_layout(self.layout());
+        if self.ui.files_open && self.pointer.0 < self.layout().left {
+            let rect = self.file_rect(self.layout());
             if let Some(files) = &mut self.ui.files {
-                files.scroll(
-                    -amount.round() as isize,
-                    usize::from(rect.rows.saturating_sub(2)),
-                );
+                files.scroll(-amount.round() as isize, usize::from(rect.rows));
             }
             self.dirty = true;
             return Ok(());
@@ -1902,11 +1921,14 @@ impl WorkspaceView {
                         )?;
                     }
 
-                    if self.hovered_block.is_some_and(|(id, _)| id == pane.id) {
-                        for row in 0..screen.screen_lines() {
-                            if screen.row_output(pane, row).is_some_and(|block| {
-                                self.hovered_block == Some((pane.id, block.id))
-                            }) {
+                    if let Some((id, block)) = self.hovered_block
+                        && id == pane.id
+                    {
+                        for row in screen.block_row_range(pane, block) {
+                            if screen
+                                .row_output(pane, row)
+                                .is_some_and(|current| current.id == block)
+                            {
                                 self.renderer.rect(
                                     origin.0,
                                     origin.1 + row as f32 * self.cell.1,
@@ -2051,9 +2073,12 @@ impl WorkspaceView {
         }
         self.renderer.clip(0., 0., 0., 0.)?;
 
+        if self.ui.files_open && !self.ui.file_preview_open() {
+            self.draw_files(layout)?;
+        }
         self.draw_agent(layout)?;
         self.draw_scrollbars()?;
-        if self.ui.files_open {
+        if self.ui.file_preview_open() {
             self.draw_files(layout)?;
         }
         if self.ui.search.open {
@@ -2134,24 +2159,22 @@ impl WorkspaceView {
         self.resize()
     }
 
-    fn file_canvas(&self, layout: GuiLayout) -> crate::workspace::Rect {
+    fn file_rect(&self, layout: GuiLayout) -> crate::workspace::Rect {
         crate::workspace::Rect {
             x: 0,
             y: 1,
-            cols: (layout.width / self.cell.0).floor() as u16,
+            cols: (layout.left / self.cell.0).floor() as u16,
             rows: ((layout.footer - layout.top) / self.cell.1).floor().max(1.) as u16,
         }
     }
 
-    fn file_rect(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        crate::workspace::Rect {
-            cols: (layout.left / self.cell.0).floor() as u16,
-            ..self.file_canvas(layout)
-        }
-    }
-
     fn file_preview_layout(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        crate::file_panel::preview_rect(self.file_canvas(layout))
+        crate::file_panel::preview_rect(crate::workspace::Rect {
+            x: 0,
+            y: 1,
+            cols: (layout.width / self.cell.0).floor() as u16,
+            rows: ((layout.footer - layout.top) / self.cell.1).floor() as u16,
+        })
     }
 }
 

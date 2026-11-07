@@ -42,69 +42,80 @@ fn matching_rows(text: &str, query: &str, row_ranges: &[std::ops::Range<usize>])
 }
 
 pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
-    let mut text = String::with_capacity(
-        screen
-            .rows
-            .iter()
-            .map(|row| row.used() + 1)
-            .sum::<usize>()
-            .next_power_of_two(),
-    );
-    let mut row_ranges = Vec::with_capacity(screen.rows.len());
+    let mut rows = Vec::new();
     let mut wrapped_rows = Vec::new();
+    let mut omitted = Vec::<Value>::new();
+    let mut matches = Vec::new();
     let cursor = screen.cursor();
     let cursor_row = i64::from(cursor.0.line) + screen.display_offset() as i64;
     let cursor_visible =
         cursor.1 != CursorShape::Hidden && (0..screen.screen_lines() as i64).contains(&cursor_row);
-    for (index, row) in screen.rows.iter().enumerate() {
-        let start = text.len();
-        text.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
-        row_ranges.push(start..text.len());
-        if row.wrapped {
-            wrapped_rows.push(Value::from(index));
-        } else if index + 1 < screen.rows.len() {
-            text.push('\n');
+    if let Some(query) = query {
+        let mut text = String::with_capacity(
+            screen
+                .rows
+                .iter()
+                .map(|row| row.used() + 1)
+                .sum::<usize>()
+                .next_power_of_two(),
+        );
+        let mut row_ranges = Vec::with_capacity(screen.rows.len());
+        for (index, row) in screen.rows.iter().enumerate() {
+            let start = text.len();
+            text.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
+            row_ranges.push(start..text.len());
+            if row.wrapped {
+                wrapped_rows.push(Value::from(index));
+            } else if index + 1 < screen.rows.len() {
+                text.push('\n');
+            }
         }
-    }
-    let matches = query.map_or_else(Vec::new, |query| matching_rows(&text, query, &row_ranges));
-    let mut rows = Vec::new();
-    let mut omitted = Vec::<Value>::new();
-    let mut omission: Option<(&str, usize)> = None;
-    for (index, range) in row_ranges.iter().enumerate() {
-        let text = &text[range.clone()];
-        if query.is_some() {
+        matches = matching_rows(&text, query, &row_ranges);
+        for (index, range) in row_ranges.iter().enumerate() {
             if (cursor_visible && cursor_row == index as i64)
                 || matches[index.saturating_sub(1)..(index + 2).min(matches.len())].contains(&true)
             {
+                rows.push(json!([index, &text[range.clone()]]));
+            }
+        }
+    } else {
+        let mut rendered = String::new();
+        let mut omission: Option<(&str, usize)> = None;
+        for (index, row) in screen.rows.iter().enumerate() {
+            if row.wrapped {
+                wrapped_rows.push(Value::from(index));
+            }
+            rendered.clear();
+            rendered.reserve(row.used());
+            rendered.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
+            let text = rendered.trim_end_matches(' ');
+            let reason = if cursor_visible && cursor_row == index as i64 {
+                None
+            } else if text.is_empty() {
+                Some("blank")
+            } else if text.chars().all(|c| c == ' ' || horizontal(c))
+                && text.chars().filter(|c| horizontal(*c)).nth(2).is_some()
+            {
+                Some("separator")
+            } else {
+                None
+            };
+            if reason != omission.map(|(reason, _)| reason) {
+                if let Some((reason, start)) = omission {
+                    omitted
+                        .push(json!({"start_row": start, "end_row": index - 1, "reason": reason}));
+                }
+                omission = reason.map(|reason| (reason, index));
+            }
+            if reason.is_none() {
                 rows.push(json!([index, text]));
             }
-            continue;
         }
-        let text = text.trim_end_matches(' ');
-        let reason = if cursor_visible && cursor_row == index as i64 {
-            None
-        } else if text.is_empty() {
-            Some("blank")
-        } else if text.chars().all(|c| c == ' ' || horizontal(c))
-            && text.chars().filter(|c| horizontal(*c)).nth(2).is_some()
-        {
-            Some("separator")
-        } else {
-            None
-        };
-        if reason != omission.map(|(reason, _)| reason) {
-            if let Some((reason, start)) = omission {
-                omitted.push(json!({"start_row": start, "end_row": index - 1, "reason": reason}));
-            }
-            omission = reason.map(|reason| (reason, index));
+        if let Some((reason, start)) = omission {
+            omitted.push(
+                json!({"start_row": start, "end_row": screen.rows.len() - 1, "reason": reason}),
+            );
         }
-        if reason.is_none() {
-            rows.push(json!([index, text]));
-        }
-    }
-    if let Some((reason, start)) = omission {
-        omitted
-            .push(json!({"start_row": start, "end_row": row_ranges.len() - 1, "reason": reason}));
     }
     let mut result = json!({
         "columns": screen.columns(),

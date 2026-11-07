@@ -871,3 +871,35 @@ fn alternate_roundtrip_restores_the_main_history_viewport_and_cursor() {
     assert_eq!(line(&core, 0), "one     ");
     assert_eq!(core.cursor().0, cursor);
 }
+
+#[test]
+fn command_elapsed_time_stops_at_completion() {
+    let (mut core, mut parser) = terminal(40, 8);
+    feed(
+        &mut core,
+        &mut parser,
+        "\x1b]133;A\x07$ \x1b]133;B\x07sleep 1\r\n\x1b]133;C\x07",
+    );
+    core.blocks.back_mut().unwrap().started =
+        Some(std::time::Instant::now() - std::time::Duration::from_millis(1250));
+    let running = core
+        .recent_command_blocks()
+        .last()
+        .unwrap()
+        .elapsed_ms
+        .unwrap();
+    assert!(running >= 1250);
+    feed(&mut core, &mut parser, "\x1b]133;D;0\x07");
+    let done = core
+        .recent_command_blocks()
+        .last()
+        .unwrap()
+        .elapsed_ms
+        .unwrap();
+    assert!(done >= running);
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    assert_eq!(
+        core.recent_command_blocks().last().unwrap().elapsed_ms,
+        Some(done)
+    );
+}

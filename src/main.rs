@@ -18,7 +18,7 @@ fn run() -> Result<()> {
     let (mut directory, mut program, mut config_path) = (None, None, None);
     let mut command = None;
     let mut gui = !cfg!(feature = "tui") && cfg!(feature = "gui");
-    let mut positions = Vec::new();
+    let mut positions = [None, None];
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--agent-owner" => {
@@ -79,15 +79,16 @@ fn run() -> Result<()> {
                 break;
             }
             "new" | "attach" | "list" | "terminate" if command.is_none() => command = Some(arg),
-            _ if command.is_some() && positions.len() < 2 && !arg.starts_with('-') => {
-                positions.push(arg)
+            _ if command.is_some() && positions[1].is_none() && !arg.starts_with('-') => {
+                let index = usize::from(positions[0].is_some());
+                positions[index] = Some(arg)
             }
             _ => return Err(Error::msg(format!("unknown argument {arg:?}; use --help"))),
         }
     }
 
-    let mut positions = positions.into_iter();
-    let (remote, name) = match (command.as_deref(), positions.next(), positions.next()) {
+    let [first, second] = positions;
+    let (remote, name) = match (command.as_deref(), first, second) {
         (_, None, None) => (None, None),
         (Some("list"), Some(host), None) => (Some(ssh::RemoteTarget::parse(&host)?), None),
         (Some("list"), _, _) => return Err(Error::msg("list takes at most one remote target")),

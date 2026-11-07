@@ -1,7 +1,7 @@
 use super::*;
 
 #[test]
-fn resource_braille_keeps_missing_history_and_sampling_gaps_empty() {
+fn resource_braille_preserves_sampling_gaps_and_vertical_segments() {
     let graph = braille_trend(
         &[
             (60., Some(50.)),
@@ -27,6 +27,18 @@ fn resource_braille_keeps_missing_history_and_sampling_gaps_empty() {
             .iter()
             .all(|&bits| bits == 0)
     );
+    for (age, column, mask) in [(60., 0, 0x47), (0., 19, 0xb8)] {
+        let mut expected = vec![0; 60];
+        for row in 0..3 {
+            expected[row * 20 + column] = mask;
+        }
+        for (from, to) in [(0., 100.), (100., 0.)] {
+            assert_eq!(
+                braille_trend(&[(age, Some(from)), (age, Some(to))], 20, 3, 60., 100.),
+                expected
+            );
+        }
+    }
 }
 
 #[test]
@@ -584,6 +596,39 @@ fn file_paste_edits_only_local_query_and_enter_inserts_the_path() {
         frontend.ui.files.as_ref().unwrap().selected().unwrap().path,
         file
     );
+    assert_eq!(
+        frontend.ui.files.as_ref().unwrap().focus(),
+        crate::files::FileFocus::List
+    );
+    assert_eq!(
+        frontend
+            .ui
+            .files
+            .as_ref()
+            .unwrap()
+            .preview_lines(0)
+            .collect::<Vec<_>>(),
+        ["preview"]
+    );
+    let tree = frontend.file_rect();
+    assert_eq!(tree.cols, frontend.file_width());
+    frontend.panel_bytes(b"l", None).unwrap();
+    assert!(frontend.ui.file_preview_open());
+    let preview = frontend.file_preview_rect();
+    assert_eq!(preview.x, (size.num_cols - preview.cols) / 2);
+    let mut output = Vec::new();
+    frontend.draw_files(&mut output).unwrap();
+    let mut terminal = crate::core::Core::new(size, 0xcccccc, 0x202020);
+    crate::vt::Parser::new().advance(&mut terminal, &output);
+    assert_eq!(
+        terminal
+            .row(usize::from(crate::panel::popup_body(preview).y))
+            .cells[usize::from(preview.x + 2)]
+        .c,
+        'p'
+    );
+    frontend.input(Input::Escape).unwrap();
+    assert!(!frontend.ui.file_preview_open());
     frontend.panel_bytes(b"\r", None).unwrap();
     assert!(frontend.ui.files_open);
     assert!(frontend.clipboard.is_none());
@@ -1168,15 +1213,15 @@ fn running_tab_close_defaults_to_cancel_and_never_sends_modal_input_to_pty() {
     };
     assert!(!frontend.ui.request_close_tab(&tab));
     frontend
-        .input(Input::Bytes(b"do not execute".to_vec()))
+        .input(Input::Bytes(b"do not execute".to_vec().into()))
         .unwrap();
-    frontend.input(Input::Bytes(b"\r".to_vec())).unwrap();
+    frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
     assert!(frontend.ui.close_prompt.is_none());
     frontend.client.flush().unwrap();
     assert!(peer.next_action().unwrap().is_none());
     assert!(!frontend.ui.request_close_tab(&tab));
-    frontend.input(Input::Bytes(b"\t".to_vec())).unwrap();
-    frontend.input(Input::Bytes(b"\r".to_vec())).unwrap();
+    frontend.input(Input::Bytes(b"\t".to_vec().into())).unwrap();
+    frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
     frontend.client.flush().unwrap();
     assert!(matches!(
         peer.next_action().unwrap(),
@@ -1337,7 +1382,9 @@ mod agent {
         assert_eq!(sync(&mut frontend, &mut server).len(), 1);
         assert!(!frontend.ui.agent.view_dirty);
         assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend.input(Input::Bytes(b"draft".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b"draft".to_vec().into()))
+            .unwrap();
         let mut view = sync(&mut frontend, &mut server).pop().unwrap();
         assert_eq!(view["sessions"][0]["input"], "draft");
         assert!(view.get("open").is_none());
@@ -1354,7 +1401,9 @@ mod agent {
         frontend.poll().unwrap();
         assert!(sync(&mut frontend, &mut server).is_empty());
         assert_eq!(frontend.ui.agent.active().context.basket.len(), 1);
-        frontend.input(Input::Bytes(b"\x1b[D".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b"\x1b[D".to_vec().into()))
+            .unwrap();
         assert_eq!(frontend.ui.agent.active().model.cursor, 4);
         assert!(!frontend.ui.agent.view_dirty);
         frontend
@@ -1395,7 +1444,7 @@ mod agent {
         frontend.input(Input::Escape).unwrap();
         assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
         assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend.input(Input::Bytes(b"\r".to_vec())).unwrap();
+        frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
         sync(&mut frontend, &mut server);
         let rewound = crate::workspace::AgentModelPatch {
             session: 0,
@@ -1423,7 +1472,9 @@ mod agent {
             .unwrap();
         server.flush().unwrap();
         frontend.poll().unwrap();
-        frontend.input(Input::Bytes(b" edited".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b" edited".to_vec().into()))
+            .unwrap();
         assert!(sync(&mut frontend, &mut server).is_empty());
         snapshot.controller = true;
         server
@@ -1435,7 +1486,9 @@ mod agent {
             sync(&mut frontend, &mut server)[0]["sessions"][0]["input"],
             "earlier edited"
         );
-        frontend.input(Input::Bytes(b"\x1b[C".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b"\x1b[C".to_vec().into()))
+            .unwrap();
         assert!(sync(&mut frontend, &mut server).is_empty());
         drop(frontend);
         drop(server);
@@ -1602,7 +1655,7 @@ mod agent {
             })
             .max()
             .unwrap();
-        assert_eq!(plus.x, tabs_end);
+        assert_eq!(plus.x, tabs_end + 1);
         assert_eq!(plus.cols, 2);
         assert_eq!(panel_close.cols, 3);
         assert_eq!(panel_close.x + panel_close.cols, frontend.size.num_cols);
@@ -1671,20 +1724,34 @@ mod agent {
                     let cells = &host.row(usize::from(rect.y)).cells;
                     assert_eq!(cells[usize::from(rect.x)].c, '+');
                     assert_eq!(cells[usize::from(rect.x - 1)].c, ' ');
-                    assert_eq!(cells[usize::from(rect.x - 2)].c, '╱');
+                    assert_eq!(cells[usize::from(rect.x - 2)].c, ' ');
+                    assert_eq!(cells[usize::from(rect.x - 3)].c, '×');
                 }
-                assert!(!cell.flags.contains(Flags::UNDERLINE));
+                let active_tab = matches!(
+                    action,
+                    AgentAction::Session(0) | AgentAction::CloseSession(0)
+                );
+                assert_eq!(cell.flags.contains(Flags::UNDERLINE), active_tab);
                 if let AgentAction::Session(index) = action {
-                    let title = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 2)];
-                    assert_eq!(title.flags.contains(Flags::BOLD), index == 0);
+                    let title = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 3)];
+                    assert!(!title.flags.contains(Flags::BOLD));
                     if index == 0 {
-                        assert_eq!(title.fg, crate::panel::rgb(0xffffff));
+                        assert_eq!(title.fg, crate::panel::rgb(0xdddddd));
                     }
                 }
                 if hovered && matches!(action, AgentAction::CloseSession(_)) {
                     assert_eq!(cell.fg, crate::panel::rgb(0xef5350));
                 }
-                let bg = 25;
+                let bg = if active_tab {
+                    0x36
+                } else if matches!(
+                    action,
+                    AgentAction::Session(_) | AgentAction::CloseSession(_)
+                ) {
+                    0x1b
+                } else {
+                    0x11
+                };
                 assert_eq!(
                     cell.bg,
                     Color::Spec(crate::vt::Rgb {
@@ -1706,9 +1773,9 @@ mod agent {
         assert_eq!(
             focused_plus.bg,
             Color::Spec(crate::vt::Rgb {
-                r: 25,
-                g: 25,
-                b: 25
+                r: 17,
+                g: 17,
+                b: 17
             })
         );
         frontend.ui.focus = Focus::Editor;
@@ -1862,7 +1929,7 @@ mod agent {
         assert!(rewind.contains("48;2;79;79;79m"));
         assert!(rewind.contains("Enter confirm"));
         frontend.input(Input::Escape).unwrap();
-        frontend.input(Input::Bytes(b"X".to_vec())).unwrap();
+        frontend.input(Input::Bytes(b"X".to_vec().into())).unwrap();
         assert!(frontend.ui.agent.active().rewind_target.is_none());
         assert_eq!(frontend.ui.agent.active().model.input, "first draftX");
         frontend
@@ -1905,7 +1972,7 @@ mod agent {
                 .unwrap()
                 .contains("48;2;79;79;79m中 world")
         );
-        frontend.input(Input::Bytes(vec![3])).unwrap();
+        frontend.input(Input::Bytes(vec![3].into())).unwrap();
         assert!(frontend.clipboard.is_none());
         assert!(frontend.ui.agent.active().model.input.is_empty());
         let editor = editor(&frontend.ui, frontend.agent_rect()).0;
@@ -1928,20 +1995,22 @@ mod agent {
             })
             .unwrap();
         assert!(frontend.ui.agent.active().selected_text().is_none());
-        frontend.input(Input::Bytes(vec![20])).unwrap();
+        frontend.input(Input::Bytes(vec![20].into())).unwrap();
         assert_eq!(frontend.ui.agent.sessions.len(), 1);
         frontend.activate_agent(AgentAction::NewSession).unwrap();
         assert_eq!(frontend.ui.agent.sessions.len(), 2);
         assert!(frontend.ui.agent.active().model.messages.is_empty());
         frontend
-            .input(Input::Bytes(b"second draft".to_vec()))
+            .input(Input::Bytes(b"second draft".to_vec().into()))
             .unwrap();
-        frontend.input(Input::Bytes(b"\x1b[5;5~".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b"\x1b[5;5~".to_vec().into()))
+            .unwrap();
         assert_eq!(frontend.ui.agent.current, 1);
         frontend.activate_agent(AgentAction::Session(0)).unwrap();
         assert_eq!(frontend.ui.agent.current, 0);
         assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.input(Input::Bytes(vec![23])).unwrap();
+        frontend.input(Input::Bytes(vec![23].into())).unwrap();
         assert_eq!(frontend.ui.agent.sessions.len(), 2);
         frontend
             .activate_agent(AgentAction::CloseSession(0))
@@ -2113,7 +2182,9 @@ mod agent {
         frontend.input(Input::Alt(b'm')).unwrap();
         assert!(frontend.ui.resources.open);
         assert!(!frontend.ui.files_open);
-        frontend.input(Input::Bytes(b"\x1b[D".to_vec())).unwrap();
+        frontend
+            .input(Input::Bytes(b"\x1b[D".to_vec().into()))
+            .unwrap();
         assert!(frontend.ui.resources.open);
         frontend.input(Input::Escape).unwrap();
         assert!(!frontend.ui.resources.open);
@@ -2147,17 +2218,17 @@ mod agent {
         .unwrap();
         frontend.input(Input::Alt(b'a')).unwrap();
         frontend
-            .input(Input::Bytes("alpha 中".as_bytes().to_vec()))
+            .input(Input::Bytes("alpha 中".as_bytes().to_vec().into()))
             .unwrap();
-        frontend.input(Input::Bytes(vec![1])).unwrap();
-        frontend.input(Input::Bytes(vec![3])).unwrap();
+        frontend.input(Input::Bytes(vec![1].into())).unwrap();
+        frontend.input(Input::Bytes(vec![3].into())).unwrap();
         assert!(frontend.clipboard.is_none());
         assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend
-            .input(Input::Bytes(b"replacement".to_vec()))
+            .input(Input::Bytes(b"replacement".to_vec().into()))
             .unwrap();
         assert_eq!(frontend.ui.agent.active().model.input, "replacement");
-        frontend.input(Input::Bytes(vec![3])).unwrap();
+        frontend.input(Input::Bytes(vec![3].into())).unwrap();
         assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.input(Input::PasteStart).unwrap();
         frontend
@@ -2166,21 +2237,23 @@ mod agent {
         frontend.ui.focus = Focus::Output;
         frontend.input(Input::PasteData(b"kept".to_vec())).unwrap();
         frontend.input(Input::PasteEnd).unwrap();
-        frontend.input(Input::Bytes(b"ignored".to_vec())).unwrap();
-        frontend.input(Input::Bytes(vec![3])).unwrap();
+        frontend
+            .input(Input::Bytes(b"ignored".to_vec().into()))
+            .unwrap();
+        frontend.input(Input::Bytes(vec![3].into())).unwrap();
         assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.client.flush().unwrap();
         assert!(peer.next_action().unwrap().is_none());
         frontend.ui.focus = Focus::Editor;
         frontend.ui.agent.active_mut().model.clear_input();
         frontend
-            .input(Input::Bytes(b"batch\t\x03".to_vec()))
+            .input(Input::Bytes(b"batch\t\x03".to_vec().into()))
             .unwrap();
         assert!(frontend.ui.focus == Focus::Output);
         assert!(frontend.ui.agent.active().model.input.is_empty());
         frontend.ui.focus = Focus::Editor;
         frontend
-            .input(Input::Bytes(b"\x01\x7fafter\r".to_vec()))
+            .input(Input::Bytes(b"\x01\x7fafter\r".to_vec().into()))
             .unwrap();
         assert_eq!(frontend.ui.agent.active().model.input, "after");
         assert!(frontend.running);
@@ -2294,6 +2367,27 @@ mod agent {
                 .as_bytes(),
             );
         }
+        let preview = frontend.ui.agent.active_mut().context.preview.take();
+        let mut backdrop = Vec::new();
+        frontend.draw_agent(&mut backdrop).unwrap();
+        parser.advance(&mut core, &backdrop);
+        frontend.ui.agent.active_mut().context.preview = preview;
+        let modal = crate::file_panel::preview_rect(Rect {
+            x: 0,
+            y: 1,
+            cols: frontend.size.num_cols,
+            rows: frontend.size.num_lines.saturating_sub(2),
+        });
+        let outside: Vec<_> = (1..frontend.size.num_lines - 1)
+            .flat_map(|y| {
+                (0..frontend.size.num_cols)
+                    .filter(move |&x| !modal.contains(x, y))
+                    .map(move |x| (x, y))
+            })
+            .map(|(x, y)| (x, y, core.row(usize::from(y)).cells[usize::from(x)]))
+            .collect();
+        output.clear();
+        frontend.draw_agent(&mut output).unwrap();
         parser.advance(&mut core, &output);
         let copy = frontend
             .agent
@@ -2307,12 +2401,8 @@ mod agent {
             core.row(usize::from(copy.y)).cells[usize::from(copy.x + 1)].c,
             '⧉'
         );
-        for row in 1..usize::from(frontend.size.num_lines - 1) {
-            assert_eq!(core.row(row).cells[0].c, ' ');
-            assert_eq!(
-                core.row(row).cells[usize::from(frontend.size.num_cols - 1)].c,
-                ' '
-            );
+        for (x, y, cell) in outside {
+            assert_eq!(core.row(usize::from(y)).cells[usize::from(x)], cell);
         }
         drop(frontend);
         drop(peer);
@@ -2360,8 +2450,13 @@ mod agent {
                 (layout.first..layout.first + usize::from(rect.rows)).contains(&layout.caret_row)
             );
             let mut output = Vec::new();
-            frontend.draw_active_cursor(&mut output).unwrap();
+            frontend.draw_active_cursor(&mut output, None).unwrap();
             assert!(output.ends_with(b"\x1b[?25h"));
+            let cursor = frontend.draw_agent(&mut Vec::new()).unwrap();
+            assert!(cursor.is_some());
+            let mut reused = Vec::new();
+            frontend.draw_active_cursor(&mut reused, cursor).unwrap();
+            assert_eq!(reused, output);
         }
         for index in 0..12 {
             frontend
@@ -2577,7 +2672,7 @@ mod agent {
             (b"\x1b[H", crate::input::keysym::HOME, 0, ""),
         ] {
             let rect = editor(&frontend.ui, frontend.agent_rect()).0;
-            frontend.input(Input::Bytes(bytes.to_vec())).unwrap();
+            frontend.input(Input::Bytes(bytes.to_vec().into())).unwrap();
             native
                 .key(
                     &mut frontend.client,
@@ -2710,10 +2805,78 @@ mod agent {
         let tab = frontend.client.snapshot().unwrap().tabs[0].clone();
         assert!(!frontend.ui.request_close_tab(&tab));
         paint(&mut frontend, &mut host, &mut parser);
-        frontend.input(Input::Bytes(b"\t".to_vec())).unwrap();
+        frontend.input(Input::Bytes(b"\t".to_vec().into())).unwrap();
         paint(&mut frontend, &mut host, &mut parser);
         frontend.input(Input::Escape).unwrap();
         paint(&mut frontend, &mut host, &mut parser);
         restored(&host);
     }
+}
+
+#[test]
+fn monitor_task_jump_switches_tabs_before_focusing_its_pane() {
+    use crate::wire::Response;
+    use crate::workspace::{TabActivity, TabView};
+    let path = std::env::temp_dir().join(format!("nextty-task-jump-{}.sock", std::process::id()));
+    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let mut client = Client::connect(&path).unwrap();
+    let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
+    std::fs::remove_file(path).unwrap();
+    let pane = PaneView {
+        id: 2,
+        tab: 20,
+        rect: Rect {
+            x: 0,
+            y: 0,
+            cols: 80,
+            rows: 20,
+        },
+        title: "build".into(),
+        cwd: None,
+        process: Default::default(),
+        blocks: vec![],
+        command_blocks: vec![],
+        input_generation: 0,
+        shell_prompt: None,
+    };
+    peer.send_response(Response::State(
+        Snapshot {
+            name: "tasks".into(),
+            controller: true,
+            focused: 1,
+            active_tab: 10,
+            tabs: vec![
+                TabView {
+                    id: 10,
+                    title: "one".into(),
+                    activity: TabActivity::Idle,
+                },
+                TabView {
+                    id: 20,
+                    title: "two".into(),
+                    activity: TabActivity::Running,
+                },
+            ],
+            panes: vec![pane],
+        },
+        vec![],
+        0,
+    ))
+    .unwrap();
+    peer.flush().unwrap();
+    client.poll().unwrap();
+    let mut ui = Ui::new().unwrap();
+    ui.resources.jump = Some(2);
+    ui.monitor_jump(&mut client).unwrap();
+    client.flush().unwrap();
+    assert!(matches!(peer.next_action().unwrap(), Some(Action::Tab(1))));
+    assert!(matches!(
+        peer.next_action().unwrap(),
+        Some(Action::ScreenRequest { .. })
+    ));
+    assert!(matches!(
+        peer.next_action().unwrap(),
+        Some(Action::Focus(2))
+    ));
+    assert!(ui.focus == Focus::Terminal);
 }
