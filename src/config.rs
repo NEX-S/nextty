@@ -1,5 +1,5 @@
 use crate::error::{Error, Result};
-use std::{io::ErrorKind, path::PathBuf};
+use std::{fmt::Display, io::ErrorKind, path::PathBuf, str::FromStr};
 
 pub(crate) const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
 
@@ -65,365 +65,68 @@ impl Config {
             .map_err(|error| Error::context(format!("configuration {}", path.display()), error))
     }
 
-    pub fn parse(text: &str) -> Result<Self> {
-        let mut parser = Parser {
-            text,
-            offset: usize::from(text.starts_with('\u{feff}')) * 3,
-        };
+    // The documented TOML subset: `key = value` lines, `#` comments, double-quoted
+    // strings without escapes, and numbers with optional `_` separators.
+    fn parse(text: &str) -> Result<Self> {
         let mut config = Self::default();
-        let mut seen = 0u16;
-        while parser.line_start()? {
-            let key = parser.key()?;
-            parser.space();
-            parser.expect('=')?;
-            parser.space();
-            macro_rules! field {
-                ($index:expr, $name:ident, $value:expr) => {{
-                    let bit = 1 << $index;
-                    if seen & bit != 0 {
-                        return parser.fail(format!("duplicate configuration field {key:?}"));
-                    }
-                    seen |= bit;
-                    config.$name = $value?;
-                }};
-            }
-            match key.as_str() {
-                "font_family" => field!(0, font_family, parser.string(true)),
-                "font_size_px" => field!(1, font_size_px, parser.number()),
-                "foreground" => field!(2, foreground, parser.color()),
-                "background" => field!(3, background, parser.color()),
-                "background_opacity" => field!(4, background_opacity, parser.number()),
-                "history_limit_bytes" => field!(5, history_limit_bytes, parser.integer()),
-                "tab_bar_opacity" => field!(6, tab_bar_opacity, parser.number()),
-                "base_url" => field!(7, base_url, parser.string(true)),
-                "model" => field!(8, model, parser.string(true)),
-                _ => return parser.fail(format!("unknown configuration field {key:?}")),
-            }
-            parser.space();
-            parser.comment()?;
-            if parser.peek().is_some() && !parser.newline() {
-                return parser.fail("expected a newline after the configuration value");
-            }
-        }
-        if config.font_family.trim().is_empty() {
-            return Err(Error::msg("font_family must not be empty"));
-        }
-        if config.history_limit_bytes == 0 {
-            return Err(Error::msg("history_limit_bytes must be greater than zero"));
-        }
-        if !config.font_size_px.is_finite() || config.font_size_px <= 0. {
-            return Err(Error::msg(
-                "font_size_px must be finite and greater than zero",
-            ));
-        }
-        if !(0. ..=1.).contains(&config.background_opacity) {
-            return Err(Error::msg("background_opacity must be between 0.0 and 1.0"));
-        }
-        if !(0. ..=1.).contains(&config.tab_bar_opacity) {
-            return Err(Error::msg("tab_bar_opacity must be between 0.0 and 1.0"));
+        for (index, line) in text.lines().enumerate() {
+            config
+                .set(line.trim())
+                .map_err(|message| Error::msg(format!("line {}: {message}", index + 1)))?;
         }
         Ok(config)
     }
-}
 
-// Only these scalar fields can be valid Config values. Tables, arrays and dates
-// cannot deserialize into them, so no general TOML value tree is needed.
-struct Parser<'a> {
-    text: &'a str,
-    offset: usize,
-}
-
-impl<'a> Parser<'a> {
-    fn fail<T>(&self, message: impl std::fmt::Display) -> Result<T> {
-        let prefix = &self.text[..self.offset];
-        let line = prefix.bytes().filter(|&b| b == b'\n').count() + 1;
-        let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
-        Err(Error::msg(format!(
-            "line {line}, column {column}: {message}"
-        )))
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.text[self.offset..].chars().next()
-    }
-
-    fn take(&mut self) -> Option<char> {
-        let ch = self.peek()?;
-        self.offset += ch.len_utf8();
-        Some(ch)
-    }
-
-    fn expect(&mut self, ch: char) -> Result<()> {
-        if self.peek() != Some(ch) {
-            return self.fail(format!("expected {ch:?}"));
+    fn set(&mut self, line: &str) -> std::result::Result<(), String> {
+        if line.is_empty() || line.starts_with('#') {
+            return Ok(());
         }
-        self.take();
-        Ok(())
-    }
-
-    fn space(&mut self) {
-        while matches!(self.peek(), Some(' ' | '\t')) {
-            self.take();
-        }
-    }
-
-    fn newline(&mut self) -> bool {
-        if self.text[self.offset..].starts_with("\r\n") {
-            self.offset += 2;
-            true
-        } else if self.peek() == Some('\n') {
-            self.offset += 1;
-            true
-        } else {
-            false
-        }
-    }
-
-    fn comment(&mut self) -> Result<()> {
-        if self.peek() == Some('#') {
-            self.take();
-            while let Some(ch) = self.peek() {
-                if matches!(ch, '\r' | '\n') {
-                    break;
-                }
-                if ch.is_ascii_control() && ch != '\t' {
-                    return self.fail("control character in comment");
-                }
-                self.take();
-            }
+        let (key, value) = line.split_once('=').ok_or("expected key = value")?;
+        let value = value.trim();
+        match key.trim() {
+            "font_family" => self.font_family = string(value)?.into(),
+            "font_size_px" => self.font_size_px = number(value)?,
+            "foreground" => self.foreground = color(value)?,
+            "background" => self.background = color(value)?,
+            "background_opacity" => self.background_opacity = number(value)?,
+            "tab_bar_opacity" => self.tab_bar_opacity = number(value)?,
+            "history_limit_bytes" => self.history_limit_bytes = number(value)?,
+            "base_url" => self.base_url = string(value)?.into(),
+            "model" => self.model = string(value)?.into(),
+            key => return Err(format!("unknown configuration field {key:?}")),
         }
         Ok(())
     }
+}
 
-    fn line_start(&mut self) -> Result<bool> {
-        loop {
-            self.space();
-            self.comment()?;
-            if !self.newline() {
-                return Ok(self.peek().is_some());
-            }
-        }
-    }
-
-    fn key(&mut self) -> Result<String> {
-        if matches!(self.peek(), Some('\'' | '"')) {
-            return self.string(false);
-        }
-        let start = self.offset;
-        while self
-            .peek()
-            .is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-        {
-            self.take();
-        }
-        if start == self.offset {
-            return self.fail("expected a configuration field name");
-        }
-        Ok(self.text[start..self.offset].to_owned())
-    }
-
-    fn string(&mut self, allow_multiline: bool) -> Result<String> {
-        let quote = match self.take() {
-            Some(ch @ ('\'' | '"')) => ch,
-            _ => return self.fail("expected a string"),
-        };
-        let triple = self.text.as_bytes()[self.offset..].starts_with(&[quote as u8; 2]);
-        if triple && !allow_multiline {
-            return self.fail("multiline keys are not allowed");
-        }
-        if triple {
-            self.offset += 2;
-            self.newline();
-        }
-        let mut value = String::new();
-        loop {
-            let Some(ch) = self.peek() else {
-                return self.fail("unterminated string");
-            };
-            if ch == quote {
-                let count = self.text[self.offset..]
-                    .chars()
-                    .take_while(|&ch| ch == quote)
-                    .count();
-                if !triple {
-                    self.take();
-                    return Ok(value);
-                }
-                if count >= 3 {
-                    if count > 5 {
-                        return self.fail("too many closing quotes");
-                    }
-                    value.extend(std::iter::repeat_n(quote, count - 3));
-                    self.offset += count;
-                    return Ok(value);
-                }
-                value.extend(std::iter::repeat_n(quote, count));
-                self.offset += count;
-                continue;
-            }
-            if triple {
-                let start = self.offset;
-                if self.newline() {
-                    value.push_str(&self.text[start..self.offset]);
-                    continue;
-                }
-            }
-            self.take();
-            if ch.is_ascii_control() && ch != '\t' {
-                return self.fail("control character in string");
-            }
-            if ch != '\\' || quote == '\'' {
-                value.push(ch);
-                continue;
-            }
-            if triple && matches!(self.peek(), Some(' ' | '\t' | '\r' | '\n')) {
-                self.space();
-                if !self.newline() {
-                    return self.fail("string continuation requires a newline");
-                }
-                loop {
-                    self.space();
-                    if !self.newline() {
-                        break;
-                    }
-                }
-                continue;
-            }
-            let escaped = match self.take() {
-                Some('b') => '\u{8}',
-                Some('t') => '\t',
-                Some('n') => '\n',
-                Some('f') => '\u{c}',
-                Some('r') => '\r',
-                Some('e') => '\u{1b}',
-                Some('"') => '"',
-                Some('\\') => '\\',
-                Some(kind @ ('x' | 'u' | 'U')) => {
-                    let count = match kind {
-                        'x' => 2,
-                        'u' => 4,
-                        _ => 8,
-                    };
-                    let mut scalar = 0u32;
-                    for _ in 0..count {
-                        let Some(digit) = self.take().and_then(|ch| ch.to_digit(16)) else {
-                            return self.fail("invalid Unicode escape");
-                        };
-                        scalar = (scalar << 4) | digit;
-                    }
-                    let Some(ch) = char::from_u32(scalar) else {
-                        return self.fail("Unicode escape is not a scalar value");
-                    };
-                    ch
-                }
-                _ => return self.fail("invalid string escape"),
-            };
-            value.push(escaped);
-        }
-    }
-
-    fn token(&mut self) -> &'a str {
-        let start = self.offset;
-        while self
-            .peek()
-            .is_some_and(|ch| !matches!(ch, ' ' | '\t' | '\r' | '\n' | '#'))
-        {
-            self.take();
-        }
-        &self.text[start..self.offset]
-    }
-
-    fn color(&mut self) -> Result<u32> {
-        let value = self.string(true)?;
-        let Some(digits) = value.strip_prefix('#').filter(|digits| {
-            digits.len() == 6 && digits.bytes().all(|byte| byte.is_ascii_hexdigit())
-        }) else {
-            return self.fail("color must be a string in #RRGGBB format");
-        };
-        Ok(u32::from_str_radix(digits, 16).unwrap())
-    }
-
-    fn number(&mut self) -> Result<f32> {
-        let token = self.token();
-        let invalid = || Error::msg(format!("invalid configuration number {token:?}"));
-        let unsigned = token.strip_prefix(['+', '-']).unwrap_or(token);
-        if matches!(unsigned, "inf" | "nan") {
-            return Ok(token.parse::<f64>().map_err(|_| invalid())? as f32);
-        }
-        for (prefix, radix) in [("0x", 16), ("0o", 8), ("0b", 2)] {
-            if let Some(digits) = token.strip_prefix(prefix) {
-                if !digits_valid(digits, radix) {
-                    return Err(invalid());
-                }
-                return u64::from_str_radix(&digits.replace('_', ""), radix)
-                    .map(|value| value as f32)
-                    .map_err(|_| invalid());
-            }
-        }
-        let (mantissa, exponent) = match unsigned.find(['e', 'E']) {
-            Some(index) => (&unsigned[..index], Some(&unsigned[index + 1..])),
-            None => (unsigned, None),
-        };
-        let (integer, fraction) = match mantissa.split_once('.') {
-            Some((integer, fraction)) => (integer, Some(fraction)),
-            None => (mantissa, None),
-        };
-        if !digits_valid(integer, 10)
-            || integer.starts_with('0') && integer.len() != 1
-            || fraction.is_some_and(|digits| !digits_valid(digits, 10))
-            || exponent.is_some_and(|digits| {
-                !digits_valid(digits.strip_prefix(['+', '-']).unwrap_or(digits), 10)
-            })
-        {
-            return Err(invalid());
-        }
-        let cleaned = token.replace('_', "");
-        if fraction.is_some() || exponent.is_some() {
-            cleaned
-                .parse::<f64>()
-                .map(|value| value as f32)
-                .map_err(|_| invalid())
-        } else if token.starts_with('-') {
-            cleaned
-                .parse::<i64>()
-                .map(|value| value as f32)
-                .map_err(|_| invalid())
-        } else {
-            cleaned
-                .parse::<u64>()
-                .map(|value| value as f32)
-                .map_err(|_| invalid())
-        }
-    }
-
-    fn integer(&mut self) -> Result<u64> {
-        let token = self.token();
-        let (digits, radix) = if let Some(digits) = token.strip_prefix("0x") {
-            (digits, 16)
-        } else if let Some(digits) = token.strip_prefix("0o") {
-            (digits, 8)
-        } else if let Some(digits) = token.strip_prefix("0b") {
-            (digits, 2)
-        } else {
-            (token.strip_prefix('+').unwrap_or(token), 10)
-        };
-        if !digits_valid(digits, radix)
-            || radix == 10 && digits.starts_with('0') && digits.len() != 1
-        {
-            return Err(Error::msg(format!(
-                "invalid configuration integer {token:?}"
-            )));
-        }
-        u64::from_str_radix(&digits.replace('_', ""), radix)
-            .map_err(|_| Error::msg(format!("configuration integer out of range {token:?}")))
+fn string(value: &str) -> std::result::Result<&str, String> {
+    let (string, rest) = value
+        .strip_prefix('"')
+        .and_then(|value| value.split_once('"'))
+        .ok_or("expected a double-quoted string")?;
+    let rest = rest.trim_start();
+    if rest.is_empty() || rest.starts_with('#') {
+        Ok(string)
+    } else {
+        Err(format!("unexpected {rest:?} after the string"))
     }
 }
 
-fn digits_valid(digits: &str, radix: u32) -> bool {
-    !digits.is_empty()
-        && digits.split('_').all(|part| {
-            !part.is_empty() && part.chars().all(|ch| ch.is_ascii() && ch.is_digit(radix))
-        })
+fn number<T: FromStr<Err: Display>>(value: &str) -> std::result::Result<T, String> {
+    let token = value.split_once('#').map_or(value, |(token, _)| token);
+    token
+        .trim()
+        .replace('_', "")
+        .parse()
+        .map_err(|error: T::Err| error.to_string())
+}
+
+fn color(value: &str) -> std::result::Result<u32, String> {
+    string(value)?
+        .strip_prefix('#')
+        .filter(|digits| digits.len() == 6)
+        .and_then(|digits| u32::from_str_radix(digits, 16).ok())
+        .ok_or_else(|| "expected a \"#RRGGBB\" color".into())
 }
 
 #[cfg(test)]
@@ -431,165 +134,51 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_and_partial_configuration() {
-        assert_eq!(Config::parse("").unwrap(), Config::default());
-        assert_eq!(Config::parse("\u{feff}").unwrap(), Config::default());
+    fn documented_example_parses_to_the_defaults() {
+        assert_eq!(
+            Config::parse(include_str!("../nextty.example.toml")).unwrap(),
+            Config::default()
+        );
+    }
+
+    #[test]
+    fn values_comments_and_separators() {
         let config = Config::parse(
-            r##"font_family = "monospace"
-font_size_px = 20
-foreground = "#aBcDeF"
-background_opacity = 0.75
-base_url = "http://localhost:8080/anthropic"
-model = "deepseek-flash""##,
+            "# comment\r\n\
+             font_family = \"mono # space\" # trailing\r\n\
+             font_size_px = 20\n\
+             \tforeground = \"#aBcDeF\"\n\
+             background_opacity=0.75 # comment\n\
+             history_limit_bytes = 1_073_741_824\n\
+             base_url = \"http://localhost:8080/anthropic\"\n\
+             model = \"deepseek-flash\"\n",
         )
         .unwrap();
-        assert_eq!(config.font_family, "monospace");
+        assert_eq!(config.font_family, "mono # space");
         assert_eq!(config.font_size_px, 20.);
         assert_eq!(config.foreground, 0xabcdef);
         assert_eq!(config.background, Config::default().background);
         assert_eq!(config.background_opacity, 0.75);
         assert_eq!(config.tab_bar_opacity, 0.7);
+        assert_eq!(config.history_limit_bytes, 1 << 30);
         assert_eq!(config.base_url, "http://localhost:8080/anthropic");
         assert_eq!(config.model, "deepseek-flash");
     }
 
     #[test]
-    fn tab_bar_opacity_is_independent_and_validated() {
-        for opacity in [0., 0.5, 1.] {
-            let config = Config::parse(&format!("tab_bar_opacity = {opacity}")).unwrap();
-            assert_eq!(config.tab_bar_opacity, opacity);
-            assert_eq!(config.background_opacity, 1.);
-        }
-        let config = Config::parse("background_opacity = 0.25\ntab_bar_opacity = 0.75").unwrap();
-        assert_eq!(config.background_opacity, 0.25);
-        assert_eq!(config.tab_bar_opacity, 0.75);
-        for value in ["-0.1", "1.1", "nan", "inf", "'0.5'", "true"] {
-            assert!(Config::parse(&format!("tab_bar_opacity = {value}")).is_err());
-        }
-        assert!(Config::parse("tab_bar_opacity = 0.7\ntab_bar_opacity = 1").is_err());
-    }
-
-    #[test]
-    fn invalid_configuration_is_reported() {
-        for text in [
-            "font_family = ' '",
-            "font_size_px = 0",
-            "font_size_px = nan",
-            "font_size_px = inf",
-            "background_opacity = -0.1",
-            "background_opacity = 1.1",
-            "background_opacity = nan",
-            "background = 42",
-            "background = '#12345'",
-            "background = '#+12345'",
-            "background = '#zz0000'",
-            "background = 'red'",
-            "unknown_option = true",
-            "background_blur = true",
-            "font_size_px = 1\nfont_size_px = 2",
-            "history_limit_bytes = 0",
-            "history_limit_bytes = 1.5",
-            "history_limit_bytes = -1",
+    fn errors_report_their_line() {
+        for (text, message) in [
+            ("model = \"x\"\nunknown = true", "line 2: unknown configuration field"),
+            ("\n\nbackground = \"red\"", "line 3: expected a \"#RRGGBB\" color"),
+            ("font_family = monospace", "line 1: expected a double-quoted string"),
+            ("font_size_px = \"17\"", "line 1: invalid float literal"),
+            ("history_limit_bytes = -1", "line 1: invalid digit"),
+            ("font_size_px = 16 other = 1", "line 1: invalid float literal"),
+            ("[font]", "line 1: expected key = value"),
         ] {
-            assert!(Config::parse(text).is_err(), "accepted {text}");
+            let error = Config::parse(text).unwrap_err().to_string();
+            assert!(error.starts_with(message), "{text:?}: {error}");
         }
-        assert_eq!(
-            Config::parse("history_limit_bytes = 1_073_741_824")
-                .unwrap()
-                .history_limit_bytes,
-            1 << 30
-        );
-    }
-
-    #[test]
-    fn quoted_keys_multiline_strings_and_escapes() {
-        let config = Config::parse("\"font\\u005ffamily\" = \"\"\"\r\nmono\\  \r\n   space\"\"\"\nforeground = \"\\x23aBcDeF\"\n").unwrap();
-        assert_eq!(config.font_family, "monospace");
-        assert_eq!(config.foreground, 0xabcdef);
-        assert_eq!(
-            Config::parse("font_family = '''\nmono\r\nspace'''\n")
-                .unwrap()
-                .font_family,
-            "mono\r\nspace"
-        );
-        assert_eq!(
-            Config::parse("font_family = \"mono\\u0000space\"")
-                .unwrap()
-                .font_family,
-            "mono\0space"
-        );
-    }
-
-    #[test]
-    fn numeric_boundaries() {
-        for number in [
-            "0b1_0000",
-            "0o20",
-            "0x10",
-            "1_6",
-            "+16",
-            "1.6e+1",
-            "9223372036854775807",
-            "9223372036854775808",
-            "18446744073709551615",
-        ] {
-            assert!(
-                Config::parse(&format!("font_size_px = {number}")).is_ok(),
-                "{number}"
-            );
-        }
-        for number in [
-            "18446744073709551616",
-            "016",
-            "0_1",
-            "-0x10",
-            "16_",
-            "1__6",
-            "1e-99",
-            "1e99",
-            "1.",
-            ".1",
-            "1e",
-            "1e_1",
-            "0x_10",
-            "0b2",
-            "1e1.0",
-        ] {
-            assert!(
-                Config::parse(&format!("font_size_px = {number}")).is_err(),
-                "{number}"
-            );
-        }
-        assert_eq!(
-            Config::parse("background_opacity = 1.00000001")
-                .unwrap()
-                .background_opacity,
-            1.
-        );
-        assert!(Config::parse("background_opacity = 1.0000001").is_err());
-    }
-
-    #[test]
-    fn rejects_wrong_types_syntax_and_control_characters() {
-        for text in [
-            "[font_family]",
-            "font_family.x = 'x'",
-            "font_family = ['x']",
-            "font_family = {x='x'}",
-            "font_size_px = 16 other = 1",
-            "font_family = \"\\q\"",
-            "font_family = \"\\uD800\"",
-            "font_family = 'mono\nspace'",
-            "font_size_px = 16\rbackground_opacity = 0.5",
-            "# comment\0",
-            "font_family = 'mono\0space'",
-            "font_size_px = 16\n\"font\\u005fsize_px\" = 20",
-        ] {
-            assert!(Config::parse(text).is_err(), "accepted {text:?}");
-        }
-        assert!(
-            Config::parse("font_size_px = 16 # comment\r\nbackground_opacity = 0.5\r\n").is_ok()
-        );
     }
 
     #[test]
