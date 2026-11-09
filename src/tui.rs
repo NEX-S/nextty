@@ -665,7 +665,7 @@ impl Frontend {
                 }
             }
             KeyResult::Paste => self.message("Paste with your host terminal's shortcut"),
-            KeyResult::Text | KeyResult::Handled => (),
+            KeyResult::Handled => (),
         }
 
         self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));

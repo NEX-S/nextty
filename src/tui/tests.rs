@@ -600,6 +600,15 @@ fn file_paste_edits_only_local_query_and_enter_inserts_the_path() {
         frontend.ui.files.as_ref().unwrap().focus(),
         crate::files::FileFocus::List
     );
+    let tree = frontend.file_rect();
+    assert_eq!(tree.cols, frontend.file_width());
+    frontend.panel_bytes(b"l", None).unwrap();
+    assert!(frontend.ui.file_preview_open());
+    while frontend.ui.files.as_ref().unwrap().searching() {
+        frontend.ui.files.as_mut().unwrap().poll();
+        assert!(Instant::now() < deadline, "file preview did not finish");
+        std::thread::sleep(Duration::from_millis(1));
+    }
     assert_eq!(
         frontend
             .ui
@@ -610,10 +619,6 @@ fn file_paste_edits_only_local_query_and_enter_inserts_the_path() {
             .collect::<Vec<_>>(),
         ["preview"]
     );
-    let tree = frontend.file_rect();
-    assert_eq!(tree.cols, frontend.file_width());
-    frontend.panel_bytes(b"l", None).unwrap();
-    assert!(frontend.ui.file_preview_open());
     let preview = frontend.file_preview_rect();
     assert_eq!(preview.x, (size.num_cols - preview.cols) / 2);
     let mut output = Vec::new();

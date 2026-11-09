@@ -321,7 +321,6 @@ pub struct WorkspaceView {
     hovered_control: Option<GuiHit>,
     control_hits: Vec<GuiHit>,
 
-    suppressed_text: Option<String>,
     trace: Option<Trace>,
 
     agent: agent_ui::AgentState,
@@ -372,7 +371,6 @@ impl WorkspaceView {
             hovered_control: None,
             control_hits: Vec::new(),
 
-            suppressed_text: None,
             trace,
         };
         view.resize()?;
@@ -629,19 +627,7 @@ impl WorkspaceView {
                 {
                     return Ok(());
                 }
-                let marked = !self.preedit.is_empty();
-                self.preedit.clear();
-                if marked {
-                    if let Some(pane) = self.active()
-                        && let Some(screen) = self.client.screen_mut(pane)
-                    {
-                        screen.damage_cursor();
-                    }
-                    self.dirty = true;
-                }
-                if self.suppressed_text.take().is_some_and(|s| s == event.text) {
-                    return Ok(());
-                }
+                self.clear_preedit();
                 if self.ui.input_target().is_some() {
                     if let Some(target) = self.ui.text_target() {
                         if self.paste.is_some() {
@@ -741,6 +727,18 @@ impl WorkspaceView {
         }
         self.message("Finish or cancel IME composition first");
         false
+    }
+
+    fn clear_preedit(&mut self) {
+        if !self.preedit.is_empty() {
+            self.preedit.clear();
+            if let Some(pane) = self.active()
+                && let Some(screen) = self.client.screen_mut(pane)
+            {
+                screen.damage_cursor();
+            }
+            self.dirty = true;
+        }
     }
 
     fn workspace_key(&mut self, pane: PaneId, symbol: u32, modifiers: u32) -> Result<bool> {
@@ -843,13 +841,29 @@ impl WorkspaceView {
             return Ok(());
         }
 
+        let panel_text = if modifiers & (native::CONTROL | native::ALT | native::SUPER) == 0 {
+            text
+        } else {
+            ""
+        };
+        if !panel_text.is_empty() {
+            self.clear_preedit();
+            if self.paste.is_some()
+                && let Some(target) = self.ui.text_target()
+            {
+                self.deferred
+                    .push_back(DeferredInput::Text(target, panel_text.into()));
+                return Ok(());
+            }
+        }
+
         if self.ui.agent.open
             && self.ui.focus == Focus::Editor
             && (!self.preedit.is_empty() || self.paste.is_some())
         {
             return Ok(());
         }
-        if self.panel_key(symbol, modifiers, "")? {
+        if self.panel_key(symbol, modifiers, panel_text)? {
             return Ok(());
         }
         if modifiers & (native::CONTROL | native::SHIFT) == native::CONTROL | native::SHIFT {
@@ -916,7 +930,6 @@ impl WorkspaceView {
             },
             viewport,
         )?;
-        let suppress = !matches!(action, KeyResult::Text);
         match action {
             KeyResult::Unhandled => return Ok(false),
             KeyResult::Copy(text, _cut) => {
@@ -931,13 +944,7 @@ impl WorkspaceView {
                     self.request_paste(target, false);
                 }
             }
-            KeyResult::Text | KeyResult::Handled => (),
-        }
-        if suppress
-            && modifiers & native::CONTROL == 0
-            && let Some(ch) = symbol_char(symbol)
-        {
-            self.suppressed_text = Some(ch.to_string());
+            KeyResult::Handled => (),
         }
         if panels != self.ui.panel_state() {
             self.resize()?;
@@ -1826,11 +1833,6 @@ impl WorkspaceView {
         self.control_hits.clear();
         self.scrollbars.clear();
         self.chrome(layout)?;
-        // The tab scissor rounds outward at fractional scale; repaint the content edge.
-        self.renderer
-            .clip(0., layout.top, layout.side, layout.footer - layout.top)?;
-        self.renderer.clear(background)?;
-        self.renderer.clip(0., 0., 0., 0.)?;
         let terminal_input = self.ui.close_prompt.is_none()
             && !self.ui.search.open
             && self.ui.focus == Focus::Terminal;
@@ -2166,6 +2168,150 @@ impl WorkspaceView {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires a Wayland session"]
+    fn preview_keys_do_not_suppress_later_input_or_ime_commits() {
+        use crate::{
+            core::Core,
+            screen::Update,
+            wire::Peer,
+            workspace::{PaneView, Rect, Snapshot},
+        };
+        use std::os::unix::net::UnixListener;
+
+        let directory =
+            std::env::temp_dir().join(format!("nextty-gui-input-{}", std::process::id()));
+        std::fs::create_dir(&directory).unwrap();
+        std::fs::write(directory.join("a-file"), "preview text").unwrap();
+        let socket = directory.join("workspace.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let mut client = Client::connect(&socket).unwrap();
+        let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
+        std::fs::remove_file(socket).unwrap();
+        let size = WindowSize {
+            num_cols: 80,
+            num_lines: 24,
+            cell_width: 10,
+            cell_height: 22,
+        };
+        let core = Core::new(size, 0xcccccc, 0x202020);
+        server
+            .send_state(
+                &Snapshot {
+                    name: "input".into(),
+                    controller: true,
+                    focused: 1,
+                    active_tab: 1,
+                    tabs: Vec::new(),
+                    panes: vec![PaneView {
+                        id: 1,
+                        tab: 1,
+                        rect: Rect {
+                            x: 0,
+                            y: 1,
+                            cols: 80,
+                            rows: 24,
+                        },
+                        title: "shell".into(),
+                        cwd: Some(directory.clone()),
+                        blocks: Vec::new(),
+                        command_blocks: Vec::new(),
+                        input_generation: 0,
+                        shell_prompt: None,
+                        process: Default::default(),
+                    }],
+                },
+                &[(1, &Update::capture(&core, true))],
+                &Default::default(),
+                0,
+            )
+            .unwrap();
+        server.flush().unwrap();
+        while client.snapshot().is_none() {
+            client.poll().unwrap();
+            if client.snapshot().is_none() {
+                let mut fd = libc::pollfd {
+                    fd: client.receiver_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert!(unsafe { libc::poll(&mut fd, 1, 5000) } > 0);
+            }
+        }
+        let config = Config {
+            font_family: "monospace".into(),
+            ..Config::default()
+        };
+        let mut view = WorkspaceView::new(client, config).unwrap();
+        let event = |kind, code, modifiers, text: &str| Event {
+            kind,
+            code,
+            modifiers,
+            text: text.into(),
+            x: 0.,
+            y: 0.,
+            start: 0,
+            end: 0,
+        };
+        view.event(event(native::KEY, u32::from('f'), native::ALT, "f"))
+            .unwrap();
+        let files = view.ui.files.as_mut().unwrap();
+        while files.selected().is_none() {
+            let mut fd = libc::pollfd {
+                fd: files.fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            assert!(unsafe { libc::poll(&mut fd, 1, 5000) } > 0);
+            files.drain_notification().unwrap();
+            files.poll();
+        }
+        view.event(event(native::KEY, keysym::RIGHT, 0, ""))
+            .unwrap();
+        assert!(view.ui.file_preview_open());
+        view.event(event(native::KEY, u32::from('x'), 0, "x"))
+            .unwrap();
+        view.event(event(native::KEY, keysym::ESCAPE, 0, ""))
+            .unwrap();
+        view.event(event(native::KEY, u32::from('f'), native::ALT, "f"))
+            .unwrap();
+        assert!(!view.ui.files_open);
+        view.event(event(native::KEY, u32::from('x'), 0, "x"))
+            .unwrap();
+        view.event(event(native::KEY, u32::from('x'), 0, "x"))
+            .unwrap();
+        view.event(event(native::KEY, u32::from('z'), native::ALT, "z"))
+            .unwrap();
+        view.event(event(native::KEY, u32::from('a'), native::CONTROL, ""))
+            .unwrap();
+        view.event(event(native::PREEDIT, 0, 0, "é")).unwrap();
+        view.event(event(native::TEXT, 0, 0, "é")).unwrap();
+        assert!(view.preedit.is_empty());
+        view.client.flush().unwrap();
+        let mut input = Vec::new();
+        while let Some(action) = server.next_action().unwrap() {
+            if let Action::Input { pane, data } = action {
+                assert_eq!(pane, 1);
+                input.extend(data);
+            }
+        }
+        assert_eq!(input, "xx\x1bz\x01é".as_bytes());
+
+        view.ui.agent.open = true;
+        view.ui.focus = Focus::Editor;
+        view.event(event(native::KEY, 0x0100_4e2d, 0, "中"))
+            .unwrap();
+        view.event(event(native::TEXT, 0, 0, "文")).unwrap();
+        let target = PasteTarget::Agent(view.ui.agent.active().id);
+        view.paste = Some(target);
+        view.event(event(native::KEY, u32::from('x'), 0, "x"))
+            .unwrap();
+        view.event(event(native::PASTE, 0, 0, "先")).unwrap();
+        assert_eq!(view.ui.agent.active().model.input, "中文先x");
+        drop(view);
+        std::fs::remove_dir_all(directory).unwrap();
+    }
 
     #[test]
     fn scrollbar_preserves_grab_position_and_reaches_both_history_ends() {

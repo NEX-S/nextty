@@ -9,6 +9,62 @@ fn test_client(stream: UnixStream) -> Client {
     )
 }
 
+#[test]
+fn disconnecting_during_history_resize_does_not_restore_search_highlighting() {
+    let budget = HistoryBudget::new(
+        std::env::temp_dir().join(format!(
+            "nextty-search-drop-{}-{}",
+            std::process::id(),
+            NEXT_PANE.fetch_add(1, Ordering::Relaxed)
+        )),
+        8 * 1024 * 1024,
+    )
+    .unwrap();
+    let size = WindowSize {
+        num_cols: 17,
+        num_lines: 5,
+        cell_width: 0,
+        cell_height: 0,
+    };
+    let mut core = Core::new(size, 0xffffff, 0);
+    core.enable_history(HistoryConfig::new(budget)).unwrap();
+    crate::vt::Parser::new().advance(&mut core, "one two\r\n".repeat(8).as_bytes());
+    let origin = core.search_anchor();
+    core.selection_start(
+        Point { line: 0, column: 4 },
+        Side::Left,
+        SelectionType::Simple,
+    );
+    core.selection_update(Point { line: 0, column: 6 }, Side::Right);
+    let core = Arc::new(Mutex::new(core));
+    let (sender, _receiver) = UnixStream::pair().unwrap();
+    let mut connection = Connection::new(1, sender).unwrap();
+    connection.search = Some(PaneSearch {
+        pane: 1,
+        request: 1,
+        query: "two".into(),
+        core: Arc::clone(&core),
+        origin: Some(origin),
+        cancelled: Default::default(),
+        state: SearchState::Queued,
+    });
+    core.lock().unwrap().resize(WindowSize {
+        num_cols: 11,
+        ..size
+    });
+    assert!(core.lock().unwrap().resize_pending());
+    drop(connection);
+    let mut core = core.lock().unwrap();
+    assert!(core.selection_range().is_none());
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while core.resize_pending() {
+        core.poll_history(true).unwrap();
+        assert!(Instant::now() < deadline, "history resize did not finish");
+        std::thread::yield_now();
+    }
+    assert!(core.selection_range().is_none());
+}
+
 #[cfg(any(feature = "gui", feature = "tui"))]
 fn finish_search(client: &mut Client, search: &mut crate::ui::Search) {
     while search.pending {
@@ -2092,6 +2148,44 @@ fn unchanged_pointer_and_view_actions_do_not_schedule_broadcasts() {
             assert!(!clients[0].full);
         }
     }
+}
+
+#[test]
+fn scrolling_during_history_resize_survives_the_new_layout() {
+    let server = TestServer::start();
+    let mut client = Client::connect(&server.socket()).unwrap();
+    let size = WindowSize {
+        num_cols: 100,
+        num_lines: 25,
+        ..CreateOptions::default().size
+    };
+    client.send(Action::Create {
+        name: "resize-scroll".into(),
+        options: CreateOptions {
+            size,
+            program: Some(Shell::new("python3".into(), vec!["-c".into(),
+                "import os,tty; tty.setraw(0); os.write(1, b'history '+b'x'*70+b'\\r\\n'); [os.write(1,(str(i)+' '+ 'x'*70+'\\r\\n').encode()) for i in range(100000)]; os.write(1,b'READY'); os.read(0,1)".into()])),
+            ..CreateOptions::default()
+        },
+    }).unwrap();
+    wait(&mut client, |client, _| grid_contains(client, "READY"));
+    let pane = client.snapshot().unwrap().focused;
+    client
+        .send(Action::Resize(WindowSize {
+            num_cols: 101,
+            ..size
+        }))
+        .unwrap();
+    client
+        .send(Action::Scroll {
+            pane,
+            scroll: Scroll::Delta(10),
+        })
+        .unwrap();
+    wait(&mut client, |client, _| {
+        let screen = &client.screens()[&pane];
+        screen.columns() == 101 && screen.display_offset() == 10
+    });
 }
 
 #[test]

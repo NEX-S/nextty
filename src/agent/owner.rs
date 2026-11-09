@@ -285,7 +285,7 @@ pub fn run() -> io::Result<()> {
         } else {
             sessions
                 .iter()
-                .filter_map(|session| session.model.deadline(&client))
+                .filter_map(|session| session.model.deadline())
                 .chain(
                     (client.can_agent_input() && sessions.iter().any(|session| session.dirty))
                         .then_some(publish_at),

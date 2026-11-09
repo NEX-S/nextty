@@ -77,14 +77,6 @@ impl Key<'_> {
         self.control() && self.letter() == Some('v')
             || self.shift() && self.symbol == keysym::INSERT
     }
-    /// Unhandled printable keys fall back to their composed text.
-    pub fn text_result(&self) -> KeyResult {
-        if self.text.is_empty() && symbol_char(self.symbol).is_some() && !self.control() {
-            KeyResult::Text
-        } else {
-            KeyResult::Handled
-        }
-    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -102,7 +94,6 @@ pub(crate) enum PasteTarget {
 
 pub(crate) enum KeyResult {
     Unhandled,
-    Text,
     Handled,
     Copy(String, bool),
     Paste,
@@ -322,6 +313,7 @@ pub fn key_bytes(
                 text.as_bytes()
             }
         }
+        _ if !text.is_empty() => text.as_bytes(),
         _ => return None,
     };
     let mut bytes = Vec::with_capacity(data.len() + usize::from(alt));
@@ -446,6 +438,22 @@ pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> 
 #[cfg(all(test, feature = "gui"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn direct_keyboard_text_preserves_utf8_and_modifier_encoding() {
+        for (symbol, modifiers, text, expected) in [
+            (u32::from('x'), 0, "x", "x"),
+            (u32::from('X'), SHIFT, "X", "X"),
+            (0x0100_4e2d, 0, "中", "中"),
+            (u32::from('x'), ALT, "x", "\x1bx"),
+            (u32::from('x'), CONTROL, "x", "\x18"),
+        ] {
+            assert_eq!(
+                key_bytes(symbol, modifiers, text, || panic!("unexpected mode read")),
+                Some(expected.as_bytes().to_vec())
+            );
+        }
+    }
 
     #[test]
     fn paste_normalizes_terminal_newlines_and_protects_bracketed_input() {

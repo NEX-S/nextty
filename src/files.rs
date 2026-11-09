@@ -229,6 +229,7 @@ impl FileNav {
     pub fn focus_preview(&mut self) -> bool {
         if self.selected().is_some_and(|entry| !entry.is_dir) {
             self.focus = FileFocus::Preview;
+            self.update_preview();
             true
         } else {
             false
@@ -495,6 +496,7 @@ impl FileNav {
         if self.preview_path.as_ref() == path {
             return;
         }
+        let path = path.filter(|_| self.focus == FileFocus::Preview);
         match (&mut self.preview_path, path) {
             (Some(previous), Some(path)) => previous.clone_from(path),
             (slot, path) => *slot = path.cloned(),
@@ -1268,7 +1270,7 @@ mod tests {
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
         assert_eq!(nav.focus(), FileFocus::List);
-        assert!(nav.preview_lines(0).len() > 0);
+        assert_eq!(nav.preview_lines(0).len(), 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
         assert_eq!(
@@ -1311,6 +1313,27 @@ mod tests {
         assert_eq!(nav.preview_scroll(), 0);
         nav.scroll(20, 20);
         assert_eq!(nav.preview_scroll(), 0);
+    }
+
+    #[test]
+    fn browsing_reads_preview_only_when_opened() {
+        let fixture = Fixture::new();
+        fixture.file("a-first");
+        let path = fixture.file("b-selected");
+        fs::write(&path, "before opening").unwrap();
+        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
+        finish(&mut nav);
+        nav.move_selection(1);
+        assert!(!nav.preview_loading());
+        assert_eq!(nav.preview_lines(0).len(), 0);
+        fs::write(&path, "after browsing").unwrap();
+        assert!(nav.focus_preview());
+        finish(&mut nav);
+        assert_eq!(nav.preview_lines(0).collect::<Vec<_>>(), ["after browsing"]);
+        nav.focus_list();
+        nav.move_selection(-1);
+        assert!(!nav.preview_loading());
+        assert_eq!(nav.preview_lines(0).len(), 0);
     }
 
     #[test]
@@ -1379,12 +1402,13 @@ mod tests {
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
         nav.move_selection(1);
+        assert!(nav.focus_preview());
         nav.set_query("old".into());
         nav.set_query("中needle".into());
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
         assert_eq!(nav.focus(), FileFocus::List);
-        assert!(nav.preview_lines(0).len() > 0);
+        assert_eq!(nav.preview_lines(0).len(), 0);
         assert!(nav.focus_preview());
         finish(&mut nav);
         assert_eq!(nav.preview_lines(0).collect::<Vec<_>>(), ["new contents"]);

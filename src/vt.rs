@@ -1,6 +1,5 @@
 //! Streaming VT input for the terminal's screen core.
 
-use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use crate::core::{Core, Flags};
@@ -318,7 +317,7 @@ pub struct Parser {
     osc: Vec<u8>,
     deadline: Option<Instant>,
 
-    queued: std::collections::VecDeque<(Vec<u8>, usize)>,
+    queued: Option<(Vec<u8>, usize)>,
 }
 
 #[inline]
@@ -357,8 +356,12 @@ impl Parser {
 
     /// Parses immediately; synchronized updates defer presentation until the mode ends.
     pub fn advance(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
+        self.advance_count(core, bytes, false).1
+    }
+
+    fn advance_count(&mut self, core: &mut Core, bytes: &[u8], queued: bool) -> (usize, bool) {
         let mut position = 0;
-        while position < bytes.len() {
+        while position < bytes.len() && (!queued || core.history_read_ready()) {
             if self.state == State::Ground && bytes[position] >= 0x20 && bytes[position] != 0x7f {
                 let length = text_prefix(&bytes[position..]);
                 self.text(core, &bytes[position..position + length]);
@@ -367,45 +370,37 @@ impl Parser {
                 position += self.step(core, &bytes[position..]);
             }
         }
-        !bytes.is_empty() && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
+        (
+            position,
+            position != 0 && !core.mode().contains(crate::core::Mode::SYNC_UPDATE),
+        )
     }
 
     pub(crate) fn has_queued(&self) -> bool {
-        !self.queued.is_empty()
+        self.queued.is_some()
     }
 
     pub(crate) fn advance_queued(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
-        let mut input = if self.queued.is_empty() {
-            (!bytes.is_empty()).then_some((Cow::Borrowed(bytes), 0))
-        } else {
-            if !bytes.is_empty() {
-                self.queued.push_back((bytes.to_vec(), 0));
-            }
-            None
-        };
+        // The IO loop drains this read before polling the PTY again.
+        assert!(self.queued.is_none() || bytes.is_empty());
+        let queued = self.queued.take();
+        let (data, mut position) = queued
+            .as_ref()
+            .map_or((bytes, 0), |(data, position)| (data.as_slice(), *position));
         let mut committed = false;
         // Keep one batch under the Core lock while respecting history backpressure.
-        let mut remaining = 16 * 1024;
-        while let Some((data, mut position)) = input.take().or_else(|| {
-            self.queued
-                .pop_front()
-                .map(|(data, position)| (Cow::Owned(data), position))
-        }) {
-            while position < data.len() && remaining != 0 && core.history_read_ready() {
-                let end = (position + remaining.min(512)).min(data.len());
-                committed |= self.advance(core, &data[position..end]);
-                remaining -= end - position;
-                position = end;
-            }
-            if position < data.len() {
-                self.queued.push_front(match data {
-                    Cow::Borrowed(data) => (data[position..].to_vec(), 0),
-                    Cow::Owned(data) => (data, position),
-                });
-            }
-            if remaining == 0 || !core.history_read_ready() {
-                break;
-            }
+        let limit = (position + 16 * 1024).min(data.len());
+        while position < limit && core.history_read_ready() {
+            let end = (position + 512).min(limit);
+            let (consumed, changed) = self.advance_count(core, &data[position..end], true);
+            committed |= changed;
+            position += consumed;
+        }
+        if position < data.len() {
+            self.queued = Some(match queued {
+                Some((data, _)) => (data, position),
+                None => (bytes[position..].to_vec(), 0),
+            });
         }
         committed && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
     }

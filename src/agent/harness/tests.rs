@@ -1589,7 +1589,7 @@ fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
     terminal_frame(&mut client, &mut peer, None);
     agent.advance(&mut client).unwrap();
     assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    assert!(agent.deadline(&client).is_some());
+    assert!(agent.deadline().is_some());
     terminal_frame(&mut client, &mut peer, Some(9));
     agent.advance(&mut client).unwrap();
     let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
@@ -1619,7 +1619,13 @@ fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
 fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
     use crate::agent::{Agent, Stage};
     use crate::workspace::ClientEvent;
-    for finish in ["timeout", "cancel", "close", "missing-screen"] {
+    for finish in [
+        "timeout",
+        "cancel",
+        "close",
+        "missing-screen",
+        "stalled-frame",
+    ] {
         let (mut client, mut peer) = terminal_client();
         let mut agent = Agent::default();
         let (request, result) = tool_request(Tool::OpenTerminal, 1, json!({"pane":1}));
@@ -1657,9 +1663,18 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
                     until: Instant::now(),
                 };
             }
+            "stalled-frame" => {
+                client.refresh_screen().unwrap();
+                agent.operation.as_mut().unwrap().stage = Stage::NewTerminalOutput {
+                    until: Instant::now(),
+                };
+                assert!(agent.deadline().is_some());
+            }
             _ => unreachable!(),
         }
         agent.advance(&mut client).unwrap();
+        assert!(agent.operation.is_none());
+        assert!(agent.deadline().is_none());
         let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
         assert_eq!(value["created"], true);
         assert_eq!(value["pane"], 7);
@@ -1673,6 +1688,108 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
         } else {
             assert!(value["observation_error"].is_string());
         }
+    }
+}
+
+#[test]
+fn accepted_input_observation_ends_without_a_fresh_frame() {
+    use crate::agent::{Agent, Operation, Stage};
+    use crate::workspace::ClientEvent;
+    for cancel in [false, true] {
+        let (mut client, _peer) = terminal_client();
+        let mut agent = Agent::default();
+        let (request, result) = tool_request(Tool::Input, 7, json!({"text":"x"}));
+        agent.operation = Some(Operation {
+            request,
+            stage: Stage::Input {
+                id: 42,
+                generation: 4,
+                before: 0,
+            },
+        });
+        agent
+            .handle_event(
+                &mut ClientEvent::AgentInput {
+                    request: 42,
+                    result: Ok(None),
+                },
+                &mut client,
+            )
+            .unwrap();
+        assert!(client.screen_stale());
+        assert!(agent.deadline().is_some());
+        if cancel {
+            agent
+                .operation
+                .as_ref()
+                .unwrap()
+                .request
+                .canceled
+                .store(true, Ordering::Release);
+        } else {
+            let Stage::InputOutput { until, .. } = &mut agent.operation.as_mut().unwrap().stage
+            else {
+                panic!()
+            };
+            *until = Instant::now();
+        }
+        agent.advance(&mut client).unwrap();
+        let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
+        assert_eq!(value["input_queued"], true);
+        assert!(value["observation_error"].is_string());
+        assert!(value.get("screen").is_none());
+        assert!(agent.operation.is_none());
+        assert!(agent.deadline().is_none());
+    }
+}
+
+#[test]
+fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
+    use crate::agent::{Agent, Operation, Stage};
+    for (tool, source, command) in [
+        (Tool::Read, "screen", None),
+        (Tool::Read, "history", None),
+        (Tool::Read, "command", Some(37)),
+        (Tool::Shell, "command", Some(37)),
+    ] {
+        let (mut client, mut peer) = terminal_client();
+        terminal_frame(&mut client, &mut peer, Some(9));
+        let mut agent = Agent::default();
+        agent.observed_input.insert(7, 1);
+        agent.observed_activity.insert(7, 2);
+        let (request, result) = tool_request(tool, 7, json!({"source":source,"wait":1}));
+        let until = Instant::now() + Duration::from_secs(1);
+        agent.operation = Some(Operation {
+            request,
+            stage: match command {
+                Some(command) => Stage::Command { command, until },
+                None => Stage::Change { until },
+            },
+        });
+        client.refresh_screen().unwrap();
+        assert_eq!(agent.deadline(), Some(until));
+        agent.advance(&mut client).unwrap();
+        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        let (Stage::Command { until, .. } | Stage::Change { until }) =
+            &mut agent.operation.as_mut().unwrap().stage
+        else {
+            panic!()
+        };
+        *until = Instant::now();
+        agent.advance(&mut client).unwrap();
+        let result = result.recv().unwrap();
+        if tool == Tool::Shell {
+            let value: Value = serde_json::from_str(&result.unwrap()).unwrap();
+            assert_eq!(value["input_queued"], true);
+            assert_eq!(value["command"], 37);
+            assert!(value["observation_error"].is_string());
+        } else {
+            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert_eq!(agent.observed_input.get(&7), Some(&1));
+        assert_eq!(agent.observed_activity.get(&7), Some(&2));
+        assert!(agent.operation.is_none());
+        assert!(agent.deadline().is_none());
     }
 }
 

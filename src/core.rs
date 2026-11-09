@@ -76,6 +76,8 @@ struct BlockPoint {
 
 struct DiskHistory {
     io: History,
+    // Main-screen geometry stays unchanged while the alternate screen is resized.
+    size: WindowSize,
     first: u64,
     hot_start: u64,
     spool: VecDeque<Row>,
@@ -99,9 +101,15 @@ enum HistoryClear {
 
 struct PendingResize {
     size: WindowSize,
-    selection: Option<Selection>,
+    selection: ResizeSelection,
     block_points: Vec<(u64, [Option<usize>; 4])>,
     at_bottom: bool,
+    viewport_changed: bool,
+}
+
+enum ResizeSelection {
+    Reflow(Option<Selection>),
+    Restore(SearchAnchor),
 }
 
 const HISTORY_LIMIT: usize = 10_000;
@@ -973,6 +981,21 @@ pub(crate) struct SearchAnchor {
     selection: Option<Selection>,
 }
 
+impl SearchAnchor {
+    fn selection_at(self, base: u64, columns: usize) -> Option<Selection> {
+        if self.columns != columns {
+            return None;
+        }
+        self.selection.map(|mut selection| {
+            let delta = (i128::from(base) - i128::from(self.base))
+                .clamp(i32::MIN as i128, i32::MAX as i128) as i32;
+            selection.start.line = selection.start.line.saturating_sub(delta);
+            selection.end.line = selection.end.line.saturating_sub(delta);
+            selection
+        })
+    }
+}
+
 pub struct Core {
     size: WindowSize,
     active: Screen,
@@ -1254,6 +1277,13 @@ impl Core {
     }
 
     fn set_display_offset(&mut self, offset: usize) -> bool {
+        if let Some(pending) = self
+            .history
+            .as_mut()
+            .and_then(|history| history.resizing.as_mut())
+        {
+            pending.viewport_changed = true;
+        }
         if offset != self.display_offset() {
             self.active.offset = offset;
 
@@ -1319,14 +1349,15 @@ impl Core {
         true
     }
     pub fn clear_selection(&mut self) -> bool {
-        // Pending reflow must not restore a selection cleared by newer input.
-
         if let Some(pending) = self
             .history
             .as_mut()
             .and_then(|history| history.resizing.as_mut())
         {
-            pending.selection = None;
+            match &mut pending.selection {
+                ResizeSelection::Reflow(selection) => *selection = None,
+                ResizeSelection::Restore(anchor) => anchor.selection = None,
+            }
         }
         self.selection.take().is_some()
     }
@@ -1463,12 +1494,27 @@ impl Core {
         self.scroll_bottom = self.screen_lines();
         self.selection = None;
         self.damage_all();
+        if !enabled && let Some(history) = &self.history {
+            if history.size != self.size {
+                self.finish_resize(history.size);
+            }
+            self.start_history_resize();
+        }
     }
 
     pub fn resize(&mut self, size: WindowSize) {
         if let Some(history) = &mut self.history {
             history.desired_size = Some(size);
-            self.start_history_resize();
+            if self.mode.contains(Mode::ALT_SCREEN) {
+                if size != self.size {
+                    self.active
+                        .resize_alternate(usize::from(size.num_cols), usize::from(size.num_lines));
+                    self.selection = None;
+                    self.finish_resize(size);
+                }
+            } else {
+                self.start_history_resize();
+            }
             return;
         }
         assert!(size.num_cols > 0 && size.num_lines > 0);
@@ -2445,6 +2491,7 @@ impl Core {
     pub fn enable_history(&mut self, config: HistoryConfig) -> io::Result<()> {
         self.history = Some(DiskHistory {
             io: History::new(config)?,
+            size: self.size,
             first: 0,
             hot_start: 0,
             spool: VecDeque::new(),
@@ -2465,14 +2512,19 @@ impl Core {
         self.history.as_ref().map(|history| history.io.event_fd())
     }
     pub(crate) fn resize_pending(&self) -> bool {
-        self.history
-            .as_ref()
-            .is_some_and(|history| history.desired_size.is_some() || history.resizing.is_some())
+        !self.mode.contains(Mode::ALT_SCREEN)
+            && self
+                .history
+                .as_ref()
+                .is_some_and(|history| history.desired_size.is_some() || history.resizing.is_some())
     }
     pub(crate) fn history_read_ready(&self) -> bool {
-        self.history.as_ref().is_none_or(|history| {
-            history.spool.len() < 64 && history.resizing.is_none() && history.desired_size.is_none()
-        })
+        self.mode.contains(Mode::ALT_SCREEN)
+            || self.history.as_ref().is_none_or(|history| {
+                history.spool.len() < 64
+                    && history.resizing.is_none()
+                    && history.desired_size.is_none()
+            })
     }
     fn spill_history(&mut self) {
         if self.mode.contains(Mode::ALT_SCREEN) {
@@ -2601,10 +2653,11 @@ impl Core {
         }
         if let Some(error) = failure {
             let history = self.history.take().unwrap();
+            let active_size = self.size;
             let size = history
                 .desired_size
                 .or(history.resizing.map(|pending| pending.size));
-            let lines = self.screen_lines();
+            let lines = usize::from(history.size.num_lines);
             let main = if self.mode.contains(Mode::ALT_SCREEN) {
                 &mut self.inactive
             } else {
@@ -2618,10 +2671,9 @@ impl Core {
             main.offset = main.offset.min(main.rows.len() - lines);
             self.selection = None;
             history.io.shutdown();
+            self.size = history.size;
             self.trim_blocks();
-            if let Some(size) = size {
-                self.resize(size);
-            }
+            self.resize(size.unwrap_or(active_size));
             self.damage_all();
             self.events.push(Event::HistoryError(io::Error::new(
                 error.kind(),
@@ -2653,6 +2705,9 @@ impl Core {
         Ok(changed || notified)
     }
     fn start_history_resize(&mut self) {
+        if self.mode.contains(Mode::ALT_SCREEN) {
+            return;
+        }
         let Some(history) = &self.history else { return };
         if history.resizing.is_some()
             || history.clear != HistoryClear::Idle
@@ -2665,7 +2720,9 @@ impl Core {
         };
         if size.num_cols == self.size.num_cols && size.num_lines == self.size.num_lines {
             self.size = size;
-            self.history.as_mut().unwrap().desired_size = None;
+            let history = self.history.as_mut().unwrap();
+            history.size = size;
+            history.desired_size = None;
             return;
         }
         let main = self.main_screen();
@@ -2680,11 +2737,7 @@ impl Core {
             absolute(main.cursor.logical_point()),
             absolute(main.saved.logical_point()),
         ];
-        let selection = if self.mode.contains(Mode::ALT_SCREEN) {
-            None
-        } else {
-            self.selection
-        };
+        let selection = self.selection;
         if let Some(selection) = selection {
             points.extend([absolute(selection.start), absolute(selection.end)]);
         }
@@ -2721,9 +2774,10 @@ impl Core {
         if history.io.reflow(request).is_ok() {
             history.resizing = Some(PendingResize {
                 size,
-                selection,
+                selection: ResizeSelection::Reflow(selection),
                 block_points,
                 at_bottom,
+                viewport_changed: false,
             });
             history.desired_size = None;
             history.requested = None;
@@ -2764,16 +2818,22 @@ impl Core {
             cursor.wrap_pending = cursor.point.column == columns;
             cursor.point.column = cursor.point.column.min(columns - 1);
         }
-        main.offset = if pending.at_bottom {
+        main.offset = if pending.viewport_changed {
+            main.offset
+                .min((hot_start - first) as usize + main.rows.len() - lines)
+        } else if pending.at_bottom {
             0
         } else {
             base.saturating_sub(view_top.max(first)) as usize
         };
-        self.selection = pending.selection.and_then(|mut selection| {
-            selection.start = point(points[2])?;
-            selection.end = point(points[3])?;
-            Some(selection)
-        });
+        self.selection = match pending.selection {
+            ResizeSelection::Reflow(selection) => selection.and_then(|mut selection| {
+                selection.start = point(points[2])?;
+                selection.end = point(points[3])?;
+                Some(selection)
+            }),
+            ResizeSelection::Restore(anchor) => anchor.selection_at(base, columns),
+        };
         for (id, indices) in pending.block_points {
             if let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) {
                 let convert = |index: Option<usize>| {
@@ -2820,10 +2880,12 @@ impl Core {
         history.page.clear();
         history.requested = None;
         history.blank = Row::new(columns, Cell::default());
+        history.size = pending.size;
         self.finish_resize(pending.size);
     }
     fn clear_disk_history(&mut self) {
         if let Some(history) = &mut self.history {
+            history.size = self.size;
             let desired_size = history
                 .desired_size
                 .or_else(|| history.resizing.as_ref().map(|pending| pending.size));
@@ -3055,7 +3117,13 @@ impl Core {
         }
     }
     fn trim_blocks(&mut self) {
-        let history = self.history_size();
+        let history = self.history.as_ref().map_or_else(
+            || self.main_screen().rows.len() - self.screen_lines(),
+            |history| {
+                (history.hot_start - history.first) as usize + self.main_screen().rows.len()
+                    - usize::from(history.size.num_lines)
+            },
+        );
         let first = self.block_origin.saturating_sub(history as u64);
         while self
             .blocks
@@ -3181,17 +3249,14 @@ impl Core {
             .saturating_sub(anchor.top)
             .min(self.history_size() as u64) as usize;
         self.set_display_offset(offset);
-        self.selection = if anchor.columns == self.columns() {
-            anchor.selection.map(|mut selection| {
-                let delta = (i128::from(base) - i128::from(anchor.base))
-                    .clamp(i32::MIN as i128, i32::MAX as i128) as i32;
-                selection.start.line = selection.start.line.saturating_sub(delta);
-                selection.end.line = selection.end.line.saturating_sub(delta);
-                selection
-            })
-        } else {
-            None
-        };
+        self.selection = anchor.selection_at(base, self.columns());
+        if let Some(pending) = self
+            .history
+            .as_mut()
+            .and_then(|history| history.resizing.as_mut())
+        {
+            pending.selection = ResizeSelection::Restore(anchor);
+        }
         self.damage_all();
     }
     pub(crate) fn search(
@@ -3334,7 +3399,10 @@ impl Core {
                 .map_or(cursor_row, |index| history.hot_start + index as u64);
             (
                 (0, 0),
-                (cursor_row.max(last_used), self.columns()),
+                (
+                    cursor_row.max(last_used),
+                    usize::from(history.size.num_cols),
+                ),
                 history.first != 0,
                 None,
             )
@@ -3392,7 +3460,7 @@ impl Core {
                 !history.spool.is_empty()
                     || history.clear != HistoryClear::Idle
                     || history.resizing.is_some()
-                    || history.desired_size.is_some()
+                    || (history.desired_size.is_some() && !self.mode.contains(Mode::ALT_SCREEN))
             })
         {
             return Err(io::ErrorKind::WouldBlock.into());

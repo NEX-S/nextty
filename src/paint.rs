@@ -205,12 +205,8 @@ impl Frame {
                     continue;
                 }
                 previous_style = Some(style);
-                let (fg, bg, default_bg) = if selected || block_cursor {
-                    if block_cursor {
-                        (background, cursor_color, false)
-                    } else {
-                        (0xccccccff, 0x303030ff, false)
-                    }
+                let (fg, bg, default_bg) = if selected {
+                    (0xccccccff, 0x303030ff, false)
                 } else {
                     let mut fg = term.color(cell.fg);
                     if flags.contains(Flags::DIM) {
@@ -228,7 +224,7 @@ impl Frame {
                     text: Run {
                         start: start as u32,
                         end: text.len() as u32,
-                        color: fg,
+                        color: if block_cursor { background } else { fg },
                         flags: u32::from((flags & (Flags::BOLD | Flags::ITALIC)).bits()),
                     },
                     start: column as u16,
@@ -246,6 +242,9 @@ impl Frame {
                 && run.background.is_none()
                 && run.underline.is_none()
                 && !run.decorations.contains(Flags::STRIKEOUT)
+                && !block_cursor.is_some_and(|(row, column)| {
+                    row == index && (usize::from(run.start)..usize::from(run.end)).contains(&column)
+                })
             {
                 let start = run.text.start as usize;
                 let trimmed = text[start..].trim_end_matches(' ').len();
@@ -374,6 +373,20 @@ impl Frame {
                     renderer.rect(x, y, width, height, color.get(), false);
                 }
             }
+            // Cell backgrounds fill the pane's remainder; the cursor stays on the grid.
+            if let Some((column, cursor_row, CursorShape::Block, width)) = self.cursor
+                && focused
+                && row == cursor_row
+            {
+                renderer.rect(
+                    origin.0 + cell.0 * column as f32,
+                    y,
+                    cell.0 * width as f32,
+                    cell.1,
+                    self.cursor_color,
+                    false,
+                );
+            }
             if let Some(line) = &data.line {
                 renderer.line(line, origin.0, y);
             }
@@ -434,6 +447,33 @@ mod tests {
         let mut screen = Screen::default();
         screen.apply(Update::capture(core, true)).unwrap();
         Frame::new(&mut screen, &LineCache::default(), true, false)
+    }
+
+    #[test]
+    fn bottom_right_block_cursor_is_separate_from_the_cell_background() {
+        let mut core = Core::new(
+            WindowSize {
+                num_cols: 4,
+                num_lines: 2,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            0xcccccc,
+            0x202020,
+        );
+        Parser::new().advance(&mut core, b"\x1b[2;4HX\x1b[2;4H\x1b[2 q");
+        let focused = frame(&core);
+        assert_eq!(focused.cursor, Some((3, 1, CursorShape::Block, 1)));
+        let run = focused.rows[1].runs.last().unwrap();
+        assert_eq!(run.text.color, focused.background);
+        assert!(run.background.is_none());
+
+        let mut screen = Screen::default();
+        screen.apply(Update::capture(&core, true)).unwrap();
+        let unfocused = Frame::new(&mut screen, &LineCache::default(), false, false);
+        let run = unfocused.rows[1].runs.last().unwrap();
+        assert_eq!(run.text.color, 0xccccccff);
+        assert!(run.background.is_none());
     }
 
     #[test]

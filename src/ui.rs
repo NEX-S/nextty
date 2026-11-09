@@ -180,13 +180,12 @@ impl Ui {
             if !control && !key.text.is_empty() {
                 self.search.edit(client, key.text)?;
             }
-            return Ok(key.text_result());
+            return Ok(KeyResult::Handled);
         }
         if self.resources.open && self.focus == Focus::Monitor {
             if paste && self.resources.searching {
                 return Ok(KeyResult::Paste);
             }
-            let searching = self.resources.searching;
             self.resources.key(
                 if key.symbol == keysym::TAB && shift {
                     keysym::LEFT_TAB
@@ -200,11 +199,7 @@ impl Ui {
             if !self.resources.open {
                 self.focus = Focus::Terminal;
             }
-            return Ok(if searching {
-                key.text_result()
-            } else {
-                KeyResult::Handled
-            });
+            return Ok(KeyResult::Handled);
         }
 
         if self.files_open && self.focus == Focus::Files {
@@ -285,11 +280,7 @@ impl Ui {
                 }
                 _ => (),
             }
-            return Ok(if shortcut.is_some() || !files.is_search() || preview {
-                KeyResult::Handled
-            } else {
-                key.text_result()
-            });
+            return Ok(KeyResult::Handled);
         }
         Ok(KeyResult::Unhandled)
     }

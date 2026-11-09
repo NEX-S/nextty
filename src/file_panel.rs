@@ -277,6 +277,8 @@ mod tests {
                 .any(|cell| cell.c == '文')
         );
         assert_eq!(files.focus(), crate::files::FileFocus::List);
+        assert!(files.focus_preview());
+        finish(&mut files);
         assert_eq!(
             files.preview_lines(0).collect::<Vec<_>>(),
             ["hello 中文", "second", "third"]

@@ -638,15 +638,9 @@ static void keyboard_text(NtWindow *w, uint32_t key, int composing) {
     int n = xkb_state_key_get_utf8(w->key_state, key + 8, text, sizeof text);
     if (n >= (int)sizeof text)
         n = 0;
-    int key_text = n > 0 && (w->modifiers & NT_ALT);
-    emit(w, (NtEvent){.kind = NT_KEY,
-                      .code = sym,
-                      .modifiers = w->modifiers,
-                      .text = key_text ? text : NULL,
-                      .length = key_text ? (size_t)n : 0});
-    if (w->modifiers & (NT_CONTROL | NT_ALT | NT_SUPER))
-        return;
-    if (composing && w->compose) {
+    int printable = n > 0 && (unsigned char)text[0] >= 32 && (unsigned char)text[0] != 127;
+    int modified = w->modifiers & (NT_CONTROL | NT_ALT | NT_SUPER);
+    if (!modified && composing && w->compose) {
         xkb_compose_state_feed(w->compose, sym);
         switch (xkb_compose_state_get_status(w->compose)) {
         case XKB_COMPOSE_COMPOSING:
@@ -669,13 +663,18 @@ static void keyboard_text(NtWindow *w, uint32_t key, int composing) {
         case XKB_COMPOSE_CANCELLED:
             xkb_compose_state_reset(w->compose);
             emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
-            return;
+            if (printable) return;
+            break;
         default:
             break;
         }
     }
-    if (n > 0 && (unsigned char)text[0] >= 32 && (unsigned char)text[0] != 127)
-        emit(w, (NtEvent){.kind = NT_TEXT, .text = text, .length = (size_t)n});
+    int key_text = modified ? n > 0 && (w->modifiers & NT_ALT) : printable;
+    emit(w, (NtEvent){.kind = NT_KEY,
+                      .code = sym,
+                      .modifiers = w->modifiers,
+                      .text = key_text ? text : NULL,
+                      .length = key_text ? (size_t)n : 0});
 }
 static void size_changed(NtWindow *w);
 static void wayland_selection(NtWindow *w, int primary);

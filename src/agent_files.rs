@@ -358,9 +358,6 @@ impl FileSearch<'_> {
                 self.truncated = true;
                 return Ok(false);
             }
-            if self.finder.needle().contains(&b'\n') {
-                return Ok(false);
-            }
             let mut first_match = self.finder.find(bytes);
             if first_match.is_none() {
                 return Ok(false);
@@ -390,11 +387,13 @@ impl FileSearch<'_> {
                 } else {
                     offset + memchr::memrchr(b'\n', skipped).unwrap() + 1
                 };
-                let end =
-                    memchr::memchr(b'\n', &bytes[found..]).map_or(bytes.len(), |end| found + end);
+                let match_end = found + self.finder.needle().len();
+                let end = memchr::memchr(b'\n', &bytes[match_end..])
+                    .map_or(bytes.len(), |end| match_end + end);
+                offset = memchr::memchr(b'\n', &bytes[found..])
+                    .map_or(bytes.len(), |end| found + end + 1);
                 let text = &text[start..end];
                 let found = found - start;
-                offset = end + 1;
                 if self.matches.len() == MATCH_LIMIT || self.remaining == 0 {
                     self.truncated = true;
                     return Ok(true);
@@ -628,6 +627,39 @@ mod tests {
                 assert_eq!(actual.path.as_os_str(), expected.path.as_os_str());
             }
         }
+    }
+
+    #[test]
+    fn search_matches_multiline_literals_and_tracks_following_line_numbers() {
+        let directory = Directory::new();
+        let path = directory.0.join("text");
+        fs::write(
+            &path,
+            "before\nneedle\nneedle\nneedle\nafter\nneedle\nneedle\n",
+        )
+        .unwrap();
+        let FileResult::Search {
+            matches, truncated, ..
+        } = execute(
+            path.clone(),
+            FileOperation::Search {
+                query: "needle\nneedle".into(),
+            },
+            &AtomicBool::new(false),
+        )
+        .unwrap()
+        else {
+            panic!()
+        };
+        assert!(!truncated);
+        assert_eq!(
+            matches,
+            [2, 3, 6].map(|line| FileMatch {
+                path: path.clone(),
+                line,
+                text: "needle\nneedle".into(),
+            })
+        );
     }
 
     #[test]

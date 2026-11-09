@@ -1361,84 +1361,6 @@ impl Workspace {
             .min(self.tabs.len().saturating_sub(1));
         terminal
     }
-    fn snapshot(&self, panes: Vec<PaneView>) -> io::Result<Snapshot> {
-        Ok(Snapshot {
-            name: self.name.clone(),
-            controller: false,
-            focused: self.focused(),
-            active_tab: self.tabs[self.active].id,
-            tabs: self
-                .tabs
-                .iter()
-                .map(|tab| {
-                    let pane = &self.panes[&tab.focused];
-                    let title = |directory: &Path| {
-                        directory
-                            .file_name()
-                            .unwrap_or(directory.as_os_str())
-                            .to_string_lossy()
-                            .into_owned()
-                    };
-                    let title = match panes.iter().find(|pane| pane.id == tab.focused) {
-                        Some(pane) => pane.cwd.as_deref().map(title),
-                        None => pane_directory(&pane.terminal)?.as_deref().map(title),
-                    }
-                    .unwrap_or_else(|| pane.title.clone());
-                    Ok(TabView {
-                        id: tab.id,
-                        title,
-                        activity: self.tab_activity(&tab.root)?,
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?,
-            panes,
-        })
-    }
-    fn tab_activity(&self, node: &Node) -> io::Result<TabActivity> {
-        let mut activity = TabActivity::Idle;
-        node.for_each_pane(&mut |id| {
-            if activity == TabActivity::Running {
-                return Ok(());
-            }
-            let terminal = &self.panes[&id].terminal;
-            let process = terminal.process_metadata();
-            if process
-                .foreground_pgid
-                .is_some_and(|pgid| pgid != process.child_pid)
-            {
-                activity = TabActivity::Running;
-                return Ok(());
-            }
-            let core = terminal
-                .core
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
-            let latest = core.latest_command_status();
-            let state =
-                if latest.is_none() && process.has_children == Some(true) || latest == Some(None) {
-                    TabActivity::Running
-                } else if matches!(latest, Some(Some(status)) if status != 0) {
-                    TabActivity::Failed
-                } else if latest.is_some() {
-                    TabActivity::Finished
-                } else if process.has_children.is_none()
-                    || core.shell_prompt().is_none() && !core.shell_editing()
-                {
-                    TabActivity::Unknown
-                } else {
-                    TabActivity::Idle
-                };
-            if state == TabActivity::Running
-                || state == TabActivity::Unknown
-                || activity == TabActivity::Idle
-                || state == TabActivity::Failed && activity == TabActivity::Finished
-            {
-                activity = state;
-            }
-            Ok(())
-        })?;
-        Ok(activity)
-    }
     fn navigate(&mut self, direction: Direction) {
         let layout = self.layout();
         let focused = self.focused();
@@ -1660,7 +1582,8 @@ impl Connection {
         let pane = match action {
             Action::Input { pane, .. }
             | Action::SelectionStart { pane, .. }
-            | Action::SelectionUpdate { pane, .. } => self
+            | Action::SelectionUpdate { pane, .. }
+            | Action::SearchSelect { pane, .. } => self
                 .workspace
                 .as_ref()
                 .and_then(|name| workspaces.get(name))
@@ -2305,88 +2228,173 @@ fn broadcast(
             && client.workspace.as_deref() == Some(&workspace.name)
     });
     let all_tabs = has_agent && workspace.tabs.len() > 1;
-    let tabs = if all_tabs {
-        workspace.tabs.as_slice()
-    } else {
-        std::slice::from_ref(&workspace.tabs[workspace.active])
-    };
-    let mut visible = Vec::new();
-    tabs[0].root.layout(workspace.area(), &mut visible);
     let active = &workspace.tabs[workspace.active];
+    let active_layout = if all_tabs {
+        Vec::new()
+    } else {
+        workspace.layout()
+    };
     let capacity = if all_tabs {
         workspace.panes.len()
     } else {
-        visible.len()
+        active_layout.len()
     };
+    let mut visible = Vec::new();
     let mut frames = Vec::with_capacity(capacity);
     let mut panes = Vec::with_capacity(capacity);
-    for (index, tab) in tabs.iter().enumerate() {
-        if index != 0 {
-            visible.clear();
-            tab.root.layout(workspace.area(), &mut visible);
-        }
-        for &(id, rect) in &visible {
+    let mut tabs = Vec::with_capacity(workspace.tabs.len());
+    for tab in &workspace.tabs {
+        let capture = has_agent || tab.id == active.id;
+        let mut title = None;
+        let mut activity = TabActivity::Idle;
+        let mut visit = |id, rect| -> io::Result<()> {
+            if !capture && activity == TabActivity::Running && id != tab.focused {
+                return Ok(());
+            }
             let pane = &workspace.panes[&id];
-            let process = pane.terminal.process_metadata();
+            let process = (capture || activity != TabActivity::Running)
+                .then(|| pane.terminal.process_metadata());
+            let foreground_running = process.as_ref().is_some_and(|process| {
+                process
+                    .foreground_pgid
+                    .is_some_and(|pgid| pgid != process.child_pid)
+            });
+            if !capture && foreground_running && id != tab.focused {
+                activity = TabActivity::Running;
+                return Ok(());
+            }
             let mut core = pane
                 .terminal
                 .core
                 .lock()
                 .map_err(|error| io::Error::other(error.to_string()))?;
-            let blocks = core.visible_blocks();
-            let command_blocks = core.recent_command_blocks();
-            let input_generation = core.input_generation();
-            let shell_prompt = core.shell_prompt();
-            let cwd = core.current_directory().map(Path::to_path_buf);
-            let synchronized = core.mode().contains(Mode::SYNC_UPDATE);
-            if !synchronized || has_agent {
-                let offset = core.display_offset();
-                let mut needs_full = false;
-                let mut needs_delta = false;
-                for client in clients.iter().filter(|client| {
-                    client.workspace.as_deref() == Some(&workspace.name)
-                        && client.screen_eligible()
-                        && (client.agent || !all_tabs || tab.id == active.id)
-                        && (!client.agent || offset == 0)
-                }) {
-                    let full = client.full || !client.known.contains_key(&id);
-                    needs_full |= full;
-                    needs_delta |= !full;
-                    if needs_full && needs_delta {
-                        break;
-                    }
-                }
-                let full = needs_full.then(|| Update::capture(&core, true));
-                let delta = (needs_delta
-                    && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
-                .then(|| Update::capture(&core, false));
-                let live = (offset != 0 && has_agent).then(|| Update::capture_live(&core));
-                let hidden = synchronized || tab.id != active.id;
-                frames.push((id, full, delta, live, hidden));
-                if !synchronized {
-                    core.reset_damage();
+            if activity != TabActivity::Running {
+                let process = process.as_ref().unwrap();
+                let latest = core.latest_command_status();
+                let state = if foreground_running
+                    || latest.is_none() && process.has_children == Some(true)
+                    || latest == Some(None)
+                {
+                    TabActivity::Running
+                } else if matches!(latest, Some(Some(status)) if status != 0) {
+                    TabActivity::Failed
+                } else if latest.is_some() {
+                    TabActivity::Finished
+                } else if process.has_children.is_none()
+                    || core.shell_prompt().is_none() && !core.shell_editing()
+                {
+                    TabActivity::Unknown
+                } else {
+                    TabActivity::Idle
+                };
+                if state == TabActivity::Running
+                    || state == TabActivity::Unknown
+                    || activity == TabActivity::Idle
+                    || state == TabActivity::Failed && activity == TabActivity::Finished
+                {
+                    activity = state;
                 }
             }
-            drop(core);
-            panes.push(PaneView {
-                id,
-                tab: tab.id,
-                rect,
-                title: pane.title.clone(),
-                cwd: match cwd {
-                    Some(directory) => Some(directory),
-                    None => pane_directory(&pane.terminal)?,
-                },
-                process,
-                blocks,
-                command_blocks,
-                input_generation,
-                shell_prompt,
+            if !capture && id != tab.focused {
+                return Ok(());
+            }
+            let cwd = core.current_directory().map(Path::to_path_buf);
+            let view = capture.then(|| {
+                let synchronized = core.mode().contains(Mode::SYNC_UPDATE);
+                if !synchronized || has_agent {
+                    let offset = core.display_offset();
+                    let mut needs_full = false;
+                    let mut needs_delta = false;
+                    for client in clients.iter().filter(|client| {
+                        client.workspace.as_deref() == Some(&workspace.name)
+                            && client.screen_eligible()
+                            && (client.agent || !all_tabs || tab.id == active.id)
+                            && (!client.agent || offset == 0)
+                    }) {
+                        let full = client.full || !client.known.contains_key(&id);
+                        needs_full |= full;
+                        needs_delta |= !full;
+                        if needs_full && needs_delta {
+                            break;
+                        }
+                    }
+                    let full = needs_full.then(|| Update::capture(&core, true));
+                    let delta = (needs_delta
+                        && (full.is_none() || core.dirty_rows().count() != core.screen_lines()))
+                    .then(|| Update::capture(&core, false));
+                    let live = (offset != 0 && has_agent).then(|| Update::capture_live(&core));
+                    let hidden = synchronized || tab.id != active.id;
+                    frames.push((id, full, delta, live, hidden));
+                    if !synchronized {
+                        core.reset_damage();
+                    }
+                }
+                PaneView {
+                    id,
+                    tab: tab.id,
+                    rect,
+                    title: pane.title.clone(),
+                    cwd: None,
+                    process: process.unwrap(),
+                    blocks: core.visible_blocks(),
+                    command_blocks: core.recent_command_blocks(),
+                    input_generation: core.input_generation(),
+                    shell_prompt: core.shell_prompt(),
+                }
             });
+            drop(core);
+            let cwd = match cwd {
+                Some(directory) => Some(directory),
+                None => pane_directory(&pane.terminal)?,
+            };
+            if id == tab.focused {
+                title = Some(cwd.as_deref().map_or_else(
+                    || pane.title.clone(),
+                    |directory| {
+                        directory
+                            .file_name()
+                            .unwrap_or(directory.as_os_str())
+                            .to_string_lossy()
+                            .into_owned()
+                    },
+                ));
+            }
+            if let Some(mut view) = view {
+                view.cwd = cwd;
+                panes.push(view);
+            }
+            Ok(())
+        };
+        if capture {
+            let layout = if all_tabs {
+                visible.clear();
+                tab.root.layout(workspace.area(), &mut visible);
+                &visible
+            } else {
+                &active_layout
+            };
+            for &(id, rect) in layout {
+                visit(id, rect)?;
+            }
+        } else {
+            tab.root
+                .for_each_pane(&mut |id| visit(id, Rect::default()))?;
         }
+        tabs.push(TabView {
+            id: tab.id,
+            title: title.unwrap(),
+            activity,
+        });
     }
     let all_frames = frames.len() == panes.len();
-    let mut all_snapshot = workspace.snapshot(panes)?;
+    let mut all_snapshot = Snapshot {
+        name: workspace.name.clone(),
+        controller: false,
+        focused: workspace.focused(),
+        active_tab: active.id,
+        tabs,
+        panes,
+    };
     let mut active_snapshot = None;
     let mut updates = Vec::with_capacity(frames.len());
     for client in clients {

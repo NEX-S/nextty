@@ -30,7 +30,8 @@ typedef struct {
  * Button code: 1 left, 2 middle, 3 right; start: pressed. Scroll y: lines up.
  * Motion/button x,y are surface-local logical pixels. Focus code: active.
  * Pointer leave clears hover without reporting a terminal mouse movement.
- * Key code is an XKB keysym; printable text arrives only through NT_TEXT.
+ * Key code is an XKB keysym and text is its direct printable input.
+ * NT_TEXT carries independent compose/IME commits.
  * Paste code: primary; text is the completed, unmodified UTF-8 selection.
  * Trace-only frame code/x/y: frame id, monotonic receipt, raw server time (ms).
  * Window state code: activated/suspended/fullscreen/maximized bits;

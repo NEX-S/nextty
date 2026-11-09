@@ -343,6 +343,52 @@ fn clearing_selection_during_history_resize_does_not_restore_it() {
 }
 
 #[test]
+fn restoring_search_during_reflow_respects_later_scroll_and_selection_clear() {
+    for (columns, clear, expected) in [
+        (17, false, Some("one")),
+        (17, true, None),
+        (11, false, None),
+    ] {
+        let mut core = core(17, 5, budget(8 * 1024 * 1024));
+        feed(
+            &mut core,
+            &mut Parser::new(),
+            "one two\r\n".repeat(32).as_bytes(),
+        );
+        core.selection_start(
+            Point { line: 0, column: 0 },
+            Side::Left,
+            SelectionType::Simple,
+        );
+        core.selection_update(Point { line: 0, column: 2 }, Side::Right);
+        let origin = core.search_anchor();
+        core.selection_start(
+            Point { line: 0, column: 4 },
+            Side::Left,
+            SelectionType::Simple,
+        );
+        core.selection_update(Point { line: 0, column: 6 }, Side::Right);
+        core.scroll_display(Scroll::Top);
+        settle(&mut core);
+        core.resize(WindowSize {
+            num_cols: columns,
+            num_lines: 4,
+            ..core.size
+        });
+        assert!(core.history.as_ref().unwrap().resizing.is_some());
+        core.restore_search(origin);
+        assert_eq!(core.display_offset(), 0);
+        core.scroll_display(Scroll::Delta(3));
+        if clear {
+            assert!(core.clear_selection());
+        }
+        settle(&mut core);
+        assert_eq!(core.display_offset(), 3);
+        assert_eq!(core.selection_to_string().as_deref(), expected);
+    }
+}
+
+#[test]
 fn disk_reflow_matches_the_existing_grid_including_a_long_soft_wrapped_cjk_line() {
     let mut disk = core(17, 5, budget(8 * 1024 * 1024));
     let mut plain = Core::new(disk.size, 0xcccccc, 0x202020);
@@ -396,6 +442,148 @@ fn disk_reflow_matches_the_existing_grid_including_a_long_soft_wrapped_cjk_line(
                 assert_eq!(disk.row(row).extras(), plain.row(row).extras());
             }
         }
+    }
+}
+
+#[test]
+fn alternate_resize_defers_main_reflow_and_preserves_following_output() {
+    let mut core = core(20, 4, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    feed(
+        &mut core,
+        &mut parser,
+        "main-history\r\n".repeat(100).as_bytes(),
+    );
+    let main = core.active.rows.clone();
+    let cursor = core.cursor();
+    feed(&mut core, &mut parser, b"\x1b[?1049h");
+    for (columns, lines) in [(8, 4), (8, 7), (32, 7)] {
+        core.resize(WindowSize {
+            num_cols: columns,
+            num_lines: lines,
+            ..core.size
+        });
+        assert_eq!(
+            (core.columns(), core.screen_lines()),
+            (columns as usize, lines as usize)
+        );
+        assert!(core.history_read_ready());
+        assert!(!core.resize_pending());
+        let history = core.history.as_ref().unwrap();
+        assert_eq!((history.size.num_cols, history.size.num_lines), (20, 4));
+        assert!(history.resizing.is_none());
+        assert_eq!(core.inactive.rows.len(), main.len());
+        for (actual, expected) in core.inactive.rows.iter().zip(&main) {
+            assert_eq!(actual.cells, expected.cells);
+            assert_eq!(actual.wrapped, expected.wrapped);
+            assert_eq!(actual.extras(), expected.extras());
+        }
+        parser.advance_queued(&mut core, b"\x1b[HALT");
+        assert!(!parser.has_queued());
+        assert_eq!(core.row(0).cells[0].c, 'A');
+    }
+    let page = core
+        .read_history(None, None, None)
+        .unwrap()
+        .0
+        .recv()
+        .unwrap()
+        .unwrap();
+    assert!(page.text.contains("main-history"));
+    parser.advance_queued(&mut core, b"\x1b[?1049l\x1b[7;32HZ");
+    assert!(parser.has_queued());
+    assert!(core.resize_pending());
+    assert_eq!(core.cursor(), cursor);
+    while parser.has_queued() {
+        core.poll_history(true).unwrap();
+        parser.advance_queued(&mut core, &[]);
+        std::thread::yield_now();
+    }
+    settle(&mut core);
+    assert_eq!((core.columns(), core.screen_lines()), (32, 7));
+    assert_eq!(core.row(6).cells[31].c, 'Z');
+    assert_eq!(
+        core.cursor().0,
+        Point {
+            line: 6,
+            column: 31
+        }
+    );
+    assert!(!core.mode().contains(Mode::ALT_SCREEN));
+}
+
+#[test]
+fn alternate_resize_return_and_reset_use_the_latest_geometry() {
+    let mut core = core(20, 4, budget(8 * 1024 * 1024));
+    let mut parser = Parser::new();
+    feed(&mut core, &mut parser, "main\r\n".repeat(30).as_bytes());
+    feed(&mut core, &mut parser, b"\x1b[?1049h");
+    core.resize(WindowSize {
+        num_cols: 8,
+        num_lines: 2,
+        ..core.size
+    });
+    core.resize(WindowSize {
+        num_cols: 20,
+        num_lines: 4,
+        ..core.size
+    });
+    parser.advance_queued(&mut core, b"\x1b[?1049lX\x1b[3J");
+    assert!(!parser.has_queued());
+    assert!(!core.resize_pending());
+    feed(&mut core, &mut parser, b"\x1b[?1049h");
+    core.resize(WindowSize {
+        num_cols: 10,
+        num_lines: 6,
+        ..core.size
+    });
+    feed(&mut core, &mut parser, b"\x1bcRESET");
+    assert_eq!((core.columns(), core.screen_lines()), (10, 6));
+    assert_eq!(core.history_size(), 0);
+    assert_eq!(
+        &core.row(0).cells[..5]
+            .iter()
+            .map(|cell| cell.c)
+            .collect::<String>(),
+        "RESET"
+    );
+    assert_eq!(core.history.as_ref().unwrap().size, core.size);
+}
+
+#[test]
+fn viewport_changes_during_reflow_replace_the_old_anchor() {
+    for (before, scroll, expected) in [
+        (0, Scroll::Delta(10), 10),
+        (20, Scroll::Bottom, 0),
+        (20, Scroll::Delta(0), 20),
+    ] {
+        let mut core = core(20, 4, budget(8 * 1024 * 1024));
+        let mut parser = Parser::new();
+        feed(
+            &mut core,
+            &mut parser,
+            "long-history-abcdefghijklmnop\r\n".repeat(100).as_bytes(),
+        );
+        let bottom = core.search_anchor();
+        core.scroll_display(Scroll::Delta(before));
+        settle(&mut core);
+        core.resize(WindowSize {
+            num_cols: 30,
+            ..core.size
+        });
+        assert!(core.resize_pending());
+        core.scroll_display(scroll);
+        settle(&mut core);
+        assert_eq!(core.display_offset(), expected);
+
+        core.scroll_display(Scroll::Delta(20));
+        core.resize(WindowSize {
+            num_cols: 22,
+            ..core.size
+        });
+        core.restore_search(bottom);
+        settle(&mut core);
+        assert_eq!(core.display_offset(), 0);
     }
 }
 #[test]

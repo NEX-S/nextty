@@ -415,10 +415,9 @@ impl Agent {
         })
     }
 
-    pub fn deadline(&self, client: &Client) -> Option<Instant> {
+    pub fn deadline(&self) -> Option<Instant> {
         self.operation
             .as_ref()
-            .filter(|_| !client.screen_stale())
             .and_then(|operation| match operation.stage {
                 Stage::Command { until, .. }
                 | Stage::Change { until, .. }
@@ -795,6 +794,7 @@ impl Agent {
     }
 
     fn advance(&mut self, client: &mut Client) -> io::Result<()> {
+        let deadline = self.deadline();
         let Some(mut operation) = self.operation.take() else {
             return Ok(());
         };
@@ -814,14 +814,15 @@ impl Agent {
                 }
                 return Err(io::ErrorKind::Interrupted.into());
             }
-            if matches!(
-                operation.stage,
-                Stage::Command { .. }
-                    | Stage::Change { .. }
-                    | Stage::InputOutput { .. }
-                    | Stage::NewTerminalOutput { .. }
-            ) && client.screen_stale()
+            if let Some(deadline) = deadline
+                && client.screen_stale()
             {
+                if Instant::now() >= deadline {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "Terminal observation timed out waiting for a fresh screen",
+                    ));
+                }
                 client.request_screen()?;
                 return Ok(None);
             }

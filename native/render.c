@@ -892,10 +892,11 @@ static int replay(NtRenderer *r) {
             } else {
                 double sx = (double)v->extent.width / f->width;
                 double sy = (double)v->extent.height / f->height;
-                int left = (int)fmax(0, fmin(v->extent.width, floor(op->clip[0] * sx)));
-                int top = (int)fmax(0, fmin(v->extent.height, floor(op->clip[1] * sy)));
-                int right = (int)fmax(left, fmin(v->extent.width, ceil((op->clip[0] + op->clip[2]) * sx)));
-                int bottom = (int)fmax(top, fmin(v->extent.height, ceil((op->clip[1] + op->clip[3]) * sy)));
+                /* Shared logical edges must quantize to the same physical pixel. */
+                int left = (int)fmax(0, fmin(v->extent.width, round(op->clip[0] * sx)));
+                int top = (int)fmax(0, fmin(v->extent.height, round(op->clip[1] * sy)));
+                int right = (int)fmax(left, fmin(v->extent.width, round((op->clip[0] + op->clip[2]) * sx)));
+                int bottom = (int)fmax(top, fmin(v->extent.height, round((op->clip[1] + op->clip[3]) * sy)));
                 v->clip = (VkRect2D){{left, top}, {(uint32_t)(right - left), (uint32_t)(bottom - top)}};
             }
             break;

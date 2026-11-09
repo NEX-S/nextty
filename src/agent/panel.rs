@@ -3273,7 +3273,7 @@ impl Ui {
                 }
             }
             self.agent.active_mut().editor_scroll = None;
-            return Ok(Some(key.text_result()));
+            return Ok(Some(KeyResult::Handled));
         }
         Ok(None)
     }
