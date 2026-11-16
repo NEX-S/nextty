@@ -72,23 +72,13 @@ pub enum NamedColor {
     Foreground = 256,
     Background,
     Cursor,
-    DimBlack,
-    DimRed,
-    DimGreen,
-    DimYellow,
-    DimBlue,
-    DimMagenta,
-    DimCyan,
-    DimWhite,
-    BrightForeground,
-    DimForeground,
 }
 
-pub(crate) const PALETTE_SIZE: usize = NamedColor::DimForeground as usize + 1;
+pub(crate) const PALETTE_SIZE: usize = NamedColor::Cursor as usize + 1;
 
 impl NamedColor {
     pub fn from_index(index: u16) -> Option<Self> {
-        const COLORS: [NamedColor; 29] = [
+        const COLORS: [NamedColor; 19] = [
             NamedColor::Black,
             NamedColor::Red,
             NamedColor::Green,
@@ -108,20 +98,10 @@ impl NamedColor {
             NamedColor::Foreground,
             NamedColor::Background,
             NamedColor::Cursor,
-            NamedColor::DimBlack,
-            NamedColor::DimRed,
-            NamedColor::DimGreen,
-            NamedColor::DimYellow,
-            NamedColor::DimBlue,
-            NamedColor::DimMagenta,
-            NamedColor::DimCyan,
-            NamedColor::DimWhite,
-            NamedColor::BrightForeground,
-            NamedColor::DimForeground,
         ];
         let index = match index {
             0..=15 => index as usize,
-            256..=268 => index as usize - 240,
+            256..=258 => index as usize - 240,
             _ => return None,
         };
         Some(COLORS[index])

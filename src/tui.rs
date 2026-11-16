@@ -12,7 +12,7 @@ use crate::panel::mix_color;
 use crate::screen::Screen;
 use crate::ui::{Focus, Ui};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
-use crate::width::{fit_label, scalar_width, text_width};
+use crate::width::{fit_label, text_width};
 use crate::workspace::{
     Action, Axis, Client, ClientEvent, PaneId, PaneView, Rect, Snapshot, SplitDrag, tab_chrome,
 };
@@ -1581,19 +1581,7 @@ impl Frontend {
                     .get(&pane)
                     .and_then(|screen| crate::context::object_at(screen, point))
             {
-                let mut command = std::process::Command::new("xdg-open");
-                command.arg(&object.text);
-                if !self.client.is_remote()
-                    && let Some(cwd) = self
-                        .client
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.pane(pane))
-                        .and_then(|pane| pane.cwd.as_ref())
-                {
-                    command.current_dir(cwd);
-                }
-                let mut child = command.spawn()?;
-                std::thread::spawn(move || child.wait());
+                crate::ui::open_object(&self.client, pane, &object.text)?;
                 return Ok(());
             }
         }
@@ -2107,7 +2095,12 @@ fn draw_tabs(
         if hovered {
             output.write_all(b"\x1b[38;2;212;217;216m")?;
         }
-        fit_text(output, &tab.title, width - 8);
+        let title = fit_label(&tab.title, width - 8);
+        output.extend_from_slice(title.as_bytes());
+        output.resize(
+            output.len() + usize::from(width - 8) - text_width(&title),
+            b' ',
+        );
         let close_hovered = pointer.is_some_and(|(column, row)| {
             row == 0 && (x + width - 4..x + width - 1).contains(&column)
         });
@@ -2404,42 +2397,6 @@ fn draw_cursor(
             x + u32::from(left) + 1
         )
     }
-}
-
-fn fit_text(output: &mut Vec<u8>, text: &str, columns: u16) {
-    let end = text.len().min(usize::from(columns));
-    let prefix = &text.as_bytes()[..end];
-    // A non-ASCII scalar at the boundary may still use zero columns.
-    if text.as_bytes().get(end).is_none_or(u8::is_ascii)
-        && prefix.iter().all(|byte| (b' '..=b'~').contains(byte))
-    {
-        output.extend_from_slice(prefix);
-        output.resize(output.len() + usize::from(columns) - end, b' ');
-        return;
-    }
-    let mut used = 0;
-    let mut start = 0;
-    let mut end = 0;
-    for ch in text.chars() {
-        let control = ch.is_control();
-        let width = if control {
-            1
-        } else {
-            u16::from(scalar_width(ch).min(2))
-        };
-        if used + width > columns {
-            break;
-        }
-        if control {
-            output.extend_from_slice(&text.as_bytes()[start..end]);
-            output.push(b' ');
-            start = end + ch.len_utf8();
-        }
-        end += ch.len_utf8();
-        used += width;
-    }
-    output.extend_from_slice(&text.as_bytes()[start..end]);
-    output.resize(output.len() + usize::from(columns - used), b' ');
 }
 
 // A multiple of three keeps intermediate base64 chunks unpadded.

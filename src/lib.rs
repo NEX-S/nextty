@@ -7,22 +7,24 @@ mod base64;
 pub mod config;
 pub mod error;
 mod eventfd;
-pub mod width;
+pub(crate) mod width;
 
 pub(crate) mod agent_files;
-pub mod files;
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub(crate) mod files;
 mod worker;
 
-pub mod history;
+pub(crate) mod history;
 
 #[cfg(any(feature = "gui", feature = "tui"))]
 mod monitor;
 
-pub mod screen;
+pub(crate) mod screen;
 
 mod shell_integration;
 
-pub mod system_stats;
+#[cfg(any(feature = "gui", feature = "tui"))]
+pub(crate) mod system_stats;
 
 #[cfg(feature = "tui")]
 pub mod tui;

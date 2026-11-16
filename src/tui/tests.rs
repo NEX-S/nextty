@@ -1184,11 +1184,16 @@ fn labels_obey_cell_width_and_cannot_inject_terminal_sequences() {
         ("中a", 4, "中a "),
         ("中中a", 3, "中 "),
         ("a\x1b\n", 4, "a   "),
-        ("a\u{2003}", 4, "a\u{2003}  "),
+        ("a\u{2003}", 4, "a   "),
         ("e\u{301}x", 1, "e\u{301}"),
     ] {
         let mut output = Vec::new();
-        fit_text(&mut output, text, columns);
+        let label = fit_label(text, columns);
+        output.extend_from_slice(label.as_bytes());
+        output.resize(
+            output.len() + usize::from(columns) - text_width(&label),
+            b' ',
+        );
         assert_eq!(output, expected.as_bytes());
     }
 }

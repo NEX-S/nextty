@@ -477,6 +477,28 @@ fn word_and_line_selection_follow_soft_wraps_and_wide_cells() {
 
 #[test]
 fn object_selection_preserves_urls_locations_and_quoted_unicode() {
+    fn select_object(core: &mut Core, line: i32, column: usize) {
+        let [start, end] = object_selection((i64::from(line), column), |row| {
+            Ok::<_, std::convert::Infallible>(core.absolute_row(row as i32))
+        })
+        .unwrap()
+        .unwrap_or([(i64::from(line), column); 2]);
+        core.selection_start(
+            Point {
+                line: start.0 as i32,
+                column: start.1,
+            },
+            Side::Left,
+            SelectionType::Simple,
+        );
+        core.selection_update(
+            Point {
+                line: end.0 as i32,
+                column: end.1,
+            },
+            Side::Right,
+        );
+    }
     for (text, column, expected) in [
         ("see (https://host/a_(b)?x=1)", 15, "https://host/a_(b)?x=1"),
         ("error: src/main.rs:42:7", 15, "src/main.rs:42:7"),
@@ -488,30 +510,19 @@ fn object_selection_preserves_urls_locations_and_quoted_unicode() {
     ] {
         let (mut core, mut parser) = terminal(40, 3);
         feed(&mut core, &mut parser, text);
-        core.selection_start(Point { line: 0, column }, Side::Left, SelectionType::Object);
+        select_object(&mut core, 0, column);
         assert_eq!(core.selection_to_string().as_deref(), Some(expected));
     }
     let (mut core, mut parser) = terminal(8, 5);
     feed(&mut core, &mut parser, "see \"中\u{301}文 file.rs\" now");
-    core.selection_start(
-        Point { line: 1, column: 2 },
-        Side::Left,
-        SelectionType::Object,
-    );
+    select_object(&mut core, 1, 2);
     assert_eq!(
         core.selection_to_string().as_deref(),
         Some("\"中\u{301}文 file.rs\"")
     );
     let (mut core, mut parser) = terminal(100, 100);
     feed(&mut core, &mut parser, &"a".repeat(10_000));
-    core.selection_start(
-        Point {
-            line: 50,
-            column: 0,
-        },
-        Side::Left,
-        SelectionType::Object,
-    );
+    select_object(&mut core, 50, 0);
     assert_eq!(core.selection_to_string().as_deref(), Some("a"));
 }
 

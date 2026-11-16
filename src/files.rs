@@ -102,7 +102,6 @@ enum ScanMode {
 struct Scan {
     entries: Vec<FileEntry>,
     error: Option<io::Error>,
-    truncated: bool,
 }
 
 impl FileNav {
@@ -260,11 +259,6 @@ impl FileNav {
         self.preview.error.as_ref()
     }
 
-    /// Search retains the best SEARCH_LIMIT matches and still scans for better ones.
-    pub fn truncated(&self) -> bool {
-        self.scan.truncated
-    }
-
     /// Partial results remain usable when an inaccessible descendant is encountered.
     pub fn error(&self) -> Option<&io::Error> {
         self.scan.error.as_ref()
@@ -298,7 +292,7 @@ impl FileNav {
         self.set_query(String::new());
     }
 
-    pub fn set_query(&mut self, query: String) {
+    pub(crate) fn set_query(&mut self, query: String) {
         if self.query.as_ref() != Some(&query) {
             self.remember_selection();
             self.query = Some(query);
@@ -334,11 +328,6 @@ impl FileNav {
             self.restore_selection = self.directory_selection.get(&self.directory).cloned();
             self.request_scan();
         }
-    }
-
-    pub fn refresh(&mut self) {
-        self.restore_selection = self.selected().map(|entry| entry.path.clone());
-        self.request_scan();
     }
 
     pub fn set_directory(&mut self, directory: PathBuf) -> io::Result<()> {
@@ -814,10 +803,6 @@ fn search_directory(
                 } else {
                     matches.partition_point(|current| compare(current).is_lt())
                 };
-                if matches.len() == SEARCH_LIMIT && !scan.truncated {
-                    scan.truncated = true;
-                    dirty = true;
-                }
                 if position < SEARCH_LIMIT {
                     matches.truncate(SEARCH_LIMIT - 1);
                     matches.insert(position, (score, path.to_path_buf()));
@@ -834,7 +819,6 @@ fn search_directory(
                         is_dir: false,
                     })
                     .collect(),
-                truncated: scan.truncated,
                 ..Scan::default()
             };
             publish(update);
@@ -1184,7 +1168,6 @@ mod tests {
         finish(&mut nav);
         assert!(nav.error().is_none());
         assert_eq!(nav.entries().len(), SEARCH_LIMIT);
-        assert!(nav.truncated());
         assert_eq!(nav.entries()[0].path, best);
     }
 
@@ -1256,7 +1239,7 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_and_search_updates_keep_the_selected_path() {
+    fn search_updates_keep_the_selected_path() {
         let fixture = Fixture::new();
         fixture.file("b-file");
         let wanted = fixture.file("c-file");
@@ -1264,9 +1247,6 @@ mod tests {
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
         nav.move_selection(1);
-        finish(&mut nav);
-        fixture.file("a-file");
-        nav.refresh();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
         assert_eq!(nav.focus(), FileFocus::List);
@@ -1278,13 +1258,10 @@ mod tests {
             ["selected contents"]
         );
         nav.focus_list();
+        fixture.file("a-file");
         nav.start_search();
         finish(&mut nav);
         nav.move_selection(2);
-        finish(&mut nav);
-        assert_eq!(nav.selected().unwrap().path, wanted);
-        fixture.file("0-file");
-        nav.refresh();
         finish(&mut nav);
         assert_eq!(nav.selected().unwrap().path, wanted);
         nav.stop_search();

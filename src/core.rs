@@ -617,7 +617,6 @@ pub enum SelectionType {
     Simple = 0,
     Semantic = 1,
     Lines = 2,
-    Object = 3,
 }
 
 fn semantic_group(c: char) -> u8 {
@@ -706,6 +705,7 @@ pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
     Ok(())
 }
 
+#[cfg(any(feature = "gui", feature = "tui", test))]
 pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
     point: (i64, usize),
     mut row: impl FnMut(i64) -> Result<Option<R>, E>,
@@ -1311,18 +1311,6 @@ impl Core {
         let value = match index {
             0..=255 => return DEFAULT_PALETTE[index],
             257 => self.background,
-            259..=266 | 268 => {
-                let c = self.palette_color(if index == 268 {
-                    NamedColor::Foreground as usize
-                } else {
-                    index - 259
-                });
-                return Rgb {
-                    r: c.r / 2,
-                    g: c.g / 2,
-                    b: c.b / 2,
-                };
-            }
             _ => self.foreground,
         };
         Rgb::from_packed(value)
@@ -1384,23 +1372,6 @@ impl Core {
             column,
         };
         match selection.kind {
-            SelectionType::Object => {
-                let object = |point: Point| {
-                    object_selection((i64::from(point.line), point.column), source_row).unwrap()
-                };
-                let first_object = object(start);
-                let last_object = if start == end {
-                    first_object
-                } else {
-                    object(end)
-                };
-                if let Some([first, _]) = first_object {
-                    start = to_point(first);
-                }
-                if let Some([_, last]) = last_object {
-                    end = to_point(last);
-                }
-            }
             SelectionType::Simple => {
                 if start == end && start_side == end_side {
                     return None;
@@ -3276,9 +3247,27 @@ impl Core {
             )
         })?;
         let hot_start = if alternate { 0 } else { history.hot_start };
+        // Search reads only used cells; leave styled blank tails out of its snapshot.
+        let hot = self
+            .active
+            .rows
+            .iter()
+            .map(|row| {
+                let used = row.used();
+                let extras = row.extras();
+                let end = extras.partition_point(|(column, _)| *column < used);
+                Row::from_parts(
+                    row.cells[..used.max(1)].to_vec(),
+                    row.wrapped,
+                    used,
+                    extras[..end].to_vec(),
+                )
+                .unwrap()
+            })
+            .collect();
         history.io.search(
             query.to_owned(),
-            (hot_start, self.active.rows.iter().cloned().collect()),
+            (hot_start, hot),
             (self.columns(), alternate),
             Arc::clone(cancelled),
             wake.try_clone_to_owned()?,

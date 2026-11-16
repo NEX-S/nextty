@@ -23,7 +23,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Condvar, Mutex};
 pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 21;
+pub(crate) const VERSION: u8 = 22;
 
 pub(crate) enum Response {
     ScreenDirty,
@@ -928,23 +928,19 @@ fn take_clipboard_file(files: &mut smallvec::SmallVec<[OwnedFd; 4]>) -> io::Resu
 }
 
 fn clipboard_file() -> io::Result<File> {
-    let root = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                "HOME or XDG_CACHE_HOME is required for remote clipboard storage",
-            )
-        })?;
+    let root = crate::config::cache_directory().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotFound,
+            "HOME or XDG_CACHE_HOME is required for remote clipboard storage",
+        )
+    })?;
     if !root.is_absolute() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             "clipboard cache directory must be absolute",
         ));
     }
-    let directory = root.join("nextty/clipboard");
+    let directory = root.join("clipboard");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
@@ -1658,10 +1654,6 @@ fn encode_action(e: &mut Encoder, action: &Action) {
             e.point(*point);
             e.u8(*side as u8);
         }
-        Action::SelectionClear { pane } => {
-            e.u8(15);
-            e.u64(*pane);
-        }
         Action::CopySelection { pane, request } => {
             e.u8(16);
             e.u64(*pane);
@@ -1818,7 +1810,6 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
                 0 => SelectionType::Simple,
                 1 => SelectionType::Semantic,
                 2 => SelectionType::Lines,
-                3 => SelectionType::Object,
                 _ => return Err(invalid("invalid selection kind")),
             },
         },
@@ -1827,7 +1818,6 @@ fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
             point: d.point()?,
             side: decode_side(d)?,
         },
-        15 => Action::SelectionClear { pane: d.u64()? },
         16 => Action::CopySelection {
             pane: d.u64()?,
             request: d.u64()?,
@@ -3473,7 +3463,7 @@ mod tests {
                 deliver_screen(&core, &mut screen, false),
                 "missing palette after {sequence:?}"
             );
-            for index in 0..269 {
+            for index in 0..PALETTE_SIZE {
                 let color = if index < 256 {
                     Color::Indexed(index as u8)
                 } else {

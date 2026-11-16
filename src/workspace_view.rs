@@ -288,10 +288,32 @@ struct SelectionDrag {
     kind: SelectionType,
 }
 
+#[derive(Default)]
+struct PaneCache {
+    lines: LineCache,
+    ime_cursor: Option<Point>,
+}
+
+impl PaneCache {
+    fn ime_position(&mut self, screen: &crate::screen::Screen) -> (usize, usize) {
+        let (cursor, shape) = screen.cursor();
+        // Hidden cursors can visit drawing cells; retain this pane's insertion point.
+        if shape != crate::vt::CursorShape::Hidden {
+            self.ime_cursor = Some(cursor);
+        }
+        let cursor = self.ime_cursor.unwrap_or(cursor);
+        (
+            cursor.column.min(screen.columns() - 1),
+            (cursor.line + screen.display_offset() as i32)
+                .clamp(0, screen.screen_lines() as i32 - 1) as usize,
+        )
+    }
+}
+
 pub struct WorkspaceView {
     client: Client,
     ui: Ui,
-    caches: HashMap<PaneId, LineCache>,
+    caches: HashMap<PaneId, PaneCache>,
     text: TextCache,
     renderer: Renderer,
     window: Window,
@@ -1587,19 +1609,7 @@ impl WorkspaceView {
                 && let Some((id, object)) = &self.hovered
                 && *id == pane
             {
-                let mut command = std::process::Command::new("xdg-open");
-                command.arg(&object.text);
-                if !self.client.is_remote()
-                    && let Some(cwd) = self
-                        .client
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.pane(pane))
-                        .and_then(|pane| pane.cwd.as_ref())
-                {
-                    command.current_dir(cwd);
-                }
-                let mut child = command.spawn()?;
-                std::thread::spawn(move || child.wait());
+                crate::ui::open_object(&self.client, pane, &object.text)?;
                 return Ok(());
             }
             let kind = match count {
@@ -1872,7 +1882,7 @@ impl WorkspaceView {
                 let active = pane.id == snapshot.focused && self.focused && snapshot.controller;
                 let cache = self.caches.entry(pane.id).or_default();
                 if let Some(screen) = screens.get_mut(&pane.id) {
-                    let (cursor, cursor_shape) = screen.cursor();
+                    let (ime_column, ime_row) = cache.ime_position(screen);
                     let offset = screen.display_offset();
                     if !screen.mode().contains(Mode::ALT_SCREEN)
                         && let Some(bar) = Scrollbar::new(
@@ -1896,7 +1906,7 @@ impl WorkspaceView {
                     }
                     let frame = Frame::new(
                         screen,
-                        cache,
+                        &cache.lines,
                         active,
                         pane.id == snapshot.focused
                             && (!terminal_input || !self.preedit.is_empty()),
@@ -1927,7 +1937,14 @@ impl WorkspaceView {
                             }
                         }
                     }
-                    frame.paint(self.cell, active, cache, &self.renderer, origin, (w, h))?;
+                    frame.paint(
+                        self.cell,
+                        active,
+                        &mut cache.lines,
+                        &self.renderer,
+                        origin,
+                        (w, h),
+                    )?;
                     if let Some((id, object)) = &self.hovered
                         && *id == pane.id
                     {
@@ -1954,11 +1971,8 @@ impl WorkspaceView {
                         }
                     }
                     if pane.id == snapshot.focused && terminal_input {
-                        let row = (cursor.line + offset as i32)
-                            .clamp(0, i32::from(pane.rect.rows) - 1)
-                            as usize;
-                        let x = origin.0 + cursor.column as f32 * self.cell.0;
-                        let y = origin.1 + row as f32 * self.cell.1;
+                        let x = origin.0 + ime_column as f32 * self.cell.0;
+                        let y = origin.1 + ime_row as f32 * self.cell.1;
                         if !self.preedit.is_empty() {
                             let count = text_width(&self.preedit) as f32;
                             self.renderer.rect(
@@ -1986,15 +2000,12 @@ impl WorkspaceView {
                             );
                         }
                         // Anchor to the insertion point while the IME replaces its preedit text.
-                        // Hidden TUI cursors visit drawing cells, not input positions.
-                        if cursor_shape != crate::vt::CursorShape::Hidden {
-                            self.window.cursor_rect(
-                                x as i32,
-                                y as i32,
-                                self.cell.0 as i32,
-                                self.cell.1 as i32,
-                            );
-                        }
+                        self.window.cursor_rect(
+                            x as i32,
+                            y as i32,
+                            self.cell.0 as i32,
+                            self.cell.1 as i32,
+                        );
                     }
                 }
                 self.renderer.clip(0., 0., 0., 0.)?;
@@ -2168,6 +2179,42 @@ impl WorkspaceView {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+
+    #[test]
+    fn ime_anchor_stays_with_each_pane_when_tui_cursors_are_hidden() {
+        use crate::{core::Core, screen::Screen, screen::Update, vt::Parser};
+
+        let mut core = Core::new(
+            WindowSize {
+                num_cols: 40,
+                num_lines: 12,
+                cell_width: 8,
+                cell_height: 16,
+            },
+            0xcccccc,
+            0x202020,
+        );
+        let mut parser = Parser::new();
+        let mut screen = Screen::default();
+        let mut left = PaneCache::default();
+        let mut right = PaneCache::default();
+        parser.advance(&mut core, b"\x1b[3;5H");
+        screen.apply(Update::capture(&core, true)).unwrap();
+        assert_eq!(left.ime_position(&screen), (4, 2));
+        parser.advance(&mut core, b"\x1b[9;7H");
+        screen.apply(Update::capture(&core, true)).unwrap();
+        assert_eq!(right.ime_position(&screen), (6, 8));
+
+        parser.advance(&mut core, b"\x1b[?25l\x1b[12;40H");
+        screen.apply(Update::capture(&core, true)).unwrap();
+        assert_eq!(left.ime_position(&screen), (4, 2));
+        assert_eq!(right.ime_position(&screen), (6, 8));
+
+        parser.advance(&mut core, b"\x1b[?25h\x1b[10;8H");
+        screen.apply(Update::capture(&core, true)).unwrap();
+        assert_eq!(right.ime_position(&screen), (7, 9));
+        assert_eq!(left.ime_cursor, Some(Point { line: 2, column: 4 }));
+    }
 
     #[test]
     #[ignore = "requires a Wayland session"]

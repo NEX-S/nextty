@@ -1,11 +1,11 @@
 //! A workspace owns its PTYs independently of any particular frontend.
-pub use crate::agent_files::{AgentChange, FileMatch, FileOperation, FileResult};
+pub use crate::agent_files::{AgentChange, FileOperation, FileResult};
 pub use crate::core::{BlockMarker, CommandBlock};
 use crate::core::{Core, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryConfig, HistoryCopy};
 pub use crate::history::{HistoryCursor, HistoryPage};
 use crate::screen::{Screen, Update};
-use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
+use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal, poisoned};
 use crate::wire::{Peer, Response};
 use std::borrow::Cow;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -235,9 +235,6 @@ pub enum Action {
         point: Point,
         side: Side,
     },
-    SelectionClear {
-        pane: PaneId,
-    },
     CopySelection {
         pane: PaneId,
         request: u64,
@@ -399,9 +396,11 @@ impl Snapshot {
     }
 }
 
-pub type TabLayout = Vec<(usize, u16, u16)>;
+#[cfg(any(feature = "gui", feature = "tui", test))]
+pub(crate) type TabLayout = Vec<(usize, u16, u16)>;
 
-pub fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout {
+#[cfg(any(feature = "gui", feature = "tui", test))]
+pub(crate) fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout {
     let text_width = |text: &str, limit: u16| {
         let prefix = crate::width::printable_ascii_prefix(
             &text.as_bytes()[..text.len().min(usize::from(limit))],
@@ -459,7 +458,8 @@ pub fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLa
     }
     layout
 }
-pub fn tab_chrome<'a>(
+#[cfg(any(feature = "gui", feature = "tui", test))]
+pub(crate) fn tab_chrome<'a>(
     snapshot: &crate::workspace::Snapshot,
     columns: u16,
     base: &'a str,
@@ -663,7 +663,7 @@ impl Client {
     pub fn remote_target(&self) -> Option<&str> {
         self.ssh.as_ref().map(|(_, target)| target.as_str())
     }
-    pub fn fd(&self) -> RawFd {
+    pub(crate) fn fd(&self) -> RawFd {
         self.peer.fd()
     }
     pub fn send(&mut self, action: Action) -> io::Result<()> {
@@ -801,7 +801,17 @@ impl Client {
         for response in responses {
             let event = match response {
                 Response::State(snapshot, updates, request) => {
-                    self.screens.retain(|id, _| snapshot.pane(*id).is_some());
+                    let same_panes = self.snapshot.as_ref().is_some_and(|previous| {
+                        previous.name == snapshot.name
+                            && previous
+                                .panes
+                                .iter()
+                                .map(|pane| pane.id)
+                                .eq(snapshot.panes.iter().map(|pane| pane.id))
+                    });
+                    if !same_panes {
+                        self.screens.retain(|id, _| snapshot.pane(*id).is_some());
+                    }
                     for (id, update) in updates {
                         let screen = self.screens.entry(id).or_default();
                         if self.agent_delegate && screen.changes_activity(&update) {
@@ -1600,7 +1610,7 @@ impl Connection {
                 .core
                 .lock()
                 .map(|core| core.resize_pending())
-                .map_err(|error| io::Error::other(error.to_string())),
+                .map_err(poisoned),
             (_, None) => Ok(false),
         }
     }
@@ -1633,12 +1643,9 @@ impl Connection {
 
 /// Run in the hidden server process. No GUI or font libraries are needed here.
 pub fn run_server(socket: &Path) -> io::Result<()> {
-    let history_directory = std::env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|path| PathBuf::from(path).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from(".cache"))
-        .join("nextty/history");
+    let history_directory = crate::config::cache_directory()
+        .unwrap_or_else(|| PathBuf::from(".cache/nextty"))
+        .join("history");
     let parent = socket
         .parent()
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "socket has no directory"))?;
@@ -2263,11 +2270,7 @@ fn broadcast(
                 activity = TabActivity::Running;
                 return Ok(());
             }
-            let mut core = pane
-                .terminal
-                .core
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            let mut core = pane.terminal.core.lock().map_err(poisoned)?;
             if activity != TabActivity::Running {
                 let process = process.as_ref().unwrap();
                 let latest = core.latest_command_status();
@@ -2640,10 +2643,7 @@ fn apply_action(
     if let Action::Input { pane, data } = action {
         let terminal = &pane_ref(pane)?.terminal;
         let focus_report = data == b"\x1b[I" || data == b"\x1b[O";
-        let mut core = terminal
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut core = terminal.core.lock().map_err(poisoned)?;
         terminal.try_write(data)?;
         if !focus_report {
             let changed = core.selection_range().is_some() || core.display_offset() != 0;
@@ -2796,7 +2796,7 @@ fn apply_action(
                     .terminal
                     .core
                     .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?
+                    .map_err(poisoned)?
                     .mode()
                     .contains(Mode::FOCUS_IN_OUT)
             {
@@ -2815,10 +2815,7 @@ fn agent_input(
     prompt: Option<u64>,
     data: Vec<u8>,
 ) -> io::Result<Option<u64>> {
-    let mut core = terminal
-        .core
-        .lock()
-        .map_err(|error| io::Error::other(error.to_string()))?;
+    let mut core = terminal.core.lock().map_err(poisoned)?;
     if core.input_generation() != generation {
         return Err(io::Error::new(
             io::ErrorKind::WouldBlock,
@@ -2865,7 +2862,7 @@ fn apply_pane_action(
                 .terminal
                 .core
                 .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
+                .map_err(poisoned)?
                 .scroll_display(scroll)
             {
                 return Ok(false);
@@ -2878,11 +2875,7 @@ fn apply_pane_action(
             kind,
         } => {
             {
-                let mut core = pane_ref(pane)?
-                    .terminal
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut core = pane_ref(pane)?.terminal.core.lock().map_err(poisoned)?;
                 validate_point(&core, point)?;
                 core.selection_start(point, side, kind);
             }
@@ -2892,30 +2885,15 @@ fn apply_pane_action(
                         .terminal
                         .core
                         .lock()
-                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .map_err(poisoned)?
                         .clear_selection();
                 }
             }
         }
         Action::SelectionUpdate { pane, point, side } => {
-            let mut core = pane_ref(pane)?
-                .terminal
-                .core
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?;
+            let mut core = pane_ref(pane)?.terminal.core.lock().map_err(poisoned)?;
             validate_point(&core, point)?;
             if !core.selection_update(point, side) {
-                return Ok(false);
-            }
-        }
-        Action::SelectionClear { pane } => {
-            if !pane_ref(pane)?
-                .terminal
-                .core
-                .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
-                .clear_selection()
-            {
                 return Ok(false);
             }
         }
@@ -2924,7 +2902,7 @@ fn apply_pane_action(
                 .terminal
                 .core
                 .lock()
-                .map_err(|error| io::Error::other(error.to_string()))?
+                .map_err(poisoned)?
                 .prompt_jump(previous)
             {
                 return Ok(false);
@@ -3359,7 +3337,7 @@ fn queue_copy(
         let result = terminal
             .core
             .lock()
-            .map_err(|error| io::Error::other(error.to_string()))
+            .map_err(poisoned)
             .and_then(|mut core| match copy.block {
                 None => core.copy_selection(),
                 Some(block) => core.copy_block(block),
@@ -3386,7 +3364,7 @@ fn queue_read(client: &mut Connection, name: Cow<'_, str>, terminal: &Terminal, 
     let result = terminal
         .core
         .lock()
-        .map_err(|error| io::Error::other(error.to_string()))
+        .map_err(poisoned)
         .and_then(|mut core| core.read_history(read.block, read.cursor, read.query.as_deref()));
     match result {
         Ok((receiver, cancelled)) => client.reads.push(PendingRead {

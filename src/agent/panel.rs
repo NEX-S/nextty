@@ -579,20 +579,7 @@ impl AgentPainter<'_> {
             .enumerate()
         {
             let y = chat_top + row as u16;
-            let indent = match line {
-                AgentLine::Role(_) => Some(3),
-                AgentLine::Text { message, .. } => {
-                    let message = &self.ui.agent.active().model.messages[*message as usize];
-                    Some(if message.role == "You" {
-                        1
-                    } else if message.id.is_some() {
-                        2
-                    } else {
-                        0
-                    })
-                }
-                AgentLine::Blank | AgentLine::Edit(_) => None,
-            };
+            let indent = line.indent(&self.ui.agent.active().model.messages);
             if let Some(indent) = indent {
                 self.frame.chat_rows.push((
                     first + row,
@@ -687,13 +674,7 @@ impl AgentPainter<'_> {
                         } else {
                             bg
                         };
-                    let indent = if user {
-                        1
-                    } else if message.id.is_some() {
-                        2
-                    } else {
-                        0
-                    };
+                    let indent = message_indent(message);
                     self.frame.grid.text(
                         editor.x,
                         y,
@@ -1305,6 +1286,26 @@ pub(crate) enum AgentLine {
     Edit(u32),
     Text { message: u32, range: Range<u32> },
     Blank,
+}
+
+pub(crate) fn message_indent(message: &AgentMessage) -> u16 {
+    if message.role == "You" {
+        1
+    } else if message.id.is_some() {
+        2
+    } else {
+        0
+    }
+}
+
+impl AgentLine {
+    pub(crate) fn indent(&self, messages: &[AgentMessage]) -> Option<u16> {
+        match self {
+            Self::Role(_) => Some(3),
+            Self::Text { message, .. } => Some(message_indent(&messages[*message as usize])),
+            Self::Blank | Self::Edit(_) => None,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]

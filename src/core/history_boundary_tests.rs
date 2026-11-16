@@ -90,25 +90,6 @@ fn cold_line_and_semantic_selection_expand_across_uncached_wrapped_rows() {
 }
 
 #[test]
-fn cold_object_selection_expands_quotes_outside_the_loaded_page() {
-    let mut core = core();
-    let mut parser = Parser::new();
-    let object = format!("\"{} file.rs\"", "中\u{301}a".repeat(100));
-    parser.advance(
-        &mut core,
-        format!("prefix\r\n{object} stop\r\nend").as_bytes(),
-    );
-    settle(&mut core);
-    core.scroll_display(Scroll::Top);
-    settle(&mut core);
-    let line = -(core.history_size() as i32) + 3;
-    core.selection_start(Point { line, column: 3 }, Side::Left, SelectionType::Object);
-    assert_eq!(
-        copy(core.copy_selection().unwrap().recv().unwrap().unwrap()),
-        object
-    );
-}
-#[test]
 fn semantic_selection_at_the_bottom_of_a_loaded_cold_page_stops_at_the_cache_boundary() {
     let mut core = core();
     let mut parser = Parser::new();

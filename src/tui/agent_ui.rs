@@ -201,20 +201,7 @@ impl Frontend {
                 .rev()
                 .find_map(|line| session.point(line, usize::MAX));
         }
-        let indent = match session.lines.get(line)? {
-            AgentLine::Role(_) => 3,
-            AgentLine::Text { message, .. } => {
-                let message = session.model.messages.get(*message as usize)?;
-                if message.role == "You" {
-                    1
-                } else if message.id.is_some() {
-                    2
-                } else {
-                    0
-                }
-            }
-            AgentLine::Blank | AgentLine::Edit(_) => return None,
-        };
+        let indent = session.lines.get(line)?.indent(&session.model.messages)?;
         session.point(
             line,
             usize::from(mouse.column.saturating_sub(self.agent.chat.x + indent)),

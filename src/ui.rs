@@ -19,6 +19,22 @@ pub(crate) fn tab_color(tab: &crate::workspace::TabView) -> u32 {
     }
 }
 
+pub(crate) fn open_object(client: &Client, pane: PaneId, text: &str) -> io::Result<()> {
+    let mut command = std::process::Command::new("xdg-open");
+    command.arg(text);
+    if !client.is_remote()
+        && let Some(cwd) = client
+            .snapshot()
+            .and_then(|snapshot| snapshot.pane(pane))
+            .and_then(|pane| pane.cwd.as_ref())
+    {
+        command.current_dir(cwd);
+    }
+    let mut child = command.spawn()?;
+    std::thread::spawn(move || child.wait());
+    Ok(())
+}
+
 pub(crate) fn workspace_action(key: char, pane: PaneId) -> Option<Action> {
     Some(match key {
         's' => Action::Split {

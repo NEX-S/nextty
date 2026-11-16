@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread::JoinHandle;
 
-use crate::core::{Cell, Extra, Flags, Row, SelectionType, object_selection};
+use crate::core::{Cell, Extra, Flags, Row, SelectionType};
 use crate::eventfd::{consume_notification, notify};
 use crate::vt::{Color, NamedColor, Rgb};
 
@@ -1342,36 +1342,18 @@ impl Archive {
             }
             Ok(rows.back().cloned().map(Cow::Owned))
         };
-        if kind == SelectionType::Object {
-            if let Some([first, _]) = object_selection((start.0 as i64, start.1), &mut source_row)?
-            {
-                *start = (first.0 as u64, first.1);
-            }
-            if let Some([_, last]) =
-                object_selection((end.0 as i64, end.1.saturating_sub(1)), &mut source_row)?
-            {
-                let row = source_row(last.0)?.unwrap();
-                *end = (last.0 as u64, last.1 + row.cells[last.1].width());
-            }
-        } else {
-            let mut first_point = (start.0 as i64, start.1);
-            let mut last_point = (end.0 as i64, end.1.saturating_sub(1));
-            crate::core::expand_selection(
-                kind,
-                &mut first_point,
-                &mut last_point,
-                &mut source_row,
-            )?;
-            *start = (first_point.0 as u64, first_point.1);
-            let row = source_row(last_point.0)?;
-            *end = (
-                last_point.0 as u64,
-                last_point.1
-                    + row
-                        .as_ref()
-                        .map_or(1, |row| row.cells[last_point.1].width()),
-            );
-        }
+        let mut first_point = (start.0 as i64, start.1);
+        let mut last_point = (end.0 as i64, end.1.saturating_sub(1));
+        crate::core::expand_selection(kind, &mut first_point, &mut last_point, &mut source_row)?;
+        *start = (first_point.0 as u64, first_point.1);
+        let row = source_row(last_point.0)?;
+        *end = (
+            last_point.0 as u64,
+            last_point.1
+                + row
+                    .as_ref()
+                    .map_or(1, |row| row.cells[last_point.1].width()),
+        );
         Ok(())
     }
     fn reflow(&mut self, request: Reflow) -> io::Result<Reply> {
@@ -2922,11 +2904,7 @@ os.write(1, b'x\r\n' * 1200 + b'LAST')
             .collect::<Vec<_>>();
         let mut archive = Archive::new(budget());
         archive.append(0, &rows[..300]).unwrap();
-        for kind in [
-            SelectionType::Lines,
-            SelectionType::Semantic,
-            SelectionType::Object,
-        ] {
+        for kind in [SelectionType::Lines, SelectionType::Semantic] {
             let mut copy = archive
                 .copy((165, 5), (165, 6), 300, &rows[300..], Some(kind), false)
                 .unwrap();

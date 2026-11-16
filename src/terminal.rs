@@ -19,6 +19,10 @@ use crate::core::{Core, Event as CoreEvent, WindowSize};
 
 pub(crate) const INPUT_CAPACITY: usize = 256 * 1024;
 
+pub(crate) fn poisoned<T>(error: std::sync::PoisonError<T>) -> io::Error {
+    io::Error::other(error.to_string())
+}
+
 #[derive(Debug)]
 pub enum Event {
     Title(Option<String>),
@@ -315,12 +319,7 @@ impl Terminal {
     }
 
     pub fn current_directory(&self) -> io::Result<PathBuf> {
-        if let Some(directory) = self
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .current_directory()
-        {
+        if let Some(directory) = self.core.lock().map_err(poisoned)?.current_directory() {
             return Ok(directory.to_path_buf());
         }
         std::fs::read_link(format!("/proc/{}/cwd", self.child_pid))
@@ -363,10 +362,7 @@ impl Terminal {
     /// Writes now when no earlier input is queued; the IO thread writes what
     /// the PTY does not accept yet.
     fn queue(&self, data: Cow<'static, [u8]>) -> io::Result<()> {
-        let mut input = self
-            .input
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut input = self.input.lock().map_err(poisoned)?;
         input.written = true;
         let idle = input.pending.is_empty();
         input.pending.push_back(data);
@@ -385,17 +381,9 @@ impl Terminal {
 
     pub fn resize(&self, size: WindowSize) -> io::Result<()> {
         let pty_size = winsize(size)?;
-        let mut core = self
-            .core
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let mut core = self.core.lock().map_err(poisoned)?;
         // Under the input lock, so input written after a resize sees the new size.
-        if let Some(master) = &self
-            .input
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?
-            .master
-        {
+        if let Some(master) = &self.input.lock().map_err(poisoned)?.master {
             set_size(master.as_raw_fd(), pty_size)?;
         }
         core.resize(size);
@@ -605,10 +593,7 @@ impl PtyLoop {
                 return Ok(());
             }
             let consumed = {
-                let mut input = self
-                    .input
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut input = self.input.lock().map_err(poisoned)?;
                 if std::mem::take(&mut input.written) {
                     process_deadline.get_or_insert_with(|| process_refresh_time(process_sampled));
                 }
@@ -623,10 +608,7 @@ impl PtyLoop {
             release_input(&self.input_bytes, consumed, &self.proxy.wakeup);
 
             let (history_fd, history_ready, changed, events) = {
-                let mut core = self
-                    .core
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?;
+                let mut core = self.core.lock().map_err(poisoned)?;
                 let mut changed = core.poll_history(history_notified)?;
                 history_notified = false;
                 if read_count != 0 || (core.history_read_ready() && parser.has_queued()) {
@@ -749,19 +731,13 @@ impl PtyLoop {
                     }
                 }
                 read_open = false;
-                self.input
-                    .lock()
-                    .map_err(|error| io::Error::other(error.to_string()))?
-                    .open = false;
+                self.input.lock().map_err(poisoned)?.open = false;
             }
         }
     }
 
     fn writing(&self) -> io::Result<bool> {
-        let input = self
-            .input
-            .lock()
-            .map_err(|error| io::Error::other(error.to_string()))?;
+        let input = self.input.lock().map_err(poisoned)?;
         Ok(input.open && !input.pending.is_empty())
     }
 
@@ -772,7 +748,7 @@ impl PtyLoop {
                     self.input_bytes.fetch_add(data.len(), Ordering::AcqRel);
                     self.input
                         .lock()
-                        .map_err(|error| io::Error::other(error.to_string()))?
+                        .map_err(poisoned)?
                         .pending
                         .push_back(data.into());
                 }

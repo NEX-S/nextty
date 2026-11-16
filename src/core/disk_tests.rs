@@ -304,11 +304,7 @@ fn alternate_expanded_copy_does_not_read_normal_history() {
     );
     assert!(core.history_size() > 8);
     feed(&mut core, &mut parser, b"\x1b[?1049h\x1b[3;1HALT_ONLY");
-    for kind in [
-        SelectionType::Semantic,
-        SelectionType::Lines,
-        SelectionType::Object,
-    ] {
+    for kind in [SelectionType::Semantic, SelectionType::Lines] {
         let point = Point { line: 2, column: 3 };
         core.selection_start(point, Side::Left, kind);
         core.selection_update(point, Side::Right);

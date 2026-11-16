@@ -2112,8 +2112,6 @@ fn unchanged_pointer_and_view_actions_do_not_schedule_broadcasts() {
             },
             false,
         ),
-        (Action::SelectionClear { pane }, true),
-        (Action::SelectionClear { pane }, false),
         (
             Action::Scroll {
                 pane,

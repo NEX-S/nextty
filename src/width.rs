@@ -2,6 +2,7 @@
 
 #[path = "width_tables.rs"]
 mod tables;
+#[cfg(any(feature = "gui", feature = "tui", test))]
 use std::borrow::Cow;
 use tables::*;
 
@@ -17,6 +18,7 @@ pub fn scalar_width(ch: char) -> u8 {
     (packed >> ((cp & 3) * 2)) & 3
 }
 
+#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn text_width(text: &str) -> usize {
     let prefix = printable_ascii_prefix(text.as_bytes());
     prefix
@@ -26,6 +28,7 @@ pub fn text_width(text: &str) -> usize {
             .sum::<usize>()
 }
 
+#[cfg(any(feature = "gui", feature = "tui", test))]
 pub(crate) fn printable_ascii_prefix(bytes: &[u8]) -> usize {
     // Whole blocks can vectorize; keep early exit for the remaining bytes.
     let prefix = bytes
@@ -45,6 +48,7 @@ pub(crate) fn printable_ascii_prefix(bytes: &[u8]) -> usize {
 }
 
 /// One clipping policy keeps the GUI and TUI header labels on the same columns.
+#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn fit_label(text: &str, columns: u16) -> Cow<'_, str> {
     let columns = usize::from(columns);
     // With widths capped at two columns, UTF-8 byte length is an upper bound.
@@ -92,6 +96,7 @@ pub fn fit_label(text: &str, columns: u16) -> Cow<'_, str> {
     Cow::Owned(label)
 }
 
+#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn fit_middle(text: &str, columns: u16) -> Cow<'_, str> {
     let prefix = printable_ascii_prefix(text.as_bytes());
     let clean = if text[prefix..].chars().any(char::is_control) {

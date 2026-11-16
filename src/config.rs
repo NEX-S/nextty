@@ -41,6 +41,14 @@ impl Default for Config {
     }
 }
 
+pub(crate) fn cache_directory() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .map(|root| root.join("nextty"))
+}
+
 impl Config {
     pub fn load(path: Option<PathBuf>) -> Result<Self> {
         let explicit = path.is_some();

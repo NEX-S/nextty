@@ -19,17 +19,14 @@ impl Integration {
             Some("bash") => false,
             _ => return Ok(None),
         };
-        let root = std::env::var_os("XDG_CACHE_HOME")
-            .filter(|path| !path.is_empty())
-            .map(PathBuf::from)
-            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        let root = crate::config::cache_directory()
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
                     "HOME is not set for shell integration",
                 )
             })?
-            .join("nextty/shell");
+            .join("shell");
         fs::create_dir_all(&root)?;
         let directory = root.join(format!(
             "{}-{}",
