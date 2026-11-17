@@ -1466,26 +1466,25 @@ impl WorkspaceView {
             }
         }
         if button == 3
-            && (modifiers & native::ALT != 0
-                || self
-                    .hit(None)
-                    .is_some_and(|(pane, _, _)| !self.mode(pane).intersects(Mode::MOUSE_MODE)))
+            && let Some((pane, point, _)) = self.hit(None)
         {
-            if let Some((pane, point, _)) = self.hit(None) {
-                if let Some(object) = self
-                    .client
-                    .screens()
-                    .get(&pane)
-                    .and_then(|screen| context::object_at(screen, point))
-                {
-                    self.window.selection(false, &object.text);
-                } else if let Some((_, block)) = self.block_at(pane, point) {
-                    self.copy_block(pane, Some(block))?;
-                } else {
-                    self.paste(pane, false);
-                }
+            if let Some(object) = self
+                .client
+                .screens()
+                .get(&pane)
+                .and_then(|screen| context::object_at(screen, point))
+            {
+                self.window.selection(false, &object.text);
+                return Ok(());
             }
-            return Ok(());
+            if let Some((_, block)) = self.block_at(pane, point) {
+                self.copy_block(pane, Some(block))?;
+                return Ok(());
+            }
+            if modifiers & native::ALT != 0 || !self.mode(pane).intersects(Mode::MOUSE_MODE) {
+                self.paste(pane, false);
+                return Ok(());
+            }
         }
         self.terminal_button(button, modifiers)
     }
