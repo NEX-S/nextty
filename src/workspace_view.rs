@@ -1475,6 +1475,7 @@ impl WorkspaceView {
                 .and_then(|screen| context::object_at(screen, point))
             {
                 self.window.selection(false, &object.text);
+                self.message("Copied");
                 return Ok(());
             }
             if let Some((_, block)) = self.block_at(pane, point) {

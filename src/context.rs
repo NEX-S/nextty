@@ -32,7 +32,7 @@ pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
     let wide_end = screen.rows[(end.0 + offset) as usize].cells[end.1]
         .flags
         .contains(Flags::WIDE_CHAR);
-    let range = SelectionRange {
+    let mut range = SelectionRange {
         start: Point {
             line: start.0 as i32,
             column: start.1,
@@ -42,145 +42,66 @@ pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
             column: end.1 + usize::from(wide_end),
         },
     };
-    let text = snapshot(screen, Some(range)).text;
-    let enclosed_symbol = range.start.line == point.line
-        && range.end.line == point.line
-        && range
-            .start
-            .column
-            .checked_sub(1)
-            .is_some_and(|column| row.cells[column].c == '<')
-        && row
-            .cells
-            .get(range.end.column + 1)
-            .is_some_and(|cell| cell.c == '>');
-    let kind = classify(&text, row, enclosed_symbol)?;
+    let mut text = snapshot(screen, Some(range)).text;
+    // A quoted link/path/IP highlights and copies the inner value, not the quotes.
+    if let Some(inner) = unquote(&text)
+        && classify(inner).is_some()
+    {
+        range.start.column += 1;
+        range.end.column -= 1;
+        text = inner.to_string();
+    }
+    let kind = classify(&text)?;
     Some(Object { range, text, kind })
 }
 
-fn classify(text: &str, row: &crate::core::Row, enclosed_symbol: bool) -> Option<&'static str> {
+fn unquote(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    (bytes.len() >= 2
+        && matches!(bytes[0], b'\'' | b'"' | b'`')
+        && bytes[0] == bytes[bytes.len() - 1])
+        .then(|| &text[1..text.len() - 1])
+}
+
+fn classify(text: &str) -> Option<&'static str> {
     if ["https://", "http://", "ssh://", "file://"]
         .iter()
         .any(|prefix| text.starts_with(prefix))
     {
         return Some("URL");
     }
-    if text
-        .strip_prefix('$')
-        .unwrap_or(text)
-        .strip_prefix("0x")
-        .is_some_and(|hex| !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit()))
-    {
-        return Some("Address");
+    if is_ip(text) {
+        return Some("IP address");
     }
-    let register = text.strip_prefix(['$', '%']).unwrap_or(text);
-    let mut lowercase = [0; 6];
-    if lowercase
-        .get_mut(..register.len())
-        .is_some_and(|lowercase| {
-            lowercase.copy_from_slice(register.as_bytes());
-            lowercase.make_ascii_lowercase();
-            matches!(
-                &*lowercase,
-                [b'r' | b'e', b'a'..=b'd', b'x']
-                    | [b'r' | b'e', b's', b'i' | b'p']
-                    | [b'r' | b'e', b'd', b'i']
-                    | [b'r' | b'e', b'b' | b'i', b'p']
-                    | [b'a'..=b'd', b'x' | b'l' | b'h']
-                    | [b'c'..=b'g' | b's', b's']
-                    | b"eflags"
-                    | b"rflags"
-            )
+    if is_path(text) {
+        return Some("Path");
+    }
+    None
+}
+
+fn is_ip(text: &str) -> bool {
+    let (host, port) = match text.split_once(':') {
+        Some((host, port)) => (host, Some(port)),
+        None => (text, None),
+    };
+    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|c| c.is_ascii_digit())) {
+        return false;
+    }
+    let octets: Vec<&str> = host.split('.').collect();
+    octets.len() == 4
+        && octets.iter().all(|octet| {
+            !octet.is_empty()
+                && octet.len() <= 3
+                && octet.bytes().all(|c| c.is_ascii_digit())
+                && octet.parse::<u16>().is_ok_and(|n| n <= 255)
         })
-        || register.strip_prefix(['r', 'R']).is_some_and(|index| {
-            let index = index
-                .strip_suffix(['d', 'D', 'w', 'W', 'b', 'B'])
-                .unwrap_or(index);
-            matches!(index, "8" | "9" | "10" | "11" | "12" | "13" | "14" | "15")
-        })
-    {
-        return Some("Register");
-    }
-    if text.starts_with(['\'', '"', '`'])
-        && text.len() > 1
-        && text.as_bytes().first() == text.as_bytes().last()
-    {
-        let inner = &text[1..text.len() - 1];
-        let cjk = inner.chars().any(|ch| {
-            matches!(
-                ch,
-                '\u{3400}'..='\u{9fff}'
-                    | '\u{f900}'..='\u{faff}'
-                    | '\u{20000}'..='\u{2ffff}'
-            )
-        });
-        let path = inner.contains('/')
-            || inner.rsplit_once('.').is_some_and(|(name, extension)| {
-                !name.is_empty()
-                    && !name.chars().any(char::is_whitespace)
-                    && !extension.is_empty()
-                    && extension.bytes().all(|c| c.is_ascii_alphanumeric())
-            });
-        return (!cjk || path).then_some("Quoted text");
-    }
-    if text.len() > 1 && text.contains('/') && !matches!(text, "/*" | "*/")
+}
+
+fn is_path(text: &str) -> bool {
+    text.len() > 1 && text.contains('/') && !matches!(text, "/*" | "*/")
         || text.rsplit_once(':').is_some_and(|(path, line)| {
             path.contains('.') && !line.is_empty() && line.bytes().all(|c| c.is_ascii_digit())
         })
-    {
-        return Some("Path");
-    }
-    if text.contains("@plt")
-        || text.contains("::")
-        || text.ends_with("()")
-        || text.rsplit_once('+').is_some_and(|(name, offset)| {
-            !name.is_empty()
-                && !offset.is_empty()
-                && (offset.bytes().all(|c| c.is_ascii_digit())
-                    || offset.strip_prefix("0x").is_some_and(|hex| {
-                        !hex.is_empty() && hex.bytes().all(|c| c.is_ascii_hexdigit())
-                    }))
-        })
-    {
-        return Some("Symbol");
-    }
-    let instruction = matches!(
-        text,
-        "mov"
-            | "movq"
-            | "movzbl"
-            | "movzx"
-            | "lea"
-            | "call"
-            | "ret"
-            | "jmp"
-            | "push"
-            | "pop"
-            | "xor"
-            | "cmp"
-            | "test"
-            | "add"
-            | "sub"
-            | "leave"
-            | "nop"
-            | "je"
-            | "jne"
-            | "jz"
-            | "jnz"
-            | "ja"
-            | "jb"
-            | "jg"
-            | "jl"
-            | "syscall"
-    );
-    if (instruction || enclosed_symbol)
-        && row.cells[..row.used()]
-            .windows(2)
-            .any(|pair| pair[0].c == '0' && pair[1].c == 'x')
-    {
-        return Some(if instruction { "Instruction" } else { "Symbol" });
-    }
-    None
 }
 
 pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapshot {
@@ -279,26 +200,43 @@ mod tests {
     }
 
     #[test]
-    fn pwndbg_objects_use_visible_alternate_screen_and_literal_ranges() {
-        let (_, screen) = screen(
-            80,
-            6,
-            "\x1b[?1049hRAX  0x7fffffffdc40  '中\u{301}文/payload'\r\n0x5555555551aa <main+42> call puts@plt\r\nat /home/nex/vuln.c:18:7\r\nhttps://example.test/a_(b)",
-        );
-        for (line, column, kind, expected) in [
-            (0, 1, "Register", "RAX"),
-            (0, 10, "Address", "0x7fffffffdc40"),
-            (0, 22, "Quoted text", "'中\u{301}文/payload'"),
-            (1, 17, "Symbol", "main+42"),
-            (1, 28, "Instruction", "call"),
-            (2, 10, "Path", "/home/nex/vuln.c:18:7"),
-            (3, 10, "URL", "https://example.test/a_(b)"),
+    fn hover_highlights_only_links_paths_and_ip() {
+        for (text, kind) in [
+            ("https://example.test/a_(b)", "URL"),
+            ("http://host/path", "URL"),
+            ("ssh://user@host", "URL"),
+            ("file:///tmp/x", "URL"),
+            ("src/main.rs", "Path"),
+            ("/home/nex/vuln.c:18:7", "Path"),
+            ("192.168.1.1", "IP address"),
+            ("10.0.0.1:8080", "IP address"),
+            ("255.255.255.255", "IP address"),
         ] {
-            let object = object_at(&screen, Point { line, column }).unwrap();
-            assert_eq!((object.kind, object.text.as_str()), (kind, expected));
-            assert_eq!(snapshot(&screen, Some(object.range)).text, expected);
+            let (_, screen) = screen(120, 3, text);
+            assert_hover_range(&screen, text, text, kind);
         }
-        assert!(object_at(&screen, Point { line: 2, column: 0 }).is_none());
+        for text in [
+            "RAX",
+            "0x7fffffffdc40",
+            "%rsp",
+            "$0x20",
+            "main+42",
+            "puts@plt",
+            "movq",
+            "call",
+            "这是一段中文",
+            "256.1.1.1",
+            "1.2.3",
+            "hello",
+        ] {
+            let (_, screen) = screen(120, 3, text);
+            for column in 0..screen.rows[0].used() {
+                assert!(
+                    object_at(&screen, Point { line: 0, column }).is_none(),
+                    "{text}, column {column}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -313,18 +251,12 @@ mod tests {
                 "URL",
             ),
             ("see https://host/path。", "https://host/path", "URL"),
-            ("[0x1234]", "0x1234", "Address"),
             ("┌─/tmp/hover.c────────┐", "/tmp/hover.c", "Path"),
             ("docs/tutorial.md（现在只写了", "docs/tutorial.md", "Path"),
             (
                 "docs/captcha-training-survey.md。它说明字符数字验证码",
                 "docs/captcha-training-survey.md",
                 "Path",
-            ),
-            (
-                "\"CODEC {pattern} {} ns/cell\"",
-                "\"CODEC {pattern} {} ns/cell\"",
-                "Quoted text",
             ),
         ] {
             let (_, screen) = screen(80, 3, text);
@@ -339,33 +271,40 @@ mod tests {
     }
 
     #[test]
-    fn gdb_operands_symbols_and_pwndbg_comments_keep_literal_ranges() {
-        for (text, objects) in [
-            (
-                "0x40046e <hover_target> movq $0x20,%rsp",
-                &[
-                    ("hover_target", "Symbol"),
-                    ("movq", "Instruction"),
-                    ("$0x20", "Address"),
-                    ("%rsp", "Register"),
-                ][..],
-            ),
-            (
-                "0x40046e mov -0x18(%rbp),%rax",
-                &[("%rbp", "Register"), ("%rax", "Register")][..],
-            ),
-            ("0x400492 movzbl %al,%eax", &[("movzbl", "Instruction")][..]),
-            ("0x400492 movzx eax,al", &[("movzx", "Instruction")][..]),
-            ("https://host/%rax", &[("https://host/%rax", "URL")][..]),
-        ] {
-            let (_, screen) = screen(80, 3, text);
-            for &(expected, kind) in objects {
-                assert_hover_range(&screen, text, expected, kind);
+    fn quoted_objects_unwrap_and_prose_is_not_hoverable() {
+        let (_, s) = screen(80, 3, "'src/中文/main.rs'");
+        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
+        assert_eq!(
+            (object.text.as_str(), object.kind),
+            ("src/中文/main.rs", "Path")
+        );
+        assert_eq!(
+            (object.range.start.column, object.range.end.column),
+            (1, 16)
+        );
+
+        let (_, s) = screen(80, 3, "\"192.168.1.1\"");
+        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
+        assert_eq!(
+            (object.text.as_str(), object.kind),
+            ("192.168.1.1", "IP address")
+        );
+
+        let (_, s) = screen(80, 3, "\"https://host/path\"");
+        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
+        assert_eq!(
+            (object.text.as_str(), object.kind),
+            ("https://host/path", "URL")
+        );
+
+        for text in ["'这是一段中文'", "\"中文 payload\"", "'中文.rs'"] {
+            let (_, s) = screen(80, 3, text);
+            for column in 0..s.rows[0].used() {
+                assert!(
+                    object_at(&s, Point { line: 0, column }).is_none(),
+                    "{text}, column {column}"
+                );
             }
-        }
-        let (_, screen) = screen(80, 3, "0x41414141 /* 'AAAA' */");
-        for column in [11, 12, 21, 22] {
-            assert!(object_at(&screen, Point { line: 0, column }).is_none());
         }
     }
 
@@ -383,7 +322,8 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(object.text, "'中\u{301}文/payload'");
+        assert_eq!(object.text, "中\u{301}文/payload");
+        assert_eq!(object.kind, "Path");
         assert_eq!(object.range.start.line, -1);
         let selected = snapshot(
             &screen,
@@ -403,38 +343,10 @@ mod tests {
     fn wide_object_spacer_and_hidden_cells_preserve_visible_text() {
         let (_, screen) = screen(20, 3, "'中/a' \x1b[8m中a\x1b[0m end");
         let object = object_at(&screen, Point { line: 0, column: 2 }).unwrap();
-        assert_eq!(object.text, "'中/a'");
+        assert_eq!(object.text, "中/a");
+        assert_eq!(object.kind, "Path");
         assert_eq!(snapshot(&screen, None).text, "'中/a'     end\n\n");
         assert!(object_at(&screen, Point { line: 0, column: 8 }).is_none());
-    }
-
-    #[test]
-    fn quoted_chinese_prose_is_not_hoverable() {
-        for text in ["'这是一段中文'", "\"中文 payload\""] {
-            let (_, screen) = screen(80, 3, text);
-            for column in 0..screen.rows[0].used() {
-                assert!(object_at(&screen, Point { line: 0, column }).is_none());
-            }
-        }
-        let (_, screen) = screen(80, 3, "'中文.rs' 'src/中文/main.rs'");
-        assert_eq!(
-            object_at(&screen, Point { line: 0, column: 2 })
-                .unwrap()
-                .text,
-            "'中文.rs'"
-        );
-        assert_eq!(
-            object_at(
-                &screen,
-                Point {
-                    line: 0,
-                    column: 12
-                }
-            )
-            .unwrap()
-            .text,
-            "'src/中文/main.rs'"
-        );
     }
 
     #[test]
