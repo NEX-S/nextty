@@ -105,7 +105,23 @@ fn classify(text: &str, row: &crate::core::Row, enclosed_symbol: bool) -> Option
         && text.len() > 1
         && text.as_bytes().first() == text.as_bytes().last()
     {
-        return Some("Quoted text");
+        let inner = &text[1..text.len() - 1];
+        let cjk = inner.chars().any(|ch| {
+            matches!(
+                ch,
+                '\u{3400}'..='\u{9fff}'
+                    | '\u{f900}'..='\u{faff}'
+                    | '\u{20000}'..='\u{2ffff}'
+            )
+        });
+        let path = inner.contains('/')
+            || inner.rsplit_once('.').is_some_and(|(name, extension)| {
+                !name.is_empty()
+                    && !name.chars().any(char::is_whitespace)
+                    && !extension.is_empty()
+                    && extension.bytes().all(|c| c.is_ascii_alphanumeric())
+            });
+        return (!cjk || path).then_some("Quoted text");
     }
     if text.len() > 1 && text.contains('/') && !matches!(text, "/*" | "*/")
         || text.rsplit_once(':').is_some_and(|(path, line)| {
@@ -267,12 +283,12 @@ mod tests {
         let (_, screen) = screen(
             80,
             6,
-            "\x1b[?1049hRAX  0x7fffffffdc40  '中\u{301}文 payload'\r\n0x5555555551aa <main+42> call puts@plt\r\nat /home/nex/vuln.c:18:7\r\nhttps://example.test/a_(b)",
+            "\x1b[?1049hRAX  0x7fffffffdc40  '中\u{301}文/payload'\r\n0x5555555551aa <main+42> call puts@plt\r\nat /home/nex/vuln.c:18:7\r\nhttps://example.test/a_(b)",
         );
         for (line, column, kind, expected) in [
             (0, 1, "Register", "RAX"),
             (0, 10, "Address", "0x7fffffffdc40"),
-            (0, 22, "Quoted text", "'中\u{301}文 payload'"),
+            (0, 22, "Quoted text", "'中\u{301}文/payload'"),
             (1, 17, "Symbol", "main+42"),
             (1, 28, "Instruction", "call"),
             (2, 10, "Path", "/home/nex/vuln.c:18:7"),
@@ -355,7 +371,7 @@ mod tests {
 
     #[test]
     fn wrapped_object_and_clipped_selection_keep_display_offset_and_unicode() {
-        let (mut core, _) = screen(10, 3, "first\r\n'中\u{301}文 payload'\r\nlast\r\nend");
+        let (mut core, _) = screen(10, 3, "first\r\n'中\u{301}文/payload'\r\nlast\r\nend");
         core.scroll_display(Scroll::Delta(1));
         let mut screen = Screen::default();
         screen.apply(Update::capture(&core, true)).unwrap();
@@ -367,7 +383,7 @@ mod tests {
             },
         )
         .unwrap();
-        assert_eq!(object.text, "'中\u{301}文 payload'");
+        assert_eq!(object.text, "'中\u{301}文/payload'");
         assert_eq!(object.range.start.line, -1);
         let selected = snapshot(
             &screen,
@@ -380,16 +396,45 @@ mod tests {
             }),
         );
         assert!(selected.incomplete);
-        assert!(selected.text.starts_with("'中\u{301}文 payload'"));
+        assert!(selected.text.starts_with("'中\u{301}文/payload'"));
     }
 
     #[test]
     fn wide_object_spacer_and_hidden_cells_preserve_visible_text() {
-        let (_, screen) = screen(20, 3, "'中' \x1b[8m中a\x1b[0m end");
+        let (_, screen) = screen(20, 3, "'中/a' \x1b[8m中a\x1b[0m end");
         let object = object_at(&screen, Point { line: 0, column: 2 }).unwrap();
-        assert_eq!(object.text, "'中'");
-        assert_eq!(snapshot(&screen, None).text, "'中'     end\n\n");
-        assert!(object_at(&screen, Point { line: 0, column: 6 }).is_none());
+        assert_eq!(object.text, "'中/a'");
+        assert_eq!(snapshot(&screen, None).text, "'中/a'     end\n\n");
+        assert!(object_at(&screen, Point { line: 0, column: 8 }).is_none());
+    }
+
+    #[test]
+    fn quoted_chinese_prose_is_not_hoverable() {
+        for text in ["'这是一段中文'", "\"中文 payload\""] {
+            let (_, screen) = screen(80, 3, text);
+            for column in 0..screen.rows[0].used() {
+                assert!(object_at(&screen, Point { line: 0, column }).is_none());
+            }
+        }
+        let (_, screen) = screen(80, 3, "'中文.rs' 'src/中文/main.rs'");
+        assert_eq!(
+            object_at(&screen, Point { line: 0, column: 2 })
+                .unwrap()
+                .text,
+            "'中文.rs'"
+        );
+        assert_eq!(
+            object_at(
+                &screen,
+                Point {
+                    line: 0,
+                    column: 12
+                }
+            )
+            .unwrap()
+            .text,
+            "'src/中文/main.rs'"
+        );
     }
 
     #[test]

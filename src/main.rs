@@ -248,7 +248,7 @@ fn help() {
     );
     #[cfg(feature = "gui")]
     println!(
-        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nShift+Home/End    Top/bottom of history\nAlt+mouse        Select/scroll when an application captures the mouse\nMiddle click     Paste primary selection\nRight click      Copy highlighted object; otherwise paste"
+        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nShift+Home/End    Top/bottom of history\nAlt+mouse        Select/scroll when an application captures the mouse\nMiddle click     Paste primary selection\nRight click      Copy highlight; otherwise paste"
     );
 
     println!(
