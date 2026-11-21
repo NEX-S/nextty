@@ -1,7 +1,6 @@
-use std::ffi::OsStr;
-use std::fs::{self, File, FileType, Metadata, OpenOptions, Permissions};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, File, Metadata, OpenOptions, Permissions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
-use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -11,7 +10,7 @@ const FILE_LIMIT: usize = 8 * 1024 * 1024;
 const MATCH_LIMIT: usize = 100;
 static TEMP_ID: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileOperation {
     Read {
         offset: u64,
@@ -25,17 +24,19 @@ pub enum FileOperation {
     },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FileMatch {
+    #[serde(with = "crate::wire::path")]
     pub path: PathBuf,
     pub line: u64,
     pub text: String,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentChange {
     pub turn: u64,
     pub tool_id: String,
+    #[serde(with = "crate::wire::path")]
     pub path: PathBuf,
     pub added: u32,
     pub removed: u32,
@@ -43,9 +44,10 @@ pub struct AgentChange {
     pub truncated: bool,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum FileResult {
     Read {
+        #[serde(with = "crate::wire::path")]
         path: PathBuf,
         offset: u64,
         text: String,
@@ -53,6 +55,7 @@ pub enum FileResult {
         has_more: bool,
     },
     Search {
+        #[serde(with = "crate::wire::path")]
         path: PathBuf,
         matches: Vec<FileMatch>,
         truncated: bool,
@@ -72,13 +75,11 @@ pub(crate) fn execute(
         FileOperation::Read { offset } => {
             let (mut file, metadata) = open_regular(&path)?;
             file.seek(SeekFrom::Start(offset))?;
-            let mut bytes = Vec::new();
-            read_bounded(
+            let mut bytes = read_bounded(
                 &mut file,
                 metadata.len().saturating_sub(offset),
                 READ_LIMIT + 1,
                 canceled,
-                &mut bytes,
             )?;
             let available = bytes.len();
             bytes.truncate(READ_LIMIT);
@@ -111,10 +112,9 @@ pub(crate) fn execute(
                 matches: Vec::new(),
                 remaining: READ_LIMIT,
                 truncated: false,
-                bytes: Vec::new(),
                 canceled,
             };
-            search.search(&path, None)?;
+            search.search(&path)?;
             Ok(FileResult::Search {
                 path,
                 matches: search.matches,
@@ -128,14 +128,7 @@ pub(crate) fn execute(
                 if metadata.len() > FILE_LIMIT as u64 {
                     return Err(io::Error::other("file exceeds 8 MiB edit limit"));
                 }
-                let mut bytes = Vec::new();
-                read_bounded(
-                    &mut file,
-                    metadata.len(),
-                    FILE_LIMIT + 1,
-                    canceled,
-                    &mut bytes,
-                )?;
+                let bytes = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, canceled)?;
                 if bytes.len() > FILE_LIMIT {
                     return Err(io::Error::other("file exceeds 8 MiB edit limit"));
                 }
@@ -169,87 +162,60 @@ pub(crate) fn execute(
 }
 
 fn edit_change(path: PathBuf, before: &str, after: &str) -> AgentChange {
-    let mut old = before.split_inclusive('\n').peekable();
-    let mut new = after.split_inclusive('\n').peekable();
-    let mut prefix = 0;
-    let mut context_before = [None; 2];
-    while let (Some(&a), Some(&b)) = (old.peek(), new.peek()) {
-        if a != b {
-            break;
-        }
-        old.next();
-        new.next();
-        prefix += 1;
-        context_before = [context_before[1], Some(a)];
-    }
-    let mut old = old.rev().peekable();
-    let mut new = new.rev().peekable();
-    let mut context_after = [None; 2];
-    while let (Some(&a), Some(&b)) = (old.peek(), new.peek()) {
-        if a != b {
-            break;
-        }
-        old.next();
-        new.next();
-        context_after = [Some(a), context_after[0]];
-    }
-    let old = old.rev();
-    let new = new.rev();
-    let removed = old.clone().count() as u32;
-    let added = new.clone().count() as u32;
+    let old: Vec<_> = before.split_inclusive('\n').collect();
+    let new: Vec<_> = after.split_inclusive('\n').collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let suffix = old[prefix..]
+        .iter()
+        .rev()
+        .zip(new[prefix..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let removed = &old[prefix..old.len() - suffix];
+    let added = &new[prefix..new.len() - suffix];
     let mut change = AgentChange {
         path,
-        added,
-        removed,
+        added: added.len() as u32,
+        removed: removed.len() as u32,
         ..AgentChange::default()
     };
-    if removed == 0 && added == 0 {
+    if removed.is_empty() && added.is_empty() {
         return change;
     }
-    let leading = context_before.iter().flatten().count();
-    let context = leading + context_after.iter().flatten().count();
-    let start = prefix - leading;
-    let old_count = removed as usize + context;
-    let new_count = added as usize + context;
-    change.diff = format!(
-        "--- a/{}\n+++ b/{}\n@@ -{},{} +{},{} @@\n",
-        change.path.display(),
-        change.path.display(),
+    let context_before = &old[prefix.saturating_sub(2)..prefix];
+    let context_after = &old[old.len() - suffix..][..suffix.min(2)];
+    let context = context_before.len() + context_after.len();
+    let start = prefix - context_before.len();
+    let (old_count, new_count) = (removed.len() + context, added.len() + context);
+    let (old_start, new_start) = (
         start + usize::from(old_count != 0),
-        old_count,
         start + usize::from(new_count != 0),
-        new_count
     );
-    if change.diff.len() > READ_LIMIT {
-        let end = change.diff.floor_char_boundary(READ_LIMIT);
-        change.diff.truncate(end);
-        change.truncated = true;
-        return change;
-    }
-    let lines = context_before
-        .into_iter()
-        .flatten()
-        .map(|line| (" ", line))
-        .chain(old.map(|line| ("-", line)))
-        .chain(new.map(|line| ("+", line)))
-        .chain(context_after.into_iter().flatten().map(|line| (" ", line)));
-    let pieces = lines.flat_map(|(prefix, line)| {
-        [
-            prefix,
-            line,
-            if line.ends_with('\n') {
-                ""
-            } else {
-                "\n\\ No newline at end of file\n"
-            },
-        ]
-    });
-    for piece in pieces {
-        let end = piece.floor_char_boundary(piece.len().min(READ_LIMIT - change.diff.len()));
-        change.diff.push_str(&piece[..end]);
-        if end != piece.len() {
-            change.truncated = true;
-            break;
+    let name = change.path.display();
+    change.diff = format!(
+        "--- a/{name}\n+++ b/{name}\n@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+    );
+    let lines = [
+        (" ", context_before),
+        ("-", removed),
+        ("+", added),
+        (" ", context_after),
+    ]
+    .into_iter()
+    .flat_map(|(mark, lines)| lines.iter().map(move |line| (mark, *line)));
+    for (mark, line) in lines {
+        let missing_newline = if line.ends_with('\n') {
+            ""
+        } else {
+            "\n\\ No newline at end of file\n"
+        };
+        for piece in [mark, line, missing_newline] {
+            let end = piece.floor_char_boundary(piece.len().min(READ_LIMIT - change.diff.len()));
+            change.diff.push_str(&piece[..end]);
+            if end != piece.len() {
+                change.truncated = true;
+                return change;
+            }
         }
     }
     change
@@ -286,19 +252,17 @@ fn read_bounded(
     size: u64,
     limit: usize,
     canceled: &AtomicBool,
-    bytes: &mut Vec<u8>,
-) -> io::Result<()> {
-    bytes.clear();
-    bytes.reserve_exact(size.min(limit as u64) as usize);
+) -> io::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(size.min(limit as u64) as usize);
     let mut file = file.take(limit as u64);
     loop {
         check_canceled(canceled)?;
-        if file.by_ref().take(64 * 1024).read_to_end(bytes)? < 64 * 1024 {
+        if file.by_ref().take(64 * 1024).read_to_end(&mut bytes)? < 64 * 1024 {
             break;
         }
     }
     check_canceled(canceled)?;
-    Ok(())
+    Ok(bytes)
 }
 
 struct FileSearch<'a> {
@@ -306,63 +270,36 @@ struct FileSearch<'a> {
     matches: Vec<FileMatch>,
     remaining: usize,
     truncated: bool,
-    bytes: Vec<u8>,
     canceled: &'a AtomicBool,
 }
 
 impl FileSearch<'_> {
-    fn search(&mut self, path: &Path, kind: Option<FileType>) -> io::Result<bool> {
+    fn search(&mut self, path: &Path) -> io::Result<bool> {
         check_canceled(self.canceled)?;
-        let kind = match kind {
-            Some(kind) if !kind.is_dir() => kind,
-            // A sorted directory entry may have been replaced with a symlink.
-            _ => fs::symlink_metadata(path)?.file_type(),
-        };
-        if kind.is_dir() {
-            let mut entries = Vec::new();
+        if fs::symlink_metadata(path)?.is_dir() {
+            let mut names = Vec::new();
             for entry in fs::read_dir(path)? {
                 check_canceled(self.canceled)?;
-                let entry = entry?;
-                entries.push((entry.file_name(), entry.file_type()?));
+                names.push(entry?.file_name());
             }
-            entries.sort_unstable_by(|a, b| a.0.cmp(&b.0));
-            // Reuse the parent bytes without normalizing its spelling.
-            let mut child = path.as_os_str().as_bytes().to_vec();
-            let prefix = child.len();
-            for (name, kind) in entries {
-                child.truncate(prefix);
-                if !child.ends_with(b"/") {
-                    child.push(b'/');
-                }
-                child.extend_from_slice(name.as_bytes());
-                let child = Path::new(OsStr::from_bytes(&child));
-                if self.search(child, Some(kind))? {
+            names.sort_unstable();
+            for name in names {
+                if self.search(&path.join(name))? {
                     return Ok(true);
                 }
             }
-        } else if kind.is_file() || (kind.is_symlink() && fs::metadata(path)?.is_file()) {
+        } else if fs::metadata(path)?.is_file() {
             let (mut file, metadata) = open_regular(path)?;
             if metadata.len() > FILE_LIMIT as u64 {
                 self.truncated = true;
                 return Ok(false);
             }
-            read_bounded(
-                &mut file,
-                metadata.len(),
-                FILE_LIMIT + 1,
-                self.canceled,
-                &mut self.bytes,
-            )?;
-            let bytes = &self.bytes;
+            let bytes = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, self.canceled)?;
             if bytes.len() > FILE_LIMIT {
                 self.truncated = true;
                 return Ok(false);
             }
-            let mut first_match = self.finder.find(bytes);
-            if first_match.is_none() {
-                return Ok(false);
-            }
-            let Ok(text) = std::str::from_utf8(bytes) else {
+            let Ok(text) = std::str::from_utf8(&bytes) else {
                 return Ok(false);
             };
             if text.contains('\0') {
@@ -372,21 +309,14 @@ impl FileSearch<'_> {
             let mut line = 1;
             while offset < text.len() {
                 check_canceled(self.canceled)?;
-                let Some(found) = first_match
-                    .take()
-                    .or_else(|| self.finder.find(&bytes[offset..]))
-                else {
+                let Some(found) = self.finder.find(&bytes[offset..]) else {
                     break;
                 };
                 let found = offset + found;
                 let skipped = &bytes[offset..found];
-                let skipped_lines = memchr::memchr_iter(b'\n', skipped).count() as u64;
-                line += skipped_lines;
-                let start = if skipped_lines == 0 {
-                    offset
-                } else {
-                    offset + memchr::memrchr(b'\n', skipped).unwrap() + 1
-                };
+                line += memchr::memchr_iter(b'\n', skipped).count() as u64;
+                let start =
+                    memchr::memrchr(b'\n', skipped).map_or(offset, |index| offset + index + 1);
                 let match_end = found + self.finder.needle().len();
                 let end = memchr::memchr(b'\n', &bytes[match_end..])
                     .map_or(bytes.len(), |end| match_end + end);
@@ -451,10 +381,7 @@ fn stage(
         .open(&path)?;
     let staged = StagedFile(path);
     for part in parts {
-        for bytes in part.as_bytes().chunks(64 * 1024) {
-            check_canceled(canceled)?;
-            file.write_all(bytes)?;
-        }
+        file.write_all(part.as_bytes())?;
     }
     if let Some(permissions) = permissions {
         file.set_permissions(permissions)?;
@@ -469,29 +396,8 @@ fn check_unchanged(
     bytes: &[u8],
     canceled: &AtomicBool,
 ) -> io::Result<()> {
-    let (current, opened) = open_regular(target)?;
-    let mut current = current.take((FILE_LIMIT + 1) as u64);
-    let equal = opened.len() == original.len() && {
-        let mut buffer = vec![0; opened.len().clamp(1, 64 * 1024) as usize];
-        let mut offset = 0;
-        loop {
-            check_canceled(canceled)?;
-            let length = match current.read(&mut buffer) {
-                Ok(length) => length,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(error),
-            };
-            if length == 0 {
-                break offset == bytes.len();
-            }
-            if bytes.get(offset..offset + length) != Some(&buffer[..length]) {
-                break false;
-            }
-            offset += length;
-        }
-    };
-    check_canceled(canceled)?;
-    let metadata = fs::metadata(target)?;
+    let (mut file, opened) = open_regular(target)?;
+    let current = read_bounded(&mut file, opened.len(), FILE_LIMIT + 1, canceled)?;
     let version = |metadata: &Metadata| {
         (
             metadata.dev(),
@@ -503,7 +409,10 @@ fn check_unchanged(
             metadata.ctime_nsec(),
         )
     };
-    if fs::canonicalize(path)? != target || version(original) != version(&metadata) || !equal {
+    if fs::canonicalize(path)? != target
+        || version(original) != version(&fs::metadata(target)?)
+        || current != bytes
+    {
         return Err(io::Error::other("file changed during edit"));
     }
     Ok(())
@@ -512,7 +421,7 @@ fn check_unchanged(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::CString;
+    use std::ffi::{CString, OsStr};
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{PermissionsExt, symlink};
 
@@ -534,6 +443,33 @@ mod tests {
         fn drop(&mut self) {
             fs::remove_dir_all(&self.0).unwrap();
         }
+    }
+
+    fn search(path: PathBuf, query: &str) -> (PathBuf, Vec<FileMatch>, bool) {
+        let operation = FileOperation::Search {
+            query: query.into(),
+        };
+        match execute(path, operation, &AtomicBool::new(false)).unwrap() {
+            FileResult::Search {
+                path,
+                matches,
+                truncated,
+            } => (path, matches, truncated),
+            _ => panic!(),
+        }
+    }
+
+    fn edit(
+        path: PathBuf,
+        old: Option<&str>,
+        new: &str,
+        canceled: &AtomicBool,
+    ) -> io::Result<FileResult> {
+        let operation = FileOperation::Edit {
+            old_text: old.map(Into::into),
+            new_text: new.into(),
+        };
+        execute(path, operation, canceled)
     }
 
     #[test]
@@ -588,21 +524,7 @@ mod tests {
             let mut root = directory.0.clone().into_os_string();
             root.push(suffix);
             let root = PathBuf::from(root);
-            let FileResult::Search {
-                path,
-                matches,
-                truncated,
-            } = execute(
-                root.clone(),
-                FileOperation::Search {
-                    query: "a+b?".into(),
-                },
-                &AtomicBool::new(false),
-            )
-            .unwrap()
-            else {
-                panic!()
-            };
+            let (path, matches, truncated) = search(root.clone(), "a+b?");
             assert!(!truncated);
             assert_eq!(path.as_os_str(), root.as_os_str());
             let expected = vec![
@@ -638,19 +560,7 @@ mod tests {
             "before\nneedle\nneedle\nneedle\nafter\nneedle\nneedle\n",
         )
         .unwrap();
-        let FileResult::Search {
-            matches, truncated, ..
-        } = execute(
-            path.clone(),
-            FileOperation::Search {
-                query: "needle\nneedle".into(),
-            },
-            &AtomicBool::new(false),
-        )
-        .unwrap()
-        else {
-            panic!()
-        };
+        let (_, matches, truncated) = search(path.clone(), "needle\nneedle");
         assert!(!truncated);
         assert_eq!(
             matches,
@@ -663,46 +573,11 @@ mod tests {
     }
 
     #[test]
-    fn search_rechecks_directories_before_recursing() {
-        let directory = Directory::new();
-        let target = Directory::new();
-        fs::write(target.0.join("text"), "needle").unwrap();
-        let path = directory.0.join("entry");
-        fs::create_dir(&path).unwrap();
-        let kind = fs::symlink_metadata(&path).unwrap().file_type();
-        fs::remove_dir(&path).unwrap();
-        symlink(&target.0, &path).unwrap();
-        let mut search = FileSearch {
-            finder: memchr::memmem::Finder::new(b"needle"),
-            matches: Vec::new(),
-            remaining: READ_LIMIT,
-            truncated: false,
-            bytes: Vec::new(),
-            canceled: &AtomicBool::new(false),
-        };
-        search.search(&path, Some(kind)).unwrap();
-        assert!(search.matches.is_empty());
-    }
-
-    #[test]
     fn search_bounds_match_count_long_lines_and_file_size() {
         let directory = Directory::new();
         let path = directory.0.join("text");
-        let canceled = AtomicBool::new(false);
         fs::write(&path, "needle\n".repeat(150)).unwrap();
-        let FileResult::Search {
-            matches, truncated, ..
-        } = execute(
-            path.clone(),
-            FileOperation::Search {
-                query: "needle".into(),
-            },
-            &canceled,
-        )
-        .unwrap()
-        else {
-            panic!()
-        };
+        let (_, matches, truncated) = search(path.clone(), "needle");
         assert_eq!(matches.len(), MATCH_LIMIT);
         assert_eq!(matches.last().unwrap().line, MATCH_LIMIT as u64);
         assert!(truncated);
@@ -712,19 +587,7 @@ mod tests {
             format!("{}needle{}", "prefix".repeat(10000), "界".repeat(10000)),
         )
         .unwrap();
-        let FileResult::Search {
-            matches, truncated, ..
-        } = execute(
-            path.clone(),
-            FileOperation::Search {
-                query: "needle".into(),
-            },
-            &canceled,
-        )
-        .unwrap()
-        else {
-            panic!()
-        };
+        let (_, matches, truncated) = search(path.clone(), "needle");
         assert!(truncated);
         assert_eq!(matches.len(), 1);
         assert!(matches[0].text.starts_with("needle"));
@@ -734,19 +597,7 @@ mod tests {
             .unwrap()
             .set_len(FILE_LIMIT as u64 + 1)
             .unwrap();
-        let FileResult::Search {
-            matches, truncated, ..
-        } = execute(
-            path,
-            FileOperation::Search {
-                query: "needle".into(),
-            },
-            &canceled,
-        )
-        .unwrap()
-        else {
-            panic!()
-        };
+        let (_, matches, truncated) = search(path, "needle");
         assert!(truncated);
         assert!(matches.is_empty());
     }
@@ -761,15 +612,7 @@ mod tests {
         fs::set_permissions(&target, Permissions::from_mode(0o751)).unwrap();
         symlink("target", &link).unwrap();
         assert_eq!(
-            execute(
-                link.clone(),
-                FileOperation::Edit {
-                    old_text: Some("old".into()),
-                    new_text: "new".into()
-                },
-                &AtomicBool::new(false),
-            )
-            .unwrap(),
+            edit(link.clone(), Some("old"), "new", &AtomicBool::new(false)).unwrap(),
             FileResult::Edited {
                 change: edit_change(
                     link.clone(),
@@ -796,29 +639,11 @@ mod tests {
         let canceled = AtomicBool::new(false);
         fs::write(&path, "aaa\n").unwrap();
         for old_text in ["missing", "aa"] {
-            assert!(
-                execute(
-                    path.clone(),
-                    FileOperation::Edit {
-                        old_text: Some(old_text.into()),
-                        new_text: "new".into()
-                    },
-                    &canceled,
-                )
-                .is_err()
-            );
+            assert!(edit(path.clone(), Some(old_text), "new", &canceled).is_err());
             assert_eq!(fs::read_to_string(&path).unwrap(), "aaa\n");
         }
         let (mut file, metadata) = open_regular(&path).unwrap();
-        let mut original = Vec::new();
-        read_bounded(
-            &mut file,
-            metadata.len(),
-            FILE_LIMIT + 1,
-            &canceled,
-            &mut original,
-        )
-        .unwrap();
+        let original = read_bounded(&mut file, metadata.len(), FILE_LIMIT + 1, &canceled).unwrap();
         fs::write(&path, "bbb\n").unwrap();
         assert!(check_unchanged(&path, &path, &metadata, &original, &canceled).is_err());
         assert_eq!(fs::read_to_string(path).unwrap(), "bbb\n");
@@ -859,37 +684,20 @@ mod tests {
     fn new_files_do_not_overwrite_and_cancellation_leaves_files_intact() {
         let directory = Directory::new();
         let path = directory.0.join("text");
-        let operation = FileOperation::Edit {
-            old_text: None,
-            new_text: "new\n".into(),
-        };
-        execute(path.clone(), operation.clone(), &AtomicBool::new(false)).unwrap();
+        let create =
+            |path: &Path, canceled: &AtomicBool| edit(path.into(), None, "new\n", canceled);
+        create(&path, &AtomicBool::new(false)).unwrap();
         assert_eq!(fs::read_to_string(&path).unwrap(), "new\n");
         assert_eq!(
-            execute(path.clone(), operation.clone(), &AtomicBool::new(false))
-                .unwrap_err()
-                .kind(),
+            create(&path, &AtomicBool::new(false)).unwrap_err().kind(),
             io::ErrorKind::AlreadyExists
         );
         let canceled = AtomicBool::new(true);
-        assert_eq!(
-            execute(
-                path.clone(),
-                FileOperation::Edit {
-                    old_text: Some("new".into()),
-                    new_text: "replacement".into()
-                },
-                &canceled,
-            )
-            .unwrap_err()
-            .kind(),
-            io::ErrorKind::Interrupted
-        );
+        let replace = edit(path.clone(), Some("new"), "replacement", &canceled);
+        assert_eq!(replace.unwrap_err().kind(), io::ErrorKind::Interrupted);
         let missing = directory.0.join("missing");
         assert_eq!(
-            execute(missing.clone(), operation, &canceled)
-                .unwrap_err()
-                .kind(),
+            create(&missing, &canceled).unwrap_err().kind(),
             io::ErrorKind::Interrupted
         );
         assert!(!missing.exists());
@@ -911,31 +719,12 @@ mod tests {
             io::ErrorKind::InvalidInput
         );
         assert_eq!(
-            execute(
-                path,
-                FileOperation::Edit {
-                    old_text: Some("old".into()),
-                    new_text: "new".into()
-                },
-                &canceled,
-            )
-            .unwrap_err()
-            .kind(),
+            edit(path, Some("old"), "new", &canceled)
+                .unwrap_err()
+                .kind(),
             io::ErrorKind::InvalidInput
         );
-        let FileResult::Search {
-            matches, truncated, ..
-        } = execute(
-            directory.0.clone(),
-            FileOperation::Search {
-                query: "any".into(),
-            },
-            &canceled,
-        )
-        .unwrap()
-        else {
-            panic!()
-        };
+        let (_, matches, truncated) = search(directory.0.clone(), "any");
         assert!(matches.is_empty());
         assert!(!truncated);
     }
@@ -944,16 +733,13 @@ mod tests {
         let directory = Directory::new();
         let path = directory.0.join("file");
         fs::write(&path, "head\nprefix old suffix\ntail\n").unwrap();
-        let result = execute(
+        let result = edit(
             path.clone(),
-            FileOperation::Edit {
-                old_text: Some("old".into()),
-                new_text: "new\nnext".into(),
-            },
+            Some("old"),
+            "new\nnext",
             &AtomicBool::new(false),
-        )
-        .unwrap();
-        let FileResult::Edited { change } = result else {
+        );
+        let FileResult::Edited { change } = result.unwrap() else {
             panic!()
         };
         assert_eq!((change.added, change.removed), (2, 1));

@@ -33,7 +33,7 @@ unsafe extern "C" {
         size_error: usize,
     ) -> *mut c_void;
     fn nt_fonts_free(fonts: *mut c_void);
-    fn nt_fonts_scale(fonts: *mut c_void, scale: f64) -> i32;
+    fn nt_fonts_scale(fonts: *mut c_void, scale: f64);
     fn nt_fonts_shape(
         fonts: *mut c_void,
         text: *const u8,
@@ -330,7 +330,7 @@ fn fallback_selection_survives_scale_changes() {
     let expected: Vec<_> = initial.glyphs().iter().map(|glyph| glyph.glyph).collect();
     assert!(!expected.is_empty() && expected.iter().all(|glyph| *glyph != 0));
     for scale in [2.0, 1.0] {
-        assert_ne!(unsafe { nt_fonts_scale(fonts.raw, scale) }, 0);
+        unsafe { nt_fonts_scale(fonts.raw, scale) };
         for _ in 0..2 {
             let shaped = fonts.shape("ب", &[], &[0, 0]);
             assert_eq!(
@@ -357,7 +357,7 @@ fn block_graphics_use_cell_geometry_at_fractional_scales() {
     let metrics = fonts.shape("mm", &[], &[0, 1]);
     let width = metrics.glyphs()[1].x - metrics.glyphs()[0].x;
     for scale in [1.0, 1.25, 1.5, 2.0] {
-        assert_ne!(unsafe { nt_fonts_scale(fonts.raw, scale) }, 0);
+        unsafe { nt_fonts_scale(fonts.raw, scale) };
         let shaped = fonts.shape(text, &[], &columns);
         assert_eq!(shaped.glyphs().len(), text.chars().count());
         for (column, (glyph, ch)) in shaped.glyphs().iter().zip(text.chars()).enumerate() {

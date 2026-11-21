@@ -12,8 +12,8 @@ typedef struct NtLine NtLine;
 enum { NT_SHIFT = 1, NT_CONTROL = 2, NT_ALT = 4, NT_SUPER = 8 };
 enum {
     NT_KEY = 1, NT_TEXT, NT_PREEDIT, NT_MOTION, NT_BUTTON, NT_SCROLL,
-    NT_FOCUS, NT_RESIZE, NT_CLOSE, NT_PASTE, NT_FRAME, NT_EXPOSE, NT_PRESENTED,
-    NT_WINDOW_STATE, NT_FRAME_RATE, NT_POINTER_LEAVE
+    NT_FOCUS, NT_RESIZE, NT_CLOSE, NT_PASTE, NT_EXPOSE, NT_PRESENTED,
+    NT_WINDOW_STATE, NT_POINTER_LEAVE
 };
 
 typedef struct {
@@ -23,20 +23,18 @@ typedef struct {
     double x, y;
     const char *text;
     size_t length;
-    int start, end;
+    int start;
 } NtEvent;
 
-/* Text is valid during the callback. Preedit ranges are UTF-8 byte offsets.
- * Button code: 1 left, 2 middle, 3 right; start: pressed. Scroll y: lines up.
+/* Text is valid during the callback. Button code: 1 left, 2 middle, 3 right; start: pressed.
+ * Scroll y: vertical lines up.
  * Motion/button x,y are surface-local logical pixels. Focus code: active.
  * Pointer leave clears hover without reporting a terminal mouse movement.
  * Key code is an XKB keysym and text is its direct printable input.
  * NT_TEXT carries independent compose/IME commits.
- * Paste code: primary; text is the completed, unmodified UTF-8 selection.
- * Trace-only frame code/x/y: frame id, monotonic receipt, raw server time (ms).
- * Window state code: activated/suspended/fullscreen/maximized bits;
- * x: monotonic receipt when tracing, zero otherwise.
- * Trace-only frame rate x: submission interval in nanoseconds. */
+ * Paste: text is the completed, unmodified UTF-8 selection.
+ * Window state code: maximized.
+ * Presented (tracing only): code is the frame number, x its CLOCK_MONOTONIC time. */
 typedef void (*NtEventFn)(void *, const NtEvent *);
 
 NtWindow *nt_window_new(int width, int height);
@@ -81,10 +79,10 @@ void nt_renderer_metrics(NtRenderer *, float *cell_width, float *cell_height);
 NtLine *nt_line_new(NtRenderer *, const char *, size_t, const NtRun *, size_t,
                     const uint16_t *columns);
 void nt_line_free(NtLine *);
-int nt_renderer_begin(NtRenderer *, uint32_t background);
+void nt_renderer_begin(NtRenderer *, uint32_t background);
 /* Replace the current clip background, including its alpha. */
-int nt_renderer_clear(NtRenderer *, uint32_t background);
-int nt_renderer_clip(NtRenderer *, float x, float y, float width, float height);
+void nt_renderer_clear(NtRenderer *, uint32_t background);
+void nt_renderer_clip(NtRenderer *, float x, float y, float width, float height);
 void nt_renderer_rect(NtRenderer *, float x, float y, float width, float height,
                       uint32_t color, int wave);
 void nt_renderer_stroke(NtRenderer *, float x1, float y1, float x2, float y2,
@@ -95,10 +93,9 @@ void nt_renderer_line(NtRenderer *, NtLine *, float x, float y);
 /* Present transfers the frame packet to one GPU worker. While pending, only
  * ready/finish/fd/metrics/free and nt_line_free may be called. Ready returns -1 on error, 0 while
  * pending, and 1 when the next frame may be built. */
-int nt_renderer_present(NtRenderer *);
+void nt_renderer_present(NtRenderer *);
 int nt_renderer_ready(NtRenderer *);
 int nt_renderer_finish(NtRenderer *);
 int nt_renderer_fd(NtRenderer *);
-double nt_renderer_swap_time(NtRenderer *);
 
 #endif

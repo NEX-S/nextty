@@ -1,45 +1,33 @@
 use super::*;
 use crate::core::Flags;
-use crate::width::{fit_label, scalar_width};
-use std::borrow::Cow;
+use crate::width::fit_label;
 
 impl WorkspaceView {
-    pub(super) fn chrome(&mut self, layout: GuiLayout) -> Result<()> {
-        self.renderer.clip(0., 0., layout.width, layout.top)?;
+    pub(super) fn chrome(&mut self, layout: GuiLayout) {
+        self.painter.clip(0., 0., layout.width, layout.top);
         let mut tabline_background = 0;
         for shift in [16, 8, 0] {
             tabline_background |= ((self.config.background >> shift & 255) * 9 / 10) << shift;
         }
-        self.renderer.clear(
-            (tabline_background << 8) | (self.config.tab_bar_opacity * 255.).round() as u32,
-        )?;
+        self.painter
+            .clear((tabline_background << 8) | (self.config.tab_bar_opacity * 255.).round() as u32);
         let Some(snapshot) = self.client.snapshot() else {
-            return Ok(());
+            return;
         };
-        let controller = snapshot.controller;
         let cell = self.cell;
-        let label = if self.client.is_remote() { "SSH" } else { "" };
-        let columns = ((layout.width - self.control_width()) / cell.0) as u16;
-        self.text.draw(
-            &self.renderer,
-            "›",
-            cell.0,
-            0.,
-            if controller { MUTED } else { 0xfe9b30ff },
-        )?;
-        let (tabs, label, before, after) = crate::workspace::tab_chrome(snapshot, columns, label);
-        let mut end = 3;
-        for (index, column, columns) in tabs {
+        let bar = self.tab_bar(snapshot, layout);
+        let hit = (self.pointer.1 < layout.top)
+            .then(|| bar.at(snapshot, self.cell().0))
+            .flatten();
+        let prompt = if snapshot.controller { MUTED } else { WARNING };
+        self.painter.text("›", cell.0, 0., prompt);
+        for &(index, column, columns) in &bar.tabs {
             let tab = &snapshot.tabs[index];
             let active = tab.id == snapshot.active_tab;
             let x = f32::from(column) * cell.0;
             let w = f32::from(columns) * cell.0;
-            let hit = GuiHit {
-                bounds: (x, 0., w, layout.top),
-                action: GuiAction::SelectTab(index),
-            };
-            let hovered = hit.contains(self.pointer);
-            self.control_hits.push(hit);
+            let close_hovered = hit == Some(TabHit::Close(tab.id));
+            let hovered = hit == Some(TabHit::Select(index)) || close_hovered;
             let background = if active {
                 self.config.background
             } else {
@@ -47,68 +35,63 @@ impl WorkspaceView {
             };
             match self.config.tab_style {
                 crate::config::TabStyle::Angled => {
-                    self.renderer
-                        .tab((x, 0.), (w, cell.1), cell.0, (background << 8) | 255)
+                    self.painter
+                        .tab((x, 0.), (w, cell.1), cell.0, opaque(background))
                 }
                 crate::config::TabStyle::Flat => {
-                    self.renderer
-                        .rect(x, 0., w, cell.1, (background << 8) | 255, false)
+                    self.painter.rect(x, 0., w, cell.1, opaque(background))
                 }
             }
-            self.text.draw(
-                &self.renderer,
-                "•",
-                x + cell.0 * 2.,
-                0.,
-                (crate::ui::tab_color(tab) << 8) | 255,
-            )?;
-            self.text.draw(
-                &self.renderer,
-                &fit(&tab.title, usize::from(columns - 8)),
+            self.painter
+                .text("•", x + cell.0 * 2., 0., opaque(crate::ui::tab_color(tab)));
+            self.painter.text(
+                &fit_label(&tab.title, columns - 8),
                 x + cell.0 * 4.,
                 0.,
                 if active || hovered {
-                    (self.config.foreground << 8) | 255
+                    opaque(self.config.foreground)
                 } else {
                     MUTED
                 },
-            )?;
+            );
             let close_x = x + w - cell.0 * 3.;
-            let hit = GuiHit {
-                bounds: (close_x - cell.0, 0., cell.0 * 3., layout.top),
-                action: GuiAction::CloseTab(tab.id),
-            };
-            let close_hovered = hit.contains(self.pointer);
-            self.control_feedback(hit);
-            self.text.draw(
-                &self.renderer,
-                "×",
-                close_x,
-                0.,
-                if close_hovered { 0xe87575ff } else { MUTED },
-            )?;
-            self.control_hits.push(hit);
-            if active && self.config.tab_style == crate::config::TabStyle::Flat {
-                self.renderer.rect(x, cell.1 - 2., w, 1., ACCENT, false);
+            if close_hovered {
+                self.painter.rect(close_x, cell.1 - 1., cell.0, 1., DANGER);
             }
-            end = column + columns + 1;
+            let color = if close_hovered { DANGER } else { MUTED };
+            self.painter.text("×", close_x, 0., color);
+            if active && self.config.tab_style == crate::config::TabStyle::Flat {
+                self.painter.rect(x, cell.1 - 2., w, 1., ACCENT);
+            }
         }
-        if end.saturating_add(3) < columns.saturating_sub(text_width(&label) as u16 + 2) {
-            let x = f32::from(end) * cell.0;
-            self.header_button(x - cell.0, cell.0 * 3., layout, GuiAction::NewTab)?;
+        if let Some(plus) = bar.plus {
+            let x = f32::from(plus + 1) * cell.0;
+            let hovered = hit == Some(TabHit::New);
+            if hovered {
+                self.painter.rect(x, cell.1 - 1., cell.0, 1., ACCENT);
+            }
+            self.painter
+                .text("+", x, 0., if hovered { ACCENT } else { 0x606060ff });
         }
-        let label = fit_label(&label, columns.saturating_sub(end + 4));
-        let label_width = text_width(&label);
-        let label_x = (f32::from(columns) - label_width as f32 - 2.) * cell.0;
-        self.overflow_hits(label_x, 0., before, after, label_width);
-        self.text.draw(
-            &self.renderer,
-            &label,
-            label_x,
-            0.,
-            if controller { 0xb8b8b8ff } else { 0xfe9b30ff },
-        )?;
-        self.renderer.clip(0., 0., 0., 0.)
+        if let Some(TabHit::Scroll(direction)) = hit
+            && let Some((column, columns)) = bar.overflow[usize::from(direction > 0)]
+        {
+            self.painter.rect(
+                f32::from(column) * cell.0,
+                cell.1 - 1.,
+                f32::from(columns) * cell.0,
+                1.,
+                INK,
+            );
+        }
+        let color = if snapshot.controller {
+            0xb8b8b8ff
+        } else {
+            WARNING
+        };
+        self.painter
+            .text(&bar.label, f32::from(bar.label_x) * cell.0, 0., color);
+        self.painter.clip(0., 0., 0., 0.)
     }
 
     pub(super) fn control_width(&self) -> f32 {
@@ -119,113 +102,70 @@ impl WorkspaceView {
         x: f32,
         w: f32,
         layout: GuiLayout,
-        action: GuiAction,
-    ) -> Result<()> {
+        (action, label): (GuiAction, &str),
+    ) {
         let hit = GuiHit {
             bounds: (x, 0., w, layout.top),
             action,
         };
-        let label = match action {
-            GuiAction::NewTab => "+",
-            GuiAction::Minimize => "−",
-            GuiAction::Maximize => "☐",
-            GuiAction::Close => "×",
-            GuiAction::Tab(-1) => "‹",
-            GuiAction::Tab(1) => "›",
-            _ => unreachable!("header controls only"),
-        };
         let disabled = matches!(action, GuiAction::Tab(_))
-            && (!self.controller()
-                || self
-                    .client
-                    .snapshot()
-                    .is_none_or(|snapshot| snapshot.tabs.len() < 2));
+            && self
+                .client
+                .snapshot()
+                .is_none_or(|snapshot| !snapshot.controller || snapshot.tabs.len() < 2);
         let color = if disabled {
             0x505850ff
-        } else if hit.contains(self.pointer) {
-            if action == GuiAction::Close {
-                0xe87575ff
-            } else if action == GuiAction::NewTab {
-                ACCENT
-            } else {
-                INK
-            }
-        } else if action == GuiAction::NewTab {
-            0x606060ff
+        } else if action == GuiAction::Close && hit.contains(self.pointer) {
+            DANGER
         } else {
             INK
         };
         if !disabled {
             self.control_feedback(hit);
-        }
-        self.text.draw(
-            &self.renderer,
-            label,
-            x + (w - self.cell.0) * 0.5,
-            (layout.top - self.cell.1) * 0.5,
-            color,
-        )?;
-        if !disabled {
             self.control_hits.push(hit);
         }
-        Ok(())
+        let y = (layout.top - self.cell.1) * 0.5;
+        self.painter
+            .text(label, x + (w - self.cell.0) * 0.5, y, color)
     }
-    pub(super) fn draw_window_controls(&mut self, layout: GuiLayout) -> Result<()> {
-        self.renderer.clip(0., 0., layout.width, layout.top)?;
-        let w = self.cell.0 * 4.;
-        let start = layout.width - self.control_width();
-        for (i, direction) in [-1, 1].into_iter().enumerate() {
-            self.header_button(
-                start + i as f32 * self.cell.0 * 3.,
-                self.cell.0 * 3.,
-                layout,
-                GuiAction::Tab(direction),
-            )?;
+    pub(super) fn draw_window_controls(&mut self, layout: GuiLayout) {
+        self.painter.clip(0., 0., layout.width, layout.top);
+        let mut x = layout.width - self.control_width();
+        for (cells, button) in [
+            (3., (GuiAction::Tab(TabHit::Scroll(-1)), "‹")),
+            (3., (GuiAction::Tab(TabHit::Scroll(1)), "›")),
+            (4., (GuiAction::Minimize, "−")),
+            (4., (GuiAction::Maximize, "☐")),
+            (4., (GuiAction::Close, "×")),
+        ] {
+            let w = self.cell.0 * cells;
+            self.header_button(x, w, layout, button);
+            x += w;
         }
-        for (i, action) in [GuiAction::Minimize, GuiAction::Maximize, GuiAction::Close]
-            .into_iter()
-            .enumerate()
-        {
-            self.header_button(layout.width - w * 3. + i as f32 * w, w, layout, action)?;
-        }
-        self.renderer.clip(0., 0., 0., 0.)
+        self.painter.clip(0., 0., 0., 0.)
     }
     fn control_feedback(&self, hit: GuiHit) {
         if hit.contains(self.pointer) {
-            let bounds = hit.bounds;
+            let (x, y, w, h) = hit.bounds;
             let underline = match hit.action {
-                GuiAction::CloseTab(_) | GuiAction::Close => Some(0xe87575ff),
-                GuiAction::NewTab => Some(ACCENT),
+                GuiAction::Close => Some(DANGER),
                 GuiAction::Tab(_) | GuiAction::Minimize | GuiAction::Maximize => Some(INK),
                 _ => None,
             };
             if let Some(color) = underline {
-                let padding = self.cell.0.min((bounds.2 - self.cell.0).max(0.) * 0.5);
-                self.renderer.rect(
-                    bounds.0 + padding,
-                    bounds.1 + bounds.3 - 1.,
-                    bounds.2 - padding * 2.,
-                    1.,
-                    color,
-                    false,
-                );
-                return;
+                let padding = self.cell.0.min((w - self.cell.0).max(0.) * 0.5);
+                self.painter
+                    .rect(x + padding, y + h - 1., w - padding * 2., 1., color);
+            } else {
+                self.painter.rect(x, y, w, h, opaque(crate::panel::HOVER));
             }
-            self.renderer.rect(
-                bounds.0,
-                bounds.1,
-                bounds.2,
-                bounds.3,
-                (crate::panel::HOVER << 8) | 255,
-                false,
-            );
         }
     }
-    pub(super) fn draw_scrollbars(&mut self) -> Result<()> {
-        self.renderer.clip(0., 0., 0., 0.)?;
+    pub(super) fn draw_scrollbars(&mut self) {
+        self.painter.clip(0., 0., 0., 0.);
         if self.ui.files_open {
             self.scrollbars.clear();
-            return Ok(());
+            return;
         }
         for bar in &self.scrollbars {
             let mut bar = *bar;
@@ -249,27 +189,24 @@ impl WorkspaceView {
                     .is_some_and(|drag| drag.bar.target == bar.target);
             let (top, height) = bar.thumb();
             if active {
-                self.renderer.rect(
+                self.painter.rect(
                     bar.bounds.0,
                     bar.bounds.1,
                     bar.bounds.2,
                     bar.bounds.3,
                     0x343834ff,
-                    false,
                 );
             }
-            self.renderer.rect(
+            self.painter.rect(
                 bar.bounds.0,
                 top,
                 bar.bounds.2,
                 height,
                 if active { 0xa2aaa0ff } else { 0x60685fff },
-                false,
             );
         }
-        Ok(())
     }
-    fn draw_resources(&mut self, layout: GuiLayout, summary_y: f32) -> Result<()> {
+    fn draw_resources(&mut self, layout: GuiLayout, summary_y: f32) {
         let top = layout.footer + 6.;
         let columns = ((layout.width - PADDING * 2.) / self.cell.0) as u16;
         let rows = ((summary_y - 6. - top) / self.cell.1) as u16;
@@ -277,70 +214,68 @@ impl WorkspaceView {
         let body_left = PADDING + f32::from(view.body_x) * self.cell.0;
         let body_top = top;
         let bottom = top + f32::from(rows) * self.cell.1;
-        self.renderer.clip(
+        self.painter.clip(
             body_left,
             body_top,
             (layout.width - body_left - PADDING).max(0.),
             (bottom - body_top).max(0.),
-        )?;
+        );
         for plot in view.plots {
             let x = PADDING + f32::from(plot.x) * self.cell.0;
             let y = top + plot.y as f32 * self.cell.1;
             let width = f32::from(plot.width.saturating_sub(1)) * self.cell.0;
             let height = f32::from(plot.height) * self.cell.1 - 2.;
             for fraction in [0., 0.5, 1.] {
-                self.renderer
-                    .rect(x, y + fraction * height, width, 1., BORDER, false);
+                self.painter
+                    .rect(x, y + fraction * height, width, 1., BORDER);
             }
             for series in plot.series {
-                let color = (crate::monitor::series_color(series.name) << 8) | 255;
-                let mut previous = None;
+                let color = opaque(crate::monitor::series_color(series.name));
+                let mut previous: Option<(f32, f32)> = None;
                 for (age, value) in series.points {
                     let Some(value) = value else {
                         previous = None;
                         continue;
                     };
                     let point = (
-                        x + (1. - age / self.ui.resources.seconds() as f32).clamp(0., 1.) * width,
+                        x + (1. - age / self.ui.resources.range as f32).clamp(0., 1.) * width,
                         y + (1. - value.clamp(0., plot.maximum) / plot.maximum) * height,
                     );
                     if let Some(from) = previous {
-                        self.renderer.stroke(from, point, 1.5, color);
+                        if from.0.floor() == point.0.floor() {
+                            continue;
+                        }
+                        self.painter.stroke(from, point, 1.5, color);
                     }
                     previous = Some(point);
                 }
                 if let Some(point) = previous {
-                    self.renderer.stroke(point, point, 3., color);
+                    self.painter.stroke(point, point, 3., color);
                 }
             }
         }
-        self.renderer.clip(
+        self.painter.clip(
             0.,
             layout.footer,
             layout.width,
             (summary_y - 6. - layout.footer).max(0.),
-        )?;
+        );
         for text in view.texts {
             let x = PADDING + f32::from(text.x) * self.cell.0;
             let y = top + text.y as f32 * self.cell.1;
             let width = f32::from(text.width) * self.cell.0;
-            self.renderer.clip(x, y, width, self.cell.1)?;
+            self.painter.clip(x, y, width, self.cell.1);
             let background = match text.emphasis(self.ui.focus == Focus::Monitor) {
                 crate::monitor::Emphasis::Selected => Some(crate::panel::SELECTED),
                 crate::monitor::Emphasis::Highlighted => Some(crate::panel::HOVER),
                 crate::monitor::Emphasis::None => None,
             };
             if let Some(background) = background {
-                self.renderer
-                    .rect(x, y, width, self.cell.1, (background << 8) | 255, false);
+                self.painter
+                    .rect(x, y, width, self.cell.1, opaque(background));
             }
-            self.text.draw(
-                &self.renderer,
-                &fit_label(&text.text, text.width),
-                x,
-                y,
-                (text.color << 8) | 255,
-            )?;
+            self.painter
+                .text(&fit_label(&text.text, text.width), x, y, opaque(text.color));
         }
         for hit in view.hits {
             self.control_hits.push(GuiHit {
@@ -353,35 +288,35 @@ impl WorkspaceView {
                 action: GuiAction::Monitor(hit.action),
             });
         }
-        self.renderer.clip(
+        self.painter.clip(
             0.,
             layout.footer,
             layout.width,
             layout.height - layout.footer,
         )
     }
-    pub(super) fn footer(&mut self, layout: GuiLayout) -> Result<()> {
-        self.renderer.clip(
+    pub(super) fn footer(&mut self, layout: GuiLayout) {
+        self.painter.clip(
             0.,
             layout.footer,
             layout.width,
             layout.height - layout.footer,
-        )?;
-        self.renderer.clear((crate::panel::BACKGROUND << 8) | 255)?;
-        self.renderer
-            .rect(0., layout.footer, layout.width, 1., BORDER, false);
+        );
+        self.painter.clear(opaque(crate::panel::BACKGROUND));
+        self.painter
+            .rect(0., layout.footer, layout.width, 1., BORDER);
         let summary_y = layout.height - self.cell.1 - 6.;
         if self.ui.resources.open {
-            self.draw_resources(layout, summary_y)?;
-            self.renderer
-                .rect(0., summary_y - 6., layout.width, 1., BORDER, false);
+            self.draw_resources(layout, summary_y);
+            self.painter
+                .rect(0., summary_y - 6., layout.width, 1., BORDER);
         }
         let columns = (layout.width / self.cell.0) as u16;
         let origin = layout.width - f32::from(columns) * self.cell.0;
-        let view = self
-            .ui
-            .resources
-            .footer(columns, self.controller(), self.client.is_remote());
+        let view =
+            self.ui
+                .resources
+                .footer(columns, self.client.controller(), self.client.is_remote());
         let left = view
             .texts
             .iter()
@@ -405,22 +340,16 @@ impl WorkspaceView {
                 self.control_hits.push(hit);
             }
             if text.emphasis(self.ui.focus == Focus::Monitor) != crate::monitor::Emphasis::None {
-                self.renderer.rect(
+                self.painter.rect(
                     x,
                     summary_y,
                     bounds.2,
                     self.cell.1,
-                    (crate::panel::SELECTED << 8) | 255,
-                    false,
+                    opaque(crate::panel::SELECTED),
                 );
             }
-            self.text.draw(
-                &self.renderer,
-                &text.text,
-                x,
-                summary_y,
-                (text.color << 8) | 255,
-            )?;
+            self.painter
+                .text(&text.text, x, summary_y, opaque(text.color));
         }
         let right = origin + f32::from(left) * self.cell.0;
         let label = self
@@ -428,8 +357,7 @@ impl WorkspaceView {
             .snapshot()
             .map(|snapshot| self.ui.footer(snapshot, self.client.is_remote()))
             .unwrap_or_default();
-        self.text.draw(
-            &self.renderer,
+        self.painter.text(
             &crate::width::fit_middle(
                 &label,
                 ((right - PADDING - self.cell.0 * 2.) / self.cell.0) as u16,
@@ -437,302 +365,78 @@ impl WorkspaceView {
             PADDING,
             summary_y,
             MUTED,
-        )?;
-        self.renderer.clip(0., 0., 0., 0.)
+        );
+        self.painter.clip(0., 0., 0., 0.)
     }
 
-    fn overflow_hits(&mut self, x: f32, y: f32, before: usize, after: usize, visible: usize) {
-        let mut column = 0;
-        for (count, direction) in [(before, -1), (after, 1)] {
-            if count == 0 {
-                continue;
-            }
-            let width = count.ilog10() as usize + 2;
-            if column + width <= visible {
-                let hit = GuiHit {
-                    bounds: (
-                        x + column as f32 * self.cell.0,
-                        y,
-                        width as f32 * self.cell.0,
-                        self.cell.1,
-                    ),
-                    action: GuiAction::Tab(direction),
-                };
-                self.control_feedback(hit);
-                self.control_hits.push(hit);
-            }
-            column += width + 1;
-        }
-    }
-    pub(super) fn draw_search(&mut self, layout: GuiLayout) -> Result<()> {
+    pub(super) fn draw_search(&mut self, layout: GuiLayout) {
         let Some(pane) = self
             .client
             .snapshot()
             .and_then(|snapshot| snapshot.pane(self.ui.search.pane))
         else {
-            return Ok(());
+            return;
         };
         let (grid_x, grid_y) = layout.origin(self.cell);
         let x = grid_x + f32::from(pane.rect.x) * self.cell.0;
         let y = grid_y + f32::from(pane.rect.y + pane.rect.rows.saturating_sub(1)) * self.cell.1;
         let width = f32::from(pane.rect.cols) * self.cell.0;
         let columns = pane.rect.cols.saturating_sub(2);
-        self.renderer.clip(x, y, width, self.cell.1)?;
-        self.renderer.rect(x, y, width, self.cell.1, CHROME, false);
+        self.painter.clip(x, y, width, self.cell.1);
+        self.painter.rect(x, y, width, self.cell.1, CHROME);
         let (label, caret) = self.ui.search.display(&self.preedit, usize::from(columns));
-        self.text
-            .draw(&self.renderer, &label, x + self.cell.0, y, INK)?;
-        self.renderer.rect(x, y, width, 1., BORDER, false);
+        self.painter.text(&label, x + self.cell.0, y, INK);
+        self.painter.rect(x, y, width, 1., BORDER);
         self.window.cursor_rect(
             (x + self.cell.0 * (1 + caret.min(usize::from(columns))) as f32) as i32,
             y as i32,
             self.cell.0 as i32,
             self.cell.1 as i32,
         );
-        self.renderer.clip(0., 0., 0., 0.)
+        self.painter.clip(0., 0., 0., 0.)
     }
-    pub(super) fn draw_close(&mut self, width: f32, height: f32) -> Result<()> {
-        let prompt = self.ui.close_prompt.unwrap();
-        let rects = close_layout(width, height, self.cell);
-        let (x, y, w, h) = rects[0];
-        let padding = self.cell.0.min(w * 0.1);
-        let columns = ((w - padding * 2.) / self.cell.0) as usize;
-        self.renderer
-            .rect(x, y, w, h, (crate::panel::BORDER << 8) | 255, false);
-        self.renderer.rect(
-            x + 1.,
-            y + 1.,
-            w - 2.,
-            h - 2.,
-            (self.config.background << 8) | 255,
-            false,
-        );
-        self.renderer.clip(x + 1., y + 1., w - 2., h - 2.)?;
-        let name = self.client.snapshot().map_or("", |s| s.name.as_str());
-        self.text.draw(
-            &self.renderer,
-            &fit(
-                &format!(
-                    "{} · {name}",
-                    if prompt.tab.is_some() {
-                        "Close tab"
-                    } else {
-                        "Close window"
-                    }
-                ),
-                columns,
-            ),
-            x + padding,
-            y + h * 0.08,
-            (self.config.foreground << 8) | 255,
-        )?;
-        self.text.draw(
-            &self.renderer,
-            &fit(
-                if prompt.tab.is_some() {
-                    "Programs may still be running in this tab"
-                } else {
-                    "End session to stop tasks and delete history"
-                },
-                columns,
-            ),
-            x + padding,
-            y + h * 0.22,
-            MUTED,
-        )?;
-        let message = if prompt.tab.is_some() {
-            Cow::Borrowed("Closing terminates all panes in this tab")
-        } else if name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
-        {
-            Cow::Owned(format!("Resume with: nextty attach {name}"))
-        } else {
-            Cow::Owned(format!(
-                "Resume with: nextty attach '{}'",
-                name.replace('\'', "'\\''")
-            ))
-        };
-        self.text.draw(
-            &self.renderer,
-            &fit(&message, columns),
-            x + padding,
-            y + h * 0.36,
-            MUTED,
-        )?;
-        for ((terminate, label), &(bx, by, bw, bh)) in [
-            (
-                true,
-                if prompt.tab.is_some() {
-                    "Close tab"
-                } else {
-                    "End session"
-                },
-            ),
-            (
-                false,
-                if prompt.tab.is_some() {
-                    "Cancel"
-                } else {
-                    "Keep running"
-                },
-            ),
-        ]
-        .into_iter()
-        .zip(&rects[1..])
-        {
-            let selected = prompt.terminate == terminate;
-            let hovered = self.pointer.0 >= bx
-                && self.pointer.0 < bx + bw
-                && self.pointer.1 >= by
-                && self.pointer.1 < by + bh;
-            let ink = match (terminate, selected || hovered) {
-                (true, true) => 0xff8a94ff,
-                (true, false) => 0xe05b65ff,
-                (false, true) => ACCENT,
-                (false, false) => INK,
-            };
-            if selected || hovered {
-                self.renderer.rect(
-                    bx,
-                    by,
-                    bw,
-                    bh,
-                    if terminate {
-                        0x633534ff
-                    } else {
-                        (crate::panel::HOVER << 8) | 255
-                    },
-                    false,
-                );
-            }
-            let label = fit(label, (bw / self.cell.0) as usize);
-            self.text.draw(
-                &self.renderer,
-                &label,
-                bx + (bw - text_width(&label) as f32 * self.cell.0) * 0.5,
-                by + (bh - self.cell.1) * 0.5,
-                ink,
-            )?;
-        }
-        self.text.draw(
-            &self.renderer,
-            &fit("Enter: confirm · Tab/←/→: select · Esc: cancel", columns),
-            x + padding,
-            y + h * 0.83,
-            MUTED,
-        )?;
-        self.renderer.clip(0., 0., 0., 0.)
-    }
-}
 
-fn fit(text: &str, limit: usize) -> Cow<'_, str> {
-    // With widths capped at two columns, UTF-8 byte length is an upper bound.
-    if text.len() <= limit
-        && !text[crate::width::printable_ascii_prefix(text.as_bytes())..]
-            .chars()
-            .any(char::is_control)
-    {
-        return Cow::Borrowed(text);
-    }
-    let mut result = String::with_capacity(text.len().min(limit));
-    let mut width = 0;
-    for c in text.chars() {
-        let c = if c.is_control() { ' ' } else { c };
-        let w = usize::from(scalar_width(c).min(2));
-        if width + w > limit {
-            if limit > 0 {
-                while width >= limit
-                    && let Some(previous) = result.pop()
-                {
-                    width -= usize::from(scalar_width(previous).min(2));
-                }
-                result.push('…');
-            }
-            break;
-        }
-        result.push(c);
-        width += w;
-    }
-    Cow::Owned(result)
-}
-
-impl WorkspaceView {
-    pub(super) fn draw_panel(&mut self, grid: &crate::panel::Grid) -> Result<()> {
-        self.renderer.clip(0., 0., 0., 0.)?;
-        grid.for_each_run(None, &[], |run| {
+    pub(super) fn draw_panel(&mut self, grid: &crate::panel::Grid) {
+        self.painter.clip(0., 0., 0., 0.);
+        let Ok(()) = grid.for_each_run::<std::convert::Infallible>(None, false, |run| {
             let x = f32::from(run.x) * self.cell.0;
             let y = f32::from(run.y) * self.cell.1;
             let width = f32::from(run.columns) * self.cell.0;
-            self.renderer
-                .rect(x, y, width, self.cell.1, (run.background << 8) | 255, false);
+            self.painter
+                .rect(x, y, width, self.cell.1, opaque(run.background));
             if run.flags.contains(Flags::UNDERLINE) {
-                self.renderer.rect(
+                self.painter.rect(
                     x,
                     y + self.cell.1 - 2.,
                     width,
                     1.,
-                    (run.underline_color.unwrap_or(run.foreground) << 8) | 255,
-                    false,
+                    opaque(run.underline_color.unwrap_or(run.foreground)),
                 );
             }
-            self.text.draw_flags(
-                &self.renderer,
+            self.painter.text_flags(
                 run.text,
                 x,
                 y,
-                (run.foreground << 8) | 255,
+                opaque(run.foreground),
                 u32::from((run.flags & (Flags::BOLD | Flags::ITALIC)).bits()),
-            )?;
+            );
             Ok(())
-        })
+        });
     }
 
-    pub(super) fn draw_files(&mut self, layout: GuiLayout) -> Result<()> {
+    pub(super) fn draw_files(&mut self, layout: GuiLayout) {
         let rect = self.file_rect(layout);
         let preview_rect = self.file_preview_layout(layout);
         let Some(files) = &mut self.ui.files else {
-            return Ok(());
+            return;
         };
         let focused = self.ui.focus == Focus::Files && files.focus() == FileFocus::List;
         let grid = crate::file_panel::list(files, rect, &self.preedit, focused, &self.config);
         let preview = (files.focus() == FileFocus::Preview)
             .then(|| crate::file_panel::preview(files, preview_rect, &self.config));
-        self.draw_panel(&grid)?;
+        self.draw_panel(&grid);
         if let Some(preview) = preview {
-            self.draw_panel(&preview)?;
+            self.draw_panel(&preview);
         }
-        Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use crate::workspace::{Snapshot, TabView};
-
-    #[test]
-    fn overflow_keeps_active_tab_and_counts_both_hidden_sides() {
-        let snapshot = Snapshot {
-            name: "dev".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 6,
-            tabs: (1..=12)
-                .map(|id| TabView {
-                    activity: crate::workspace::TabActivity::Idle,
-                    id,
-                    title: format!("tab-{id}"),
-                })
-                .collect(),
-            panes: Vec::new(),
-        };
-        let (tabs, label, before, after) = crate::workspace::tab_chrome(&snapshot, 80, "SSH");
-        assert!(
-            tabs.iter()
-                .any(|(index, _, _)| snapshot.tabs[*index].id == snapshot.active_tab)
-        );
-        assert_eq!(before + tabs.len() + after, snapshot.tabs.len());
-        assert!(before > 0 && after > 0);
-        assert!(label.contains('‹') && label.contains('›') && label.ends_with("SSH"));
     }
 }

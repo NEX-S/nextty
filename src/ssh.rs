@@ -19,58 +19,22 @@ impl RemoteTarget {
             )
         };
         let address = value.strip_prefix("ssh://").unwrap_or(value);
-        let (user, host_port) = match address.split_once('@') {
-            Some((user, host)) => {
-                if user.is_empty()
-                    || !user
-                        .bytes()
-                        .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-                {
-                    return Err(invalid());
-                }
-                (Some(user), host)
-            }
-            None => (None, address),
-        };
+        let (user, host_port) = address.split_at(address.find('@').map_or(0, |at| at + 1));
         let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
             let (host, suffix) = rest.split_once(']').ok_or_else(invalid)?;
-            host.parse::<Ipv6Addr>().map_err(|_| invalid())?;
-            let port = if suffix.is_empty() {
-                None
-            } else {
-                Some(suffix.strip_prefix(':').ok_or_else(invalid)?)
-            };
-            (host, port)
+            (host, suffix.strip_prefix(':'))
         } else if host_port.parse::<Ipv6Addr>().is_ok() {
             (host_port, None)
         } else {
-            let (host, port) = host_port
+            host_port
                 .split_once(':')
-                .map_or((host_port, None), |(host, port)| (host, Some(port)));
-            if host.is_empty()
-                || host.starts_with('-')
-                || !host
-                    .bytes()
-                    .all(|c| c.is_ascii_alphanumeric() || b"._-".contains(&c))
-            {
-                return Err(invalid());
-            }
-            (host, port)
+                .map_or((host_port, None), |(host, port)| (host, Some(port)))
         };
-        let port = port
-            .map(|port| {
-                if !port.bytes().all(|c| c.is_ascii_digit()) {
-                    return Err(invalid());
-                }
-                port.parse::<u16>()
-                    .ok()
-                    .filter(|port| *port != 0)
-                    .ok_or_else(invalid)
-            })
-            .transpose()?;
         Ok(Self {
-            destination: user.map_or_else(|| host.to_owned(), |user| format!("{user}@{host}")),
-            port,
+            destination: format!("{user}{host}"),
+            port: port
+                .map(|port| port.parse().map_err(|_| invalid()))
+                .transpose()?,
         })
     }
 
@@ -81,16 +45,18 @@ impl RemoteTarget {
         }
     }
 
-    pub fn command(&self) -> Command {
+    /// `new` makes the remote bridge start the workspace server and `list` makes it end quietly
+    /// when there is none; other commands connect to a running server only.
+    pub fn command(&self, bridge: &str) -> Command {
         let mut command = Command::new("ssh");
         command.args(["-T", "-oRemoteCommand=none"]);
         if let Some(port) = self.port {
             command.arg("-p").arg(port.to_string());
         }
-        command.arg("--").arg(&self.destination).arg(format!(
-            "nextty --bridge {}",
-            nextty::workspace::BRIDGE_VERSION
-        ));
+        command
+            .arg("--")
+            .arg(&self.destination)
+            .arg(format!("nextty --bridge {bridge}"));
         command
     }
 }
@@ -124,32 +90,10 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_addresses_and_options_are_rejected_before_ssh() {
-        for input in [
-            "",
-            "-oProxyCommand=bad",
-            "@host",
-            "user@",
-            "user@@host",
-            "host:0",
-            "host:65536",
-            "host:abc",
-            "host:",
-            "[::1",
-            "[host]:22",
-            "[::1]/path",
-            "ssh://host/path",
-            "host;command",
-            "host\ncommand",
-            "host name",
-        ] {
-            assert!(RemoteTarget::parse(input).is_err(), "{input:?}");
-        }
-    }
-
-    #[test]
     fn ssh_arguments_do_not_include_session_or_program_shell_text() {
-        let command = RemoteTarget::parse("nex@host:2222").unwrap().command();
+        let command = RemoteTarget::parse("nex@host:2222")
+            .unwrap()
+            .command("attach");
         let args: Vec<_> = command
             .get_args()
             .map(|arg| arg.to_str().unwrap())
@@ -163,7 +107,7 @@ mod tests {
                 "2222",
                 "--",
                 "nex@host",
-                &format!("nextty --bridge {}", nextty::workspace::BRIDGE_VERSION)
+                "nextty --bridge attach"
             ]
         );
     }

@@ -1,12 +1,5 @@
 use super::*;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub(super) enum AgentScroll {
-    Transcript,
-    Editor,
-    Preview,
-}
-
 pub(super) struct EditorViewport {
     pub(super) x: f32,
     pub(super) y: f32,
@@ -17,49 +10,40 @@ pub(super) struct EditorViewport {
 #[derive(Default)]
 pub(super) struct AgentState {
     pub(super) drag: Option<f32>,
-    pub(super) divider_hover: bool,
     selecting_editor: bool,
     chat_rows: Vec<(usize, crate::workspace::Rect)>,
+    pub(super) hits: Vec<(crate::workspace::Rect, AgentAction)>,
     tool_click: Option<usize>,
 }
 
 impl WorkspaceView {
     pub(super) fn agent_point(&self, clamp: bool) -> Option<crate::agent::panel::TranscriptPoint> {
-        let (line, rect) = if clamp {
-            self.agent
-                .chat_rows
-                .iter()
-                .rfind(|(_, rect)| f32::from(rect.y) * self.cell.1 <= self.pointer.1)
-                .or_else(|| self.agent.chat_rows.first())?
-        } else {
-            self.agent.chat_rows.iter().find(|(_, rect)| {
-                let y = f32::from(rect.y) * self.cell.1;
-                (y..y + self.cell.1).contains(&self.pointer.1)
-            })?
-        };
-        let column = ((self.pointer.0 - f32::from(rect.x) * self.cell.0) / self.cell.0) as usize;
-        self.ui
-            .agent
-            .active()
-            .point(*line, column.min(usize::from(rect.cols)))
+        let (column, row) = self.cell();
+        crate::ui::transcript_point(
+            self.ui.agent.active(),
+            &self.agent.chat_rows,
+            column,
+            row,
+            clamp,
+        )
     }
 
     pub(super) fn editor_viewport(&self) -> Option<EditorViewport> {
-        let hit = self
-            .control_hits
+        let (rect, _) = self
+            .agent
+            .hits
             .iter()
-            .find(|hit| hit.action == GuiAction::Agent(AgentAction::Editor))?;
+            .find(|(_, action)| *action == AgentAction::Editor)?;
         let columns = self
             .ui
             .agent
             .active()
-            .editor_columns((hit.bounds.2 / self.cell.0) as usize);
-        let rows = (hit.bounds.3 / self.cell.1).round().max(1.) as usize;
+            .editor_columns(usize::from(rect.cols));
         Some(EditorViewport {
-            x: hit.bounds.0,
-            y: hit.bounds.1,
+            x: f32::from(rect.x) * self.cell.0,
+            y: f32::from(rect.y) * self.cell.1,
             columns,
-            rows,
+            rows: usize::from(rect.rows).max(1),
         })
     }
 
@@ -87,30 +71,23 @@ impl WorkspaceView {
     /// Clicks while a context preview covers the window.
     pub(super) fn preview_button(&mut self, button: u32) -> Result<()> {
         if button == 1
-            && let Some(action) = self
-                .control_hits
-                .iter()
-                .rfind(|hit| {
-                    hit.contains(self.pointer)
-                        && matches!(
-                            hit.action,
-                            GuiAction::Agent(AgentAction::ClosePreview | AgentAction::CopyPreview)
-                        )
-                })
-                .map(|hit| hit.action)
+            && let Some(action) =
+                crate::ui::agent_hit(&self.agent.hits, self.cell().0, self.cell().1).filter(
+                    |action| matches!(action, AgentAction::ClosePreview | AgentAction::CopyPreview),
+                )
         {
-            self.gui_action(action)?;
+            self.gui_action(GuiAction::Agent(action))?;
         }
         Ok(())
     }
     pub(super) fn agent_control_button(
         &mut self,
         button: u32,
-        action: GuiAction,
+        action: AgentAction,
         modifiers: u32,
     ) -> Result<bool> {
         match (button, action) {
-            (3, GuiAction::Agent(AgentAction::Copy(index) | AgentAction::Tool(index))) => {
+            (3, AgentAction::Copy(index) | AgentAction::Tool(index)) => {
                 if let Some(text) = self.ui.agent.active().selected_text() {
                     self.window.selection(false, &text);
                     self.message("Copied");
@@ -118,10 +95,10 @@ impl WorkspaceView {
                     self.gui_action(GuiAction::Agent(AgentAction::Copy(index)))?;
                 }
             }
-            (3, GuiAction::Agent(AgentAction::Editor)) => {
+            (3, AgentAction::Editor) => {
                 self.gui_action(GuiAction::Agent(AgentAction::ContextMenu))?
             }
-            (1, GuiAction::Agent(AgentAction::Copy(_) | AgentAction::Tool(_))) => {
+            (1, AgentAction::Copy(_) | AgentAction::Tool(_)) => {
                 if self.composition_finished() {
                     self.ui.focus = Focus::Output;
                     if let Some(point) = self.agent_point(false) {
@@ -130,14 +107,14 @@ impl WorkspaceView {
                             .active_mut()
                             .begin_selection(point, modifiers & native::SHIFT != 0);
                         self.agent.tool_click = match action {
-                            GuiAction::Agent(AgentAction::Tool(index)) => Some(index),
+                            AgentAction::Tool(index) => Some(index),
                             _ => None,
                         };
                     }
                     self.dirty = true;
                 }
             }
-            (1 | 2, GuiAction::Agent(AgentAction::Editor)) => {
+            (1 | 2, AgentAction::Editor) => {
                 if self.composition_finished() {
                     self.ui.focus = Focus::Editor;
                     self.ui.cancel_rewind();
@@ -157,22 +134,19 @@ impl WorkspaceView {
         if !self.ui.agent.open {
             return Ok(());
         }
-        let side = crate::workspace::Rect {
-            x: (layout.side / self.cell.0) as u16,
-            y: 1,
-            cols: ((layout.width - layout.side) / self.cell.0) as u16,
-            rows: ((layout.footer - layout.top) / self.cell.1).max(1.) as u16,
-        };
+        let side = rect(
+            (layout.side / self.cell.0) as u16,
+            1,
+            ((layout.width - layout.side) / self.cell.0) as u16,
+            ((layout.footer - layout.top) / self.cell.1).max(1.) as u16,
+        );
         let size = WindowSize {
             num_cols: (layout.width / self.cell.0) as u16,
             num_lines: (layout.height / self.cell.1) as u16,
             cell_width: self.cell.0 as u16,
             cell_height: self.cell.1 as u16,
         };
-        let pointer = Some((
-            (self.pointer.0 / self.cell.0) as u16,
-            (self.pointer.1 / self.cell.1) as u16,
-        ));
+        let pointer = Some(self.cell());
         let panel = crate::agent::panel::draw(
             &mut self.ui,
             &self.config,
@@ -182,121 +156,73 @@ impl WorkspaceView {
             &self.preedit,
         )?;
         if let Some(backdrop) = &panel.backdrop {
-            self.draw_panel(backdrop)?;
+            self.draw_panel(backdrop);
         }
-        self.draw_panel(&panel.grid)?;
+        self.draw_panel(&panel.grid);
         self.agent.chat_rows = panel.chat_rows;
-        for (rect, action) in panel.hits {
-            self.control_hits.push(GuiHit {
-                bounds: (
-                    f32::from(rect.x) * self.cell.0,
-                    f32::from(rect.y) * self.cell.1,
-                    f32::from(rect.cols) * self.cell.0,
-                    f32::from(rect.rows) * self.cell.1,
-                ),
-                action: GuiAction::Agent(action),
-            });
-        }
-        let editor = self.ui.agent.active().editor_layout(
-            self.ui
-                .agent
-                .active()
-                .editor_columns(usize::from(panel.editor.cols)),
+        self.agent.hits = panel.hits;
+        let (cell, session) = (self.cell, self.ui.agent.active());
+        let editor = session.editor_layout(
+            session.editor_columns(usize::from(panel.editor.cols)),
             usize::from(panel.editor.rows),
         );
-        let chat = panel.chat;
-        let mut bars = vec![
+        let transcript = ScrollTarget::Transcript;
+        let bars = [
             (
-                ScrollTarget::Agent(AgentScroll::Transcript),
-                chat,
-                self.ui.agent.active().lines.len(),
-                self.ui.agent.active().model.scroll,
+                transcript,
+                panel.chat,
+                session.lines.len(),
+                session.model.scroll,
             ),
             (
-                ScrollTarget::Agent(AgentScroll::Editor),
+                ScrollTarget::Editor,
                 panel.editor,
                 editor.lines.len(),
                 editor.first,
             ),
         ];
+        for (target, rect, total, offset) in bars {
+            self.scrollbars
+                .extend(Scrollbar::in_rect(target, rect, cell, total, offset));
+        }
         if let Some(rect) = panel.preview
-            && let Some(preview) = &self.ui.agent.active().context.preview
+            && let Some(preview) = &session.context.preview
         {
-            bars.push((
-                ScrollTarget::Agent(AgentScroll::Preview),
+            let target = ScrollTarget::Preview;
+            self.scrollbars.extend(Scrollbar::in_rect(
+                target,
                 rect,
+                cell,
                 preview.lines.len(),
                 preview.scroll,
             ));
         }
-        for (target, rect, total, offset) in bars {
-            if let Some(bar) = Scrollbar::new(
-                target,
-                (
-                    f32::from(rect.x + rect.cols) * self.cell.0 - 3.,
-                    f32::from(rect.y) * self.cell.1,
-                    3.,
-                    f32::from(rect.rows) * self.cell.1,
-                ),
-                total,
-                usize::from(rect.rows),
-                offset,
-            ) {
-                self.scrollbars.push(bar);
-            }
-        }
         if let Some((column, row)) = panel.cursor {
             let x = f32::from(column) * self.cell.0;
             let y = f32::from(row) * self.cell.1;
-            self.renderer.rect(x, y, 2., self.cell.1, INK, false);
+            self.painter.rect(x, y, 2., self.cell.1, INK);
             self.window
                 .cursor_rect(x as i32, y as i32, self.cell.0 as i32, self.cell.1 as i32);
         }
         self.ui.agent.spare_grid = Some(panel.grid);
         Ok(())
     }
-    pub(super) fn poll_agent_events(&mut self, pollfds: &[libc::pollfd]) -> Result<()> {
-        let revision = self.ui.agent.active().model.revision;
-        let (changed, messages_changed) = self.ui.poll_agent(&mut self.client, &self.config)?;
-        let layout_changed = pollfds
-            .iter()
-            .any(|source| source.fd == self.ui.agent.layout_fd() && source.revents != 0)
-            && self.ui.agent.poll_layout()?;
+    pub(super) fn agent_refresh(&mut self, revision: u64, messages_changed: bool) {
         if revision != self.ui.agent.active().model.revision {
             self.agent.chat_rows.clear();
             self.agent.tool_click = None;
         }
         if messages_changed {
-            self.control_hits.retain(|hit| {
+            self.agent.hits.retain(|(_, action)| {
                 !matches!(
-                    hit.action,
-                    GuiAction::Agent(
-                        AgentAction::Copy(_) | AgentAction::Tool(_) | AgentAction::Rewind(_)
-                    )
+                    action,
+                    AgentAction::Copy(_) | AgentAction::Tool(_) | AgentAction::Rewind(_)
                 )
             });
         }
-        self.dirty |= changed && self.ui.agent.open || layout_changed;
-        Ok(())
     }
 
-    pub(super) fn agent_event(&mut self, event: &Event) -> bool {
-        match event.kind {
-            native::TEXT if self.ui.agent.active().rewind_target.is_some() => {
-                self.ui.cancel_rewind()
-            }
-            native::PREEDIT
-                if self.ui.agent.open
-                    && matches!(self.ui.focus, Focus::Output | Focus::Controls) =>
-            {
-                return true;
-            }
-            _ => (),
-        }
-        false
-    }
-
-    pub(super) fn agent_action(&mut self, action: AgentAction) -> Result<bool> {
+    pub(super) fn agent_action(&mut self, action: AgentAction) -> bool {
         if !matches!(
             action,
             AgentAction::Stop
@@ -305,9 +231,8 @@ impl WorkspaceView {
                 | AgentAction::CopyPreview
         ) && !self.composition_finished()
         {
-            return Ok(false);
+            return false;
         }
-        let open = self.ui.agent.open;
         match self.ui.activate_agent(action, &self.client) {
             Ok(Some(copy)) => {
                 self.window.selection(false, &copy);
@@ -316,13 +241,10 @@ impl WorkspaceView {
             Ok(None) => (),
             Err(error) => self.message(error.to_string()),
         }
-        if open != self.ui.agent.open {
-            self.resize()?;
-        }
         self.agent.selecting_editor = false;
         self.agent.tool_click = None;
         self.agent.chat_rows.clear();
-        Ok(true)
+        true
     }
 
     pub(super) fn agent_button_release(&mut self, button: u32) -> Result<bool> {
@@ -398,44 +320,31 @@ impl WorkspaceView {
         Ok(false)
     }
 
-    pub(super) fn agent_scroll(&mut self, amount: f32) -> bool {
-        let delta = if amount > 0. { -3 } else { 3 };
-        if let Some(crate::agent::panel::ContextPreview { scroll, .. }) =
-            &mut self.ui.agent.active_mut().context.preview
-        {
-            *scroll = scroll.saturating_add_signed(delta);
-            self.dirty = true;
-            return true;
-        }
-        if self.ui.resources.open && self.pointer.1 >= self.layout().footer {
+    /// `down` is the wheel travel in lines, positive towards newer content.
+    pub(super) fn agent_scroll(&mut self, down: isize) -> bool {
+        let layout = self.layout();
+        let in_panel = self.ui.agent.open
+            && self.pointer.0 >= layout.side
+            && !(self.ui.resources.open && self.pointer.1 >= layout.footer);
+        if !self.preview_open() && !in_panel {
             return false;
         }
-        if self.ui.agent.open && self.pointer.0 >= self.layout().side {
-            if self.control_hits.iter().any(|hit| {
-                hit.action == GuiAction::Agent(AgentAction::Editor) && hit.contains(self.pointer)
-            }) {
-                if let Some(layout) = self.editor_viewport() {
-                    let editor = self
-                        .ui
-                        .agent
-                        .active()
-                        .editor_layout(layout.columns, layout.rows);
-                    self.ui.agent.active_mut().editor_scroll = Some(
-                        editor
-                            .first
-                            .saturating_add_signed(delta)
-                            .min(editor.lines.len().saturating_sub(layout.rows)),
-                    );
-                }
-                self.dirty = true;
-                return true;
-            }
-            let scroll = &mut self.ui.agent.active_mut().model.scroll;
-            *scroll = scroll.saturating_add_signed(-delta);
-            self.dirty = true;
-            return true;
-        }
-        false
+        let (column, row) = self.cell();
+        let editor = (crate::ui::agent_hit(&self.agent.hits, column, row)
+            == Some(AgentAction::Editor))
+        .then(|| self.editor_viewport())
+        .flatten()
+        .map(|viewport| {
+            let editor = self
+                .ui
+                .agent
+                .active()
+                .editor_layout(viewport.columns, viewport.rows);
+            (editor.first, editor.lines.len(), viewport.rows)
+        });
+        self.ui.agent_wheel(down, editor);
+        self.dirty = true;
+        true
     }
     pub(super) fn agent_button(&mut self, button: u32, layout: GuiLayout) -> bool {
         if self.ui.agent.active().context.menu {

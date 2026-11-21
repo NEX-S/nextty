@@ -13,11 +13,6 @@ void main() {
     }
     float a = rgba.a;
     if (kind == 1) a *= texture(mask_atlas, texcoord).r;
-    if (kind == 4) {
-        vec2 q = abs(texcoord - shape.xy * .5) - shape.xy * .5 + shape.z;
-        float d = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0) - shape.z;
-        a *= clamp(.5 - d / max(fwidth(d), .001), 0.0, 1.0);
-    }
     if (kind == 5) {
         float edge = shape.z * (1.0 - texcoord.y / shape.y);
         float d = min(texcoord.x, shape.x - texcoord.x) - edge;

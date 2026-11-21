@@ -3,53 +3,51 @@
 #[path = "tui_input.rs"]
 mod input;
 
-use crate::agent::panel::{AgentAction, AgentLine, editor};
-use crate::clipboard_reader::ClipboardReader;
+use crate::agent::panel::{AgentAction, editor};
 use crate::config::Config;
 use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::input::{PasteTarget, TextDecoder, mouse_bytes};
-use crate::panel::mix_color;
+use crate::panel::{Grid, rect};
 use crate::screen::Screen;
-use crate::ui::{Focus, Ui};
+use crate::ui::{Focus, READ_ONLY, Ui, cursor_bytes};
 use crate::vt::{Color, CursorShape, NamedColor, Rgb};
-use crate::width::{fit_label, text_width};
+use crate::width::text_width;
 use crate::workspace::{
-    Action, Axis, Client, ClientEvent, PaneId, PaneView, Rect, Snapshot, SplitDrag, tab_chrome,
+    Action, Axis, Client, PaneId, PaneView, Rect, Response, Snapshot, SplitDrag,
 };
-use input::{Decoder, Input, Mouse};
-use std::io::{self, Write};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use input::{Decoder, Input, PointerEvent, PointerKind};
+use std::collections::VecDeque;
+use std::fs::File;
+use std::io::{self, Read, Write};
+use std::mem::ManuallyDrop;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
 use std::time::{Duration, Instant};
 
 const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J";
 const LEAVE: &[u8] = b"\x1b[?2026l\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
 
+fn check(result: i32) -> io::Result<i32> {
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(result)
+    }
+}
+
 struct TerminalGuard {
     input: RawFd,
     output: RawFd,
     termios: libc::termios,
     output_flags: i32,
-    mask: libc::sigset_t,
-    signals: OwnedFd,
+    signals: File,
 }
 
 impl TerminalGuard {
     fn enter(input: RawFd, output: RawFd) -> io::Result<Self> {
-        if unsafe { libc::isatty(input) } != 1 || unsafe { libc::isatty(output) } != 1 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "TUI requires a terminal on stdin and stdout",
-            ));
-        }
         let mut termios = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(input, &mut termios) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let output_flags = unsafe { libc::fcntl(output, libc::F_GETFL) };
-        if output_flags < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check(unsafe { libc::tcgetattr(input, &mut termios) })?;
+        let output_flags = check(unsafe { libc::fcntl(output, libc::F_GETFL) })?;
         let mut signals = unsafe { std::mem::zeroed() };
         unsafe { libc::sigemptyset(&mut signals) };
         for signal in [
@@ -63,59 +61,30 @@ impl TerminalGuard {
         ] {
             unsafe { libc::sigaddset(&mut signals, signal) };
         }
-        let mut mask = unsafe { std::mem::zeroed() };
-        let result = unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, &mut mask) };
-        if result != 0 {
-            return Err(io::Error::from_raw_os_error(result));
-        }
-        let fd = unsafe { libc::signalfd(-1, &signals, libc::SFD_CLOEXEC | libc::SFD_NONBLOCK) };
-        if fd < 0 {
-            let error = io::Error::last_os_error();
-            unsafe { libc::pthread_sigmask(libc::SIG_SETMASK, &mask, std::ptr::null_mut()) };
-            return Err(error);
-        }
+        unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) };
+        let signalfd = libc::SFD_CLOEXEC | libc::SFD_NONBLOCK;
+        let signals = check(unsafe { libc::signalfd(-1, &signals, signalfd) })?;
         let guard = Self {
             input,
             output,
             termios,
             output_flags,
-            mask,
-            signals: unsafe { OwnedFd::from_raw_fd(fd) },
+            signals: unsafe { File::from_raw_fd(signals) },
         };
         let mut raw = termios;
         unsafe { libc::cfmakeraw(&mut raw) };
-        if unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        if unsafe { libc::fcntl(output, libc::F_SETFL, output_flags | libc::O_NONBLOCK) } < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        check(unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) })?;
+        check(unsafe { libc::fcntl(output, libc::F_SETFL, output_flags | libc::O_NONBLOCK) })?;
         Ok(guard)
     }
 
     fn next_signal(&self) -> io::Result<Option<u32>> {
-        let mut info: libc::signalfd_siginfo = unsafe { std::mem::zeroed() };
-        let count = unsafe {
-            libc::read(
-                self.signals.as_raw_fd(),
-                (&mut info as *mut libc::signalfd_siginfo).cast(),
-                std::mem::size_of_val(&info),
-            )
-        };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if error.kind() == io::ErrorKind::WouldBlock {
-                return Ok(None);
-            }
-            return Err(error);
+        let mut info = [0; size_of::<libc::signalfd_siginfo>()];
+        match (&self.signals).read_exact(&mut info) {
+            Ok(()) => Ok(Some(u32::from_ne_bytes(info[..4].try_into().unwrap()))),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(None),
+            Err(error) => Err(error),
         }
-        if count as usize != std::mem::size_of_val(&info) {
-            return Err(io::Error::new(
-                io::ErrorKind::UnexpectedEof,
-                "short signalfd read",
-            ));
-        }
-        Ok(Some(info.ssi_signo))
     }
 }
 
@@ -127,170 +96,110 @@ impl Drop for TerminalGuard {
             libc::tcflush(self.output, libc::TCOFLUSH);
             libc::write(self.output, LEAVE.as_ptr().cast(), LEAVE.len());
             libc::fcntl(self.output, libc::F_SETFL, self.output_flags);
-            libc::pthread_sigmask(libc::SIG_SETMASK, &self.mask, std::ptr::null_mut());
         }
     }
 }
 
 /// Attach the terminal frontend to a client already sent Create or Attach.
-pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
-    let terminal = TerminalGuard::enter(libc::STDIN_FILENO, libc::STDOUT_FILENO)?;
+pub fn run(client: Client, config: Config) -> io::Result<()> {
     let size = terminal_size(libc::STDOUT_FILENO)?;
+    let terminal = TerminalGuard::enter(libc::STDIN_FILENO, libc::STDOUT_FILENO)?;
     let mut frontend = Frontend::new(client, size, config)?;
-    let mut output = Output {
-        bytes: ENTER.to_vec(),
-        written: 0,
-    };
+    // One frame or one clipboard chunk at a time; a slow SSH link never queues more frames.
+    let mut output = ENTER.to_vec();
     frontend.client.send(Action::Resize(frontend.view_size()))?;
+    let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
+    let mut stdout = ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDOUT_FILENO) });
     let mut decoder = Decoder::default();
     let mut fds: Vec<libc::pollfd> = Vec::new();
     let result = (|| {
-        let mut output_ready = true;
         frontend.poll()?;
         while frontend.running {
-            {
-                let (changed, _) = frontend
-                    .ui
-                    .poll_agent(&mut frontend.client, &frontend.config)?;
-                let layout_changed = fds.iter().any(|source| {
-                    source.fd == frontend.ui.agent.layout_fd() && source.revents != 0
-                }) && frontend.ui.agent.poll_layout()?;
-                if (changed && frontend.ui.agent.open) || layout_changed {
-                    frontend.agent.dirty = true;
-                    frontend.dirty = true;
-                }
-            }
-
-            let (resources, changed) = frontend.ui.service(&frontend.client, &fds)?;
-            frontend.resource_dirty |= resources;
+            let (changed, _) = frontend
+                .ui
+                .service(&mut frontend.client, &frontend.config, &fds)?;
             frontend.dirty |= changed;
             if output.is_empty() {
-                if let Some(transfer) = &mut frontend.clipboard {
-                    if let Some(message) =
-                        transfer.step(&mut output.bytes, frontend.clipboard_reader.as_mut())?
-                    {
-                        frontend.clipboard = None;
+                if let Some(transfer) = frontend.copies.front_mut() {
+                    if let Some(message) = transfer.step(&mut output)? {
+                        frontend.copies.pop_front();
                         frontend.message(message);
                     }
-                } else if frontend.dirty {
-                    frontend.draw(&mut output.bytes)?;
+                } else if frontend.dirty || frontend.screen_dirty {
+                    frontend.draw(&mut output)?;
                     frontend.dirty = false;
+                    frontend.screen_dirty = false;
                     frontend.client.request_screen()?;
                 }
             }
-            if output_ready && let Err(error) = output.flush_available(libc::STDOUT_FILENO) {
-                let mut state = libc::pollfd {
-                    fd: libc::STDOUT_FILENO,
-                    events: 0,
-                    revents: 0,
-                };
-                crate::poll::poll(std::slice::from_mut(&mut state), 0)?;
-                if state.revents & libc::POLLHUP != 0 {
-                    break;
+            if !output.is_empty() {
+                match stdout.write(&output) {
+                    Ok(count) => {
+                        output.drain(..count);
+                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                    // The host terminal went away.
+                    Err(error) if error.raw_os_error() == Some(libc::EIO) => break,
+                    Err(error) => return Err(error),
                 }
-                return Err(error);
             }
-            output_ready = output.is_empty();
             let now = Instant::now();
-            let mut timeout = decoder.timeout(now);
-
-            if let Some(until) = frontend.ui.deadline() {
-                let remaining = until.saturating_duration_since(now);
-                timeout = Some(timeout.map_or(remaining, |timeout| timeout.min(remaining)));
-            }
-            let clipboard_waiting = frontend.clipboard.as_ref().is_some_and(|transfer| {
-                matches!(transfer.reader, ClipboardSource::File)
-                    && frontend.clipboard_reader.as_ref().unwrap().pending()
-            });
-            if output.is_empty()
-                && (frontend.clipboard.is_some() && !clipboard_waiting
-                    || frontend.clipboard.is_none() && frontend.dirty)
+            let mut timeout = [
+                decoder.timeout(now),
+                frontend
+                    .ui
+                    .deadline()
+                    .map(|until| until.saturating_duration_since(now)),
+            ]
+            .into_iter()
+            .flatten()
+            .min();
+            if frontend.client.needs_poll()
+                || output.is_empty()
+                    && (!frontend.copies.is_empty() || frontend.dirty || frontend.screen_dirty)
             {
                 timeout = Some(Duration::ZERO);
             }
-            if frontend.client.needs_poll() {
-                timeout = Some(Duration::ZERO);
-            }
             frontend.client.flush()?;
+            let watch = |fd, events| libc::pollfd {
+                fd,
+                events,
+                revents: 0,
+            };
             fds.clear();
             fds.extend([
-                libc::pollfd {
-                    fd: libc::STDIN_FILENO,
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
+                watch(libc::STDIN_FILENO, libc::POLLIN),
                 frontend.client.pollfd(),
-                libc::pollfd {
-                    fd: terminal.signals.as_raw_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: libc::STDOUT_FILENO,
-                    events: if output.is_empty() { 0 } else { libc::POLLOUT },
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: frontend.client.receiver_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: frontend
-                        .clipboard_reader
-                        .as_ref()
-                        .filter(|_| output.is_empty() && clipboard_waiting)
-                        .map_or(-1, ClipboardReader::fd),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
+                watch(terminal.signals.as_raw_fd(), libc::POLLIN),
+                watch(
+                    libc::STDOUT_FILENO,
+                    if output.is_empty() { 0 } else { libc::POLLOUT },
+                ),
             ]);
             fds.extend(frontend.ui.fds());
-            let milliseconds = timeout.map_or(-1, crate::poll::timeout_millis);
-            crate::poll::poll(&mut fds, milliseconds)?;
-            if fds[4].revents != 0 {
-                crate::eventfd::consume_notification(fds[4].fd)?;
-            }
-            if fds[5].revents != 0 {
-                crate::eventfd::consume_notification(fds[5].fd)?;
-            }
-            output_ready |= fds[3].revents & libc::POLLOUT != 0;
-            if fds[1].revents & libc::POLLOUT != 0 {
-                frontend.client.flush()?;
-            }
+            crate::sys::poll(&mut fds, timeout.map_or(-1, crate::sys::timeout_millis))?;
             while fds[2].revents != 0
                 && let Some(signal) = terminal.next_signal()?
             {
                 if signal == libc::SIGWINCH as u32 {
                     frontend.size = terminal_size(libc::STDOUT_FILENO)?;
-                    frontend.full = true;
-                    frontend.dirty = true;
-                    if frontend.controller() {
-                        frontend.resize()?;
-                    }
+                    frontend.frame = None;
+                    frontend.resize()?;
                 } else {
                     frontend.running = false;
                 }
             }
             if fds[0].revents & libc::POLLIN != 0 {
                 let mut bytes = [0; 8192];
-                let count = unsafe {
-                    libc::read(libc::STDIN_FILENO, bytes.as_mut_ptr().cast(), bytes.len())
-                };
-                if count > 0 {
-                    for event in decoder.feed(&bytes[..count as usize], Instant::now()) {
-                        frontend.input(event)?;
+                match stdin.read(&mut bytes) {
+                    Ok(0) => frontend.running = false,
+                    Ok(count) => {
+                        for event in decoder.feed(&bytes[..count], Instant::now()) {
+                            frontend.input(event)?;
+                        }
                     }
-                } else if count == 0 {
-                    frontend.running = false;
-                } else {
-                    let error = io::Error::last_os_error();
-                    if !matches!(
-                        error.kind(),
-                        io::ErrorKind::Interrupted | io::ErrorKind::WouldBlock
-                    ) {
-                        return Err(error);
-                    }
+                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
+                    Err(error) => return Err(error),
                 }
             }
             if (fds[0].revents | fds[3].revents) & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
@@ -306,7 +215,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
                 && (fds[1].revents
                     & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
                     != 0
-                    || fds[4].revents != 0
                     || frontend.client.needs_poll())
             {
                 frontend.poll()?;
@@ -328,67 +236,6 @@ pub fn run(client: Client, config: crate::config::Config) -> io::Result<()> {
     result
 }
 
-// Keep one frame or one clipboard chunk; a slow SSH link never queues more frames.
-struct Output {
-    bytes: Vec<u8>,
-    written: usize,
-}
-
-impl Output {
-    fn is_empty(&self) -> bool {
-        self.bytes.is_empty()
-    }
-
-    fn flush_available(&mut self, fd: RawFd) -> io::Result<()> {
-        if self.is_empty() {
-            return Ok(());
-        }
-        let remaining = &self.bytes[self.written..];
-        let count = unsafe { libc::write(fd, remaining.as_ptr().cast(), remaining.len()) };
-        if count < 0 {
-            let error = io::Error::last_os_error();
-            if matches!(
-                error.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) {
-                return Ok(());
-            }
-            return Err(error);
-        }
-        if count == 0 {
-            return Err(io::Error::new(io::ErrorKind::WriteZero, "write TUI frame"));
-        }
-        self.written += count as usize;
-        if self.written == self.bytes.len() {
-            self.bytes.clear();
-            self.written = 0;
-        }
-        Ok(())
-    }
-}
-
-fn draw_text(
-    output: &mut Vec<u8>,
-    x: u16,
-    y: u16,
-    columns: u16,
-    text: &str,
-    foreground: u32,
-    background: u32,
-) -> io::Result<()> {
-    let text = fit_label(text, columns);
-    crate::panel::cursor_position(output, y + 1, x + 1)?;
-    output.extend_from_slice(b"\x1b[38;2");
-    crate::panel::sgr_rgb(output, Rgb::from_packed(foreground));
-    output.extend_from_slice(b";48;2");
-    crate::panel::sgr_rgb(output, Rgb::from_packed(background));
-    output.push(b'm');
-    output.extend_from_slice(text.as_bytes());
-    let padding = usize::from(columns) - text_width(&text);
-    output.resize(output.len() + padding, b' ');
-    Ok(())
-}
-
 fn braille_trend(
     points: &[(f32, Option<f32>)],
     columns: usize,
@@ -401,7 +248,7 @@ fn braille_trend(
     }
     let mut cells = vec![0u8; columns * rows];
     let bits = [[1, 8], [2, 16], [4, 32], [64, 128]];
-    let mut previous: Option<(usize, usize)> = None;
+    let mut previous = None;
     for &(age, value) in points {
         let Some(value) = value else {
             previous = None;
@@ -409,24 +256,14 @@ fn braille_trend(
         };
         let x = ((1. - age / seconds).clamp(0., 1.) * (columns * 2 - 1) as f32).round() as usize;
         let y = ((1. - value / maximum).clamp(0., 1.) * (rows * 4 - 1) as f32).round() as usize;
-        if previous == Some((x, y)) {
-            continue;
-        }
         let (from_x, from_y) = previous.unwrap_or((x, y));
-        let count = from_x.abs_diff(x).max(from_y.abs_diff(y));
-        if from_x == x {
-            for py in from_y.min(y) + 1..from_y.max(y) {
-                cells[py / 4 * columns + x / 2] |= bits[py % 4][x % 2];
-            }
-        } else {
-            for step in 1..count {
-                let fraction = step as f32 / count as f32;
-                let px = (from_x as f32 + (x as f32 - from_x as f32) * fraction).round() as usize;
-                let py = (from_y as f32 + (y as f32 - from_y as f32) * fraction).round() as usize;
-                cells[py / 4 * columns + px / 2] |= bits[py % 4][px % 2];
-            }
+        let count = from_x.abs_diff(x).max(from_y.abs_diff(y)).max(1);
+        for step in 1..=count {
+            let fraction = step as f32 / count as f32;
+            let px = (from_x as f32 + (x as f32 - from_x as f32) * fraction).round() as usize;
+            let py = (from_y as f32 + (y as f32 - from_y as f32) * fraction).round() as usize;
+            cells[py / 4 * columns + px / 2] |= bits[py % 4][px % 2];
         }
-        cells[y / 4 * columns + x / 2] |= bits[y % 4][x % 2];
         previous = Some((x, y));
     }
     cells
@@ -434,9 +271,7 @@ fn braille_trend(
 
 fn terminal_size(fd: RawFd) -> io::Result<WindowSize> {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    if unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) } < 0 {
-        return Err(io::Error::last_os_error());
-    }
+    check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) })?;
     if size.ws_col < 2 || size.ws_row < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -455,199 +290,137 @@ struct Frontend {
     client: Client,
     size: WindowSize,
     running: bool,
+    /// Something other than terminal output changed, so the next draw repaints everything.
     dirty: bool,
-    full: bool,
-    damage: Vec<bool>,
-    overlays: smallvec::SmallVec<[Rect; 5]>,
-    frame_size: WindowSize,
-    layout: Vec<(PaneId, Rect)>,
-    header: Vec<u8>,
+    screen_dirty: bool,
+    /// The last drawn frame; `None` repaints everything.
+    frame: Option<Grid>,
+    /// The frame before `frame`, kept to reuse its allocation and to diff against.
+    spare: Option<Grid>,
+    /// The snapshot of the last full draw, if nothing overlaid the panes.
+    drawn: Option<Snapshot>,
     ui: Ui,
-    config: crate::config::Config,
-
-    resource_dirty: bool,
-
-    footer: String,
+    config: Config,
     panel_utf8: TextDecoder,
-    panel_focus: Focus,
     paste: Option<PasteTarget>,
     selecting: Option<PaneId>,
     split_drag: Option<SplitDrag>,
-    clipboard: Option<ClipboardTransfer>,
-    clipboard_reader: Option<ClipboardReader>,
-    copy_pending: bool,
+    last_click: Option<(Instant, PaneId, Point)>,
+    /// Copies queue behind a running transfer so a cut never loses its text.
+    copies: VecDeque<ClipboardTransfer>,
     pointer: Option<(u16, u16)>,
-
     agent: agent_ui::AgentState,
 }
 
 impl Frontend {
-    fn new(client: Client, size: WindowSize, config: crate::config::Config) -> io::Result<Self> {
+    fn new(client: Client, size: WindowSize, config: Config) -> io::Result<Self> {
         Ok(Self {
             client,
             size,
             running: true,
             dirty: true,
-            full: true,
-            damage: vec![false; usize::from(size.num_lines)],
-            overlays: smallvec::SmallVec::new(),
-            frame_size: size,
-            layout: Vec::new(),
-            header: Vec::new(),
+            screen_dirty: false,
+            frame: None,
+            spare: None,
+            drawn: None,
             ui: Ui::new()?,
             config,
-
-            agent: agent_ui::AgentState {
-                dirty: true,
-                ..Default::default()
-            },
-
-            resource_dirty: true,
-
-            footer: String::new(),
             panel_utf8: TextDecoder::default(),
-            panel_focus: Focus::Terminal,
             paste: None,
             selecting: None,
             split_drag: None,
-            clipboard: None,
-            clipboard_reader: None,
-            copy_pending: false,
+            last_click: None,
+            copies: VecDeque::new(),
             pointer: None,
+            agent: agent_ui::AgentState::default(),
         })
     }
 
-    fn label(&self) -> std::borrow::Cow<'_, str> {
-        let status = self
-            .ui
-            .status
-            .as_ref()
-            .map_or("", |(text, _)| text.as_str());
-        if self.controller() {
-            return status.into();
-        }
-        if status.is_empty() {
-            return "Read-only  ".into();
-        }
-        format!("Read-only  {status}").into()
+    fn panel_layout(&self) -> crate::ui::PanelLayout {
+        let agent = if self.ui.agent.open {
+            self.agent_width()
+        } else {
+            0
+        };
+        let available = self.size.num_cols.saturating_sub(agent);
+        crate::ui::PanelLayout::new(available, available, self.ui.files_open)
     }
 
     fn file_width(&self) -> u16 {
-        if !self.ui.files_open {
-            return 0;
-        }
-        let available = self.size.num_cols;
-
-        let available = if self.ui.agent.open {
-            available.saturating_sub(self.agent_width())
-        } else {
-            available
-        };
-        crate::file_panel::sidebar_width(available)
+        self.panel_layout().file_width
     }
 
     fn file_rect(&self) -> Rect {
-        Rect {
-            x: 0,
-            y: 1,
-            cols: self.file_width(),
-            rows: self.view_size().num_lines.saturating_sub(1),
-        }
+        rect(
+            0,
+            1,
+            self.file_width(),
+            self.view_size().num_lines.saturating_sub(1),
+        )
     }
 
     fn file_preview_rect(&self) -> Rect {
-        crate::file_panel::preview_rect(Rect {
-            x: 0,
-            y: 1,
-            cols: self.size.num_cols,
-            rows: self.size.num_lines.saturating_sub(2),
-        })
+        crate::file_panel::preview_rect(rect(
+            0,
+            1,
+            self.size.num_cols,
+            self.size.num_lines.saturating_sub(2),
+        ))
     }
 
     fn view_size(&self) -> WindowSize {
-        let size = self.size;
-
-        let size = if self.ui.agent.open {
-            WindowSize {
-                num_cols: size.num_cols.saturating_sub(self.agent_width()),
-                ..size
-            }
-        } else {
-            size
-        };
-
+        let rows = self.size.num_lines;
+        let resources = &self.ui.resources;
+        let chrome = resources.rows(rows.saturating_sub(2)) + if resources.open { 2 } else { 1 };
         WindowSize {
-            num_cols: size.num_cols.saturating_sub(self.file_width()).max(2),
-            num_lines: size
-                .num_lines
-                .saturating_sub(
-                    self.ui
-                        .resources
-                        .rows(self.size.num_lines.saturating_sub(2))
-                        + if self.ui.resources.open { 2 } else { 1 },
-                )
-                .max(2),
-            ..size
+            num_cols: self.panel_layout().terminal_columns,
+            num_lines: rows.saturating_sub(chrome).max(2),
+            ..self.size
         }
     }
 
     fn resize(&mut self) -> io::Result<()> {
         self.ui.search.close(&mut self.client)?;
-        let size = self.view_size();
-        let changed = size != self.frame_size;
-        self.full |= changed;
         self.dirty = true;
-        if self.controller() && changed {
-            self.client.send(Action::Resize(size))?;
+        if self.client.controller() {
+            self.client.send(Action::Resize(self.view_size()))?;
         }
         Ok(())
     }
 
-    fn copy_text(&mut self, text: String, primary: bool) -> bool {
-        if self.clipboard.is_some() {
-            self.message("Clipboard transfer already in progress");
-            false
-        } else {
-            self.clipboard = Some(ClipboardTransfer {
-                reader: ClipboardSource::Memory(text.into_bytes()),
-                target: if primary { b'p' } else { b'c' },
-                incomplete: false,
-                started: false,
-                bytes: 0,
-            });
-            true
-        }
+    fn copy_text(&mut self, text: String, primary: bool) {
+        let target = if primary { b'p' } else { b'c' };
+        self.queue_copy(Box::new(io::Cursor::new(text.into_bytes())), target, false);
+    }
+
+    fn queue_copy(&mut self, reader: Box<dyn Read>, target: u8, incomplete: bool) {
+        self.copies.push_back(ClipboardTransfer {
+            reader,
+            target,
+            incomplete,
+            bytes: 0,
+        });
     }
 
     fn panel_key(&mut self, symbol: u32, modifiers: u32, text: &str) -> io::Result<()> {
         use crate::input::{Key, KeyResult};
-        let mut viewport = (
-            usize::from(self.size.num_cols),
-            usize::from(self.size.num_lines),
-        );
-        if self.ui.files_open && self.ui.focus == Focus::Files {
-            let preview = self.ui.file_preview_open();
-            let rect = if preview {
-                self.file_preview_rect()
-            } else {
-                self.file_rect()
-            };
-            viewport = (
-                usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(if preview { 5 } else { 0 })),
-            );
+        let viewport = if self.ui.files_open && self.ui.focus == Focus::Files {
+            self.ui
+                .file_viewport(self.file_rect(), self.file_preview_rect())
         } else if self.ui.agent.open && self.ui.focus.is_agent() {
             let rect = editor(&self.ui, self.agent_rect()).0;
-            viewport = (
-                self.ui
-                    .agent
-                    .active()
-                    .editor_columns(usize::from(rect.cols)),
-                usize::from(rect.rows),
-            );
-        }
-        let target = self.ui.input_target();
-        let panels = self.ui.panel_state();
+            let columns = self
+                .ui
+                .agent
+                .active()
+                .editor_columns(usize::from(rect.cols));
+            (columns, usize::from(rect.rows))
+        } else {
+            (
+                usize::from(self.size.num_cols),
+                usize::from(self.size.num_lines),
+            )
+        };
         match self.ui.key(
             &mut self.client,
             Key {
@@ -658,693 +431,378 @@ impl Frontend {
             viewport,
         )? {
             KeyResult::Unhandled => return Ok(()),
-            KeyResult::Copy(text, cut) => {
-                let copied = self.copy_text(text, false);
-                if copied && cut {
-                    self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
-                }
-            }
+            KeyResult::Copy(text) => self.copy_text(text, false),
             KeyResult::Paste => self.message("Paste with your host terminal's shortcut"),
+            KeyResult::Quit => self.running = false,
             KeyResult::Handled => (),
         }
-
-        self.agent.dirty |= matches!(target, Some(PasteTarget::Agent(_)));
-        self.resource_dirty |= matches!(target, Some(PasteTarget::Monitor));
         self.dirty = true;
-        if panels != self.ui.panel_state() {
-            self.resize()?;
-        }
         Ok(())
     }
 
-    fn panel_bytes(&mut self, bytes: &[u8], pasted: Option<PasteTarget>) -> io::Result<()> {
-        if pasted.is_none() {
-            if let Some((symbol, modifiers)) = crate::input::sequence_key(bytes) {
-                self.panel_utf8.clear();
-                self.panel_key(symbol, modifiers, "")?;
-                return Ok(());
-            }
-            if bytes.starts_with(b"\x1b[") || bytes.starts_with(b"\x1bO") {
-                return Ok(());
-            }
-            if self.panel_focus != self.ui.focus {
-                self.panel_utf8.clear();
-                self.panel_focus = self.ui.focus;
-            }
+    fn panel_paste(&mut self, bytes: &[u8], target: PasteTarget) -> io::Result<()> {
+        let text = self.panel_utf8.decode(bytes);
+        self.ui.paste(&mut self.client, target, &text)?;
+        self.dirty = true;
+        Ok(())
+    }
+
+    fn panel_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
+        if let Some((symbol, modifiers)) = crate::input::sequence_key(bytes) {
+            self.panel_utf8.clear();
+            return self.panel_key(symbol, modifiers, "");
         }
-        let bytes = if pasted.is_none()
-            && bytes.first() == Some(&0x1b)
-            && bytes.get(1).is_some_and(|byte| !byte.is_ascii())
-        {
-            &bytes[1..]
-        } else {
-            bytes
+        if matches!(bytes, [0x1b, b'[' | b'O', ..]) {
+            return Ok(());
+        }
+        // Alt plus a non-ASCII character arrives as ESC and the character.
+        let bytes = match bytes {
+            [0x1b, rest @ ..] if rest.first().is_some_and(|byte| !byte.is_ascii()) => rest,
+            _ => bytes,
         };
         let text = self.panel_utf8.decode(bytes);
-        if let Some(target) = pasted {
-            self.ui.paste(&mut self.client, target, &text)?;
-            self.dirty = true;
-            self.resource_dirty = true;
-
-            self.agent.dirty = true;
-        } else {
-            let mut remaining = text.as_ref();
-            while !remaining.is_empty() {
-                if self.ui.text_target().is_some() {
-                    let end = remaining.find(char::is_control).unwrap_or(remaining.len());
-                    if end != 0 {
-                        self.panel_key(0, 0, &remaining[..end])?;
-                        remaining = &remaining[end..];
-                        continue;
-                    }
+        let mut remaining = text.as_ref();
+        while let Some(ch) = remaining.chars().next() {
+            if self.ui.text_target().is_some() {
+                let end = remaining.find(char::is_control).unwrap_or(remaining.len());
+                if end != 0 {
+                    self.panel_key(0, 0, &remaining[..end])?;
+                    remaining = &remaining[end..];
+                    continue;
                 }
-                let ch = remaining.chars().next().unwrap();
-                let (symbol, modifiers) = crate::input::character_key(ch);
-                let key_text = if ch.is_control() {
-                    ""
-                } else {
-                    &remaining[..ch.len_utf8()]
-                };
-                self.panel_key(symbol, modifiers, key_text)?;
-                remaining = &remaining[ch.len_utf8()..];
             }
+            let (symbol, modifiers) = crate::input::character_key(ch);
+            let (typed, rest) = remaining.split_at(ch.len_utf8());
+            self.panel_key(symbol, modifiers, if ch.is_control() { "" } else { typed })?;
+            remaining = rest;
         }
         Ok(())
     }
 
-    fn draw_resources(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        use crate::monitor::{BACKGROUND, Emphasis, GREEN, MUTED};
+    fn draw_resources(&mut self, grid: &mut Grid) {
+        use crate::monitor::{BACKGROUND, Emphasis, MUTED};
+        let (columns, rows) = (self.size.num_cols, self.size.num_lines);
         let top = self.view_size().num_lines;
-        let last = self.size.num_lines - 1;
-        for row in top..self.size.num_lines {
-            draw_text(output, 0, row, self.size.num_cols, "", MUTED, BACKGROUND)?;
+        let last = rows - 1;
+        let monitor_focused = self.ui.focus == Focus::Monitor;
+        self.ui.resources.pointer = self
+            .pointer
+            .filter(|&(_, row)| self.ui.resources.open && row > top && row < last)
+            .map(|(column, row)| (column, i32::from(row) - i32::from(top) - 1));
+        for row in top..rows {
+            grid.text(0, row, columns, "", MUTED, BACKGROUND);
         }
         if self.ui.resources.open {
-            draw_text(output, 0, top, 0, "", crate::panel::BORDER, BACKGROUND)?;
-            draw_rule(output, usize::from(self.size.num_cols))?;
+            draw_border(grid, 0, top, columns, false);
             let origin = i32::from(top) + 1;
-            let height = last.saturating_sub(top + 1);
-            let view = self.ui.resources.view(self.size.num_cols, height);
-            let mut cells = Vec::new();
-            let mut text = String::new();
+            let view = self
+                .ui
+                .resources
+                .view(columns, last.saturating_sub(top + 1));
             for plot in view.plots {
                 let width = usize::from(plot.width);
-                let graphs: smallvec::SmallVec<[Vec<u8>; 2]> = plot
-                    .series
-                    .iter()
-                    .map(|series| {
-                        braille_trend(
-                            &series.points,
-                            width,
-                            usize::from(plot.height),
-                            self.ui.resources.seconds() as f32,
-                            plot.maximum,
-                        )
-                    })
-                    .collect();
-                for row in 0..usize::from(plot.height) {
-                    let y = origin + plot.y + row as i32;
-                    if y < origin || y >= i32::from(last) {
-                        continue;
-                    }
-                    cells.clear();
-                    cells.resize(width, (0u32, GREEN));
-                    for (series, graph) in plot.series.iter().zip(&graphs) {
-                        let color = crate::monitor::series_color(series.name);
-                        for (column, &bits) in
-                            graph[row * width..(row + 1) * width].iter().enumerate()
-                        {
-                            if bits != 0 {
-                                cells[column].0 |= u32::from(bits);
-                                cells[column].1 = color;
-                            }
+                let seconds = self.ui.resources.range as f32;
+                for series in &plot.series {
+                    let color = crate::monitor::series_color(series.name);
+                    let height = usize::from(plot.height);
+                    let graph = braille_trend(&series.points, width, height, seconds, plot.maximum);
+                    for (index, &bits) in graph.iter().enumerate().filter(|(_, bits)| **bits != 0) {
+                        let y = origin + plot.y + (index / width) as i32;
+                        if y < origin || y >= i32::from(last) {
+                            continue;
                         }
-                    }
-                    let mut start = 0;
-                    for run in cells.chunk_by(|a, b| a.1 == b.1) {
-                        text.clear();
-                        text.extend(run.iter().map(|(bits, _)| {
-                            if *bits == 0 {
-                                ' '
-                            } else {
-                                char::from_u32(0x2800 + bits).unwrap()
-                            }
-                        }));
-                        draw_text(
-                            output,
-                            plot.x + start as u16,
-                            y as u16,
-                            run.len() as u16,
-                            &text,
-                            run[0].1,
-                            BACKGROUND,
-                        )?;
-                        start += run.len();
+                        let (x, y) = (plot.x + (index % width) as u16, y as u16);
+                        // Series overlap in one braille cell: merge dots, the last series colors it.
+                        let old = grid
+                            .rows
+                            .get(usize::from(y))
+                            .and_then(|row| row.cells.get(usize::from(x)));
+                        let old = old
+                            .and_then(|cell| u32::from(cell.c).checked_sub(0x2800))
+                            .filter(|bits| *bits < 0x100)
+                            .unwrap_or(0);
+                        let braille = char::from_u32(0x2800 + (old | u32::from(bits))).unwrap();
+                        grid.text(x, y, 1, &braille.to_string(), color, BACKGROUND);
                     }
                 }
             }
             for text in view.texts {
                 let y = origin + text.y;
-                if y >= origin && y < i32::from(last) && text.x < self.size.num_cols {
-                    draw_text(
-                        output,
+                if y >= origin && y < i32::from(last) && text.x < columns {
+                    grid.text(
                         text.x,
                         y as u16,
-                        text.width.min(self.size.num_cols - text.x),
+                        text.width.min(columns - text.x),
                         &text.text,
                         text.color,
-                        match text.emphasis(self.ui.focus == Focus::Monitor) {
+                        match text.emphasis(monitor_focused) {
                             Emphasis::Selected => crate::panel::SELECTED,
                             Emphasis::Highlighted => crate::panel::HOVER,
                             Emphasis::None => BACKGROUND,
                         },
-                    )?;
+                    );
                 }
             }
         }
-        let view = self.ui.resources.footer(
-            self.size.num_cols,
-            self.controller(),
-            self.client.is_remote(),
-        );
+        let view =
+            self.ui
+                .resources
+                .footer(columns, self.client.controller(), self.client.is_remote());
         let right = view
             .texts
             .iter()
             .map(|text| text.x)
             .min()
-            .unwrap_or(self.size.num_cols);
+            .unwrap_or(columns);
         for text in view.texts {
             let hovered = self
                 .pointer
                 .is_some_and(|(x, y)| y == last && (text.x..text.x + text.width).contains(&x))
                 && view.hits.iter().any(|hit| hit.x == text.x);
-            draw_text(
-                output,
-                text.x,
-                last,
-                text.width,
-                &text.text,
-                text.color,
-                if hovered || text.emphasis(self.ui.focus == Focus::Monitor) != Emphasis::None {
-                    crate::panel::HOVER
-                } else {
-                    BACKGROUND
-                },
-            )?;
+            let highlighted = hovered || text.emphasis(monitor_focused) != Emphasis::None;
+            let background = if highlighted {
+                crate::panel::HOVER
+            } else {
+                BACKGROUND
+            };
+            grid.text(text.x, last, text.width, &text.text, text.color, background);
         }
         if let Some(snapshot) = self.client.snapshot() {
             let context = self.ui.footer(snapshot, self.client.is_remote());
-            draw_text(
-                output,
-                1,
-                last,
-                right.saturating_sub(2),
-                &crate::width::fit_middle(&context, right.saturating_sub(2)),
-                MUTED,
-                BACKGROUND,
-            )?;
+            let width = right.saturating_sub(2);
+            let text = crate::width::fit_middle(&context, width);
+            grid.text(1, last, width, &text, MUTED, BACKGROUND);
         }
-        Ok(())
     }
 
-    fn resource_mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let files_open = self.ui.files_open;
+    fn resource_mouse(&mut self, pointer: PointerEvent) -> io::Result<()> {
         let top = self.view_size().num_lines;
         let last = self.size.num_lines - 1;
-        let pointer = (self.ui.resources.open && mouse.row > top && mouse.row < last)
-            .then_some((mouse.column, i32::from(mouse.row) - i32::from(top) - 1));
-        let pointer_changed =
-            self.ui.resources.pointer != pointer || self.pointer != Some((mouse.column, mouse.row));
-        self.pointer = Some((mouse.column, mouse.row));
-        self.ui.resources.pointer = pointer;
+        let columns = self.size.num_cols;
+        self.dirty = true;
         if self.ui.resources.dragging {
-            if mouse.release {
-                self.ui.resources.dragging = false;
-            } else if mouse.code & 32 != 0 {
-                self.ui.resources.resize(
-                    last.saturating_sub(mouse.row + 1),
-                    self.size.num_lines.saturating_sub(2),
-                );
-                return self.resize();
+            match pointer.kind {
+                PointerKind::Release => self.ui.resources.dragging = false,
+                PointerKind::Motion => {
+                    let height = self.size.num_lines.saturating_sub(2);
+                    self.ui
+                        .resources
+                        .resize(last.saturating_sub(pointer.row + 1), height);
+                    return self.resize();
+                }
+                _ => (),
             }
-            return Ok(());
-        }
-        if mouse.code & 32 != 0 {
-            self.resource_dirty |= pointer_changed;
-            self.dirty |= pointer_changed;
-            return Ok(());
-        }
-        if mouse.code & 64 != 0 && !mouse.release && self.ui.resources.open {
+        } else if pointer.kind == PointerKind::Scroll && self.ui.resources.open {
             let scroll = &mut self.ui.resources.scroll;
-            *scroll = if mouse.code & 1 == 0 {
-                scroll.saturating_sub(3)
-            } else {
-                scroll.saturating_add(3)
-            };
-        } else if !mouse.release && mouse.code & 0b1110_0011 == 0 {
-            self.ui.files_open = false;
-            if mouse.row == last {
-                let view = self.ui.resources.footer(
-                    self.size.num_cols,
-                    self.controller(),
+            *scroll = scroll.saturating_add_signed(pointer.wheel());
+        } else if pointer.press(0) {
+            let (view, origin) = if pointer.row == last {
+                let footer = self.ui.resources.footer(
+                    columns,
+                    self.client.controller(),
                     self.client.is_remote(),
                 );
-                if let Some(hit) = view
-                    .hits
-                    .iter()
-                    .find(|hit| (hit.x..hit.x + hit.width).contains(&mouse.column))
-                {
-                    let open = self.ui.resources.open;
-                    self.ui.resources.action(hit.action);
-                    self.ui.monitor_jump(&mut self.client)?;
-                    self.ui.focus = if self.ui.resources.open {
-                        Focus::Monitor
-                    } else {
-                        Focus::Terminal
-                    };
-                    if open != self.ui.resources.open {
-                        return self.resize();
-                    }
-                }
-            } else if mouse.row == top {
-                self.ui.resources.dragging = true;
-                self.ui.focus = Focus::Monitor;
+                (footer, last)
+            } else if pointer.row == top {
+                self.ui.monitor_drag();
+                return Ok(());
             } else {
                 self.ui.focus = Focus::Monitor;
-                let view = self
-                    .ui
-                    .resources
-                    .view(self.size.num_cols, last.saturating_sub(top + 1));
-                if let Some(hit) = view.hits.iter().rfind(|hit| {
-                    mouse.row as i32 == i32::from(top) + 1 + hit.y
-                        && (hit.x..hit.x.saturating_add(hit.width)).contains(&mouse.column)
-                }) {
-                    self.ui.resources.action(hit.action);
-                    self.ui.monitor_jump(&mut self.client)?;
-                    if !self.ui.resources.open {
-                        self.ui.focus = Focus::Terminal;
-                        return self.resize();
-                    }
-                }
+                let height = last.saturating_sub(top + 1);
+                (self.ui.resources.view(columns, height), top + 1)
+            };
+            let hit = view.hits.iter().rfind(|hit| {
+                i32::from(pointer.row) == i32::from(origin) + hit.y
+                    && (hit.x..hit.x + hit.width).contains(&pointer.col)
+            });
+            if let Some(hit) = hit {
+                self.ui.monitor_action(&mut self.client, hit.action)?;
             }
         }
-        if files_open != self.ui.files_open {
-            self.resize()?;
-        }
-        self.resource_dirty = true;
-        self.dirty = true;
         Ok(())
     }
 
-    fn draw_active_cursor(
+    /// `panel_cursor` is the caret of the focused panel, if it has one.
+    fn draw_cursor(
         &self,
         output: &mut Vec<u8>,
-        ui_cursor: Option<(u16, u16)>,
+        panel_cursor: Option<(u16, u16)>,
     ) -> io::Result<()> {
-        if self.ui.close_prompt.is_some() {
-            return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
-        }
-        if self.ui.search.open {
-            let (column, row) = ui_cursor.unwrap();
-            return write!(
+        let in_panel = self.ui.close_prompt.is_some() || self.ui.input_target().is_some();
+        let mode = self
+            .client
+            .focused()
+            .filter(|_| !in_panel)
+            .map_or(Mode::NONE, |pane| self.client.mode(pane));
+        output.extend_from_slice(if mode.contains(Mode::APP_CURSOR) {
+            b"\x1b[?1h"
+        } else {
+            b"\x1b[?1l"
+        });
+        output.extend_from_slice(if mode.contains(Mode::APP_KEYPAD) {
+            b"\x1b="
+        } else {
+            b"\x1b>"
+        });
+        let pane_cursor = self.pane_cursor().filter(|_| !in_panel);
+        if let Some((column, row, shape)) = pane_cursor {
+            write!(
                 output,
-                "\x1b[{};{}H\x1b[?1l\x1b>\x1b[?25h",
+                "\x1b[0m\x1b[{shape} q\x1b[{};{}H\x1b[?25h",
                 row + 1,
                 column + 1
-            );
+            )
+        } else if let Some((column, row)) = panel_cursor {
+            write!(output, "\x1b[{};{}H\x1b[?25h", row + 1, column + 1)
+        } else {
+            output.write_all(b"\x1b[?25l")
         }
-
-        if self.ui.resources.open && self.ui.focus == Focus::Monitor
-            || self.ui.files_open && self.ui.focus == Focus::Files
-        {
-            return output.write_all(b"\x1b[?1l\x1b>\x1b[?25l");
-        }
-
-        if self.ui.agent.open {
-            if self.ui.focus.is_agent() {
-                output.write_all(b"\x1b[?1l\x1b>")?;
-            }
-            if self.ui.agent.active().context.preview.is_some()
-                || matches!(self.ui.focus, Focus::Output | Focus::Controls)
-            {
-                return output.write_all(b"\x1b[?25l");
-            }
-            if self.ui.focus == Focus::Editor {
-                let cursor = ui_cursor.or_else(|| {
-                    let (rect, layout) = editor(&self.ui, self.agent_rect());
-                    (layout.first..layout.first + usize::from(rect.rows))
-                        .contains(&layout.caret_row)
-                        .then(|| {
-                            (
-                                rect.x + layout.caret_column as u16,
-                                rect.y + (layout.caret_row - layout.first) as u16,
-                            )
-                        })
-                });
-                if let Some((column, row)) = cursor {
-                    return write!(output, "\x1b[{};{}H\x1b[?25h", row + 1, column + 1);
-                }
-                return output.write_all(b"\x1b[?25l");
-            }
-        }
-        if let Some(snapshot) = self.client.snapshot() {
-            draw_cursor(
-                output,
-                &self.client,
-                snapshot,
-                self.view_size(),
-                self.file_width(),
-            )?;
-        }
-        Ok(())
     }
 
-    fn focused(&self) -> Option<PaneId> {
-        self.client.snapshot().map(|snapshot| snapshot.focused)
+    fn pane_cursor(&self) -> Option<(u32, i32, u8)> {
+        let snapshot = self.client.snapshot()?;
+        let pane = snapshot.focused_pane()?;
+        let screen = self.client.screens().get(&pane.id)?;
+        let (point, shape) = screen.cursor();
+        let row = point.line + screen.display_offset() as i32;
+        let x = u32::from(pane.rect.x) + point.column as u32;
+        let y = i32::from(pane.rect.y) + row;
+        let size = self.view_size();
+        (snapshot.controller
+            && shape != CursorShape::Hidden
+            && (0..i32::from(pane.rect.rows)).contains(&row)
+            && x < u32::from(size.num_cols)
+            && y < i32::from(size.num_lines))
+        .then(|| {
+            let shape = match shape {
+                CursorShape::Underline => 4,
+                CursorShape::Beam => 6,
+                _ => 2,
+            };
+            (x + u32::from(self.file_width()), y, shape)
+        })
     }
 
-    fn controller(&self) -> bool {
-        self.client
-            .snapshot()
-            .is_some_and(|snapshot| snapshot.controller)
-    }
     fn message(&mut self, message: impl Into<String>) {
         self.ui.message(message);
         self.dirty = true;
     }
 
     fn send_input(&mut self, pane: PaneId, data: &[u8]) -> io::Result<()> {
-        if self.controller() {
+        if self.client.controller() {
             self.client.send_input(pane, data)
         } else {
-            self.message("READ ONLY — attach again to take control; Alt+q detach");
+            self.message(READ_ONLY);
             Ok(())
         }
     }
 
     fn poll(&mut self) -> io::Result<()> {
-        let old_hover = self.hovered_block();
         for event in self.client.poll()? {
             self.event(event)?;
-        }
-        let hovered = self.hovered_block();
-        if old_hover != hovered {
-            self.damage_block(old_hover);
-            self.damage_block(hovered);
         }
         Ok(())
     }
 
-    fn event(&mut self, event: ClientEvent) -> io::Result<()> {
+    fn event(&mut self, event: Response) -> io::Result<()> {
         match event {
-            ClientEvent::Updated => {
-                if self.ui.search.open {
-                    self.ui.search.observe(&mut self.client)?;
-                }
-                self.dirty = true;
-                let Some(snapshot) = self.client.snapshot() else {
-                    return Ok(());
-                };
-                let layout = snapshot.panes.iter().map(|pane| (pane.id, pane.rect));
-                if !self.layout.iter().copied().eq(layout.clone()) {
-                    self.full = true;
-                    self.layout.clear();
-                    self.layout.extend(layout);
-                }
+            Response::ScreenDirty => {
+                self.ui.search.observe(&mut self.client)?;
+                self.screen_dirty = true;
             }
-            ClientEvent::Error(error) | ClientEvent::CopyError { error, .. } => {
-                self.copy_pending = false;
-                self.message(error);
-            }
-            ClientEvent::Detached => self.running = false,
-            ClientEvent::Clipboard {
-                request: _,
-                file,
-                incomplete,
+            Response::Error(error) | Response::CopyError { error, .. } => self.message(error),
+            Response::Detached => self.running = false,
+            Response::Clipboard {
+                file, incomplete, ..
             } => {
-                self.copy_pending = false;
-                if self.clipboard_reader.is_none() {
-                    self.clipboard_reader = Some(ClipboardReader::new(OSC52_CHUNK_SIZE)?);
-                }
-                if self.clipboard.is_some() {
-                    self.clipboard_reader.as_ref().unwrap().discard(file)?;
-                    self.message("Clipboard transfer already in progress");
-                } else if std::env::var("TERM").is_ok_and(|term| term == "dumb" || term == "linux")
-                {
-                    self.clipboard_reader.as_ref().unwrap().discard(file)?;
+                if std::env::var("TERM").is_ok_and(|term| term == "dumb" || term == "linux") {
                     self.message("This host terminal does not support OSC 52 clipboard transfer");
                 } else {
-                    self.clipboard_reader.as_ref().unwrap().queue(file)?;
-                    self.clipboard = Some(ClipboardTransfer {
-                        reader: ClipboardSource::File,
-                        target: b'c',
-                        incomplete,
-                        started: false,
-                        bytes: 0,
-                    });
+                    self.queue_copy(Box::new(file), b'c', incomplete);
                 }
             }
-            ClientEvent::ClipboardStore { primary, text } => {
-                self.copy_text(text, primary);
-            }
-            ClientEvent::Search {
+            Response::ClipboardStore { primary, text } => self.copy_text(text, primary),
+            Response::Search {
                 pane,
                 request,
                 count,
                 truncated,
             } => {
-                if self
-                    .ui
-                    .search
-                    .result(&mut self.client, pane, request, count, truncated)?
-                {
-                    self.dirty = true;
-                }
+                let count = count as usize;
+                self.dirty |=
+                    self.ui
+                        .search
+                        .result(&mut self.client, pane, request, count, truncated)?;
             }
-            ClientEvent::List(_)
-            | ClientEvent::AgentInput { .. }
-            | ClientEvent::History { .. }
-            | ClientEvent::AgentFile { .. }
-            | ClientEvent::AgentNewTab { .. } => {}
+            _ => (),
         }
         Ok(())
     }
 
     fn input(&mut self, event: Input) -> io::Result<()> {
-        let close_rect = self.close_rect();
-        if self.ui.file_preview_open() {
-            match event {
-                Input::Escape => {
-                    self.panel_key(crate::input::keysym::ESCAPE, 0, "")?;
-                }
-                Input::Bytes(bytes) => {
-                    self.panel_bytes(&bytes, None)?;
-                }
-                Input::Mouse(mouse) => {
-                    self.file_mouse(mouse);
-                }
-                _ => (),
-            }
-            return Ok(());
+        let panels = self.ui.panel_state();
+        let previous = self.pointer;
+        if let Input::Mouse(pointer) = &event {
+            self.pointer = Some((pointer.col, pointer.row));
+            self.dirty |= previous != self.pointer;
         }
-        if let Some(prompt) = self.ui.close_prompt.as_mut() {
-            let tab = prompt.tab.unwrap();
-            match &event {
-                Input::Escape => self.ui.close_prompt = None,
-                Input::Bytes(bytes)
-                    if matches!(bytes.as_slice(), b"\t" | b"\x1b[D" | b"\x1b[C" | b"\x1b[Z") =>
-                {
-                    prompt.terminate = !prompt.terminate
-                }
-                Input::Bytes(bytes) if bytes.as_slice() == b"\r" => {
-                    if prompt.terminate {
-                        self.client.send(Action::CloseTab(tab))?;
-                    }
-                    self.ui.close_prompt = None;
-                }
-                Input::Mouse(mouse)
-                    if mouse.code & 3 == 0
-                        && !mouse.release
-                        && mouse.row == close_rect.y + close_rect.rows.saturating_sub(1) =>
-                {
-                    let left = close_rect.x + 2;
-                    if mouse.column >= left && mouse.column < left.saturating_add(10) {
-                        self.ui.close_prompt = None;
-                    } else if mouse.column >= left.saturating_add(12)
-                        && mouse.column < left.saturating_add(24)
-                    {
-                        self.client.send(Action::CloseTab(tab))?;
-                        self.ui.close_prompt = None;
-                    }
-                }
-                _ => (),
-            }
-            self.dirty = true;
-            return Ok(());
+        self.dispatch(event, previous)?;
+        if panels != self.ui.panel_state() {
+            self.resize()?;
         }
+        Ok(())
+    }
 
-        if let Input::Alt(key) = event {
-            if self.ui.agent.active().rewind_target.is_some() {
-                self.ui.cancel_rewind();
-            }
+    fn dispatch(&mut self, event: Input, previous: Option<(u16, u16)>) -> io::Result<()> {
+        let modal = self.ui.modal();
+        if !modal && let Input::Alt(key) = event {
             if key == b'q' {
                 self.running = false;
                 return Ok(());
             }
-            if matches!(
-                key,
-                b'a' | b'f'
-                    | b'm'
-                    | b'v'
-                    | b's'
-                    | b'h'
-                    | b'j'
-                    | b'k'
-                    | b'l'
-                    | b','
-                    | b'.'
-                    | b'\r'
-                    | b'\n'
-                    | b'p'
-                    | b'n'
-                    | b'c'
-            ) {
-                self.ui.search.close(&mut self.client)?;
-            }
-            match key {
-                b'/' => {
-                    if let Some(pane) = self.focused() {
-                        self.ui.search.begin(&mut self.client, pane)?;
-                    }
-                    self.dirty = true;
-                    return Ok(());
-                }
-
-                b'a' => {
-                    self.ui.toggle_agent();
-                    return self.resize();
-                }
-
-                b'f' => return self.toggle_files(),
-
-                b'm' => {
-                    self.ui.toggle_monitor();
-                    return self.resize();
-                }
-                _ => (),
-            }
-            if self.shortcut(key)? {
-                self.ui.focus = Focus::Terminal;
+            if self.ui.alt(&mut self.client, char::from(key))? {
+                self.dirty = true;
                 return Ok(());
             }
         }
-        if self.ui.input_target().is_some() {
-            match &event {
-                Input::Escape => {
-                    self.panel_key(crate::input::keysym::ESCAPE, 0, "")?;
-                    return Ok(());
+        if modal || self.ui.input_target().is_some() {
+            match event {
+                Input::Bytes(bytes) => return self.panel_bytes(&bytes),
+                Input::Mouse(pointer) if modal => return self.modal_mouse(pointer),
+                Input::Alt(key) if !modal => {
+                    return self.panel_key(u32::from(key), crate::input::ALT, "");
                 }
-                Input::Bytes(bytes) => return self.panel_bytes(bytes, None),
-                Input::Alt(key) => {
-                    self.panel_key(u32::from(*key), crate::input::ALT, "")?;
-                    return Ok(());
-                }
-                Input::PasteStart => {
+                Input::PasteStart if !modal => {
                     self.panel_utf8.clear();
                     self.paste = self.ui.paste_target();
                     return Ok(());
                 }
+                _ if modal => return Ok(()),
                 _ => (),
             }
         }
+        let Some(pane) = self.client.focused() else {
+            return Ok(());
+        };
+        let mode = self.client.mode(pane);
         match event {
-            Input::Alt(key) => {
-                if let Some(pane) = self.focused() {
-                    self.send_input(pane, &[0x1b, key])?;
-                }
+            Input::Alt(key) => self.send_input(pane, &[0x1b, key])?,
+            Input::Bytes(bytes) => self.send_input(pane, &cursor_bytes(bytes, mode))?,
+            Input::Focus(focused) if mode.contains(Mode::FOCUS_IN_OUT) => {
+                self.send_input(pane, if focused { b"\x1b[I" } else { b"\x1b[O" })?;
             }
-            Input::Escape => {
-                if let Some(pane) = self.focused() {
-                    self.send_input(pane, &[0x1b])?;
-                }
-            }
-            Input::Bytes(bytes) => {
-                if let Some(pane) = self.focused() {
-                    let mode = self
-                        .client
-                        .screens()
-                        .get(&pane)
-                        .map_or(Mode::NONE, Screen::mode);
-                    self.send_input(pane, &cursor_bytes(bytes, mode))?;
-                }
-            }
-            Input::Focus(focused) => {
-                if let Some(pane) = self.focused()
-                    && self
-                        .client
-                        .screens()
-                        .get(&pane)
-                        .is_some_and(|screen| screen.mode().contains(Mode::FOCUS_IN_OUT))
-                {
-                    self.send_input(pane, if focused { b"\x1b[I" } else { b"\x1b[O" })?;
-                }
-            }
-            Input::Mouse(mouse) => {
-                if self.ui.agent.active().context.preview.is_some()
-                    || self.agent.selecting_editor
-                    || self.ui.agent.active().selecting()
-                {
-                    self.agent_mouse(mouse)?;
-                    return Ok(());
-                }
-
-                if mouse.row < self.view_size().num_lines
-                    && (self.ui.resources.pointer.take().is_some()
-                        || self
-                            .pointer
-                            .is_some_and(|(_, row)| row >= self.view_size().num_lines))
-                {
-                    self.resource_dirty = true;
-                    self.dirty = true;
-                }
-
-                if self.ui.resources.dragging || mouse.row >= self.view_size().num_lines {
-                    return self.resource_mouse(mouse);
-                }
-
-                if !mouse.release && mouse.code & 0b1110_0011 == 0 {
-                    self.ui.focus = Focus::Terminal;
-                }
-
-                if self.agent_mouse(mouse)? {
-                    return Ok(());
-                }
-
-                if self.ui.files_open && self.file_rect().contains(mouse.column, mouse.row) {
-                    if !mouse.release && mouse.code & 32 == 0 {
-                        self.ui.focus = Focus::Files;
-                        self.file_mouse(mouse);
-                    }
-                    return Ok(());
-                }
-                self.mouse(mouse)?;
-            }
+            Input::Focus(_) => (),
+            Input::Mouse(pointer) => self.route_mouse(pointer, previous)?,
             Input::PasteStart => {
-                if let Some(pane) = self.focused() {
-                    let bracketed = self
-                        .client
-                        .screens()
-                        .get(&pane)
-                        .is_some_and(|screen| screen.mode().contains(Mode::BRACKETED_PASTE));
-                    self.paste = Some(PasteTarget::Pane { pane, bracketed });
-                    if bracketed {
-                        self.send_input(pane, b"\x1b[200~")?;
-                    }
+                let bracketed = mode.contains(Mode::BRACKETED_PASTE);
+                self.paste = Some(PasteTarget::Pane { pane, bracketed });
+                if bracketed {
+                    self.send_input(pane, b"\x1b[200~")?;
                 }
             }
             Input::PasteData(bytes) => match self.paste {
                 Some(PasteTarget::Pane { pane, .. }) => self.send_input(pane, &bytes)?,
-                Some(target) => self.panel_bytes(&bytes, Some(target))?,
+                Some(target) => self.panel_paste(&bytes, target)?,
                 None => (),
             },
             Input::PasteEnd => {
@@ -1361,415 +819,263 @@ impl Frontend {
         Ok(())
     }
 
-    fn shortcut(&mut self, key: u8) -> io::Result<bool> {
-        let Some(pane) = self.focused() else {
-            return Ok(false);
+    fn modal_mouse(&mut self, pointer: PointerEvent) -> io::Result<()> {
+        self.dirty = true;
+        let Some(prompt) = self.ui.close_prompt else {
+            self.file_mouse(pointer);
+            return Ok(());
         };
-        let action = match key {
-            b'c' => {
-                if self.copy_pending || self.clipboard.is_some() {
-                    self.message("Clipboard transfer already in progress");
-                    return Ok(true);
-                }
-                let snapshot = self.client.snapshot().unwrap();
-                let current = snapshot.pane(pane).unwrap();
-                let line = self.client.screens().get(&pane).map_or(0, |screen| {
-                    let line = screen.cursor().0.line;
-                    let offset = screen.display_offset() as i32;
-                    if (0..screen.screen_lines() as i32).contains(&(line + offset)) {
-                        line
-                    } else {
-                        -offset
-                    }
-                });
-                let block = current
-                    .blocks
-                    .iter()
-                    .filter(|block| block.output.is_some() && block.line <= line)
-                    .max_by_key(|block| block.line)
-                    .or_else(|| current.blocks.iter().rfind(|block| block.output.is_some()));
-                let Some(block) = block else {
-                    self.message("No command output block available; enable shell integration");
-                    return Ok(true);
-                };
-                Action::CopyBlock {
-                    pane,
-                    block: block.id,
-                    request: 0,
-                }
-            }
-            key => {
-                let Some(action) = crate::ui::workspace_action(char::from(key), pane) else {
-                    return Ok(false);
-                };
-                action
-            }
-        };
-        if !self.controller() {
-            self.message("READ ONLY — attach again to take control; Alt+q detach");
-            return Ok(true);
+        let close = crate::ui::close_rect(self.size.num_cols, self.size.num_lines);
+        if pointer.press(0)
+            && let Some(terminate) = crate::ui::close_hit(close, prompt, pointer.col, pointer.row)
+            && matches!(
+                self.ui.choose_close(&mut self.client, terminate)?,
+                crate::input::KeyResult::Quit
+            )
+        {
+            self.running = false;
         }
-
-        let files_open = std::mem::take(&mut self.ui.files_open);
-        self.ui.focus = Focus::Terminal;
-        if files_open {
-            self.resize()?;
-        }
-        self.client.send(action)?;
-        if key == b'c' {
-            self.copy_pending = true;
-        }
-        Ok(true)
+        Ok(())
     }
 
-    fn mouse(&mut self, mouse: Mouse) -> io::Result<()> {
-        let previous = self.pointer;
-        if previous != Some((mouse.column, mouse.row)) {
-            let old_object = self.hovered_object();
-            let old_hover = self.hovered_block();
-            self.pointer = Some((mouse.column, mouse.row));
-            if mouse.row == 0 || previous.is_some_and(|(_, row)| row == 0) {
-                self.dirty = true;
-            }
-            let hovered = self.hovered_block();
-            if old_hover != hovered {
-                self.damage_block(old_hover);
-                self.damage_block(hovered);
-            }
-            let object = self.hovered_object();
-            if old_object != object {
-                for (pane, object) in old_object.iter().chain(object.iter()) {
-                    let screen = &self.client.screens()[pane];
-                    let view = self.client.snapshot().unwrap().pane(*pane).unwrap();
-                    for line in object.range.start.line..=object.range.end.line {
-                        let row = line + screen.display_offset() as i32 + i32::from(view.rect.y);
-                        if let Some(damage) = self.damage.get_mut(row as usize) {
-                            *damage = true;
-                        }
-                    }
-                }
-                self.dirty = true;
-            }
+    fn route_mouse(
+        &mut self,
+        pointer: PointerEvent,
+        previous: Option<(u16, u16)>,
+    ) -> io::Result<()> {
+        if self.agent_captures_mouse() {
+            return self.agent_mouse(pointer).map(drop);
         }
-        let left = if mouse.row == 0 { 0 } else { self.file_width() };
-        let mut mouse = mouse;
-        mouse.column = mouse.column.saturating_sub(left);
-        let previous = previous.map(|(column, row)| (column.saturating_sub(left), row));
-        if let Some(drag) = self.split_drag {
-            if mouse.release {
-                self.split_drag = None;
-            } else if mouse.code & 32 != 0
-                && previous.is_none_or(|(column, row)| match drag.axis {
-                    Axis::LeftRight => column != mouse.column,
-                    Axis::TopBottom => row != mouse.row,
-                })
-            {
-                self.client.send(drag.action(mouse.column, mouse.row))?;
+        if self.ui.resources.dragging || pointer.row >= self.view_size().num_lines {
+            return self.resource_mouse(pointer);
+        }
+        if pointer.press(0) {
+            self.ui.focus = Focus::Terminal;
+        }
+        if self.agent_mouse(pointer)? {
+            return Ok(());
+        }
+        if self.ui.files_open && self.file_rect().contains(pointer.col, pointer.row) {
+            if pointer.kind != PointerKind::Motion && pointer.kind != PointerKind::Release {
+                self.ui.focus = Focus::Files;
+                self.file_mouse(pointer);
             }
             return Ok(());
         }
-        if self.controller()
-            && !mouse.release
-            && mouse.code & 0b1110_0011 == 0
-            && let Some(drag) = self
-                .client
-                .snapshot()
-                .and_then(|s| s.divider_at(mouse.column, mouse.row))
+        self.terminal_mouse(pointer, previous)
+    }
+
+    fn terminal_mouse(
+        &mut self,
+        pointer: PointerEvent,
+        previous: Option<(u16, u16)>,
+    ) -> io::Result<()> {
+        if pointer.row == 0 {
+            if pointer.press(0)
+                && let Some(snapshot) = self
+                    .client
+                    .snapshot()
+                    .filter(|snapshot| snapshot.controller)
+                && let Some(hit) =
+                    crate::ui::tab_bar(snapshot, self.view_size().num_cols + self.file_width(), "")
+                        .at(snapshot, pointer.col)
+            {
+                self.ui.tab_click(&mut self.client, hit)?;
+                self.dirty = true;
+            }
+            return Ok(());
+        }
+        let left = self.file_width();
+        let (column, row) = (pointer.col.saturating_sub(left), pointer.row);
+        if let Some(drag) = self.split_drag {
+            if pointer.kind == PointerKind::Release {
+                self.split_drag = None;
+            } else if pointer.kind == PointerKind::Motion
+                && previous.is_none_or(|(old_column, old_row)| match drag.axis {
+                    Axis::LeftRight => old_column != pointer.col,
+                    Axis::TopBottom => old_row != pointer.row,
+                })
+            {
+                self.client.send(drag.action(column, row))?;
+            }
+            return Ok(());
+        }
+        let Some(snapshot) = self
+            .client
+            .snapshot()
+            .filter(|snapshot| snapshot.controller)
+        else {
+            return Ok(());
+        };
+        if pointer.press(0)
+            && let Some(drag) = snapshot.divider_at(column, row)
         {
             self.split_drag = Some(drag);
             return Ok(());
         }
-        if mouse.row == 0 && !mouse.release && mouse.code & 0b1100_0011 == 0 {
-            if self.controller()
-                && let Some(snapshot) = self.client.snapshot()
-            {
-                let status = self.label();
-                let (tabs, label, before, after) =
-                    tab_chrome(snapshot, self.view_size().num_cols, &status);
-                let mut plus = 3;
-                for (index, x, width) in tabs {
-                    plus = x + width + 1;
-                    let tab = &snapshot.tabs[index];
-                    if (x..x + width).contains(&mouse.column) {
-                        let action = if (x + width - 4..x + width - 1).contains(&mouse.column) {
-                            if !self.ui.request_close_tab(tab) {
-                                self.dirty = true;
-                                return Ok(());
-                            }
-                            Action::CloseTab(tab.id)
-                        } else {
-                            let active = snapshot
-                                .tabs
-                                .iter()
-                                .position(|tab| tab.id == snapshot.active_tab)
-                                .unwrap();
-                            Action::Tab(index as i32 - active as i32)
-                        };
-                        return self.client.send(action);
-                    }
-                }
-                let max = self.view_size().num_cols.saturating_sub(plus + 4);
-                let fitted = fit_label(&label, max);
-                let mut column = self
-                    .view_size()
-                    .num_cols
-                    .saturating_sub(text_width(&fitted) as u16 + 2);
-                for (count, direction) in [(before, -1), (after, 1)] {
-                    if count > 0 {
-                        let width = count.ilog10() as u16 + 2;
-                        if (column..column + width).contains(&mouse.column) {
-                            return self.client.send(Action::Tab(direction));
-                        }
-                        column += width + 1;
-                    }
-                }
-                if (plus.saturating_sub(1)..plus.saturating_add(2)).contains(&mouse.column)
-                    && plus.saturating_add(1) < self.size.num_cols
-                {
-                    return self.client.send(Action::NewTab {
-                        pane: snapshot.focused,
-                    });
-                }
-            }
-            return Ok(());
-        }
-        let Some(view) = self
-            .client
-            .snapshot()
-            .and_then(|snapshot| snapshot.pane_at(mouse.column, mouse.row))
-        else {
+        let Some(view) = snapshot.pane_at(column, row) else {
             return Ok(());
         };
-        let pane = view.id;
-        let physical_x = mouse.column - view.rect.x;
-        let y = mouse.row - view.rect.y;
+        let (pane, rect, focused) = (view.id, view.rect, snapshot.focused);
+        if pointer.press(0) && focused != pane {
+            self.ui.act(&mut self.client, Action::Focus(pane))?;
+        }
         let Some(screen) = self.client.screens().get(&pane) else {
             return Ok(());
         };
         let mode = screen.mode();
         let offset = screen.display_offset();
-        let x = usize::from(physical_x).min(screen.columns().saturating_sub(1)) as u16;
-        if !self.controller() {
-            return Ok(());
-        }
-        if !mouse.release && mouse.code & 0b1100_0011 == 0 && self.focused() != Some(pane) {
-            self.client.send(Action::Focus(pane))?;
-        }
-
-        if !mouse.release
-            && mouse.code & 0b1110_0011 == 0
-            && (!mode.intersects(Mode::MOUSE_MODE) || mouse.code & 8 != 0)
-        {
-            let point = Point {
-                line: i32::from(y) - offset as i32,
-                column: usize::from(x),
-            };
+        let y = row - rect.y;
+        let x = (column - rect.x).min(screen.columns().saturating_sub(1) as u16);
+        let point = Point {
+            line: i32::from(y) - offset as i32,
+            column: usize::from(x),
+        };
+        let alt = pointer.mods & crate::input::ALT != 0;
+        if pointer.press(0) && (!mode.intersects(Mode::MOUSE_MODE) || alt) {
             let now = Instant::now();
-            let double = self
-                .agent
-                .last_click
-                .is_some_and(|(at, old_pane, old_point)| {
-                    old_pane == pane
-                        && old_point == point
-                        && now.duration_since(at) < Duration::from_millis(400)
-                });
-            self.agent.last_click = Some((now, pane, point));
-            if double
-                && let Some(object) = self
-                    .client
-                    .screens()
-                    .get(&pane)
-                    .and_then(|screen| crate::context::object_at(screen, point))
-            {
+            let double = self.last_click.is_some_and(|(at, old_pane, old_point)| {
+                old_pane == pane
+                    && old_point == point
+                    && now.duration_since(at) < Duration::from_millis(400)
+            });
+            self.last_click = Some((now, pane, point));
+            if double && let Some(object) = crate::context::object_at(screen, point) {
                 crate::ui::open_object(&self.client, pane, &object.text)?;
                 return Ok(());
             }
         }
-
-        if mode.intersects(Mode::MOUSE_MODE) && mouse.code & 8 == 0 {
-            if mouse.code & 32 != 0
+        if mode.intersects(Mode::MOUSE_MODE) && !alt {
+            if pointer.kind == PointerKind::Motion
                 && !mode.contains(Mode::MOUSE_MOTION)
-                && (!mode.contains(Mode::MOUSE_DRAG) || mouse.code & 3 == 3)
+                && (!mode.contains(Mode::MOUSE_DRAG) || pointer.button == 3)
             {
                 return Ok(());
             }
             if let Some(data) = mouse_bytes(
-                mouse.code,
+                pointer.code,
                 usize::from(x),
                 usize::from(y),
-                mouse.release,
+                pointer.kind == PointerKind::Release,
                 mode,
             ) {
                 self.send_input(pane, &data)?;
             }
-        } else if mouse.code & 64 != 0 && !mouse.release {
-            let up = mouse.code & 1 == 0;
-            if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && mouse.code & 8 == 0 {
+        } else if pointer.kind == PointerKind::Scroll {
+            let up = pointer.button == 0;
+            if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && !alt {
                 let bytes = if up { *b"\x1b[A" } else { *b"\x1b[B" };
                 self.send_input(pane, &cursor_bytes(bytes, mode))?;
             } else {
                 self.client.send(Action::Scroll {
                     pane,
-                    scroll: Scroll::Delta(if up { 3 } else { -3 }),
+                    scroll: Scroll::Delta(-pointer.wheel() as i32),
                 })?;
             }
-        } else if mouse.code & 3 == 2 && mouse.code & 32 == 0 && !mouse.release {
+        } else if pointer.press(2) {
             if let Some((_, object)) = self.hovered_object() {
                 self.copy_text(object.text, false);
             } else {
                 self.message("Paste with your host terminal's shortcut");
             }
-        } else if mouse.code & 3 == 0 {
-            let point = Point {
-                line: i32::from(y) - offset as i32,
-                column: usize::from(x),
-            };
-            if mouse.release {
-                self.selecting = None;
-            } else if mouse.code & 32 != 0 {
-                if self.selecting == Some(pane) {
+        } else if pointer.button == 0 {
+            match pointer.kind {
+                PointerKind::Release => self.selecting = None,
+                PointerKind::Motion if self.selecting == Some(pane) => {
                     self.client.send(Action::SelectionUpdate {
                         pane,
                         point,
                         side: Side::Right,
                     })?;
                 }
-            } else {
-                self.selecting = Some(pane);
-                self.client.send(Action::SelectionStart {
-                    pane,
-                    point,
-                    side: Side::Left,
-                    kind: SelectionType::Simple,
-                })?;
+                PointerKind::Press => {
+                    self.selecting = Some(pane);
+                    self.client.send(Action::SelectionStart {
+                        pane,
+                        point,
+                        side: Side::Left,
+                        kind: SelectionType::Simple,
+                    })?;
+                }
+                _ => (),
             }
         }
         Ok(())
     }
 
-    fn damage_block(&mut self, target: Option<(PaneId, u64)>) {
-        let Some((id, block)) = target else {
-            return;
-        };
-        let Some((snapshot, screens)) = self.client.snapshot_and_screens_mut() else {
-            return;
-        };
-        let Some(pane) = snapshot.pane(id) else {
-            return;
-        };
-        let Some(screen) = screens.get_mut(&id) else {
-            return;
-        };
-        let range = screen.block_row_range(pane, block);
-        for row in range.start..range.end.min(usize::from(pane.rect.rows)) {
-            if screen
-                .row_output(pane, row)
-                .is_some_and(|current| current.id == block)
-            {
-                screen.dirty[row] = true;
-            }
-        }
-        self.dirty = true;
-    }
-
-    fn close_rect(&self) -> Rect {
-        let cols = self.size.num_cols.saturating_sub(4).min(64);
-        let rows = 7.min(self.size.num_lines.saturating_sub(2));
-        Rect {
-            x: (self.size.num_cols - cols) / 2,
-            y: (self.size.num_lines - rows) / 2,
-            cols,
-            rows,
-        }
-    }
-
-    fn damage_overlays(&mut self) {
-        self.damage.resize(usize::from(self.size.num_lines), false);
-        let mut overlays = smallvec::SmallVec::new();
-
-        if self.ui.file_preview_open() {
-            overlays.push(self.file_preview_rect());
-        }
-        if self.ui.agent.active().context.preview.is_some() {
-            overlays.push(crate::file_panel::preview_rect(Rect {
-                x: 0,
-                y: 1,
-                cols: self.size.num_cols,
-                rows: self.size.num_lines.saturating_sub(2),
-            }));
-        }
-        if self.ui.search.open {
-            overlays.push(Rect {
-                x: 0,
-                y: 0,
-                cols: self.size.num_cols,
-                rows: 1,
-            });
-        }
-        if self.ui.close_prompt.is_some() {
-            overlays.push(self.close_rect());
-        }
-        if self.overlays != overlays {
-            for rect in self.overlays.iter().chain(&overlays) {
-                for row in rect.y..rect.y.saturating_add(rect.rows).min(self.size.num_lines) {
-                    self.damage[usize::from(row)] = true;
-                }
-            }
-            self.overlays = overlays;
-        }
+    fn hovered(&self) -> Option<(PaneId, Point)> {
+        let (x, y) = self.pointer?;
+        let x = x.checked_sub(self.file_width())?;
+        let pane = self.client.snapshot()?.pane_at(x, y)?;
+        let offset = self.client.screens().get(&pane.id)?.display_offset();
+        Some((
+            pane.id,
+            Point {
+                line: i32::from(y - pane.rect.y) - offset as i32,
+                column: usize::from(x - pane.rect.x),
+            },
+        ))
     }
 
     fn hovered_object(&self) -> Option<(PaneId, crate::context::Object)> {
-        let (x, y) = self.pointer?;
-        let x = x.checked_sub(self.file_width())?;
-        let pane = self.client.snapshot()?.pane_at(x, y)?;
-        let screen = self.client.screens().get(&pane.id)?;
-        let point = Point {
-            line: i32::from(y - pane.rect.y) - screen.display_offset() as i32,
-            column: usize::from(x - pane.rect.x),
-        };
-        crate::context::object_at(screen, point).map(|object| (pane.id, object))
-    }
-
-    fn hovered_block(&self) -> Option<(PaneId, u64)> {
-        let (x, y) = self.pointer?;
-        let x = x.checked_sub(self.file_width())?;
-        let pane = self.client.snapshot()?.pane_at(x, y)?;
-        let screen = self.client.screens().get(&pane.id)?;
-        screen
-            .row_output(pane, usize::from(y - pane.rect.y))
-            .map(|block| (pane.id, block.id))
+        let (pane, point) = self.hovered()?;
+        crate::context::object_at(self.client.screens().get(&pane)?, point)
+            .map(|object| (pane, object))
     }
 
     fn draw(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
-        self.damage_overlays();
         let Some(snapshot) = self.client.snapshot() else {
+            self.frame = None;
             write!(output, "\x1b[H\x1b[0mWaiting for workspace — Alt+q detach")?;
             return Ok(());
         };
         output.write_all(b"\x1b[?2026h")?;
-        if self.full {
-            output.write_all(b"\x1b[2J")?;
-        }
         let size = self.view_size();
-        let label = self.label();
-        let start = output.len();
-        draw_tabs(
-            output,
-            snapshot,
-            size.num_cols + self.file_width(),
-            &label,
-            self.pointer,
-            &self.config,
-        )?;
-        if self.full || self.damage[0] || self.header != output[start..] {
-            self.header.clear();
-            self.header.extend_from_slice(&output[start..]);
-        } else {
-            output.truncate(start);
-        }
-        let hovered = self.hovered_block();
+        let left = self.file_width();
+        let host_columns = size.num_cols + left;
+        let screen = rect(0, 0, self.size.num_cols, self.size.num_lines);
+        let (foreground, background) = (self.config.foreground, self.config.background);
+        let hovered = self
+            .hovered()
+            .and_then(|(pane, point)| crate::ui::block_at(&self.client, pane, point));
         let object = self.hovered_object();
+        let plain = hovered.is_none()
+            && object.is_none()
+            && !(self.ui.resources.open
+                || self.ui.files_open
+                || self.ui.agent.open
+                || self.ui.search.open
+                || self.ui.close_prompt.is_some());
+        // Terminal output alone repaints only the rows the screens report as damaged.
+        let incremental = plain
+            && !self.dirty
+            && self.frame.is_some()
+            && self.spare.is_some()
+            && self
+                .drawn
+                .as_ref()
+                .is_some_and(|drawn| same_view(drawn, snapshot));
+        let (mut frame, mut previous) = if incremental {
+            (self.frame.take().unwrap(), self.spare.take())
+        } else {
+            let mut frame = self
+                .spare
+                .take()
+                .unwrap_or_else(|| Grid::new(screen, foreground, background));
+            frame.reset(screen, foreground, background);
+            self.drawn = plain.then(|| snapshot.clone());
+            (frame, self.frame.take())
+        };
+        if !incremental {
+            paint_tabs(
+                &mut frame,
+                snapshot,
+                host_columns,
+                self.pointer,
+                &self.config,
+            );
+        }
+        let mut damage = Vec::new();
         for pane in &snapshot.panes {
             if let Some(screen) = self.client.screens().get(&pane.id) {
                 let rows = screen
@@ -1777,11 +1083,16 @@ impl Frontend {
                     .min(usize::from(pane.rect.rows))
                     .min(usize::from(size.num_lines.saturating_sub(pane.rect.y)));
                 for row in 0..rows {
-                    if !self.full
-                        && !screen.dirty[row]
-                        && !self.damage[usize::from(pane.rect.y) + row]
-                    {
-                        continue;
+                    if incremental {
+                        if !screen.dirty[row] {
+                            continue;
+                        }
+                        // Panes side by side share a host row; keep its old cells once.
+                        let y = usize::from(pane.rect.y) + row;
+                        if !damage.contains(&y) {
+                            previous.as_mut().unwrap().rows[y].clone_from(&frame.rows[y]);
+                            damage.push(y);
+                        }
                     }
                     let highlight = hovered.is_some_and(|(id, block)| {
                         id == pane.id
@@ -1789,417 +1100,226 @@ impl Frontend {
                                 .row_output(pane, row)
                                 .is_some_and(|current| current.id == block)
                     });
-                    draw_row(
-                        output,
+                    let object = object
+                        .as_ref()
+                        .filter(|(id, _)| *id == pane.id)
+                        .map(|(_, object)| object.range);
+                    paint_row(
+                        &mut frame,
                         screen,
                         pane,
                         row,
-                        size.num_cols + self.file_width(),
-                        (
-                            highlight,
-                            object
-                                .as_ref()
-                                .filter(|(id, _)| *id == pane.id)
-                                .map(|(_, object)| object.range),
-                        ),
-                        self.file_width(),
-                    )?;
+                        host_columns,
+                        (highlight, object),
+                        left,
+                    );
                 }
             }
         }
-        draw_separators(
-            output,
-            snapshot,
-            size,
-            self.full,
-            &self.damage,
-            self.file_width(),
-        )?;
-
-        let footer_changed = {
-            let footer = self.ui.footer(snapshot, self.client.is_remote());
-            let changed = self.footer != footer;
-            if changed {
-                self.footer = footer.into_owned();
+        let mut cursor = None;
+        if !incremental {
+            draw_separators(&mut frame, snapshot, size, left);
+            self.draw_resources(&mut frame);
+            if self.ui.files_open && !self.ui.file_preview_open() {
+                self.draw_files(&mut frame);
             }
-            changed
-        };
-        if self.full
-            || self.resource_dirty
-            || footer_changed
-            || self.damage[usize::from(size.num_lines)..]
-                .iter()
-                .any(|dirty| *dirty)
-        {
-            self.draw_resources(output)?;
-            self.resource_dirty = false;
-        }
-
-        if self.ui.files_open && !self.ui.file_preview_open() {
-            self.draw_files(output)?;
-        }
-
-        let agent_cursor = if self.ui.agent.open
-            && (self.full
-                || self.agent.dirty
-                || self.ui.agent.active().context.preview.is_some()
-                || self.damage.iter().any(|dirty| *dirty))
-        {
-            let cursor = self.draw_agent(output)?;
-            self.agent.dirty = false;
-            cursor
-        } else {
-            None
-        };
-
-        if self.ui.file_preview_open() {
-            self.draw_files(output)?;
-        }
-        let ui_cursor = if self.ui.search.open {
-            let (label, caret) = self
-                .ui
-                .search
-                .display("", usize::from(self.size.num_cols.saturating_sub(2)));
-            draw_text(
-                output,
-                0,
-                0,
-                self.size.num_cols,
-                "",
-                self.config.foreground,
-                crate::panel::CHROME,
-            )?;
-            draw_text(
-                output,
-                1,
-                0,
-                self.size.num_cols.saturating_sub(2),
-                &label,
-                self.config.foreground,
-                crate::panel::CHROME,
-            )?;
-            Some((caret as u16 + 1, 0))
-        } else {
-            agent_cursor
-        };
-        if let Some(prompt) = self.ui.close_prompt {
-            let rect = self.close_rect();
-            let background = mix_color(self.config.foreground, self.config.background, 9);
-            let muted = mix_color(self.config.foreground, self.config.background, 176);
-            let mut grid = crate::panel::Grid::new(rect, self.config.foreground, background);
-            let cols = rect.cols.saturating_sub(4);
-            grid.text(
-                rect.x + 2,
-                rect.y,
-                cols,
-                "Close tab?",
-                self.config.foreground,
-                background,
-            );
-            grid.text(
-                rect.x + 2,
-                rect.y + 2,
-                cols,
-                "Programs may still be running in this tab.",
-                muted,
-                background,
-            );
-            grid.text(
-                rect.x + 2,
-                rect.y + 3,
-                cols,
-                "Closing stops all panes in this tab.",
-                muted,
-                background,
-            );
-            if rect.rows >= 7 {
-                grid.text(
-                    rect.x + 2,
-                    rect.y + 5,
-                    cols,
-                    "Tab select   Enter confirm   Esc cancel",
-                    muted,
-                    background,
-                );
+            if self.ui.agent.open {
+                cursor = self.draw_agent(&mut frame)?;
             }
-            let row = rect.y + rect.rows.saturating_sub(1);
-            grid.text(
-                rect.x + 2,
-                row,
-                cols,
-                "  Cancel      Close tab  ",
-                muted,
-                background,
-            );
-            let (x, width, label, color) = if prompt.terminate {
-                (
-                    rect.x + 14,
-                    12.min(cols.saturating_sub(12)),
-                    " Close tab ",
-                    0xe87575,
-                )
-            } else {
-                (rect.x + 2, 10.min(cols), " Cancel ", crate::panel::ACCENT)
-            };
-            grid.text(
-                x,
-                row,
-                width,
-                label,
-                color,
-                mix_color(self.config.foreground, self.config.background, 24),
-            );
-            grid.ansi(output, None, &[])?;
-        }
-        self.draw_active_cursor(output, ui_cursor)?;
-        let (snapshot, screens) = self.client.snapshot_and_screens_mut().unwrap();
-        for pane in &snapshot.panes {
-            if let Some(screen) = screens.get_mut(&pane.id) {
-                screen.reset_damage();
+            if self.ui.file_preview_open() {
+                self.draw_files(&mut frame);
+            }
+            if self.ui.search.open {
+                let columns = self.size.num_cols;
+                let (label, caret) = self
+                    .ui
+                    .search
+                    .display("", usize::from(columns.saturating_sub(2)));
+                let chrome = crate::panel::CHROME;
+                frame.text(0, 0, columns, "", foreground, chrome);
+                frame.text(1, 0, columns.saturating_sub(2), &label, foreground, chrome);
+                cursor = Some((caret as u16 + 1, 0));
+            }
+            if let Some(prompt) = self.ui.close_prompt {
+                let name = &self.client.snapshot().unwrap().name;
+                let close = crate::ui::close_rect(self.size.num_cols, self.size.num_lines);
+                let grid = crate::ui::close_grid(prompt, name, close, self.pointer, &self.config);
+                frame.blit(&grid);
+                cursor = None;
             }
         }
-        self.full = false;
-        self.damage.fill(false);
-        self.frame_size = size;
-        output.write_all(b"\x1b[?2026l")?;
-        Ok(())
+        frame.damage = incremental.then_some(damage);
+        frame.ansi(output, previous.as_ref())?;
+        let (_, screens) = self.client.snapshot_and_screens_mut().unwrap();
+        for screen in screens.values_mut() {
+            screen.reset_damage();
+        }
+        self.draw_cursor(output, cursor)?;
+        self.spare = previous;
+        self.frame = Some(frame);
+        output.write_all(b"\x1b[?2026l")
     }
 
-    fn toggle_files(&mut self) -> io::Result<()> {
-        if self.client.is_remote() {
-            self.message("Files are unavailable in remote sessions");
-            return Ok(());
-        }
-        if self.ui.files_open {
-            self.ui.files_open = false;
-            self.ui.focus = Focus::Terminal;
-            return self.resize();
-        }
-        let directory = self
-            .client
-            .snapshot()
-            .and_then(Snapshot::focused_pane)
-            .and_then(|pane| pane.cwd.clone());
-        let Some(directory) = directory else {
-            self.message("Active pane working directory is unavailable");
-            return Ok(());
-        };
-        self.ui.load_files(directory)?;
-        self.panel_utf8.clear();
-        self.ui.files_open = true;
-        self.ui.focus = Focus::Files;
-        self.resize()
-    }
-
-    fn file_mouse(&mut self, mouse: Mouse) {
-        let preview = self.ui.file_preview_open();
-        let rect = if preview {
-            self.file_preview_rect()
-        } else {
-            self.file_rect()
-        };
-        let files = self.ui.files.as_mut().unwrap();
-        if preview
-            && (!rect.contains(mouse.column, mouse.row)
-                || crate::panel::popup_close(rect).contains(mouse.column, mouse.row))
-        {
-            if !mouse.release && mouse.code & 0b1100_0011 == 0 {
-                files.focus_list();
-                self.dirty = true;
-            }
-            return;
-        }
-        if !mouse.release && mouse.code & 64 != 0 {
-            files.scroll(
-                if mouse.code & 1 == 0 { -3 } else { 3 },
-                usize::from(if preview {
-                    crate::panel::popup_body(rect).rows
-                } else {
-                    rect.rows.saturating_sub(2)
-                }),
-            );
-        } else if !preview
-            && !mouse.release
-            && mouse.code & 0b1100_0011 == 0
-            && let Some(index) =
-                crate::file_panel::Layout::new(rect, files).entry_at(files, mouse.column, mouse.row)
-        {
-            files.move_selection(index as isize - files.selection() as isize);
-            files.focus_preview();
-        }
+    fn file_mouse(&mut self, pointer: PointerEvent) {
         self.dirty = true;
+        let (list, preview) = (self.file_rect(), self.file_preview_rect());
+        if pointer.kind == PointerKind::Scroll {
+            self.ui.file_wheel(pointer.wheel(), list, preview);
+        } else if pointer.press(0) {
+            self.ui.file_press(list, preview, pointer.col, pointer.row);
+        }
     }
 
-    fn draw_files(&mut self, output: &mut Vec<u8>) -> io::Result<()> {
+    fn draw_files(&mut self, grid: &mut Grid) {
         let rect = self.file_rect();
         let preview = self.file_preview_rect();
         let Some(files) = &mut self.ui.files else {
-            return Ok(());
+            return;
         };
         let focused =
             self.ui.focus == Focus::Files && files.focus() == crate::files::FileFocus::List;
-        crate::file_panel::list(files, rect, "", focused, &self.config).ansi(output, None, &[])?;
+        grid.blit(&crate::file_panel::list(
+            files,
+            rect,
+            "",
+            focused,
+            &self.config,
+        ));
         if files.focus() == crate::files::FileFocus::Preview {
-            crate::file_panel::preview(files, preview, &self.config).ansi(output, None, &[])?;
+            grid.blit(&crate::file_panel::preview(files, preview, &self.config));
         }
-        Ok(())
     }
 }
 
-fn draw_tabs(
-    output: &mut Vec<u8>,
+/// Whether two snapshots draw the same; input generations, prompts and process data change per keystroke.
+fn same_view(a: &Snapshot, b: &Snapshot) -> bool {
+    (&a.name, a.controller, a.focused, a.active_tab, &a.tabs)
+        == (&b.name, b.controller, b.focused, b.active_tab, &b.tabs)
+        && a.panes.len() == b.panes.len()
+        && a.panes.iter().zip(&b.panes).all(|(a, b)| {
+            (a.id, a.tab, a.rect, &a.title, &a.cwd, &a.blocks)
+                == (b.id, b.tab, b.rect, &b.title, &b.cwd, &b.blocks)
+        })
+}
+
+fn paint_tabs(
+    grid: &mut Grid,
     snapshot: &Snapshot,
     columns: u16,
-    label: &str,
     pointer: Option<(u16, u16)>,
     config: &Config,
-) -> io::Result<()> {
-    let style = config.tab_style;
-    output.write_all(b"\x1b[H\x1b[0;48;2;25;25;25m\x1b[2K")?;
-    let marker = if snapshot.controller {
-        "150;150;150"
-    } else {
-        "254;155;48"
-    };
-    write!(output, "\x1b[1;2H\x1b[38;2;{marker}m›")?;
-    let (tabs, label, _, _) = tab_chrome(snapshot, columns, label);
-    let mut end = 3;
-    for (index, x, width) in tabs {
+) {
+    use crate::panel::{ACCENT, CHROME};
+    use crate::ui::TabHit;
+    grid.text(0, 0, columns, "", crate::panel::MUTED, CHROME);
+    let controller = snapshot.controller;
+    grid.text(
+        1,
+        0,
+        1,
+        "›",
+        if controller { 0x969696 } else { 0xfe9b30 },
+        CHROME,
+    );
+    let bar = crate::ui::tab_bar(
+        snapshot,
+        columns,
+        if controller { "" } else { "Read-only  " },
+    );
+    let hit = pointer
+        .filter(|&(_, row)| row == 0)
+        .and_then(|(column, _)| bar.at(snapshot, column));
+    let angled = config.tab_style == crate::config::TabStyle::Angled;
+    for &(index, x, width) in &bar.tabs {
         let tab = &snapshot.tabs[index];
         let active = tab.id == snapshot.active_tab;
-        let bg = if active { 32 } else { 28 };
-        let fg = if active { 204 } else { 150 };
-        let color = crate::ui::tab_color(tab);
-        let close = if active { "148;148;148" } else { "96;96;96" };
-        let hovered =
-            pointer.is_some_and(|(column, row)| row == 0 && (x..x + width).contains(&column));
-        let (left, right) = if style == crate::config::TabStyle::Angled {
-            ("◢", "◣")
+        let background = if active { 0x202020 } else { 0x1c1c1c };
+        let close_hovered = hit == Some(TabHit::Close(tab.id));
+        let title_color = if close_hovered || hit == Some(TabHit::Select(index)) {
+            0xd4d9d8
+        } else if active {
+            0xcccccc
         } else {
-            (" ", " ")
+            0x969696
         };
-        let flat_active = style == crate::config::TabStyle::Flat && active;
-        let selected_style = if flat_active {
-            "4;58;2;181;210;162;"
+        let close_color = if close_hovered {
+            0xe87575
+        } else if active {
+            0x949494
         } else {
-            ""
+            0x606060
         };
-        write!(
-            output,
-            "\x1b[1;{}H\x1b[0;{selected_style}38;2;{bg};{bg};{bg};48;2;25;25;25m{left}\x1b[38;2;{};{};{};48;2;{bg};{bg};{bg}m • \x1b[38;2;{fg};{fg};{fg}m",
-            x + 1,
-            color >> 16 & 255,
-            color >> 8 & 255,
-            color & 255
-        )?;
-        if hovered {
-            output.write_all(b"\x1b[38;2;212;217;216m")?;
+        let (left, right) = if angled { ("◢", "◣") } else { (" ", " ") };
+        grid.text(x, 0, 1, left, background, CHROME);
+        grid.text(x + 1, 0, 3, " • ", crate::ui::tab_color(tab), background);
+        grid.text(x + 4, 0, width - 8, &tab.title, title_color, background);
+        grid.text(x + width - 4, 0, 3, " × ", close_color, background);
+        grid.text(x + width - 1, 0, 1, right, background, CHROME);
+        let flat_active = config.tab_style == crate::config::TabStyle::Flat && active;
+        if flat_active || close_hovered {
+            let underline = if close_hovered && !flat_active {
+                0xe87575
+            } else {
+                ACCENT
+            };
+            let row = &mut grid.rows[0];
+            for column in x..x + width {
+                if flat_active || column >= x + width - 4 {
+                    let column = usize::from(column);
+                    row.cells[column].flags.insert(Flags::UNDERLINE);
+                    row.extra_mut(column).underline_color = Some(crate::panel::rgb(underline));
+                }
+            }
         }
-        let title = fit_label(&tab.title, width - 8);
-        output.extend_from_slice(title.as_bytes());
-        output.resize(
-            output.len() + usize::from(width - 8) - text_width(&title),
-            b' ',
-        );
-        let close_hovered = pointer.is_some_and(|(column, row)| {
-            row == 0 && (x + width - 4..x + width - 1).contains(&column)
-        });
-        let close = if close_hovered { "232;117;117" } else { close };
-        let underline = if close_hovered {
-            "4;58;2;232;117;117"
-        } else if flat_active {
-            "4;58;2;181;210;162"
-        } else {
-            "24;59"
-        };
-        let edge_style = if flat_active {
-            "4;58;2;181;210;162"
-        } else {
-            "24;59"
-        };
-        write!(
-            output,
-            "\x1b[38;2;{close};48;2;{bg};{bg};{bg}m \x1b[{underline}m×\x1b[{edge_style}m \x1b[38;2;{bg};{bg};{bg};48;2;25;25;25m{right}\x1b[24;59m"
-        )?;
-        end = x + width + 1;
     }
-    if end.saturating_add(1) < columns {
-        let hovered = pointer.is_some_and(|(column, row)| {
-            row == 0 && (end.saturating_sub(1)..end + 2).contains(&column)
-        });
-        let x = end.saturating_sub(1);
-        let fg = if hovered { 0xb5d2a2 } else { 0x606060 };
-        output.write_all(b"\x1b[24;59m")?;
-        draw_text(output, x, 0, 3, "", fg, 0x191919)?;
+    if let Some(x) = bar.plus {
+        let hovered = hit == Some(TabHit::New);
+        let color = if hovered { ACCENT } else { 0x606060 };
+        grid.text(x, 0, 3, "", color, CHROME);
+        grid.text(x + 1, 0, 1, "+", color, CHROME);
         if hovered {
-            write!(
-                output,
-                "\x1b[4;58;2;{};{};{}m",
-                fg >> 16 & 255,
-                fg >> 8 & 255,
-                fg & 255
-            )?;
+            grid.rows[0].cells[usize::from(x + 1)]
+                .flags
+                .insert(Flags::UNDERLINE);
         }
-        write!(output, "\x1b[1;{}H+\x1b[24;59m", x + 2)?;
     }
-    let max = columns.saturating_sub(end + 4);
-    if max > 0 {
-        let label = fit_label(&label, max);
-        let width = text_width(&label) as u16;
-        let x = columns - width - 2;
-        let color = if !snapshot.controller {
-            "254;155;48"
-        } else {
-            "184;184;184"
-        };
-        write!(
-            output,
-            "\x1b[1;{}H\x1b[0;38;2;{color};48;2;25;25;25m{label}",
-            x + 1
-        )?;
-    }
-    output.write_all(b"\x1b[0m")
+    let width = text_width(&bar.label) as u16;
+    grid.text(
+        bar.label_x,
+        0,
+        width,
+        &bar.label,
+        if controller { 0xb8b8b8 } else { 0xfe9b30 },
+        CHROME,
+    );
 }
 
-fn cursor_bytes<T: AsMut<[u8]>>(mut bytes: T, mode: Mode) -> T {
-    if let [
-        0x1b,
-        prefix @ (b'[' | b'O'),
-        b'A' | b'B' | b'C' | b'D' | b'H' | b'F',
-    ] = bytes.as_mut()
-    {
-        *prefix = if mode.contains(Mode::APP_CURSOR) {
-            b'O'
-        } else {
-            b'['
-        };
-    }
-    bytes
-}
-
-fn draw_row(
-    output: &mut Vec<u8>,
+fn paint_row(
+    frame: &mut Grid,
     screen: &Screen,
     pane: &PaneView,
     row: usize,
     host_columns: u16,
-    highlight: (bool, Option<crate::core::SelectionRange>),
+    (highlight, object): (bool, Option<crate::core::SelectionRange>),
     left: u16,
-) -> io::Result<()> {
-    let (highlight, object) = highlight;
-    let mut rect = pane.rect;
-    rect.x += left;
-    if rect.x >= host_columns {
-        return Ok(());
+) {
+    let x = pane.rect.x + left;
+    if x >= host_columns {
+        return;
     }
-    let physical_columns = usize::from(rect.cols.min(host_columns - rect.x));
+    let y = pane.rect.y + row as u16;
+    let physical_columns = usize::from(pane.rect.cols.min(host_columns - x));
     let columns = screen.columns().min(physical_columns);
     let data = screen.row(row);
+    let previous_used = frame.rows[usize::from(y)].used;
+    frame.put_row(x, y, data, physical_columns);
     let line = row as i32 - screen.display_offset() as i32;
     let selection = screen
         .selection_range()
         .filter(|selection| (selection.start.line..=selection.end.line).contains(&line));
-    let columns = if highlight || selection.is_some_and(|selection| line < selection.end.line) {
+    let target = &mut frame.rows[usize::from(y)];
+    let start = usize::from(x);
+    let used = if highlight || selection.is_some_and(|selection| line < selection.end.line) {
         columns
     } else {
         let text_end = data.cells[..columns]
@@ -2213,240 +1333,118 @@ fn draw_row(
             .max(selection.map_or(0, |selection| selection.end.column + 1))
             .min(columns)
     };
-    crate::panel::cursor_position(output, rect.y + row as u16 + 1, rect.x + 1)?;
-    if columns < physical_columns {
-        let bg = screen.color(Color::Named(NamedColor::Background));
-        output.extend_from_slice(b"\x1b[0;48;2");
-        crate::panel::sgr_rgb(output, bg);
-        write!(output, "m\x1b[{}X", physical_columns)?;
-    }
-    let mut previous = None;
-    for (column, cell, extra) in data.cells_with_extras(0..columns) {
-        if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-            continue;
-        }
-        let selected = object.is_some_and(|range| range.contains(Point { line, column }))
-            || !cell.flags.contains(Flags::PROMPT)
-                && selection.is_some_and(|selection| selection.contains(Point { line, column }));
-        let style = (cell.fg, cell.bg, cell.flags & Flags::TEXT_STYLE, selected);
-        if previous != Some(style) {
+    target.used = previous_used.max(start + used);
+    for column in 0..physical_columns {
+        let index = start + column;
+        let hide = {
+            let cell = &mut target.cells[index];
+            let selected = object.is_some_and(|range| range.contains(Point { line, column }))
+                || !cell.flags.contains(Flags::PROMPT)
+                    && selection
+                        .is_some_and(|selection| selection.contains(Point { line, column }));
+            let default_background = cell.bg == Color::Named(NamedColor::Background);
+            let inverse = cell.flags.contains(Flags::INVERSE);
             let mut fg = screen.color(cell.fg);
             let mut bg = screen.color(cell.bg);
-            if cell.flags.contains(Flags::INVERSE) {
+            if inverse {
                 std::mem::swap(&mut fg, &mut bg);
             }
+            cell.fg = Color::Spec(fg);
+            cell.bg = Color::Spec(bg);
+            cell.flags.remove(Flags::INVERSE);
             if selected {
-                bg = Rgb {
+                cell.bg = Color::Spec(Rgb {
                     r: 55,
                     g: 55,
                     b: 55,
-                };
-            } else if highlight
-                && cell.bg == Color::Named(NamedColor::Background)
-                && !cell.flags.contains(Flags::INVERSE)
-            {
-                bg = Rgb {
+                });
+            } else if highlight && default_background && !inverse {
+                cell.bg = Color::Spec(Rgb {
                     r: 38,
                     g: 38,
                     b: 38,
-                };
+                });
             }
-            output.extend_from_slice(b"\x1b[0;38;2");
-            crate::panel::sgr_rgb(output, fg);
-            output.extend_from_slice(b";48;2");
-            crate::panel::sgr_rgb(output, bg);
-            for (flag, sgr) in [
-                (Flags::BOLD, b'1'),
-                (Flags::DIM, b'2'),
-                (Flags::ITALIC, b'3'),
-                (Flags::STRIKEOUT, b'9'),
-            ] {
-                if cell.flags.contains(flag) {
-                    output.extend_from_slice(&[b';', sgr]);
-                }
+            let hide = column >= columns
+                || cell.flags.contains(Flags::HIDDEN)
+                || cell.c.is_control()
+                || cell.flags.contains(Flags::WIDE_CHAR) && column + 1 >= columns;
+            if hide {
+                cell.c = ' ';
+                cell.flags.remove(Flags::HIDDEN);
             }
-            if cell.flags.intersects(Flags::ALL_UNDERLINES) {
-                output.extend_from_slice(b";4");
+            hide
+        };
+        if hide || target.extra(index).is_some() {
+            let extra = target.extra_mut(index);
+            if hide {
+                extra.zerowidth.clear();
             }
-            output.push(b'm');
-            previous = Some(style);
+            if let Some(color) = &mut extra.underline_color {
+                *color = Color::Spec(screen.color(*color));
+            }
         }
-        if cell.flags.contains(Flags::HIDDEN)
-            || cell.c.is_control()
-            || cell.flags.contains(Flags::WIDE_CHAR) && column + 1 >= columns
-        {
-            output.resize(output.len() + cell.width().min(columns - column), b' ');
+    }
+}
+
+fn draw_border(frame: &mut Grid, x: u16, y: u16, count: u16, vertical: bool) {
+    for step in 0..count {
+        let (x, y) = if vertical {
+            (x, y + step)
         } else {
-            if cell.c.is_ascii() {
-                output.push(cell.c as u8);
-            } else {
-                output.extend_from_slice(cell.c.encode_utf8(&mut [0; 4]).as_bytes());
-            }
-            if let Some(extra) = extra {
-                for ch in &extra.zerowidth {
-                    if !ch.is_control() {
-                        output.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
-                    }
-                }
-            }
-        }
-    }
-    output.extend_from_slice(b"\x1b[0m");
-    Ok(())
-}
-
-fn draw_rule(output: &mut impl Write, columns: usize) -> io::Result<()> {
-    const RULE: &[u8] = "────────────────────────────────".as_bytes();
-    let mut bytes = columns * "─".len();
-    while bytes != 0 {
-        let count = bytes.min(RULE.len());
-        output.write_all(&RULE[..count])?;
-        bytes -= count;
-    }
-    Ok(())
-}
-
-fn draw_separators(
-    output: &mut impl Write,
-    snapshot: &Snapshot,
-    size: WindowSize,
-    full: bool,
-    damage: &[bool],
-    left: u16,
-) -> io::Result<()> {
-    output.write_all(b"\x1b[0;38;2;48;48;48m")?;
-    for pane in &snapshot.panes {
-        if pane.rect.x > 0 && pane.rect.x <= size.num_cols {
-            for row in pane.rect.y
-                ..pane
-                    .rect
-                    .y
-                    .saturating_add(pane.rect.rows)
-                    .min(size.num_lines)
-            {
-                if full || damage[usize::from(row)] {
-                    crate::panel::cursor_position(output, row + 1, pane.rect.x + left)?;
-                    output.write_all("│".as_bytes())?;
-                }
-            }
-        }
-        if pane.rect.y > 1
-            && pane.rect.y <= size.num_lines
-            && (full || damage[usize::from(pane.rect.y - 1)])
+            (x + step, y)
+        };
+        if let Some(cell) = frame
+            .rows
+            .get_mut(usize::from(y))
+            .and_then(|row| row.cells.get_mut(usize::from(x)))
         {
-            crate::panel::cursor_position(output, pane.rect.y, pane.rect.x + left + 1)?;
-            draw_rule(
-                output,
-                usize::from(
-                    pane.rect
-                        .cols
-                        .min(size.num_cols.saturating_sub(pane.rect.x)),
-                ),
-            )?;
+            cell.c = if vertical { '│' } else { '─' };
+            cell.fg = crate::panel::rgb(crate::panel::BORDER);
         }
     }
-    Ok(())
 }
 
-fn draw_cursor(
-    output: &mut impl Write,
-    client: &Client,
-    snapshot: &Snapshot,
-    size: WindowSize,
-    left: u16,
-) -> io::Result<()> {
-    let Some(pane) = snapshot.focused_pane() else {
-        return output.write_all(b"\x1b[?25l");
-    };
-    let Some(screen) = client.screens().get(&pane.id) else {
-        return output.write_all(b"\x1b[?25l");
-    };
-    let mode = screen.mode();
-    output.write_all(if mode.contains(Mode::APP_CURSOR) {
-        b"\x1b[?1h"
-    } else {
-        b"\x1b[?1l"
-    })?;
-    output.write_all(if mode.contains(Mode::APP_KEYPAD) {
-        b"\x1b="
-    } else {
-        b"\x1b>"
-    })?;
-    let (point, shape) = screen.cursor();
-    let row = point.line + screen.display_offset() as i32;
-    let x = u32::from(pane.rect.x) + point.column as u32;
-    let y = i32::from(pane.rect.y) + row;
-    if !snapshot.controller
-        || shape == CursorShape::Hidden
-        || row < 0
-        || row >= i32::from(pane.rect.rows)
-        || x >= u32::from(size.num_cols)
-        || y >= i32::from(size.num_lines)
-    {
-        output.write_all(b"\x1b[?25l")
-    } else {
-        write!(
-            output,
-            "\x1b[0m\x1b[{} q\x1b[{};{}H\x1b[?25h",
-            match shape {
-                CursorShape::Underline => 4,
-                CursorShape::Beam => 6,
-                _ => 2,
-            },
-            y + 1,
-            x + u32::from(left) + 1
-        )
+fn draw_separators(frame: &mut Grid, snapshot: &Snapshot, size: WindowSize, left: u16) {
+    for PaneView { rect, .. } in &snapshot.panes {
+        if rect.x > 0 && rect.x <= size.num_cols {
+            let rows = rect.rows.min(size.num_lines.saturating_sub(rect.y));
+            draw_border(frame, rect.x + left - 1, rect.y, rows, true);
+        }
+        if rect.y > 1 && rect.y <= size.num_lines {
+            let columns = rect.cols.min(size.num_cols.saturating_sub(rect.x));
+            draw_border(frame, rect.x + left, rect.y - 1, columns, false);
+        }
     }
 }
 
 // A multiple of three keeps intermediate base64 chunks unpadded.
 const OSC52_CHUNK_SIZE: usize = 48 * 1024;
 
-enum ClipboardSource {
-    File,
-    Memory(Vec<u8>),
-}
-
 struct ClipboardTransfer {
-    reader: ClipboardSource,
+    reader: Box<dyn Read>,
     target: u8,
     incomplete: bool,
-    started: bool,
     bytes: u64,
 }
 
 impl ClipboardTransfer {
-    fn step(
-        &mut self,
-        output: &mut Vec<u8>,
-        reader: Option<&mut ClipboardReader>,
-    ) -> io::Result<Option<String>> {
-        if !self.started {
+    fn step(&mut self, output: &mut Vec<u8>) -> io::Result<Option<String>> {
+        if self.bytes == 0 {
             output.extend_from_slice(b"\x1b]52;");
             output.extend_from_slice(&[self.target, b';']);
-            self.started = true;
         }
-        let file_chunk;
-        let chunk = match &self.reader {
-            ClipboardSource::File => {
-                file_chunk = match reader.unwrap().read() {
-                    Ok(Some(chunk)) => chunk,
-                    Ok(None) => return Ok(None),
-                    Err(error) => {
-                        output.extend_from_slice(b"\x1b\\");
-                        return Err(error);
-                    }
-                };
-                file_chunk.as_slice()
-            }
-            ClipboardSource::Memory(bytes) if bytes.is_empty() => &[],
-            ClipboardSource::Memory(bytes) => {
-                let remaining = &bytes[self.bytes as usize..];
-                &remaining[..remaining.len().min(OSC52_CHUNK_SIZE)]
-            }
-        };
-        if chunk.is_empty() {
+        let mut chunk = Vec::new();
+        let read = self
+            .reader
+            .by_ref()
+            .take(OSC52_CHUNK_SIZE as u64)
+            .read_to_end(&mut chunk);
+        if read.is_err() || chunk.is_empty() {
             output.extend_from_slice(b"\x1b\\");
+        }
+        read?;
+        if chunk.is_empty() {
             return Ok(Some(format!(
                 "Sent {} bytes via OSC 52{}; host may reject clipboard limits",
                 self.bytes,
@@ -2458,13 +1456,7 @@ impl ClipboardTransfer {
             )));
         }
         self.bytes += chunk.len() as u64;
-        crate::base64::encode(chunk, output);
-        if let ClipboardSource::Memory(bytes) = &mut self.reader
-            && self.bytes == bytes.len() as u64
-        {
-            // The final encoded chunk may remain blocked on stdout.
-            *bytes = Vec::new();
-        }
+        crate::base64::encode(&chunk, output);
         Ok(None)
     }
 }

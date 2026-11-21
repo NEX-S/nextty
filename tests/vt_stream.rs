@@ -28,7 +28,7 @@ impl Terminal {
     }
 
     fn write(&mut self, input: &[u8]) -> bool {
-        self.parser.advance(&mut self.core, input)
+        self.parser.advance(&mut self.core, input).1
     }
 
     fn line(&self, row: usize) -> String {

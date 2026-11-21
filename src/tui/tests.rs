@@ -1,131 +1,22 @@
 use super::*;
+use crate::core::Core;
+use crate::panel::rect;
+use crate::screen::Update;
+use crate::ui::tests::{actions, pair, pane, size};
+use crate::vt::Parser;
+use crate::workspace::TabActivity;
+use std::os::fd::OwnedFd;
 
-#[test]
-fn resource_braille_preserves_sampling_gaps_and_vertical_segments() {
-    let graph = braille_trend(
-        &[
-            (60., Some(50.)),
-            (59.9, Some(50.)),
-            (30., None),
-            (0.1, Some(50.)),
-            (0., Some(50.)),
-        ],
-        20,
-        2,
-        60.,
-        100.,
-    );
-    assert!(graph.chunks_exact(20).any(|line| line[0] != 0));
-    assert!(graph.chunks_exact(20).any(|line| line[19] != 0));
-    assert!(
-        graph
-            .chunks_exact(20)
-            .all(|line| line[1..19].iter().all(|&bits| bits == 0))
-    );
-    assert!(
-        braille_trend(&[], 20, 2, 60., 100.)
-            .iter()
-            .all(|&bits| bits == 0)
-    );
-    for (age, column, mask) in [(60., 0, 0x47), (0., 19, 0xb8)] {
-        let mut expected = vec![0; 60];
-        for row in 0..3 {
-            expected[row * 20 + column] = mask;
-        }
-        for (from, to) in [(0., 100.), (100., 0.)] {
-            assert_eq!(
-                braille_trend(&[(age, Some(from)), (age, Some(to))], 20, 3, 60., 100.),
-                expected
-            );
-        }
-    }
-}
-
-#[test]
-fn shortening_selection_preserves_text_and_clears_unselected_padding() {
-    use crate::{core::Core, screen::Update};
-    let size = WindowSize {
-        num_cols: 40,
-        num_lines: 3,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let mut core = Core::new(size, 0xcccccc, 0x202020);
-    crate::vt::Parser::new().advance(
-        &mut core,
-        "hi\r\n\x1b[44mcolored\x1b[0m\r\n中a\u{301}".as_bytes(),
-    );
-    core.selection_start(
-        Point { line: 0, column: 1 },
-        Side::Left,
-        SelectionType::Simple,
-    );
-    let pane = PaneView {
-        process: Default::default(),
-        id: 1,
-        tab: 1,
-        rect: Rect {
-            x: 0,
-            y: 0,
-            cols: 40,
-            rows: 3,
-        },
-        title: String::new(),
-        cwd: None,
-        blocks: Vec::new(),
-        command_blocks: Vec::new(),
-        input_generation: 0,
-        shell_prompt: None,
-    };
-    let mut screen = Screen::default();
-    let mut host = Core::new(size, 0xcccccc, 0x202020);
-    let mut parser = crate::vt::Parser::new();
-    for end in [
-        Some(Point { line: 1, column: 9 }),
-        Some(Point { line: 0, column: 3 }),
-        None,
-    ] {
-        if let Some(end) = end {
-            core.selection_update(end, Side::Right);
-        } else {
-            core.clear_selection();
-        }
-        screen.apply(Update::capture(&core, false)).unwrap();
-        let mut bytes = Vec::new();
-        for row in screen.dirty_rows() {
-            draw_row(&mut bytes, &screen, &pane, row, 40, (false, None), 0).unwrap();
-        }
-        parser.advance(&mut host, &bytes);
-        for row in 0..3 {
-            for column in 0..40 {
-                let original = core.row(row).cells[column];
-                let rendered = host.row(row).cells[column];
-                let selected = core.selection_range().is_some_and(|range| {
-                    range.contains(Point {
-                        line: row as i32,
-                        column,
-                    })
-                });
-                let background = if selected {
-                    Rgb {
-                        r: 55,
-                        g: 55,
-                        b: 55,
-                    }
-                } else {
-                    core.color(original.bg)
-                };
-                assert_eq!(rendered.c, original.c);
-                assert_eq!(host.color(rendered.bg), background);
-            }
-        }
-        assert_eq!(
-            host.row(2).extra(2).map(|extra| &extra.zerowidth),
-            core.row(2).extra(2).map(|extra| &extra.zerowidth),
-        );
-        core.reset_damage();
-        screen.reset_damage();
-    }
+/// The bytes that repaint pane row 0 over a host row holding stale text.
+fn draw_row(screen: &Screen, pane: &PaneView, host_columns: u16) -> Vec<u8> {
+    let rect = rect(0, 0, host_columns, pane.rect.y + pane.rect.rows);
+    let mut previous = crate::panel::Grid::new(rect, 0xcccccc, 0x202020);
+    previous.text(0, pane.rect.y, 1, "?", 0xcccccc, 0x202020);
+    let mut grid = crate::panel::Grid::new(rect, 0xcccccc, 0x202020);
+    paint_row(&mut grid, screen, pane, 0, host_columns, (false, None), 0);
+    let mut output = Vec::new();
+    grid.ansi(&mut output, Some(&previous)).unwrap();
+    output
 }
 
 fn pty() -> (OwnedFd, OwnedFd) {
@@ -209,16 +100,10 @@ fn stdout_hangup_detaches_even_while_stdin_remains_open() {
         bytes.extend_from_slice(&buffer[..count]);
     }
     drop(output);
-    let deadline = Instant::now() + Duration::from_millis(500);
-    let status = loop {
-        if let Some(status) = child.try_wait().unwrap() {
-            break Some(status);
-        }
-        if Instant::now() >= deadline {
-            break None;
-        }
+    let status = (0..500).find_map(|_| {
         std::thread::sleep(Duration::from_millis(1));
-    };
+        child.try_wait().unwrap()
+    });
     if status.is_none() {
         child.kill().unwrap();
         child.wait().unwrap();
@@ -250,526 +135,65 @@ fn stdout_hangup_detaches_even_while_stdin_remains_open() {
 }
 
 #[test]
-fn metadata_updates_remove_hover_from_unchanged_output_rows() {
-    use crate::{core::Core, screen::Update, wire::Peer, workspace::Snapshot};
-    use std::{fs, os::unix::net::UnixListener};
-    let socket = std::path::PathBuf::from(format!("target/tui-hover-{}.sock", std::process::id()));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let client = Client::connect(&socket).unwrap();
-    let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-    let size = WindowSize {
-        num_cols: 7,
-        num_lines: 4,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let mut core = Core::new(
-        WindowSize {
-            num_cols: 7,
-            num_lines: 3,
-            ..size
-        },
-        0xcccccc,
-        0x202020,
-    );
-    let mut parser = crate::vt::Parser::new();
-    parser.advance(
-        &mut core,
-        b"\x1b]133;A\x07\x1b]133;B\x07\x1b]133;C\x07top\r\nABCDEFG",
-    );
-    let mut snapshot = Snapshot {
-        name: "hover".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: Vec::new(),
-        panes: vec![PaneView {
-            process: Default::default(),
-            id: 1,
-            tab: 1,
-            rect: Rect {
-                x: 0,
-                y: 1,
-                cols: 7,
-                rows: 3,
-            },
-            title: String::new(),
-            cwd: None,
-            blocks: core.visible_blocks(),
-            command_blocks: core.recent_command_blocks(),
-            input_generation: 0,
-            shell_prompt: None,
-        }],
-    };
-    server
-        .send_state(
-            &snapshot,
-            &[(1, &Update::capture(&core, true))],
-            &Default::default(),
-            0,
-        )
-        .unwrap();
-    server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-    frontend.pointer = Some((6, 2));
-    frontend.poll().unwrap();
-    let mut host = Core::new(size, 0xcccccc, 0x202020);
-    let mut host_parser = crate::vt::Parser::new();
-    let mut bytes = Vec::new();
-    frontend.draw(&mut bytes).unwrap();
-    host_parser.advance(&mut host, &bytes);
-    assert_eq!(host.row(1).cells[0].c, 't');
-    assert_eq!(
-        host.row(1).cells[3].bg,
-        Color::Spec(Rgb {
-            r: 38,
-            g: 38,
-            b: 38
-        })
-    );
-    frontend
-        .mouse(Mouse {
-            column: 0,
-            row: 0,
-            code: 35,
-            release: false,
-        })
-        .unwrap();
-    assert!(frontend.hovered_block().is_none());
-    bytes.clear();
-    frontend.draw(&mut bytes).unwrap();
-    host_parser.advance(&mut host, &bytes);
-    assert_eq!(
-        host.row(1).cells[3].bg,
-        Color::Spec(Rgb {
-            r: 32,
-            g: 32,
-            b: 32
-        })
-    );
-    frontend
-        .mouse(Mouse {
-            column: 6,
-            row: 2,
-            code: 35,
-            release: false,
-        })
-        .unwrap();
-    assert!(frontend.hovered_block().is_some());
-    core.reset_damage();
-    parser.advance(&mut core, b"\x1b[2;7H");
-    snapshot.panes[0].blocks = core.visible_blocks();
-    server
-        .send_state(
-            &snapshot,
-            &[(1, &Update::capture(&core, false))],
-            &Default::default(),
-            0,
-        )
-        .unwrap();
-    server.flush().unwrap();
-    frontend.poll().unwrap();
-    assert!(frontend.hovered_block().is_none());
-    bytes.clear();
-    frontend.draw(&mut bytes).unwrap();
-    host_parser.advance(&mut host, &bytes);
-    assert_eq!(
-        host.row(1).cells[3].bg,
-        Color::Spec(Rgb {
-            r: 32,
-            g: 32,
-            b: 32
-        })
-    );
-    core.reset_damage();
-    parser.advance(&mut core, b"\x1b]133;D;1\x07");
-    let update = Update::capture(&core, false);
-    assert!(update.rows.is_empty());
-    snapshot.panes[0].blocks = core.visible_blocks();
-    server
-        .send_state(&snapshot, &[(1, &update)], &Default::default(), 0)
-        .unwrap();
-    server.flush().unwrap();
-    frontend.poll().unwrap();
-    assert_eq!(
-        frontend.client.screens()[&1]
-            .dirty_rows()
-            .collect::<Vec<_>>(),
-        [0]
-    );
-    bytes.clear();
-    frontend.draw(&mut bytes).unwrap();
-    host_parser.advance(&mut host, &bytes);
-    assert_eq!(
-        host.row(1).cells[1].fg,
-        Color::Spec(Rgb {
-            r: 204,
-            g: 204,
-            b: 204
-        })
-    );
-    assert!(host.row(1).cells.iter().all(|cell| cell.c != '│'));
-    drop(frontend);
-    drop(server);
-    drop(listener);
-    fs::remove_file(socket).unwrap();
-}
-
-#[test]
-fn retained_header_updates_titles_status_control_and_full_redraws() {
-    use crate::core::Core;
-    use crate::wire::{Peer, Response};
-    use crate::workspace::TabView;
-    use std::{fs, os::unix::net::UnixListener};
-    let socket = std::path::PathBuf::from(format!("target/tui-header-{}.sock", std::process::id()));
-    let listener = UnixListener::bind(&socket).unwrap();
-    let client = Client::connect(&socket).unwrap();
-    let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-    let size = WindowSize {
-        num_cols: 100,
-        num_lines: 4,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let mut snapshot = Snapshot {
-        name: "header".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: vec![TabView {
-            activity: crate::workspace::TabActivity::Idle,
-            id: 1,
-            title: "alpha".into(),
-        }],
-        panes: Vec::new(),
-    };
-    server
-        .send_response(Response::State(snapshot.clone(), Vec::new(), 0))
-        .unwrap();
-    server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-    frontend.poll().unwrap();
-    let mut host = Core::new(size, 0xcccccc, 0x202020);
-    let mut parser = crate::vt::Parser::new();
-    let mut output = Vec::new();
-    let header_text = |host: &Core| {
-        host.row(0)
-            .cells
-            .iter()
-            .filter(|cell| !cell.flags.contains(Flags::WIDE_CHAR_SPACER))
-            .map(|cell| cell.c)
-            .collect::<String>()
-    };
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert!(header_text(&host).contains("alpha"));
-    let previous = host.row(0).clone();
-    output.clear();
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert_eq!(host.row(0).cells, previous.cells);
-
-    snapshot.tabs[0].title = "beta".into();
-    snapshot.controller = false;
-    server
-        .send_response(Response::State(snapshot, Vec::new(), 0))
-        .unwrap();
-    server.flush().unwrap();
-    frontend.poll().unwrap();
-    output.clear();
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert!(header_text(&host).contains("beta"));
-    assert!(header_text(&host).contains("Read-only"));
-
-    frontend.message("Copied 123 bytes");
-    output.clear();
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert!(header_text(&host).contains("Copied 123 bytes"));
-    frontend.ui.status = None;
-    output.clear();
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert!(!header_text(&host).contains("Copied"));
-    let previous = host.row(0).clone();
-    frontend.full = true;
-    output.clear();
-    frontend.draw(&mut output).unwrap();
-    parser.advance(&mut host, &output);
-    assert_eq!(host.row(0).cells, previous.cells);
-    drop(frontend);
-    drop(listener);
-    fs::remove_file(socket).unwrap();
-}
-
-#[test]
 fn file_paste_edits_only_local_query_and_enter_inserts_the_path() {
-    use crate::wire::{Peer, Response};
-    use crate::workspace::TabView;
-    use std::{fs, os::unix::net::UnixListener};
     let directory = std::env::current_dir()
         .unwrap()
         .join(format!("target/tui-file-input-{}", std::process::id()));
-    fs::create_dir_all(&directory).unwrap();
+    std::fs::create_dir_all(&directory).unwrap();
     let file = directory.join("quoted 'name 中文");
-    fs::write(&file, b"preview").unwrap();
-    let socket = directory
-        .strip_prefix(std::env::current_dir().unwrap())
-        .unwrap()
-        .join("test.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    let client = Client::connect(&socket).unwrap();
-    let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-    let size = WindowSize {
-        num_cols: 80,
-        num_lines: 24,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    server
-        .send_response(Response::State(
-            Snapshot {
-                name: "files".into(),
-                controller: true,
-                focused: 1,
-                active_tab: 1,
-                tabs: vec![TabView {
-                    activity: crate::workspace::TabActivity::Idle,
-                    id: 1,
-                    title: "shell".into(),
-                }],
-                panes: vec![PaneView {
-                    process: Default::default(),
-                    id: 1,
-                    tab: 1,
-                    rect: Rect {
-                        x: 0,
-                        y: 1,
-                        cols: 80,
-                        rows: 23,
-                    },
-                    title: "shell".into(),
-                    cwd: Some(directory.clone()),
-                    blocks: Vec::new(),
-                    command_blocks: Vec::new(),
-                    input_generation: 0,
-                    shell_prompt: None,
-                }],
-            },
-            Vec::new(),
-            0,
-        ))
-        .unwrap();
-    server.flush().unwrap();
-    let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-    frontend.poll().unwrap();
+    std::fs::write(&file, b"preview").unwrap();
+    let (client, mut peer) = pair(&[(1, "shell", TabActivity::Idle)], Some(directory.clone()));
+    let mut frontend =
+        Frontend::new(client, size(80, 24), crate::config::Config::default()).unwrap();
     frontend.ui.files = Some(crate::files::FileNav::new(directory.clone()).unwrap());
     frontend.ui.files_open = true;
     frontend.ui.focus = Focus::Files;
     let pasted = "/hjkl\x1bq\n中文".repeat(1024);
     frontend
-        .panel_bytes(pasted.as_bytes(), Some(PasteTarget::Files))
+        .panel_paste(pasted.as_bytes(), PasteTarget::Files)
         .unwrap();
-    assert_eq!(frontend.ui.files.as_ref().unwrap().query(), pasted);
+    let files = frontend.ui.files.as_ref().unwrap();
+    assert_eq!(
+        files.query.as_ref().unwrap().text,
+        "/hjklq中文".repeat(1024)
+    );
     assert!(frontend.ui.files_open);
-    frontend.client.flush().unwrap();
-    assert!(server.next_action().unwrap().is_none());
-    frontend.ui.files.as_mut().unwrap().stop_search();
-    frontend
-        .panel_bytes(&[0xc3], Some(PasteTarget::Files))
-        .unwrap();
-    frontend
-        .panel_bytes(&[0xa9], Some(PasteTarget::Files))
-        .unwrap();
-    assert_eq!(frontend.ui.files.as_ref().unwrap().query(), "é");
-    frontend.panel_bytes(b"ab\x7f", None).unwrap();
-    assert_eq!(frontend.ui.files.as_ref().unwrap().query(), "éa");
-    frontend.ui.files.as_mut().unwrap().stop_search();
+    assert!(actions(&mut frontend.client, &mut peer).is_empty());
+
+    let files = frontend.ui.files.as_mut().unwrap();
+    files.stop_search();
     let deadline = Instant::now() + Duration::from_secs(5);
-    while frontend.ui.files.as_ref().unwrap().searching() {
-        frontend.ui.files.as_mut().unwrap().poll();
+    while files.searching() {
+        files.poll();
         assert!(Instant::now() < deadline, "file navigation did not finish");
         std::thread::sleep(Duration::from_millis(1));
     }
-    assert_eq!(
-        frontend.ui.files.as_ref().unwrap().selected().unwrap().path,
-        file
-    );
-    assert_eq!(
-        frontend.ui.files.as_ref().unwrap().focus(),
-        crate::files::FileFocus::List
-    );
-    let tree = frontend.file_rect();
-    assert_eq!(tree.cols, frontend.file_width());
-    frontend.panel_bytes(b"l", None).unwrap();
+    assert_eq!(files.selected().unwrap().path, file);
+    frontend.panel_bytes(b"l").unwrap();
     assert!(frontend.ui.file_preview_open());
-    while frontend.ui.files.as_ref().unwrap().searching() {
-        frontend.ui.files.as_mut().unwrap().poll();
-        assert!(Instant::now() < deadline, "file preview did not finish");
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert_eq!(
-        frontend
-            .ui
-            .files
-            .as_ref()
-            .unwrap()
-            .preview_lines(0)
-            .collect::<Vec<_>>(),
-        ["preview"]
-    );
-    let preview = frontend.file_preview_rect();
-    assert_eq!(preview.x, (size.num_cols - preview.cols) / 2);
-    let mut output = Vec::new();
-    frontend.draw_files(&mut output).unwrap();
-    let mut terminal = crate::core::Core::new(size, 0xcccccc, 0x202020);
-    crate::vt::Parser::new().advance(&mut terminal, &output);
-    assert_eq!(
-        terminal
-            .row(usize::from(crate::panel::popup_body(preview).y))
-            .cells[usize::from(preview.x + 2)]
-        .c,
-        'p'
-    );
-    frontend.input(Input::Escape).unwrap();
-    assert!(!frontend.ui.file_preview_open());
-    frontend.panel_bytes(b"\r", None).unwrap();
-    assert!(frontend.ui.files_open);
-    assert!(frontend.clipboard.is_none());
-    frontend.client.flush().unwrap();
-    let mut inserted = false;
-    while let Some(action) = server.next_action().unwrap() {
-        if let Action::Input { data, .. } = action {
-            assert_eq!(data, file.to_string_lossy().as_bytes());
-            inserted = true;
-        }
-    }
-    assert!(inserted);
-    server
-        .send_response(Response::State(
-            frontend.client.snapshot().unwrap().clone(),
-            Vec::new(),
-            0,
-        ))
+    frontend
+        .input(Input::Bytes(smallvec::smallvec![0x1b]))
         .unwrap();
-    server.send_response(Response::Detached).unwrap();
-    server.flush().unwrap();
-    let events = frontend.client.poll().unwrap();
-    assert!(matches!(
-        events.as_slice(),
-        [ClientEvent::Updated, ClientEvent::Detached]
-    ));
-    for event in events {
-        frontend.event(event).unwrap();
-    }
-    assert!(!frontend.running);
+    assert!(!frontend.ui.file_preview_open());
+    frontend.panel_bytes(b"\r").unwrap();
+    assert!(frontend.ui.files_open);
+    let [Action::Input { data, .. }] = &actions(&mut frontend.client, &mut peer)[..] else {
+        panic!("Enter should insert the selected path once");
+    };
+    assert_eq!(data, file.to_string_lossy().as_bytes());
     drop(frontend);
-    drop(listener);
-    fs::remove_dir_all(directory).unwrap();
-}
-
-#[test]
-fn result_rows_keep_full_width_and_hover_preserves_selection() {
-    use crate::core::Core;
-    use crate::screen::Update;
-    let size = WindowSize {
-        num_cols: 9,
-        num_lines: 4,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let mut core = Core::new(size, 0xaaaaaa, 0x202020);
-    let mut vt = crate::vt::Parser::new();
-    vt.advance(&mut core, b"\x1b]133;A\x07 ");
-    vt.advance(&mut core, "• ".as_bytes());
-    vt.advance(
-        &mut core,
-        b"\x1b]133;B\x07cmd\r\n\x1b]133;C\x07123456789\r\n\x1b]133;D;1\x07",
-    );
-    core.selection_start(
-        Point { line: 0, column: 0 },
-        Side::Left,
-        SelectionType::Simple,
-    );
-    core.selection_update(Point { line: 1, column: 7 }, Side::Right);
-    let pane = PaneView {
-        process: Default::default(),
-        id: 1,
-        tab: 1,
-        rect: Rect {
-            x: 0,
-            y: 0,
-            cols: 9,
-            rows: 4,
-        },
-        title: String::new(),
-        cwd: None,
-        blocks: core.visible_blocks(),
-        command_blocks: core.recent_command_blocks(),
-        input_generation: 0,
-        shell_prompt: None,
-    };
-    let mut screen = Screen::default();
-    screen.apply(Update::capture(&core, true)).unwrap();
-    let mut bytes = Vec::new();
-    draw_row(&mut bytes, &screen, &pane, 0, 9, (false, None), 0).unwrap();
-    draw_row(&mut bytes, &screen, &pane, 1, 9, (true, None), 0).unwrap();
-    let mut host = Core::new(
-        WindowSize {
-            num_cols: 9,
-            ..size
-        },
-        0xaaaaaa,
-        0x202020,
-    );
-    crate::vt::Parser::new().advance(&mut host, &bytes);
-    assert_eq!(host.row(0).cells[1].c, '•');
-    assert_eq!(host.row(1).cells[0].c, '1');
-    assert_eq!(host.row(1).cells[8].c, '9');
-    assert_eq!(
-        host.row(0).cells[1].bg,
-        Color::Spec(Rgb {
-            r: 32,
-            g: 32,
-            b: 32
-        })
-    );
-    assert_eq!(
-        host.row(0).cells[3].bg,
-        Color::Spec(Rgb {
-            r: 55,
-            g: 55,
-            b: 55
-        })
-    );
-    assert_eq!(
-        host.row(1).cells[8].bg,
-        Color::Spec(Rgb {
-            r: 38,
-            g: 38,
-            b: 38
-        })
-    );
+    std::fs::remove_dir_all(directory).unwrap();
 }
 
 #[test]
 fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
-    use crate::core::Core;
-    use crate::screen::Update;
     for (right, start) in [("main", 17), ("中a\u{301}", 18)] {
-        let size = WindowSize {
-            num_cols: 21,
-            num_lines: 3,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut core = Core::new(size, 0xaaaaaa, 0x202020);
-        let mut parser = crate::vt::Parser::new();
+        let mut core = Core::new(size(21, 3), 0xaaaaaa, 0x202020);
+        let mut parser = Parser::new();
         parser.advance(
-                &mut core,
-                format!("\x1b]133;A\x07 • \x1b]133;B\x07cmd\x1b[1;{}H\x1b]133;P;2\x07{right}\x1b]133;P;0\x07\x1b[1;4H", start + 1).as_bytes(),
-            );
+            &mut core,
+            format!("\x1b]133;A\x07 • \x1b]133;B\x07cmd\x1b[1;{}H\x1b]133;P;2\x07{right}\x1b]133;P;0\x07\x1b[1;4H", start + 1).as_bytes(),
+        );
         core.selection_start(Point::default(), Side::Left, SelectionType::Simple);
         core.selection_update(
             Point {
@@ -778,39 +202,12 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
             },
             Side::Right,
         );
-        assert_eq!(core.selection_to_string().as_deref(), Some("cmd"));
-        let pane = PaneView {
-            process: Default::default(),
-            id: 1,
-            tab: 1,
-            rect: Rect {
-                x: 2,
-                y: 1,
-                cols: 21,
-                rows: 3,
-            },
-            title: String::new(),
-            cwd: None,
-            blocks: Vec::new(),
-            command_blocks: Vec::new(),
-            input_generation: 0,
-            shell_prompt: None,
-        };
+        let pane = pane(1, 1, rect(2, 1, 21, 3));
         let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
-        let mut bytes = Vec::new();
-        draw_row(&mut bytes, &screen, &pane, 0, 28, (false, None), 0).unwrap();
-        let mut host = Core::new(
-            WindowSize {
-                num_cols: 28,
-                num_lines: 5,
-                ..size
-            },
-            0xaaaaaa,
-            0x202020,
-        );
-        let mut host_parser = crate::vt::Parser::new();
-        host_parser.advance(&mut host, &bytes);
+        screen.apply(Update::capture(&core, true));
+        let mut host = Core::new(size(28, 5), 0xaaaaaa, 0x202020);
+        let mut host_parser = Parser::new();
+        host_parser.advance(&mut host, &draw_row(&screen, &pane, 28));
         assert_eq!(host.row(1).cells[3].c, '•');
         assert_eq!(
             host.row(1).cells[22].c,
@@ -831,55 +228,28 @@ fn right_prompt_reaches_pane_edge_and_repaint_clears_its_old_position() {
             );
         }
         parser.advance(&mut core, format!("\x1b[1;{}H\x1b[K", start + 1).as_bytes());
-        screen.apply(Update::capture(&core, true)).unwrap();
-        bytes.clear();
-        draw_row(&mut bytes, &screen, &pane, 0, 28, (false, None), 0).unwrap();
-        host_parser.advance(&mut host, &bytes);
+        screen.apply(Update::capture(&core, true));
+        host_parser.advance(&mut host, &draw_row(&screen, &pane, 28));
         assert!(host.row(1).cells[19..23].iter().all(|cell| cell.c == ' '));
     }
 }
 
 #[test]
 fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
-    use crate::core::{Cell, Core, Row};
-    use crate::screen::Update;
-    let size = WindowSize {
-        num_cols: 40,
-        num_lines: 2,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let core = Core::new(size, 0xcccccc, 0x202020);
+    use crate::core::{Cell, Row};
+    let core = Core::new(size(40, 2), 0xcccccc, 0x202020);
     let mut update = Update::capture(&core, true);
     let mut cells = vec![Cell::default(); 40];
     cells[0].c = 'x';
     cells[39].bg = Color::Indexed(1);
-    update.rows[0].1 = Row::from_parts(cells, false, 1, Vec::new()).unwrap();
+    update.rows[0].1 = Row::from_parts(cells, false, 1, Vec::new());
     let mut screen = Screen::default();
-    screen.apply(update).unwrap();
-    let pane = PaneView {
-        process: Default::default(),
-        id: 1,
-        tab: 1,
-        rect: Rect {
-            x: 0,
-            y: 0,
-            cols: 40,
-            rows: 2,
-        },
-        title: String::new(),
-        cwd: None,
-        blocks: Vec::new(),
-        command_blocks: Vec::new(),
-        input_generation: 0,
-        shell_prompt: None,
-    };
-    let mut output = Vec::new();
-    draw_row(&mut output, &screen, &pane, 0, 40, (false, None), 0).unwrap();
-    let mut host = Core::new(size, 0xcccccc, 0x202020);
-    let mut parser = crate::vt::Parser::new();
+    screen.apply(update);
+    let pane = pane(1, 1, rect(0, 0, 40, 2));
+    let mut host = Core::new(size(40, 2), 0xcccccc, 0x202020);
+    let mut parser = Parser::new();
     parser.advance(&mut host, b"old contents must disappear");
-    parser.advance(&mut host, &output);
+    parser.advance(&mut host, &draw_row(&screen, &pane, 40));
     assert_eq!(host.row(0).cells[0].c, 'x');
     assert!(host.row(0).cells[1..].iter().all(|cell| cell.c == ' '));
     assert_eq!(
@@ -887,186 +257,20 @@ fn sparse_redraw_erases_old_text_and_keeps_styled_trailing_spaces() {
         Color::Spec(screen.color(Color::Indexed(1)))
     );
 
-    screen.apply(Update::capture(&core, true)).unwrap();
-    output.clear();
-    draw_row(&mut output, &screen, &pane, 0, 40, (false, None), 0).unwrap();
+    screen.apply(Update::capture(&core, true));
+    let output = draw_row(&screen, &pane, 40);
     assert!(
         output.len() < 80,
         "empty rows should not emit a screenful of spaces"
     );
     parser.advance(&mut host, &output);
-    assert!(host.row(0).cells.iter().all(|cell| cell.c == ' '));
+    let background = Color::Spec(screen.color(Color::Named(NamedColor::Background)));
     assert!(
         host.row(0)
             .cells
             .iter()
-            .all(|cell| cell.bg == Color::Spec(screen.color(Color::Named(NamedColor::Background))))
+            .all(|cell| cell.c == ' ' && cell.bg == background)
     );
-}
-
-#[test]
-fn tab_dots_follow_active_color_with_spaces_inside_both_edges() {
-    use crate::core::Core;
-    let mut snapshot = Snapshot {
-        name: "tabs".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: vec![
-            crate::workspace::TabView {
-                activity: crate::workspace::TabActivity::Idle,
-                id: 1,
-                title: "src".into(),
-            },
-            crate::workspace::TabView {
-                activity: crate::workspace::TabActivity::Idle,
-                id: 2,
-                title: "docs".into(),
-            },
-        ],
-        panes: Vec::new(),
-    };
-    let size = WindowSize {
-        num_cols: 80,
-        num_lines: 2,
-        cell_width: 0,
-        cell_height: 0,
-    };
-    let mut host = Core::new(size, 0xcccccc, 0x202020);
-    let mut parser = crate::vt::Parser::new();
-    for active in [1, 2] {
-        snapshot.active_tab = active;
-        let mut output = Vec::new();
-        draw_tabs(&mut output, &snapshot, 80, "", None, &Config::default()).unwrap();
-        parser.advance(&mut host, &output);
-        for (index, x, width) in tab_chrome(&snapshot, 80, "").0 {
-            let row = &host.row(0).cells;
-            let x = usize::from(x);
-            assert_eq!(row[x].c, '◢');
-            assert_eq!(row[x + 1].c, ' ');
-            assert_eq!(row[x + 2].c, '•');
-            assert_eq!(
-                row[x + 2].fg,
-                Color::Spec(Rgb {
-                    r: 181,
-                    g: 210,
-                    b: 162
-                })
-            );
-            assert_eq!(row[x + 3].c, ' ');
-            assert_eq!(
-                row[x + 4].c,
-                snapshot.tabs[index].title.chars().next().unwrap()
-            );
-            assert_eq!(row[x + usize::from(width) - 3].c, '×');
-            assert_eq!(row[x + usize::from(width) - 2].c, ' ');
-            assert_eq!(row[x + usize::from(width) - 1].c, '◣');
-            for column in [x, x + usize::from(width) - 1] {
-                assert!(!row[column].flags.contains(Flags::UNDERLINE));
-                assert_eq!(
-                    host.row(0)
-                        .extra(column)
-                        .and_then(|extra| extra.underline_color),
-                    None
-                );
-            }
-            let bg = if snapshot.tabs[index].id == active {
-                32
-            } else {
-                28
-            };
-            for cell in [row[x + 4], row[x + usize::from(width) - 3]] {
-                assert!(!cell.flags.contains(Flags::UNDERLINE));
-                assert_eq!(
-                    cell.bg,
-                    Color::Spec(Rgb {
-                        r: bg,
-                        g: bg,
-                        b: bg
-                    })
-                );
-            }
-        }
-    }
-    let tabs = tab_chrome(&snapshot, 80, "").0;
-    let (_, first, width) = tabs[0];
-    let (_, last, last_width) = *tabs.last().unwrap();
-    let plus = last + last_width + 1;
-    for (pointer, column) in [
-        ((first + 4, 0), first + 4),
-        ((first + width - 4, 0), first + width - 3),
-        ((plus, 0), plus),
-    ] {
-        for hovered in [true, false] {
-            let mut output = Vec::new();
-            draw_tabs(
-                &mut output,
-                &snapshot,
-                80,
-                "",
-                hovered.then_some(pointer),
-                &Config::default(),
-            )
-            .unwrap();
-            parser.advance(&mut host, &output);
-            let cell = host.row(0).cells[usize::from(column)];
-            assert_eq!(
-                cell.flags.contains(Flags::UNDERLINE),
-                hovered && column != first + 4
-            );
-            let bg = if column == plus { 25 } else { 28 };
-            assert_eq!(
-                cell.bg,
-                Color::Spec(Rgb {
-                    r: bg,
-                    g: bg,
-                    b: bg
-                })
-            );
-            if hovered && column == first + width - 3 {
-                assert_eq!(
-                    host.row(0)
-                        .extra(usize::from(column))
-                        .and_then(|extra| extra.underline_color),
-                    Some(Color::Spec(Rgb {
-                        r: 232,
-                        g: 117,
-                        b: 117
-                    }))
-                );
-            }
-        }
-    }
-}
-
-#[test]
-fn overflowing_tabs_keep_active_tab_visible_and_share_click_geometry() {
-    let mut snapshot = Snapshot {
-        name: "tabs".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: (1..=8)
-            .map(|id| crate::workspace::TabView {
-                activity: crate::workspace::TabActivity::Idle,
-                id,
-                title: format!("long terminal title {id}"),
-            })
-            .collect(),
-        panes: Vec::new(),
-    };
-    for active in [1, 8, 4, 1] {
-        snapshot.active_tab = active;
-        let tabs = tab_chrome(&snapshot, 40, "CPU 10%  MEM 20%  DSK 30%").0;
-        assert!(
-            tabs.iter()
-                .any(|(index, _, _)| snapshot.tabs[*index].id == active)
-        );
-        for (_, x, width) in tabs {
-            assert!(x + width <= 40);
-            assert!(width >= 9);
-        }
-    }
 }
 
 #[test]
@@ -1101,33 +305,18 @@ fn raw_guard_restores_termios_and_receives_resize_notifications() {
 }
 
 #[test]
-fn tui_resize_uses_cells_and_zero_pixel_metrics() {
-    let (_master, slave) = pty();
-    assert_eq!(
-        terminal_size(slave.as_raw_fd()).unwrap(),
-        WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0
-        }
-    );
-}
-
-#[test]
 fn clipboard_stream_crosses_chunk_boundaries_without_truncation() {
     let plain = vec![b'x'; OSC52_CHUNK_SIZE * 3 + 2];
     let mut transfer = ClipboardTransfer {
-        reader: ClipboardSource::Memory(plain.clone()),
+        reader: Box::new(io::Cursor::new(plain.clone())),
         target: b'c',
         incomplete: true,
-        started: false,
         bytes: 0,
     };
     let mut output = Vec::new();
-    assert!(transfer.step(&mut output, None).unwrap().is_none());
+    assert!(transfer.step(&mut output).unwrap().is_none());
     let message = loop {
-        if let Some(message) = transfer.step(&mut output, None).unwrap() {
+        if let Some(message) = transfer.step(&mut output).unwrap() {
             break message;
         }
     };
@@ -1144,1390 +333,19 @@ fn clipboard_stream_crosses_chunk_boundaries_without_truncation() {
     );
 }
 
-#[test]
-fn application_cursor_translation_preserves_modified_and_ordinary_input() {
-    assert_eq!(
-        cursor_bytes(b"\x1b[A".to_vec(), Mode::APP_CURSOR),
-        b"\x1bOA"
-    );
-    assert_eq!(cursor_bytes(b"\x1bOF".to_vec(), Mode::NONE), b"\x1b[F");
-    assert_eq!(
-        cursor_bytes(b"\x1b[1;5A".to_vec(), Mode::APP_CURSOR),
-        b"\x1b[1;5A"
-    );
-    assert_eq!(
-        cursor_bytes("你好".as_bytes().to_vec(), Mode::NONE),
-        "你好".as_bytes()
-    );
-}
-
-#[test]
-fn mouse_local_coordinates_and_release_match_inner_modes() {
-    assert_eq!(
-        mouse_bytes(0, 2, 3, false, Mode::SGR_MOUSE).unwrap(),
-        b"\x1b[<0;3;4M"
-    );
-    assert_eq!(
-        mouse_bytes(16, 2, 3, true, Mode::SGR_MOUSE).unwrap(),
-        b"\x1b[<16;3;4m"
-    );
-    assert_eq!(
-        mouse_bytes(0, 0, 0, false, Mode::NONE).unwrap(),
-        b"\x1b[M !!"
-    );
-    assert!(mouse_bytes(0, 223, 0, false, Mode::NONE).is_none());
-}
-
-#[test]
-fn labels_obey_cell_width_and_cannot_inject_terminal_sequences() {
-    for (text, columns, expected) in [
-        ("中a", 4, "中a "),
-        ("中中a", 3, "中 "),
-        ("a\x1b\n", 4, "a   "),
-        ("a\u{2003}", 4, "a   "),
-        ("e\u{301}x", 1, "e\u{301}"),
-    ] {
-        let mut output = Vec::new();
-        let label = fit_label(text, columns);
-        output.extend_from_slice(label.as_bytes());
-        output.resize(
-            output.len() + usize::from(columns) - text_width(&label),
-            b' ',
-        );
-        assert_eq!(output, expected.as_bytes());
-    }
-}
-
-#[test]
-fn running_tab_close_defaults_to_cancel_and_never_sends_modal_input_to_pty() {
-    use std::os::unix::net::UnixListener;
-    let path = format!("target/tui-close-tab-{}.sock", std::process::id());
-    let listener = UnixListener::bind(&path).unwrap();
-    let client = Client::connect(std::path::Path::new(&path)).unwrap();
-    let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
-    let mut frontend = Frontend::new(
-        client,
-        WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        },
-        crate::config::Config::default(),
-    )
-    .unwrap();
-    let mut tab = crate::workspace::TabView {
-        id: 7,
-        title: "busy".into(),
-        activity: crate::workspace::TabActivity::Running,
-    };
-    assert!(!frontend.ui.request_close_tab(&tab));
-    frontend
-        .input(Input::Bytes(b"do not execute".to_vec().into()))
-        .unwrap();
-    frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
-    assert!(frontend.ui.close_prompt.is_none());
-    frontend.client.flush().unwrap();
-    assert!(peer.next_action().unwrap().is_none());
-    assert!(!frontend.ui.request_close_tab(&tab));
-    frontend.input(Input::Bytes(b"\t".to_vec().into())).unwrap();
-    frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
-    frontend.client.flush().unwrap();
-    assert!(matches!(
-        peer.next_action().unwrap(),
-        Some(Action::CloseTab(7))
-    ));
-    tab.activity = crate::workspace::TabActivity::Idle;
-    assert!(frontend.ui.request_close_tab(&tab));
-    std::fs::remove_file(path).unwrap();
-}
-
-#[test]
-fn both_tab_styles_share_status_colors_and_gray_close_buttons() {
-    use crate::config::TabStyle;
-    use crate::workspace::{TabActivity, TabView};
-    let states = [
-        TabActivity::Running,
-        TabActivity::Finished,
-        TabActivity::Failed,
-        TabActivity::Unknown,
-    ];
-    let snapshot = Snapshot {
-        name: "tabs".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: states
-            .into_iter()
-            .enumerate()
-            .map(|(index, activity)| TabView {
-                id: index as u64 + 1,
-                title: "task".into(),
-                activity,
-            })
-            .collect(),
-        panes: Vec::new(),
-    };
-    for style in [TabStyle::Angled, TabStyle::Flat] {
-        let mut output = Vec::new();
-        draw_tabs(
-            &mut output,
-            &snapshot,
-            100,
-            "",
-            None,
-            &Config {
-                tab_style: style,
-                ..Config::default()
-            },
-        )
-        .unwrap();
-        let mut host = crate::core::Core::new(
-            WindowSize {
-                num_cols: 100,
-                num_lines: 2,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        crate::vt::Parser::new().advance(&mut host, &output);
-        for ((index, x, width), color) in tab_chrome(&snapshot, 100, "")
-            .0
-            .into_iter()
-            .zip([0xfe9b30, 0xb5d2a2, 0xef5350, 0xb5d2a2])
-        {
-            let cells = &host.row(0).cells;
-            assert_eq!(
-                cells[x as usize].c,
-                if style == TabStyle::Angled {
-                    '◢'
-                } else {
-                    ' '
-                }
-            );
-            assert_eq!(cells[(x + 2) as usize].c, '•');
-            assert_eq!(
-                cells[(x + 2) as usize].fg,
-                Color::Spec(Rgb {
-                    r: (color >> 16) as u8,
-                    g: (color >> 8) as u8,
-                    b: color as u8
-                })
-            );
-            let close = cells[(x + width - 3) as usize];
-            assert_eq!(close.c, '×');
-            let gray = if index == 0 { 148 } else { 96 };
-            assert_eq!(
-                close.fg,
-                Color::Spec(Rgb {
-                    r: gray,
-                    g: gray,
-                    b: gray
-                })
-            );
-        }
-    }
-}
-
 mod agent {
     use super::*;
 
     #[test]
-    fn agent_view_sync_tracks_keys_layout_rewind_and_controller_recovery() {
-        use crate::wire::{Peer, Response};
-        use serde_json::json;
-        use std::os::unix::net::UnixListener;
-        let path =
-            std::path::PathBuf::from(format!("target/tui-agent-sync-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-        let size = WindowSize {
-            num_cols: 140,
-            num_lines: 40,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut snapshot = Snapshot {
-            name: "sync".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: Vec::new(),
-            panes: Vec::new(),
-        };
-        server
-            .send_response(Response::State(snapshot.clone(), Vec::new(), 0))
-            .unwrap();
-        server
-            .send_response(Response::Agent(crate::workspace::AgentEvent::Ready))
-            .unwrap();
-        server.flush().unwrap();
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-        frontend.poll().unwrap();
-        frontend
-            .ui
-            .poll_agent(&mut frontend.client, &frontend.config)
-            .unwrap();
-        frontend.client.flush().unwrap();
-        assert!(server.next_action().unwrap().is_none());
-        let sync = |frontend: &mut Frontend, server: &mut Peer| {
-            frontend
-                .ui
-                .poll_agent(&mut frontend.client, &frontend.config)
-                .unwrap();
-            frontend.client.flush().unwrap();
-            let mut views = Vec::<serde_json::Value>::new();
-            while let Some(action) = server.next_action().unwrap() {
-                if let Action::AgentView(payload) = action {
-                    views.push(serde_json::from_slice(&payload).unwrap());
-                }
-            }
-            views
-        };
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend.input(Input::Alt(b'a')).unwrap();
-        assert_eq!(sync(&mut frontend, &mut server).len(), 1);
-        assert!(!frontend.ui.agent.view_dirty);
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend
-            .input(Input::Bytes(b"draft".to_vec().into()))
-            .unwrap();
-        let mut view = sync(&mut frontend, &mut server).pop().unwrap();
-        assert_eq!(view["sessions"][0]["input"], "draft");
-        assert!(view.get("open").is_none());
-        assert!(view["sessions"][0].get("cursor").is_none());
-
-        let attachment = json!(["registers", "pane 1", "Screen", "rax 0x1234", false]);
-        view["sessions"][0]["basket"] = json!([attachment]);
-        server
-            .send_response(Response::Agent(crate::workspace::AgentEvent::Draft(
-                serde_json::to_vec(&view).unwrap(),
-            )))
-            .unwrap();
-        server.flush().unwrap();
-        frontend.poll().unwrap();
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        assert_eq!(frontend.ui.agent.active().context.basket.len(), 1);
-        frontend
-            .input(Input::Bytes(b"\x1b[D".to_vec().into()))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.active().model.cursor, 4);
-        assert!(!frontend.ui.agent.view_dirty);
-        frontend
-            .input(Input::Mouse(Mouse {
-                code: 35,
-                column: 100,
-                row: 10,
-                release: false,
-            }))
-            .unwrap();
-        assert!(!frontend.ui.agent.view_dirty);
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        let mut output = Vec::new();
-        frontend.draw_agent(&mut output).unwrap();
-        assert!(sync(&mut frontend, &mut server).is_empty());
-
-        let model = crate::workspace::AgentModelPatch {
-            session: 0,
-            revision: 1,
-            turn: 1,
-            messages: vec![crate::workspace::AgentMessage {
-                role: "You".into(),
-                text: "earlier".into(),
-                id: None,
-                turn: 1,
-            }],
-            recovery: b"{}".to_vec(),
-            ..crate::workspace::AgentModelPatch::default()
-        };
-        server
-            .send_response(Response::Agent(crate::workspace::AgentEvent::Model(model)))
-            .unwrap();
-        server.flush().unwrap();
-        frontend.poll().unwrap();
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend.input(Input::Escape).unwrap();
-        assert!(frontend.ui.agent.active().rewind_target.is_none());
-        frontend.input(Input::Escape).unwrap();
-        assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        frontend.input(Input::Bytes(b"\r".to_vec().into())).unwrap();
-        sync(&mut frontend, &mut server);
-        let rewound = crate::workspace::AgentModelPatch {
-            session: 0,
-            revision: 2,
-            turn: 1,
-            recovery: serde_json::to_vec(&json!({"rewind_restore":[1, "earlier", [attachment]]}))
-                .unwrap(),
-            ..crate::workspace::AgentModelPatch::default()
-        };
-        server
-            .send_response(Response::Agent(crate::workspace::AgentEvent::Model(
-                rewound,
-            )))
-            .unwrap();
-        server.flush().unwrap();
-        frontend.poll().unwrap();
-        let view = sync(&mut frontend, &mut server).pop().unwrap();
-        assert_eq!(view["sessions"][0]["input"], "earlier");
-        assert_eq!(view["sessions"][0]["basket"], json!([attachment]));
-        assert_eq!(view["sessions"][0]["rewind_applied"], 1);
-
-        snapshot.controller = false;
-        server
-            .send_response(Response::State(snapshot.clone(), Vec::new(), 0))
-            .unwrap();
-        server.flush().unwrap();
-        frontend.poll().unwrap();
-        frontend
-            .input(Input::Bytes(b" edited".to_vec().into()))
-            .unwrap();
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        snapshot.controller = true;
-        server
-            .send_response(Response::State(snapshot, Vec::new(), 0))
-            .unwrap();
-        server.flush().unwrap();
-        frontend.poll().unwrap();
-        assert_eq!(
-            sync(&mut frontend, &mut server)[0]["sessions"][0]["input"],
-            "earlier edited"
-        );
-        frontend
-            .input(Input::Bytes(b"\x1b[C".to_vec().into()))
-            .unwrap();
-        assert!(sync(&mut frontend, &mut server).is_empty());
-        drop(frontend);
-        drop(server);
-        drop(listener);
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn agent_markdown_renders_and_selects_the_visible_text() {
-        use crate::core::Core;
-        use std::os::unix::net::UnixListener;
-        let path =
-            std::path::PathBuf::from(format!("target/tui-markdown-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let _peer = listener.accept().unwrap();
-        let size = WindowSize {
-            num_cols: 140,
-            num_lines: 42,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-        frontend.ui.agent.open = true;
-        let source = "## 标题\n\n**bold** normal _italic_ and `x*y`\n\n> quoted\n\n- first\n- second\n\n```gdb\n  x/4gx $sp\n\n  0x123\n```\n\n[docs](https://example.com)";
-        frontend
-            .ui
-            .agent
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: source.into(),
-                id: None,
-            });
-        frontend.ui.agent.wait_layout(usize::from(
-            editor(&frontend.ui, frontend.agent_rect()).0.cols,
-        ));
-        let mut bytes = Vec::new();
-        frontend.draw_agent(&mut bytes).unwrap();
-        let mut host = Core::new(size, 0xcccccc, 0x202020);
-        let mut parser = crate::vt::Parser::new();
-        parser.advance(&mut host, &bytes);
-        let line = |needle: &str| {
-            let session = frontend.ui.agent.active();
-            session
-                .lines
-                .iter()
-                .position(|line| match line {
-                    AgentLine::Text { message, range } => session.message_text(*message as usize)
-                        [range.start as usize..range.end as usize]
-                        .contains(needle),
-                    _ => false,
-                })
-                .unwrap()
-        };
-        let heading = line("标题");
-        let bold = line("bold");
-        let code = line("  x/4gx");
-        let row = |line: usize| usize::from(frontend.agent.chat.y) + line - frontend.agent.first;
-        let x = usize::from(frontend.agent.chat.x);
-        assert_eq!(host.row(row(heading)).cells[x].c, '标');
-        assert!(host.row(row(heading)).cells[x].flags.contains(Flags::BOLD));
-        assert!(host.row(row(bold)).cells[x].flags.contains(Flags::BOLD));
-        assert!(!host.row(row(bold)).cells[x + 5].flags.contains(Flags::BOLD));
-        assert_eq!(host.row(row(code)).cells[x + 2].c, 'x');
-        assert_eq!(
-            host.color(host.row(row(code)).cells[x + 2].bg),
-            Rgb {
-                r: 48,
-                g: 48,
-                b: 48
-            }
-        );
-        assert!(
-            matches!(&frontend.ui.agent.active().lines[code + 1], AgentLine::Text { range, .. } if range.is_empty())
-        );
-        let session = frontend.ui.agent.active_mut();
-        let start = session.point(bold, 0).unwrap();
-        let end = session.point(bold, 4).unwrap();
-        session.begin_selection(start, false);
-        session.extend_selection(end);
-        assert_eq!(session.selected_text().as_deref(), Some("bold"));
-        assert_eq!(session.model.messages[0].text, source);
-        bytes.clear();
-        frontend.draw_agent(&mut bytes).unwrap();
-        parser.advance(&mut host, &bytes);
-        let y = usize::from(frontend.agent.chat.y) + bold - frontend.agent.first;
-        assert_eq!(
-            host.color(host.row(y).cells[x].bg),
-            Rgb {
-                r: 79,
-                g: 79,
-                b: 79
-            }
-        );
-        let luminance = |rgb: Rgb| {
-            let channel = |value: u8| {
-                let value = f64::from(value) / 255.;
-                if value <= 0.04045 {
-                    value / 12.92
-                } else {
-                    ((value + 0.055) / 1.055).powf(2.4)
-                }
-            };
-            channel(rgb.r) * 0.2126 + channel(rgb.g) * 0.7152 + channel(rgb.b) * 0.0722
-        };
-        for (foreground, background) in [(0x202020, 0xf5f5f5), (0xffffff, 0x000000)] {
-            frontend.config.foreground = foreground;
-            frontend.config.background = background;
-            let mut bytes = Vec::new();
-            frontend.draw_agent(&mut bytes).unwrap();
-            let mut host = Core::new(size, foreground, background);
-            crate::vt::Parser::new().advance(&mut host, &bytes);
-            let panel = frontend.agent_rect();
-            for y in panel.y..panel.y + panel.rows {
-                for x in panel.x..panel.x + panel.cols {
-                    let cell = &host.row(usize::from(y)).cells[usize::from(x)];
-                    if !cell.c.is_whitespace() && !matches!(cell.c, '│' | '─' | '├' | '•' | '╱')
-                    {
-                        let fg = luminance(host.color(cell.fg));
-                        let bg = luminance(host.color(cell.bg));
-                        let contrast = (fg.max(bg) + 0.05) / (fg.min(bg) + 0.05);
-                        assert!(
-                            contrast >= 3.,
-                            "unreadable {:?} at {x},{y}: {contrast}",
-                            cell.c
-                        );
-                    }
-                }
-            }
-        }
-        std::fs::remove_file(path).unwrap();
-    }
-
-    fn assert_agent_tab_controls(frontend: &mut Frontend) -> Rect {
-        let mut rendered = Vec::new();
-        frontend.draw_agent(&mut rendered).unwrap();
-        let rendered = String::from_utf8(rendered).unwrap();
-        assert!(rendered.contains(crate::agent::panel::REWIND_LABEL));
-        assert!(!rendered.contains("↶"));
-        let plus = frontend
-            .agent
-            .hits
-            .iter()
-            .find(|(_, action)| *action == AgentAction::NewSession)
-            .unwrap()
-            .0;
-        let panel_close = frontend
-            .agent
-            .hits
-            .iter()
-            .find(|(_, action)| *action == AgentAction::ClosePanel)
-            .unwrap()
-            .0;
-        let tabs_end = frontend
-            .agent
-            .hits
-            .iter()
-            .filter_map(|(rect, action)| {
-                matches!(action, AgentAction::Session(_)).then_some(rect.x + rect.cols)
-            })
-            .max()
-            .unwrap();
-        assert_eq!(plus.x, tabs_end + 1);
-        assert_eq!(plus.cols, 2);
-        assert_eq!(panel_close.cols, 3);
-        assert_eq!(panel_close.x + panel_close.cols, frontend.size.num_cols);
-        assert!(plus.x + plus.cols <= panel_close.x);
-        let rewind_hits: Vec<_> = frontend
-            .agent
-            .hits
-            .iter()
-            .filter(|(_, action)| *action == AgentAction::Rewind(0))
-            .collect();
-        assert_eq!(rewind_hits.len(), 1);
-        let rewind_button = rewind_hits[0].0;
-        assert!(
-            frontend
-                .agent
-                .chat
-                .contains(rewind_button.x, rewind_button.y)
-        );
-        assert!(
-            !editor(&frontend.ui, frontend.agent_rect())
-                .0
-                .contains(rewind_button.x, rewind_button.y)
-        );
-        let (editor_rect, editor_layout) = editor(&frontend.ui, frontend.agent_rect());
-        assert_eq!(
-            editor_layout.lines,
-            frontend
-                .ui
-                .agent
-                .active()
-                .editor_layout(usize::from(editor_rect.cols), 3)
-                .lines
-        );
-        let mut host = crate::core::Core::new(frontend.size, 0xcccccc, 0x202020);
-        let mut parser = crate::vt::Parser::new();
-        let tab_buttons: Vec<_> = frontend
-            .agent
-            .hits
-            .iter()
-            .filter(|(_, action)| {
-                matches!(
-                    action,
-                    AgentAction::Session(_)
-                        | AgentAction::CloseSession(_)
-                        | AgentAction::NewSession
-                        | AgentAction::ClosePanel
-                )
-            })
-            .copied()
-            .collect();
-        for (rect, action) in tab_buttons {
-            for hovered in [true, false] {
-                frontend.pointer = hovered.then_some((rect.x, rect.y));
-                let mut bytes = Vec::new();
-                frontend.draw_agent(&mut bytes).unwrap();
-                parser.advance(&mut host, &bytes);
-                let cell = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 1)];
-                if action == AgentAction::ClosePanel {
-                    assert_eq!(cell.c, '›');
-                    assert_eq!(
-                        host.row(usize::from(rect.y)).cells[usize::from(rect.x + 2)].c,
-                        ' '
-                    );
-                }
-                if action == AgentAction::NewSession {
-                    let cells = &host.row(usize::from(rect.y)).cells;
-                    assert_eq!(cells[usize::from(rect.x)].c, '+');
-                    assert_eq!(cells[usize::from(rect.x - 1)].c, ' ');
-                    assert_eq!(cells[usize::from(rect.x - 2)].c, ' ');
-                    assert_eq!(cells[usize::from(rect.x - 3)].c, '×');
-                }
-                let active_tab = matches!(
-                    action,
-                    AgentAction::Session(0) | AgentAction::CloseSession(0)
-                );
-                assert_eq!(cell.flags.contains(Flags::UNDERLINE), active_tab);
-                if let AgentAction::Session(index) = action {
-                    let title = host.row(usize::from(rect.y)).cells[usize::from(rect.x + 3)];
-                    assert!(!title.flags.contains(Flags::BOLD));
-                    if index == 0 {
-                        assert_eq!(title.fg, crate::panel::rgb(0xdddddd));
-                    }
-                }
-                if hovered && matches!(action, AgentAction::CloseSession(_)) {
-                    assert_eq!(cell.fg, crate::panel::rgb(0xef5350));
-                }
-                let bg = if active_tab {
-                    0x36
-                } else if matches!(
-                    action,
-                    AgentAction::Session(_) | AgentAction::CloseSession(_)
-                ) {
-                    0x1b
-                } else {
-                    0x11
-                };
-                assert_eq!(
-                    cell.bg,
-                    Color::Spec(crate::vt::Rgb {
-                        r: bg,
-                        g: bg,
-                        b: bg
-                    })
-                );
-            }
-        }
-        frontend.ui.focus = Focus::Controls;
-        frontend.ui.agent.keyboard = AgentAction::NewSession;
-        frontend.pointer = None;
-        let mut bytes = Vec::new();
-        frontend.draw_agent(&mut bytes).unwrap();
-        parser.advance(&mut host, &bytes);
-        let focused_plus = host.row(usize::from(plus.y)).cells[usize::from(plus.x + 1)];
-        assert!(!focused_plus.flags.contains(Flags::UNDERLINE));
-        assert_eq!(
-            focused_plus.bg,
-            Color::Spec(crate::vt::Rgb {
-                r: 17,
-                g: 17,
-                b: 17
-            })
-        );
-        frontend.ui.focus = Focus::Editor;
-        for hovered in [true, false] {
-            frontend.pointer = hovered.then_some((rewind_button.x, rewind_button.y));
-            let mut bytes = Vec::new();
-            frontend.draw_agent(&mut bytes).unwrap();
-            parser.advance(&mut host, &bytes);
-            let cell =
-                host.row(usize::from(rewind_button.y)).cells[usize::from(rewind_button.x + 1)];
-            assert!(!cell.flags.contains(Flags::UNDERLINE));
-            assert_eq!(
-                cell.bg,
-                Color::Spec(crate::vt::Rgb {
-                    r: 48,
-                    g: 48,
-                    b: 48
-                })
-            );
-        }
-        rewind_button
-    }
-
-    #[test]
-    fn agent_tabs_keep_drafts_and_drag_selection_copies_across_messages() {
-        use std::os::unix::net::UnixListener;
-        let path =
-            std::path::PathBuf::from(format!("target/tui-agent-tabs-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
-        let mut frontend = Frontend::new(
-            client,
-            WindowSize {
-                num_cols: 110,
-                num_lines: 30,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            crate::config::Config::default(),
-        )
-        .unwrap();
-        peer.send_response(crate::wire::Response::State(
-            Snapshot {
-                name: "tabs".into(),
-                controller: false,
-                focused: 1,
-                active_tab: 1,
-                tabs: Vec::new(),
-                panes: Vec::new(),
-            },
-            Vec::new(),
-            0,
-        ))
-        .unwrap();
-        peer.send_response(crate::wire::Response::Agent(
-            crate::workspace::AgentEvent::Ready,
-        ))
-        .unwrap();
-        peer.flush().unwrap();
-        frontend.poll().unwrap();
-        frontend.input(Input::Alt(b'a')).unwrap();
-        frontend
-            .ui
-            .poll_agent(&mut frontend.client, &frontend.config)
-            .unwrap();
-        frontend.client.flush().unwrap();
-        assert!(matches!(
-            peer.next_action().unwrap(),
-            Some(Action::AgentOpen)
-        ));
-        let model = &mut frontend.ui.agent.active_mut().model;
-        model.insert("first draft").unwrap();
-        model.messages.extend([
-            crate::workspace::AgentMessage {
-                role: "You".into(),
-                text: "hello 中 world".into(),
-                id: None,
-                turn: 1,
-            },
-            crate::workspace::AgentMessage {
-                role: "Agent".into(),
-                text: "agent reply".into(),
-                id: None,
-                turn: 1,
-            },
-        ]);
-        frontend.ui.agent.wait_layout(usize::from(
-            editor(&frontend.ui, frontend.agent_rect()).0.cols,
-        ));
-        let rewind_button = assert_agent_tab_controls(&mut frontend);
-        let original = frontend.ui.agent.active().model.messages[0].text.clone();
-        frontend.ui.agent.active_mut().model.messages[0].text = "wrapped 中🙂 text ".repeat(200);
-        frontend.ui.agent.active_mut().columns = 0;
-        frontend.draw_agent(&mut Vec::new()).unwrap();
-        assert!(frontend.agent.first > 0);
-        let visible_rewind: Vec<_> = frontend
-            .agent
-            .hits
-            .iter()
-            .filter(|(_, action)| *action == AgentAction::Rewind(0))
-            .collect();
-        assert_eq!(visible_rewind.len(), 1);
-        let last_user_line = frontend
-            .ui
-            .agent
-            .active()
-            .lines
-            .iter()
-            .rposition(|line| matches!(line, AgentLine::Text { message: 0, .. }))
-            .unwrap();
-        assert!(last_user_line > frontend.agent.first);
-        assert_eq!(
-            visible_rewind[0].0.y,
-            frontend.agent.chat.y + (last_user_line - frontend.agent.first) as u16
-        );
-        let session = frontend.ui.agent.active();
-        for line in &session.lines {
-            if let AgentLine::Text { message: 0, range } = line {
-                assert!(
-                    crate::width::text_width(
-                        &session.model.messages[0].text[range.start as usize..range.end as usize]
-                    ) <= usize::from(frontend.agent.chat.cols.saturating_sub(
-                        1 + crate::width::text_width(crate::agent::panel::REWIND_LABEL) as u16
-                    ))
-                );
-            }
-        }
-        frontend.ui.agent.active_mut().model.messages[0].text = original;
-        frontend.ui.agent.active_mut().columns = 0;
-        frontend.draw_agent(&mut Vec::new()).unwrap();
-        frontend
-            .agent_mouse(Mouse {
-                code: 0,
-                column: rewind_button.x,
-                row: rewind_button.y,
-                release: false,
-            })
-            .unwrap();
-        assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
-        assert_eq!(frontend.ui.agent.active().model.input, "first draft");
-        frontend.input(Input::Escape).unwrap();
-        frontend.input(Input::Escape).unwrap();
-        frontend.input(Input::Escape).unwrap();
-        assert_eq!(frontend.ui.agent.active().rewind_target, Some(1));
-        assert_eq!(frontend.ui.agent.active().model.input, "first draft");
-        assert_eq!(frontend.ui.agent.active().model.messages.len(), 2);
-        let mut rewind = Vec::new();
-        frontend.draw_agent(&mut rewind).unwrap();
-        let rewind = String::from_utf8(rewind).unwrap();
-        assert!(rewind.contains("48;2;79;79;79m"));
-        assert!(rewind.contains("Enter confirm"));
-        frontend.input(Input::Escape).unwrap();
-        frontend.input(Input::Bytes(b"X".to_vec().into())).unwrap();
-        assert!(frontend.ui.agent.active().rewind_target.is_none());
-        assert_eq!(frontend.ui.agent.active().model.input, "first draftX");
-        frontend
-            .ui
-            .agent
-            .active_mut()
-            .model
-            .key(crate::input::keysym::BACKSPACE, false);
-        let chat = frontend.agent.chat;
-        for mouse in [
-            Mouse {
-                code: 0,
-                column: chat.x + 7,
-                row: chat.y,
-                release: false,
-            },
-            Mouse {
-                code: 32,
-                column: chat.x + 5,
-                row: chat.y + 2,
-                release: false,
-            },
-            Mouse {
-                code: 0,
-                column: chat.x + 5,
-                row: chat.y + 2,
-                release: true,
-            },
-        ] {
-            frontend.agent_mouse(mouse).unwrap();
-        }
-        assert_eq!(
-            frontend.ui.agent.active().selected_text().as_deref(),
-            Some("中 world\n\nagent")
-        );
-        let mut selected = Vec::new();
-        frontend.draw_agent(&mut selected).unwrap();
-        assert!(
-            String::from_utf8(selected)
-                .unwrap()
-                .contains("48;2;79;79;79m中 world")
-        );
-        frontend.input(Input::Bytes(vec![3].into())).unwrap();
-        assert!(frontend.clipboard.is_none());
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        let editor = editor(&frontend.ui, frontend.agent_rect()).0;
-        frontend
-            .agent_mouse(Mouse {
-                code: 2,
-                column: editor.x,
-                row: editor.y,
-                release: false,
-            })
-            .unwrap();
-        assert!(frontend.ui.agent.active().context.menu);
-        frontend.ui.agent.active_mut().context.menu = false;
-        frontend
-            .agent_mouse(Mouse {
-                code: 0,
-                column: chat.x,
-                row: chat.y + 4,
-                release: false,
-            })
-            .unwrap();
-        assert!(frontend.ui.agent.active().selected_text().is_none());
-        frontend.input(Input::Bytes(vec![20].into())).unwrap();
-        assert_eq!(frontend.ui.agent.sessions.len(), 1);
-        frontend.activate_agent(AgentAction::NewSession).unwrap();
-        assert_eq!(frontend.ui.agent.sessions.len(), 2);
-        assert!(frontend.ui.agent.active().model.messages.is_empty());
-        frontend
-            .input(Input::Bytes(b"second draft".to_vec().into()))
-            .unwrap();
-        frontend
-            .input(Input::Bytes(b"\x1b[5;5~".to_vec().into()))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.current, 1);
-        frontend.activate_agent(AgentAction::Session(0)).unwrap();
-        assert_eq!(frontend.ui.agent.current, 0);
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.input(Input::Bytes(vec![23].into())).unwrap();
-        assert_eq!(frontend.ui.agent.sessions.len(), 2);
-        frontend
-            .activate_agent(AgentAction::CloseSession(0))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.sessions.len(), 1);
-        assert_eq!(frontend.ui.agent.active().model.input, "second draft");
-        frontend
-            .activate_agent(AgentAction::CloseSession(0))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.sessions.len(), 1);
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.input(Input::PasteStart).unwrap();
-        frontend.input(Input::PasteData(vec![0xe4])).unwrap();
-        frontend.activate_agent(AgentAction::NewSession).unwrap();
-        frontend.input(Input::PasteData(vec![0xb8, 0xad])).unwrap();
-        frontend.input(Input::PasteEnd).unwrap();
-        assert_eq!(frontend.ui.agent.sessions[0].model.input, "中");
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.activate_agent(AgentAction::Session(0)).unwrap();
-        frontend.input(Input::PasteStart).unwrap();
-        frontend
-            .activate_agent(AgentAction::CloseSession(0))
-            .unwrap();
-        frontend
-            .input(Input::PasteData(b"discard".to_vec()))
-            .unwrap();
-        frontend.input(Input::PasteEnd).unwrap();
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        assert!(
-            frontend
-                .ui
-                .status
-                .as_ref()
-                .unwrap()
-                .0
-                .contains("Conversation was closed")
-        );
-        frontend.ui.agent.active_mut().model.input = "preserved draft".into();
-        frontend.ui.agent.active_mut().model.busy = true;
-        let session = frontend.ui.agent.active().id;
-        let conversations = frontend.ui.agent.sessions.len();
-        frontend.draw_agent(&mut Vec::new()).unwrap();
-        let close = frontend
-            .agent
-            .hits
-            .iter()
-            .find(|(_, action)| *action == AgentAction::ClosePanel)
-            .unwrap()
-            .0;
-        frontend
-            .agent_mouse(Mouse {
-                code: 0,
-                column: close.x,
-                row: close.y,
-                release: false,
-            })
-            .unwrap();
-        assert!(!frontend.ui.agent.open);
-        assert_eq!(frontend.ui.agent.sessions.len(), conversations);
-        assert_eq!(frontend.ui.agent.active().id, session);
-        assert_eq!(frontend.ui.agent.active().model.input, "preserved draft");
-        assert!(frontend.ui.agent.active().model.busy);
-        frontend.ui.agent.active_mut().model.busy = false;
-        frontend.client.flush().unwrap();
-        assert!(peer.next_action().unwrap().is_none());
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn global_shortcuts_and_layered_escape_keep_focus_and_drafts() {
-        use std::{fs, os::unix::net::UnixListener};
-        let path = std::path::PathBuf::from(format!(
-            "target/tui-global-focus-{}.sock",
-            std::process::id()
-        ));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
-        let snapshot = Snapshot {
-            name: "focus".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: vec![crate::workspace::TabView {
-                activity: crate::workspace::TabActivity::Idle,
-                id: 1,
-                title: "test".into(),
-            }],
-            panes: vec![PaneView {
-                process: Default::default(),
-                id: 1,
-                tab: 1,
-                rect: Rect {
-                    x: 0,
-                    y: 1,
-                    cols: 80,
-                    rows: 23,
-                },
-                title: "test".into(),
-                cwd: Some(std::env::current_dir().unwrap()),
-                blocks: Vec::new(),
-                command_blocks: Vec::new(),
-                input_generation: 0,
-                shell_prompt: None,
-            }],
-        };
-        peer.send_state(&snapshot, &[], &Default::default(), 0)
-            .unwrap();
-        peer.flush().unwrap();
-        let mut frontend = Frontend::new(
-            client,
-            WindowSize {
-                num_cols: 80,
-                num_lines: 24,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            crate::config::Config::default(),
-        )
-        .unwrap();
-        frontend.poll().unwrap();
-        frontend.input(Input::Alt(b'f')).unwrap();
-        frontend.input(Input::Alt(b'a')).unwrap();
-        assert!(frontend.ui.files_open && frontend.ui.agent.open);
-        assert!(frontend.ui.focus == Focus::Editor);
-        frontend.panel_bytes(b"keep draft", None).unwrap();
-        assert_eq!(frontend.ui.agent.active().model.input, "keep draft");
-        assert_eq!(frontend.ui.files.as_ref().unwrap().query(), "");
-        frontend.input(Input::Alt(b'a')).unwrap();
-        assert!(frontend.ui.files_open && !frontend.ui.agent.open);
-        assert!(frontend.ui.focus == Focus::Files);
-        frontend.input(Input::Alt(b'f')).unwrap();
-        frontend.input(Input::Alt(b'a')).unwrap();
-        frontend.client.flush().unwrap();
-        while peer.next_action().unwrap().is_some() {}
-        frontend.input(Input::Alt(b'v')).unwrap();
-        frontend.client.flush().unwrap();
-        assert!(matches!(
-            peer.next_action().unwrap(),
-            Some(Action::Split {
-                axis: Axis::LeftRight,
-                ..
-            })
-        ));
-        assert!(frontend.ui.focus == Focus::Terminal);
-        assert_eq!(frontend.ui.agent.active().model.input, "keep draft");
-        frontend.ui.focus = Focus::Editor;
-        frontend.input(Input::Alt(b'f')).unwrap();
-        assert!(frontend.ui.files_open);
-        assert!(frontend.ui.focus == Focus::Files);
-        let files = frontend.ui.files.as_mut().unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let entry = loop {
-            files.poll();
-            if let Some(index) = files.entries().iter().position(|entry| !entry.is_dir) {
-                break index;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "file listing did not become available"
-            );
-            std::thread::sleep(Duration::from_millis(5));
-        };
-        files.move_selection(entry as isize - files.selection() as isize);
-        assert!(files.focus_preview());
-        frontend.input(Input::Escape).unwrap();
-        assert!(frontend.ui.files_open);
-        assert!(frontend.ui.files.as_ref().unwrap().focus() == crate::files::FileFocus::List);
-        frontend.input(Input::Alt(b'm')).unwrap();
-        assert!(frontend.ui.resources.open);
-        assert!(!frontend.ui.files_open);
-        frontend
-            .input(Input::Bytes(b"\x1b[D".to_vec().into()))
-            .unwrap();
-        assert!(frontend.ui.resources.open);
-        frontend.input(Input::Escape).unwrap();
-        assert!(!frontend.ui.resources.open);
-        assert!(frontend.ui.focus == Focus::Terminal);
-        drop(frontend);
-        drop(peer);
-        drop(listener);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn agent_draft_selection_and_captured_paste_never_reach_the_pane() {
-        use std::{fs, os::unix::net::UnixListener};
-        let path = std::path::PathBuf::from(format!(
-            "target/tui-agent-editor-{}.sock",
-            std::process::id()
-        ));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
-        let mut frontend = Frontend::new(
-            client,
-            WindowSize {
-                num_cols: 100,
-                num_lines: 30,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            crate::config::Config::default(),
-        )
-        .unwrap();
-        frontend.input(Input::Alt(b'a')).unwrap();
-        frontend
-            .input(Input::Bytes("alpha 中".as_bytes().to_vec().into()))
-            .unwrap();
-        frontend.input(Input::Bytes(vec![1].into())).unwrap();
-        frontend.input(Input::Bytes(vec![3].into())).unwrap();
-        assert!(frontend.clipboard.is_none());
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend
-            .input(Input::Bytes(b"replacement".to_vec().into()))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.active().model.input, "replacement");
-        frontend.input(Input::Bytes(vec![3].into())).unwrap();
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.input(Input::PasteStart).unwrap();
-        frontend
-            .input(Input::PasteData(b"draft ".to_vec()))
-            .unwrap();
-        frontend.ui.focus = Focus::Output;
-        frontend.input(Input::PasteData(b"kept".to_vec())).unwrap();
-        frontend.input(Input::PasteEnd).unwrap();
-        frontend
-            .input(Input::Bytes(b"ignored".to_vec().into()))
-            .unwrap();
-        frontend.input(Input::Bytes(vec![3].into())).unwrap();
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.client.flush().unwrap();
-        assert!(peer.next_action().unwrap().is_none());
-        frontend.ui.focus = Focus::Editor;
-        frontend.ui.agent.active_mut().model.clear_input();
-        frontend
-            .input(Input::Bytes(b"batch\t\x03".to_vec().into()))
-            .unwrap();
-        assert!(frontend.ui.focus == Focus::Output);
-        assert!(frontend.ui.agent.active().model.input.is_empty());
-        frontend.ui.focus = Focus::Editor;
-        frontend
-            .input(Input::Bytes(b"\x01\x7fafter\r".to_vec().into()))
-            .unwrap();
-        assert_eq!(frontend.ui.agent.active().model.input, "after");
-        assert!(frontend.running);
-        assert!(
-            frontend
-                .ui
-                .status
-                .as_ref()
-                .unwrap()
-                .0
-                .contains("No workspace")
-        );
-        frontend.ui.agent.active_mut().model.clear_input();
-        frontend
-            .ui
-            .agent
-            .active_mut()
-            .model
-            .insert(
-                &(0..12)
-                    .map(|i| format!("draft line {i:02}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            )
-            .unwrap();
-        frontend.ui.agent.active_mut().editor_scroll = Some(6);
-        frontend.draw_agent(&mut Vec::new()).unwrap();
-        let rect = editor(&frontend.ui, frontend.agent_rect()).0;
-        frontend
-            .agent_mouse(Mouse {
-                code: 0,
-                column: rect.x,
-                row: rect.y,
-                release: false,
-            })
-            .unwrap();
-        frontend
-            .agent_mouse(Mouse {
-                code: 32,
-                column: rect.x + 10,
-                row: rect.y,
-                release: false,
-            })
-            .unwrap();
-        frontend
-            .agent_mouse(Mouse {
-                code: 0,
-                column: rect.x + 10,
-                row: rect.y,
-                release: true,
-            })
-            .unwrap();
-        let selection = frontend.ui.agent.active().model.selection().unwrap();
-        assert_eq!(
-            &frontend.ui.agent.active().model.input[selection],
-            "draft line"
-        );
-        frontend.ui.agent.active_mut().editor_scroll = Some(1);
-        frontend.draw_agent(&mut Vec::new()).unwrap();
-        let rect = editor(&frontend.ui, frontend.agent_rect()).0;
-        for (code, row, release) in [
-            (0, rect.y + rect.rows - 1, false),
-            (32, rect.y + rect.rows, false),
-            (0, rect.y + rect.rows, true),
-        ] {
-            frontend
-                .input(Input::Mouse(Mouse {
-                    code,
-                    column: rect.x,
-                    row,
-                    release,
-                }))
-                .unwrap();
-        }
-        let selection = frontend.ui.agent.active().model.selection().unwrap();
-        assert_eq!(
-            &frontend.ui.agent.active().model.input[selection],
-            "draft line 08\n"
-        );
-        assert!(!frontend.agent.selecting_editor);
-        frontend.ui.agent.active_mut().context.preview =
-            Some(crate::agent::panel::ContextPreview::new(
-                crate::agent::panel::ContextItem {
-                    label: "Screen".into(),
-                    source: "test pane".into(),
-                    kind: "Screen".into(),
-                    snapshot: crate::context::Snapshot {
-                        text: "snapshot".into(),
-                        incomplete: false,
-                    },
-                },
-                0,
-            ));
-        let mut output = Vec::new();
-        frontend.draw_agent(&mut output).unwrap();
-        assert!(frontend.agent.hits.iter().all(|(_, action)| matches!(
-            action,
-            AgentAction::ClosePreview | AgentAction::CopyPreview
-        )));
-        let mut core = crate::core::Core::new(frontend.size, 0xcccccc, 0x202020);
-        let mut parser = crate::vt::Parser::new();
-        for row in 1..frontend.size.num_lines {
-            parser.advance(
-                &mut core,
-                format!(
-                    "\x1b[{};1Hl\x1b[{};{}Hr",
-                    row + 1,
-                    row + 1,
-                    frontend.size.num_cols
-                )
-                .as_bytes(),
-            );
-        }
-        let preview = frontend.ui.agent.active_mut().context.preview.take();
-        let mut backdrop = Vec::new();
-        frontend.draw_agent(&mut backdrop).unwrap();
-        parser.advance(&mut core, &backdrop);
-        frontend.ui.agent.active_mut().context.preview = preview;
-        let modal = crate::file_panel::preview_rect(Rect {
-            x: 0,
-            y: 1,
-            cols: frontend.size.num_cols,
-            rows: frontend.size.num_lines.saturating_sub(2),
-        });
-        let outside: Vec<_> = (1..frontend.size.num_lines - 1)
-            .flat_map(|y| {
-                (0..frontend.size.num_cols)
-                    .filter(move |&x| !modal.contains(x, y))
-                    .map(move |x| (x, y))
-            })
-            .map(|(x, y)| (x, y, core.row(usize::from(y)).cells[usize::from(x)]))
-            .collect();
-        output.clear();
-        frontend.draw_agent(&mut output).unwrap();
-        parser.advance(&mut core, &output);
-        let copy = frontend
-            .agent
-            .hits
-            .iter()
-            .find(|(_, action)| *action == AgentAction::CopyPreview)
-            .unwrap()
-            .0;
-        assert_eq!(copy.cols, 3);
-        assert_eq!(
-            core.row(usize::from(copy.y)).cells[usize::from(copy.x + 1)].c,
-            '⧉'
-        );
-        for (x, y, cell) in outside {
-            assert_eq!(core.row(usize::from(y)).cells[usize::from(x)], cell);
-        }
-        drop(frontend);
-        drop(peer);
-        drop(listener);
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn agent_editor_grows_with_wrapped_text_and_keeps_cursor_visible() {
-        use std::os::unix::net::UnixListener;
-        let path = format!("target/tui-editor-layout-{}.sock", std::process::id());
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(std::path::Path::new(&path)).unwrap();
-        let _server = listener.accept().unwrap();
-        let mut frontend = Frontend::new(
-            client,
-            WindowSize {
-                num_cols: 160,
-                num_lines: 48,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            crate::config::Config::default(),
-        )
-        .unwrap();
-        frontend.ui.agent.open = true;
-        frontend.ui.focus = Focus::Editor;
-        assert_eq!(frontend.agent_width(), 80);
-        assert_eq!(editor(&frontend.ui, frontend.agent_rect()).0.rows, 3);
-        frontend
-            .ui
-            .agent
-            .active_mut()
-            .model
-            .insert(&"中文长问题\n".repeat(20))
-            .unwrap();
-        for (cols, rows) in [(80, 24), (120, 40), (160, 48)] {
-            frontend.size.num_cols = cols;
-            frontend.size.num_lines = rows;
-            let rect = editor(&frontend.ui, frontend.agent_rect()).0;
-            let layout = editor(&frontend.ui, frontend.agent_rect()).1;
-            assert!(rect.rows > 1 && rect.rows <= 8);
-            assert!(rect.y + rect.rows <= rows);
-            assert!(
-                (layout.first..layout.first + usize::from(rect.rows)).contains(&layout.caret_row)
-            );
-            let mut output = Vec::new();
-            frontend.draw_active_cursor(&mut output, None).unwrap();
-            assert!(output.ends_with(b"\x1b[?25h"));
-            let cursor = frontend.draw_agent(&mut Vec::new()).unwrap();
-            assert!(cursor.is_some());
-            let mut reused = Vec::new();
-            frontend.draw_active_cursor(&mut reused, cursor).unwrap();
-            assert_eq!(reused, output);
-        }
-        for index in 0..12 {
-            frontend
-                .ui
-                .agent
-                .active_mut()
-                .context
-                .basket
-                .push(crate::agent::panel::ContextItem {
-                    label: format!("attachment-{index}"),
-                    source: "test".into(),
-                    kind: "Screen".into(),
-                    snapshot: crate::context::Snapshot::default(),
-                });
-        }
-        for (cols, rows) in [(80, 24), (40, 12), (20, 8), (8, 4)] {
-            frontend.size.num_cols = cols;
-            frontend.size.num_lines = rows;
-            frontend.ui.agent.keyboard = AgentAction::Inspect(0);
-            let mut output = Vec::new();
-            frontend.draw_agent(&mut output).unwrap();
-            let editor = editor(&frontend.ui, frontend.agent_rect()).0;
-            for (rect, action) in &frontend.agent.hits {
-                if matches!(action, AgentAction::Inspect(_) | AgentAction::Remove(_)) {
-                    assert!(rect.y < editor.y);
-                    assert!(rect.y >= frontend.agent.chat.y);
-                }
-            }
-            if cols >= 40 {
-                assert!(
-                    frontend
-                        .agent
-                        .hits
-                        .iter()
-                        .any(|(_, action)| *action == AgentAction::Inspect(0))
-                );
-            }
-        }
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn agent_editor_keeps_utf8_fragments_and_recovers_after_invalid_bytes() {
-        use std::os::unix::net::UnixListener;
-        let path = std::env::temp_dir().join(format!("nextty-utf8-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let _server = listener.accept().unwrap().0;
-        std::fs::remove_file(path).unwrap();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
+        let (client, _server) = pair(&[(1, "shell", TabActivity::Idle)], None);
+        let mut frontend =
+            Frontend::new(client, size(80, 24), crate::config::Config::default()).unwrap();
         frontend.ui.focus = Focus::Editor;
         frontend.ui.agent.open = true;
-        frontend.panel_bytes(b"a\xff\xe4", None).unwrap();
+        frontend.panel_bytes(b"a\xff\xe4").unwrap();
         assert_eq!(frontend.ui.agent.active().model.input, "a�");
-        frontend.panel_bytes(b"\xb8\xadb", None).unwrap();
+        frontend.panel_bytes(b"\xb8\xadb").unwrap();
         assert_eq!(frontend.ui.agent.active().model.input, "a�中b");
         let mut decoder = Decoder::default();
         for event in decoder.feed("\x1béx".as_bytes(), Instant::now()) {
@@ -2537,244 +355,27 @@ mod agent {
         assert!(frontend.running);
     }
 
-    #[test]
-    fn stale_attachment_click_and_monitor_footer_keep_frontend_usable() {
-        use std::os::unix::net::UnixListener;
-        let path = std::env::temp_dir().join(format!("nextty-clicks-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let _server = listener.accept().unwrap().0;
-        std::fs::remove_file(path).unwrap();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-        frontend.agent.hits.push((
-            Rect {
-                x: 0,
-                y: 0,
-                cols: 1,
-                rows: 1,
-            },
-            AgentAction::Remove(3),
-        ));
-        let mut mouse = Mouse {
-            code: 0,
-            column: 0,
-            row: 0,
-            release: false,
-        };
-        frontend.agent_mouse(mouse).unwrap();
-        assert!(frontend.ui.agent.active().context.basket.is_empty());
-        frontend.ui.files_open = true;
-        frontend.ui.focus = Focus::Files;
-        mouse.row = size.num_lines - 1;
-        mouse.column = size.num_cols - 2;
-        frontend.input(Input::Mouse(mouse)).unwrap();
-        assert!(!frontend.ui.files_open);
-        assert!(frontend.ui.focus == Focus::Monitor);
-        assert!(frontend.ui.resources.open);
-        let footer = frontend.ui.resources.footer(size.num_cols, true, false);
-        mouse.column = footer
-            .hits
-            .iter()
-            .find(|hit| hit.action == crate::monitor::Action::Range(3600))
-            .unwrap()
-            .x;
-        frontend.input(Input::Mouse(mouse)).unwrap();
-        assert!(frontend.ui.resources.open);
-        assert_eq!(frontend.ui.resources.seconds(), 3600);
-        mouse.column = size.num_cols - 2;
-        frontend.input(Input::Mouse(mouse)).unwrap();
-        assert!(!frontend.ui.resources.open);
-        assert!(frontend.ui.focus == Focus::Terminal);
-        for (icon, tab) in [('', 1), ('', 2), ('', 3), ('', 5)] {
-            let footer = frontend.ui.resources.footer(size.num_cols, true, false);
-            let target = footer
-                .texts
-                .iter()
-                .find(|text| text.text.contains(icon))
-                .unwrap();
-            mouse.column = target.x + 1;
-            mouse.code = 35;
-            frontend.input(Input::Mouse(mouse)).unwrap();
-            let mut bytes = Vec::new();
-            frontend.draw_resources(&mut bytes).unwrap();
-            let mut host = crate::core::Core::new(size, 0xcccccc, 0x202020);
-            crate::vt::Parser::new().advance(&mut host, &bytes);
-            for text in &footer.texts {
-                if ['', '', '', '']
-                    .iter()
-                    .any(|icon| text.text.contains(*icon))
-                {
-                    let color = if text.x == target.x {
-                        crate::panel::HOVER
-                    } else {
-                        crate::monitor::BACKGROUND
-                    };
-                    assert_eq!(
-                        host.row(usize::from(size.num_lines - 1)).cells[usize::from(text.x + 1)].bg,
-                        Color::Spec(Rgb {
-                            r: (color >> 16) as u8,
-                            g: (color >> 8) as u8,
-                            b: color as u8
-                        })
-                    );
-                }
-            }
-            mouse.code = 0;
-            frontend.input(Input::Mouse(mouse)).unwrap();
-            assert!(frontend.ui.resources.open);
-            assert_eq!(frontend.ui.resources.tab, tab);
-            let footer = frontend.ui.resources.footer(size.num_cols, true, false);
-            let arrow = footer
-                .hits
-                .iter()
-                .find(|hit| hit.action == crate::monitor::Action::Close)
-                .unwrap();
-            assert_eq!(arrow.x + arrow.width, size.num_cols - 1);
-            mouse.column = arrow.x + 1;
-            frontend.input(Input::Mouse(mouse)).unwrap();
-            assert!(!frontend.ui.resources.open);
+    /// A frontend over one pane whose screen shows `rows` lines of text.
+    fn frontend_with_text(host: WindowSize, rows: u16) -> (Frontend, crate::wire::Peer, Core) {
+        let (client, mut server) = pair(&[(1, "shell", TabActivity::Running)], None);
+        let mut terminal = Core::new(size(80, rows), 0xcccccc, 0x202020);
+        for row in 0..rows {
+            let text = format!("\x1b[{};1Hrow {row:02} unchanged text", row + 1);
+            Parser::new().advance(&mut terminal, text.as_bytes());
         }
-        mouse.column = size.num_cols - 1;
-        frontend.input(Input::Mouse(mouse)).unwrap();
-        assert!(!frontend.ui.resources.open);
-    }
-
-    #[test]
-    fn panel_keyboard_matches_native_symbols_and_terminal_bytes() {
-        use std::os::unix::net::UnixListener;
-        let path =
-            std::env::temp_dir().join(format!("nextty-panel-keys-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let _server = listener.accept().unwrap().0;
-        std::fs::remove_file(path).unwrap();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
-        frontend.ui.agent.open = true;
-        frontend.ui.focus = Focus::Editor;
-        let mut native = Ui::new().unwrap();
-        native.agent.open = true;
-        native.focus = Focus::Editor;
-        for (bytes, symbol, modifiers, text) in [
-            ("ab中文".as_bytes(), 0, 0, "ab中文"),
-            (
-                b"\x1b[1;2D",
-                crate::input::keysym::LEFT,
-                crate::input::SHIFT,
-                "",
-            ),
-            (b"\x7f", crate::input::keysym::BACKSPACE, 0, ""),
-            (b"\x01", u32::from('a'), crate::input::CONTROL, ""),
-            ("替换".as_bytes(), 0, 0, "替换"),
-            (b"\x0a", u32::from('j'), crate::input::CONTROL, ""),
-            (b"tail", 0, 0, "tail"),
-            (b"\x1b[H", crate::input::keysym::HOME, 0, ""),
-        ] {
-            let rect = editor(&frontend.ui, frontend.agent_rect()).0;
-            frontend.input(Input::Bytes(bytes.to_vec().into())).unwrap();
-            native
-                .key(
-                    &mut frontend.client,
-                    crate::input::Key {
-                        symbol,
-                        modifiers,
-                        text,
-                    },
-                    (usize::from(rect.cols), usize::from(rect.rows)),
-                )
-                .unwrap();
-            assert_eq!(
-                frontend.ui.agent.active().model.input,
-                native.agent.active().model.input
-            );
-            assert_eq!(
-                frontend.ui.agent.active().model.cursor,
-                native.agent.active().model.cursor
-            );
-            assert_eq!(
-                frontend.ui.agent.active().model.selection(),
-                native.agent.active().model.selection()
-            );
-        }
+        let state =
+            crate::wire::Response::State(None, vec![(1, Update::capture(&terminal, true))], 0);
+        server.send_response(state).unwrap();
+        server.flush().unwrap();
+        let mut frontend = Frontend::new(client, host, crate::config::Config::default()).unwrap();
+        frontend.poll().unwrap();
+        (frontend, server, terminal)
     }
 
     #[test]
     fn modal_overlays_restore_terminal_and_agent_rows_without_clearing_the_screen() {
-        use crate::wire::Peer;
-        use std::os::unix::net::UnixListener;
-        let path =
-            std::env::temp_dir().join(format!("nextty-modal-damage-{}.sock", std::process::id()));
-        let listener = UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-        std::fs::remove_file(path).unwrap();
-        let size = WindowSize {
-            num_cols: 100,
-            num_lines: 40,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let inner = WindowSize {
-            num_cols: 50,
-            num_lines: 38,
-            ..size
-        };
-        let mut terminal = crate::core::Core::new(inner, 0xcccccc, 0x202020);
-        let mut parser = crate::vt::Parser::new();
-        for row in 0..inner.num_lines {
-            parser.advance(
-                &mut terminal,
-                format!("\x1b[{};1Hrow {row:02} unchanged terminal text", row + 1).as_bytes(),
-            );
-        }
-        server
-            .send_state(
-                &Snapshot {
-                    name: "damage".into(),
-                    controller: true,
-                    focused: 1,
-                    active_tab: 1,
-                    tabs: vec![crate::workspace::TabView {
-                        id: 1,
-                        title: "shell".into(),
-                        activity: crate::workspace::TabActivity::Running,
-                    }],
-                    panes: vec![PaneView {
-                        id: 1,
-                        tab: 1,
-                        rect: Rect {
-                            x: 0,
-                            y: 1,
-                            cols: 50,
-                            rows: 38,
-                        },
-                        title: "shell".into(),
-                        cwd: None,
-                        blocks: Vec::new(),
-                        command_blocks: Vec::new(),
-                        input_generation: 0,
-                        shell_prompt: None,
-                        process: Default::default(),
-                    }],
-                },
-                &[(1, &crate::screen::Update::capture(&terminal, true))],
-                &Default::default(),
-                0,
-            )
-            .unwrap();
-        server.flush().unwrap();
-        let mut frontend = Frontend::new(client, size, crate::config::Config::default()).unwrap();
+        let host = size(100, 40);
+        let (mut frontend, _server, _) = frontend_with_text(host, 22);
         frontend.ui.agent.open = true;
         frontend
             .ui
@@ -2783,110 +384,77 @@ mod agent {
             .model
             .insert("keep this Agent draft")
             .unwrap();
-        frontend.poll().unwrap();
-        let mut host = crate::core::Core::new(size, 0xcccccc, 0x202020);
-        let mut parser = crate::vt::Parser::new();
-        let mut output = Vec::new();
-        frontend.draw(&mut output).unwrap();
-        parser.advance(&mut host, &output);
-        let baseline: Vec<_> = (0..size.num_lines)
-            .map(|row| host.row(usize::from(row)).cells.clone())
-            .collect();
-        let paint = |frontend: &mut Frontend,
-                     host: &mut crate::core::Core,
-                     parser: &mut crate::vt::Parser| {
+        let mut screen = Core::new(host, 0xcccccc, 0x202020);
+        let mut parser = Parser::new();
+        let mut paint = |frontend: &mut Frontend| {
             let mut bytes = Vec::new();
             frontend.draw(&mut bytes).unwrap();
             assert!(!bytes.windows(4).any(|part| part == b"\x1b[2J"));
-            assert!(bytes.starts_with(b"\x1b[?2026h"));
-            assert!(bytes.ends_with(b"\x1b[?2026l"));
-            parser.advance(host, &bytes);
+            assert!(bytes.starts_with(b"\x1b[?2026h") && bytes.ends_with(b"\x1b[?2026l"));
+            parser.advance(&mut screen, &bytes);
+            (0..host.num_lines)
+                .map(|row| screen.row(usize::from(row)).cells.clone())
+                .collect::<Vec<_>>()
         };
-        let restored = |host: &crate::core::Core| {
-            for (row, cells) in baseline.iter().enumerate() {
-                assert_eq!(&host.row(row).cells, cells, "row {row}");
-            }
-        };
+        let baseline = paint(&mut frontend);
         frontend.input(Input::Alt(b'/')).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        frontend.input(Input::Escape).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        restored(&host);
+        paint(&mut frontend);
+        frontend
+            .input(Input::Bytes(smallvec::smallvec![0x1b]))
+            .unwrap();
+        assert_eq!(paint(&mut frontend), baseline);
         let tab = frontend.client.snapshot().unwrap().tabs[0].clone();
         assert!(!frontend.ui.request_close_tab(&tab));
-        paint(&mut frontend, &mut host, &mut parser);
+        paint(&mut frontend);
         frontend.input(Input::Bytes(b"\t".to_vec().into())).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        frontend.input(Input::Escape).unwrap();
-        paint(&mut frontend, &mut host, &mut parser);
-        restored(&host);
+        paint(&mut frontend);
+        frontend
+            .input(Input::Bytes(smallvec::smallvec![0x1b]))
+            .unwrap();
+        assert_eq!(paint(&mut frontend), baseline);
     }
-}
 
-#[test]
-fn monitor_task_jump_switches_tabs_before_focusing_its_pane() {
-    use crate::wire::Response;
-    use crate::workspace::{TabActivity, TabView};
-    let path = std::env::temp_dir().join(format!("nextty-task-jump-{}.sock", std::process::id()));
-    let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-    let mut client = Client::connect(&path).unwrap();
-    let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
-    std::fs::remove_file(path).unwrap();
-    let pane = PaneView {
-        id: 2,
-        tab: 20,
-        rect: Rect {
-            x: 0,
-            y: 0,
-            cols: 80,
-            rows: 20,
-        },
-        title: "build".into(),
-        cwd: None,
-        process: Default::default(),
-        blocks: vec![],
-        command_blocks: vec![],
-        input_generation: 0,
-        shell_prompt: None,
-    };
-    peer.send_response(Response::State(
-        Snapshot {
-            name: "tasks".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 10,
-            tabs: vec![
-                TabView {
-                    id: 10,
-                    title: "one".into(),
-                    activity: TabActivity::Idle,
-                },
-                TabView {
-                    id: 20,
-                    title: "two".into(),
-                    activity: TabActivity::Running,
-                },
-            ],
-            panes: vec![pane],
-        },
-        vec![],
-        0,
-    ))
-    .unwrap();
-    peer.flush().unwrap();
-    client.poll().unwrap();
-    let mut ui = Ui::new().unwrap();
-    ui.resources.jump = Some(2);
-    ui.monitor_jump(&mut client).unwrap();
-    client.flush().unwrap();
-    assert!(matches!(peer.next_action().unwrap(), Some(Action::Tab(1))));
-    assert!(matches!(
-        peer.next_action().unwrap(),
-        Some(Action::ScreenRequest { .. })
-    ));
-    assert!(matches!(
-        peer.next_action().unwrap(),
-        Some(Action::Focus(2))
-    ));
-    assert!(ui.focus == Focus::Terminal);
+    #[test]
+    fn output_only_draw_repaints_damaged_rows_and_matches_a_full_draw() {
+        let host = size(80, 24);
+        let (mut frontend, mut server, mut terminal) = frontend_with_text(host, 22);
+        let mut screen = Core::new(host, 0xcccccc, 0x202020);
+        let mut parser = Parser::new();
+        let mut bytes = Vec::new();
+        frontend.draw(&mut bytes).unwrap();
+        parser.advance(&mut screen, &bytes);
+        // The second full draw leaves the previous frame for incremental draws to diff against.
+        bytes.clear();
+        frontend.draw(&mut bytes).unwrap();
+        parser.advance(&mut screen, &bytes);
+
+        terminal.reset_damage();
+        Parser::new().advance(&mut terminal, b"\x1b[4;1Hhello\x1b[2;1H\x1b[K");
+        let state =
+            crate::wire::Response::State(None, vec![(1, Update::capture(&terminal, false))], 0);
+        server.send_response(state).unwrap();
+        server.flush().unwrap();
+        frontend.poll().unwrap();
+        frontend.dirty = false;
+        bytes.clear();
+        frontend.draw(&mut bytes).unwrap();
+        assert!(!bytes.windows(3).any(|part| part == b"row"), "{bytes:?}");
+        parser.advance(&mut screen, &bytes);
+
+        frontend.frame = None;
+        bytes.clear();
+        frontend.draw(&mut bytes).unwrap();
+        let mut fresh = Core::new(host, 0xcccccc, 0x202020);
+        Parser::new().advance(&mut fresh, &bytes);
+        for row in 0..usize::from(host.num_lines) {
+            let shown = |core: &Core| -> Vec<_> {
+                core.row(row)
+                    .cells
+                    .iter()
+                    .map(|cell| (cell.c, cell.bg))
+                    .collect()
+            };
+            assert_eq!(shown(&screen), shown(&fresh), "row {row}");
+        }
+    }
 }

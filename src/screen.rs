@@ -1,6 +1,6 @@
 //! Visible grid snapshots shared by desktop and workspace frontends.
 
-use crate::core::{BlockMarker, Flags};
+use crate::core::{BlockMarker, Flags, WindowSize};
 use crate::core::{Core, Mode, Point, Row, SelectionRange};
 use crate::vt::{Color, CursorShape, PALETTE_SIZE, Rgb};
 
@@ -21,7 +21,7 @@ pub struct Screen {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Update {
+pub struct Update {
     pub columns: usize,
     pub lines: usize,
     pub rows: Vec<(usize, Row)>,
@@ -53,21 +53,21 @@ impl Default for Screen {
 }
 
 impl Update {
-    pub fn capture(core: &Core, full: bool) -> Self {
-        let rows: Vec<_> = if full {
-            (0..core.screen_lines())
-                .map(|index| (index, core.row(index).clone()))
-                .collect()
-        } else {
-            core.dirty_rows()
-                .map(|index| (index, core.row(index).clone()))
-                .collect()
-        };
+    pub fn capture_since(core: &Core, previous: Option<(WindowSize, u64, u64, &[u64])>) -> Self {
+        let full = previous.is_none_or(|(size, full_revision, _, rows)| {
+            size != core.window_size()
+                || full_revision != core.full_revision()
+                || rows.len() != core.screen_lines()
+        });
+        let rows: Vec<_> = (0..core.screen_lines())
+            .filter(|index| full || core.row(*index).revision != previous.unwrap().3[*index])
+            .map(|index| (index, core.row(index).clone()))
+            .collect();
         Self::from_rows(
             core,
             rows,
             core.display_offset(),
-            full || core.palette_dirty(),
+            full || previous.is_some_and(|(_, _, revision, _)| revision != core.palette_revision()),
         )
     }
 
@@ -131,17 +131,8 @@ impl Screen {
             })
     }
 
-    pub(crate) fn apply(&mut self, update: Update) -> std::io::Result<()> {
+    pub(crate) fn apply(&mut self, update: Update) {
         if self.columns != update.columns || self.rows.len() != update.lines {
-            if update.palette.is_none()
-                || update.rows.len() != update.lines
-                || update.rows.iter().enumerate().any(|(i, (n, _))| i != *n)
-            {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "resize requires a complete screen and palette",
-                ));
-            }
             self.rows = update.rows.into_iter().map(|(_, row)| row).collect();
             self.dirty.clear();
             self.dirty.resize(update.lines, true);
@@ -201,31 +192,9 @@ impl Screen {
         self.selection = update.selection;
         self.offset = update.offset;
         self.history = update.history;
-        Ok(())
     }
 
     // Prompts and partial boundary rows still need row_output's check.
-    #[cfg(any(feature = "gui", feature = "tui"))]
-    pub(crate) fn block_row_range(
-        &self,
-        pane: &crate::workspace::PaneView,
-        block: u64,
-    ) -> std::ops::Range<usize> {
-        let Some((start, end)) = pane
-            .blocks
-            .iter()
-            .find(|current| current.id == block)
-            .and_then(|current| current.output)
-        else {
-            return 0..0;
-        };
-        let rows = self.screen_lines() as i64;
-        let offset = self.display_offset() as i64;
-        let first = (i64::from(start.line) + offset).clamp(0, rows) as usize;
-        let last = (i64::from(end.line) + offset + 1).clamp(0, rows) as usize;
-        first..last
-    }
-
     pub fn row_output<'a>(
         &self,
         pane: &'a crate::workspace::PaneView,
@@ -338,143 +307,128 @@ fn output_block(blocks: &[BlockMarker], line: i32, used: usize) -> Option<&Block
     })
 }
 
-#[test]
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::core::WindowSize;
+    use crate::core::tests::terminal;
+    use crate::panel::rect;
+    use crate::workspace::PaneView;
 
-fn activity_compares_text_independently_of_render_damage_and_colors() {
-    let mut core = Core::new(
-        crate::core::WindowSize {
-            num_cols: 20,
-            num_lines: 4,
-            cell_width: 0,
-            cell_height: 0,
-        },
-        0xffffff,
-        0,
-    );
-    crate::vt::Parser::new().advance(&mut core, "中e\u{301}".as_bytes());
-    let mut screen = Screen::default();
-    let update = Update::capture_live(&core);
-    assert!(screen.changes_activity(&update));
-    screen.apply(update).unwrap();
-    assert!(screen.dirty.iter().all(|dirty| *dirty));
-    let mut update = Update::capture_live(&core);
-    assert!(!screen.changes_activity(&update));
-    update.rows[0].1.cells[0].fg = Color::Indexed(1);
-    assert!(!screen.changes_activity(&update));
-    update.rows[0].1.cells[0].c = '文';
-    assert!(screen.changes_activity(&update));
-    screen.apply(update).unwrap();
-    let mut update = Update::capture_live(&core);
-    update.rows[0].1.cells[0].c = '文';
-    assert!(!screen.changes_activity(&update));
-    update.cursor.1 = CursorShape::Hidden;
-    assert!(screen.changes_activity(&update));
-    let mut update = Update::capture_live(&core);
-    screen.apply(update.clone()).unwrap();
-    update.rows[0].1.extra_mut(2).underline_color = Some(Color::Indexed(1));
-    assert!(!screen.changes_activity(&update));
-    update.rows[0].1.extra_mut(2).zerowidth.clear();
-    assert!(screen.changes_activity(&update));
-    screen.rows[0].cells[2].flags.insert(Flags::HIDDEN);
-    update.rows[0].1.cells[2].flags.insert(Flags::HIDDEN);
-    assert!(!screen.changes_activity(&update));
-}
+    impl Update {
+        pub fn capture(core: &Core, full: bool) -> Self {
+            let rows = (0..core.screen_lines())
+                .filter(|index| full || core.dirty_rows().any(|dirty| dirty == *index))
+                .map(|index| (index, core.row(index).clone()))
+                .collect();
+            Self::from_rows(
+                core,
+                rows,
+                core.display_offset(),
+                full || core.palette_dirty(),
+            )
+        }
+    }
 
-#[test]
-fn selection_damage_matches_visible_highlight_changes() {
-    for columns in [1, 8] {
-        let mut core = Core::new(
-            crate::core::WindowSize {
-                num_cols: columns,
-                num_lines: 4,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xffffff,
-            0,
-        );
-        let mut initial = Screen::default();
-        initial.apply(Update::capture(&core, true)).unwrap();
-        core.reset_damage();
-        let last = usize::from(columns - 1);
-        let range = |(line, column), (end_line, end_column)| {
-            Some(SelectionRange {
-                start: Point { line, column },
-                end: Point {
-                    line: end_line,
-                    column: end_column,
-                },
-            })
-        };
-        let selections = [
-            None,
-            range((0, 0), (0, last)),
-            range((0, last), (2, 0)),
-            range((1, 0), (3, last)),
-            range((-4, 0), (-2, last)),
-            range((-2, last), (2, 0)),
-            range((8, 0), (9, last)),
-        ];
-        for offset in [0, 2, 8] {
-            for old in selections {
-                for new in selections {
-                    let mut screen = initial.clone();
-                    screen.selection = old;
-                    screen.offset = offset;
-                    screen.reset_damage();
-                    screen.dirty[3] = true;
-                    let mut update = Update::capture(&core, false);
-                    update.selection = new;
-                    update.offset = offset;
-                    screen.apply(update).unwrap();
-                    for row in 0..4 {
-                        let changed = (0..usize::from(columns)).any(|column| {
-                            let point = Point {
-                                line: row as i32 - offset as i32,
-                                column,
-                            };
-                            old.is_some_and(|range| range.contains(point))
-                                != new.is_some_and(|range| range.contains(point))
-                        });
-                        assert_eq!(
-                            screen.dirty[row],
-                            changed || row == 3,
-                            "{columns} columns, offset {offset}, {old:?} -> {new:?}, row {row}"
-                        );
+    #[test]
+    fn activity_compares_text_independently_of_render_damage_and_colors() {
+        let (mut core, mut parser) = terminal(20, 4);
+        parser.advance(&mut core, "中e\u{301}".as_bytes());
+        let mut screen = Screen::default();
+        let update = Update::capture_live(&core);
+        assert!(screen.changes_activity(&update));
+        screen.apply(update);
+        assert!(screen.dirty.iter().all(|dirty| *dirty));
+        let mut update = Update::capture_live(&core);
+        assert!(!screen.changes_activity(&update));
+        update.rows[0].1.cells[0].fg = Color::Indexed(1);
+        assert!(!screen.changes_activity(&update));
+        update.rows[0].1.cells[0].c = '文';
+        assert!(screen.changes_activity(&update));
+        screen.apply(update);
+        let mut update = Update::capture_live(&core);
+        update.rows[0].1.cells[0].c = '文';
+        assert!(!screen.changes_activity(&update));
+        update.cursor.1 = CursorShape::Hidden;
+        assert!(screen.changes_activity(&update));
+        let mut update = Update::capture_live(&core);
+        screen.apply(update.clone());
+        update.rows[0].1.extra_mut(2).underline_color = Some(Color::Indexed(1));
+        assert!(!screen.changes_activity(&update));
+        update.rows[0].1.extra_mut(2).zerowidth.clear();
+        assert!(screen.changes_activity(&update));
+        screen.rows[0].cells[2].flags.insert(Flags::HIDDEN);
+        update.rows[0].1.cells[2].flags.insert(Flags::HIDDEN);
+        assert!(!screen.changes_activity(&update));
+    }
+
+    #[test]
+    fn selection_damage_matches_visible_highlight_changes() {
+        for columns in [1, 8] {
+            let (mut core, _) = terminal(columns, 4);
+            let mut initial = Screen::default();
+            initial.apply(Update::capture(&core, true));
+            core.reset_damage();
+            let last = usize::from(columns - 1);
+            let range = |(line, column), (end_line, end_column)| {
+                Some(SelectionRange {
+                    start: Point { line, column },
+                    end: Point {
+                        line: end_line,
+                        column: end_column,
+                    },
+                })
+            };
+            let selections = [
+                None,
+                range((0, 0), (0, last)),
+                range((0, last), (2, 0)),
+                range((1, 0), (3, last)),
+                range((-4, 0), (-2, last)),
+                range((-2, last), (2, 0)),
+                range((8, 0), (9, last)),
+            ];
+            for offset in [0, 2, 8] {
+                for old in selections {
+                    for new in selections {
+                        let mut screen = initial.clone();
+                        screen.selection = old;
+                        screen.offset = offset;
+                        screen.reset_damage();
+                        screen.dirty[3] = true;
+                        let mut update = Update::capture(&core, false);
+                        update.selection = new;
+                        update.offset = offset;
+                        screen.apply(update);
+                        for row in 0..4 {
+                            let changed = (0..usize::from(columns)).any(|column| {
+                                let point = Point {
+                                    line: row as i32 - offset as i32,
+                                    column,
+                                };
+                                old.is_some_and(|range| range.contains(point))
+                                    != new.is_some_and(|range| range.contains(point))
+                            });
+                            assert_eq!(
+                                screen.dirty[row],
+                                changed || row == 3,
+                                "{columns} columns, offset {offset}, {old:?} -> {new:?}, row {row}"
+                            );
+                        }
                     }
                 }
             }
         }
     }
-}
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::core::WindowSize;
-    use crate::workspace::{PaneView, Rect};
     fn state(source: &[u8]) -> (Screen, PaneView) {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 21,
-                num_lines: 6,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        crate::vt::Parser::new().advance(&mut core, source);
+        let (mut core, mut parser) = terminal(21, 6);
+        parser.advance(&mut core, source);
         let pane = PaneView {
             process: Default::default(),
             id: 1,
             tab: 1,
-            rect: Rect {
-                x: 0,
-                y: 1,
-                cols: 21,
-                rows: 6,
-            },
+            rect: rect(0, 1, 21, 6),
             title: String::new(),
             cwd: None,
             blocks: core.visible_blocks(),
@@ -483,9 +437,70 @@ mod tests {
             shell_prompt: None,
         };
         let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         (screen, pane)
     }
+    #[test]
+    fn capture_since_uses_only_rows_changed_for_that_client() {
+        let (mut core, mut parser) = terminal(8, 3);
+        let initial = core.row_versions();
+        core.reset_damage();
+        parser.advance(&mut core, b"a");
+        let update = Update::capture_since(
+            &core,
+            Some((
+                core.window_size(),
+                core.full_revision(),
+                core.palette_revision(),
+                &initial,
+            )),
+        );
+        assert_eq!(update.rows.len(), 1);
+        assert_eq!(update.rows[0].0, 0);
+        let current = core.row_versions();
+        assert!(
+            Update::capture_since(
+                &core,
+                Some((
+                    core.window_size(),
+                    core.full_revision(),
+                    core.palette_revision(),
+                    &current,
+                ))
+            )
+            .rows
+            .is_empty()
+        );
+        parser.advance(&mut core, b"\x1b[2;1Hb");
+        let update = Update::capture_since(
+            &core,
+            Some((
+                core.window_size(),
+                core.full_revision(),
+                core.palette_revision(),
+                &current,
+            )),
+        );
+        assert_eq!(update.rows.len(), 1);
+        assert_eq!(update.rows[0].0, 1);
+        let previous = core.window_size();
+        core.resize(WindowSize {
+            num_cols: 10,
+            ..previous
+        });
+        let update = Update::capture_since(
+            &core,
+            Some((
+                previous,
+                core.full_revision(),
+                core.palette_revision(),
+                &current,
+            )),
+        );
+        assert_eq!(update.rows.len(), 3);
+        assert!(update.palette.is_some());
+    }
+
     #[test]
     fn hover_covers_only_pure_output_and_half_open_rows() {
         let (screen, pane) = state(b"\x1b]133;A\x07 > \x1b]133;B\x07echo\r\n\x1b]133;C\x07output\r\n\x1b]133;D;0\x07\x1b]133;A\x07 > \x1b]133;B\x07");
@@ -533,5 +548,38 @@ mod tests {
             state(b"\x1b]133;A\x07 > \x1b]133;B\x07echo\r\n\x1b]133;C\x07out\x1b[?1049hALT");
         assert!(screen.mode().contains(Mode::ALT_SCREEN));
         assert!(screen.row_output(&pane, 0).is_none());
+    }
+    #[test]
+    fn every_palette_change_reaches_the_screen() {
+        let (mut core, mut parser) = terminal(8, 3);
+        let mut screen = Screen::default();
+        screen.apply(Update::capture(&core, true));
+        for sequence in [
+            "\x1b]4;1;#112233;17;#445566;255;#778899\x07",
+            "\x1b]10;#102030;#405060;#708090\x07",
+            "\x1b]104;1\x07",
+            "\x1b]110\x07",
+            "\x1b]4;1;#abcdef\x07\x1b]10;#123456\x07\x1bc",
+        ] {
+            core.reset_damage();
+            parser.advance(&mut core, sequence.as_bytes());
+            let update = Update::capture(&core, false);
+            assert!(
+                update.palette.is_some(),
+                "missing palette after {sequence:?}"
+            );
+            screen.apply(update);
+            for index in 0..PALETTE_SIZE {
+                let color = if index < 256 {
+                    Color::Indexed(index as u8)
+                } else {
+                    Color::Named(crate::vt::NamedColor::from_index(index as u16).unwrap())
+                };
+                assert_eq!(screen.color(color), core.color(color), "slot {index}");
+            }
+        }
+        core.reset_damage();
+        parser.advance(&mut core, b"\x1b]4;1;?\x07xy");
+        assert!(Update::capture(&core, false).palette.is_none());
     }
 }

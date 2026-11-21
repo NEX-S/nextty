@@ -8,51 +8,56 @@ const PASTE_END: &[u8] = b"\x1b[201~";
 pub(crate) enum Input {
     Bytes(SmallVec<[u8; 8]>),
     Alt(u8),
-    Escape,
     Focus(bool),
-    Mouse(Mouse),
+    Mouse(PointerEvent),
     PasteStart,
     PasteData(Vec<u8>),
     PasteEnd,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) struct Mouse {
-    pub code: u16,
-    pub column: u16,
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerKind {
+    Press,
+    Release,
+    Motion,
+    Scroll,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PointerEvent {
+    pub col: u16,
     pub row: u16,
-    pub release: bool,
+    pub button: u8,
+    pub kind: PointerKind,
+    pub mods: u32,
+    /// The xterm button code, which is also what mouse-reporting applications expect.
+    pub code: u16,
+}
+
+impl PointerEvent {
+    pub fn press(self, button: u8) -> bool {
+        self.kind == PointerKind::Press && self.button == button
+    }
+
+    /// Wheel travel in lines, positive towards the end.
+    pub fn wheel(self) -> isize {
+        let lines = crate::ui::WHEEL_LINES as isize;
+        if self.button == 0 { -lines } else { lines }
+    }
 }
 
 #[derive(Default)]
 pub(crate) struct Decoder {
     pending: Vec<u8>,
-    ready: Vec<Input>,
     escape_since: Option<Instant>,
     paste: bool,
 }
 
 impl Decoder {
-    pub fn feed(&mut self, bytes: &[u8], now: Instant) -> std::vec::Drain<'_, Input> {
-        if self.pending.is_empty() && !bytes.is_empty() && !bytes.contains(&0x1b) {
-            let output = &mut self.ready;
-            output.push(if self.paste {
-                Input::PasteData(bytes.to_vec())
-            } else {
-                Input::Bytes(SmallVec::from_slice(bytes))
-            });
-            return output.drain(..);
-        }
-        if let Some(event) = self.expire(now) {
-            self.ready.push(event);
-        }
-        let output = &mut self.ready;
-        let input = if self.pending.is_empty() {
-            bytes
-        } else {
-            self.pending.extend_from_slice(bytes);
-            &self.pending
-        };
+    pub fn feed(&mut self, bytes: &[u8], now: Instant) -> Vec<Input> {
+        let mut output: Vec<_> = self.expire(now).into_iter().collect();
+        let mut input = std::mem::take(&mut self.pending);
+        input.extend_from_slice(bytes);
         let mut consumed = 0;
         while consumed < input.len() {
             let pending = &input[consumed..];
@@ -89,7 +94,7 @@ impl Decoder {
             self.escape_since = None;
             match pending[1] {
                 0x1b => {
-                    output.push(Input::Escape);
+                    output.push(Input::Bytes(smallvec::smallvec![0x1b]));
                     consumed += 1;
                 }
                 b'[' => {
@@ -99,11 +104,7 @@ impl Decoder {
                         .map(|index| index + 2)
                     else {
                         if pending.len() == 2 {
-                            self.escape_since.get_or_insert(now);
-                        }
-                        if pending.len() >= 4096 {
-                            output.push(Input::Bytes(SmallVec::from_slice(pending)));
-                            consumed += pending.len();
+                            self.escape_since = Some(now);
                         }
                         break;
                     };
@@ -124,7 +125,7 @@ impl Decoder {
                 }
                 b'O' => {
                     if pending.len() < 3 {
-                        self.escape_since.get_or_insert(now);
+                        self.escape_since = Some(now);
                         break;
                     }
                     output.push(Input::Bytes(SmallVec::from_slice(&pending[..3])));
@@ -142,12 +143,9 @@ impl Decoder {
                 }
             }
         }
-        if self.pending.is_empty() {
-            self.pending.extend_from_slice(&bytes[consumed..]);
-        } else {
-            self.pending.drain(..consumed);
-        }
-        output.drain(..)
+        input.drain(..consumed);
+        self.pending = input;
+        output
     }
 
     pub fn expire(&mut self, now: Instant) -> Option<Input> {
@@ -155,7 +153,7 @@ impl Decoder {
             .take_if(|start| now.duration_since(*start) >= ESCAPE_WAIT)?;
         let event = match self.pending.as_slice() {
             [0x1b, byte] => Input::Alt(*byte),
-            _ => Input::Escape,
+            _ => Input::Bytes(smallvec::smallvec![0x1b]),
         };
         self.pending.clear();
         Some(event)
@@ -167,18 +165,33 @@ impl Decoder {
     }
 }
 
-fn mouse(sequence: &[u8]) -> Option<Mouse> {
+fn mouse(sequence: &[u8]) -> Option<PointerEvent> {
     let (&final_byte, body) = sequence.strip_prefix(b"\x1b[<")?.split_last()?;
     if !matches!(final_byte, b'M' | b'm') {
         return None;
     }
     let (code, coordinates) = std::str::from_utf8(body).ok()?.split_once(';')?;
     let (column, row) = coordinates.split_once(';')?;
-    Some(Mouse {
-        code: code.parse().ok()?,
-        column: column.parse::<u16>().ok()?.checked_sub(1)?,
+    let code: u16 = code.parse().ok()?;
+    let kind = if code & 64 != 0 {
+        PointerKind::Scroll
+    } else if final_byte == b'm' {
+        PointerKind::Release
+    } else if code & 32 != 0 {
+        PointerKind::Motion
+    } else {
+        PointerKind::Press
+    };
+    let mods = (u32::from(code & 4 != 0) * crate::input::SHIFT)
+        | (u32::from(code & 8 != 0) * crate::input::ALT)
+        | (u32::from(code & 16 != 0) * crate::input::CONTROL);
+    Some(PointerEvent {
+        col: column.parse::<u16>().ok()?.checked_sub(1)?,
         row: row.parse::<u16>().ok()?.checked_sub(1)?,
-        release: final_byte == b'm',
+        button: (code & 3) as u8,
+        kind,
+        mods,
+        code,
     })
 }
 
@@ -186,50 +199,23 @@ fn mouse(sequence: &[u8]) -> Option<Mouse> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn consecutive_escapes_remain_separate_keys() {
-        let mut decoder = Decoder::default();
-        let now = Instant::now();
-        assert_eq!(
-            decoder.feed(b"\x1b\x1b", now).collect::<Vec<_>>(),
-            vec![Input::Escape]
-        );
-        assert_eq!(decoder.expire(now + ESCAPE_WAIT), Some(Input::Escape));
-    }
-
-    #[test]
-    fn ordinary_input_has_no_escape_timeout() {
-        let mut decoder = Decoder::default();
-        assert_eq!(
-            decoder
-                .feed(b"a\x03\xc3", Instant::now())
-                .collect::<Vec<_>>(),
-            vec![Input::Bytes(b"a\x03\xc3".to_vec().into())]
-        );
-        assert!(decoder.timeout(Instant::now()).is_none());
-        assert_eq!(
-            decoder.feed(b"\xa9", Instant::now()).collect::<Vec<_>>(),
-            vec![Input::Bytes(vec![0xa9].into())]
-        );
+    fn bytes(bytes: &[u8]) -> Input {
+        Input::Bytes(SmallVec::from_slice(bytes))
     }
 
     #[test]
     fn only_a_lone_escape_expires_and_split_csi_is_preserved() {
         let now = Instant::now();
         let mut decoder = Decoder::default();
-        assert!(decoder.feed(b"\x1b", now).next().is_none());
+        assert_eq!(decoder.feed(b"\x1b\x1b", now), [bytes(b"\x1b")]);
+        assert_eq!(decoder.expire(now + ESCAPE_WAIT), Some(bytes(b"\x1b")));
+        assert!(decoder.feed(b"\x1b", now).is_empty());
         assert!(decoder.expire(now + Duration::from_millis(24)).is_none());
-        assert_eq!(decoder.expire(now + ESCAPE_WAIT), Some(Input::Escape));
-        assert!(decoder.feed(b"\x1b[1;", now).next().is_none());
+        assert_eq!(decoder.expire(now + ESCAPE_WAIT), Some(bytes(b"\x1b")));
+        assert!(decoder.feed(b"\x1b[1;", now).is_empty());
         assert!(decoder.expire(now + Duration::from_secs(1)).is_none());
-        assert_eq!(
-            decoder.feed(b"5A", now).collect::<Vec<_>>(),
-            vec![Input::Bytes(b"\x1b[1;5A".to_vec().into())]
-        );
-        assert_eq!(
-            decoder.feed(b"\x1bs", now).collect::<Vec<_>>(),
-            vec![Input::Alt(b's')]
-        );
+        assert_eq!(decoder.feed(b"5A", now), [bytes(b"\x1b[1;5A")]);
+        assert_eq!(decoder.feed(b"\x1bs", now), [Input::Alt(b's')]);
     }
 
     #[test]
@@ -237,11 +223,11 @@ mod tests {
         let now = Instant::now();
         for prefix in *b"[O" {
             let mut decoder = Decoder::default();
-            assert!(decoder.feed(&[0x1b, prefix], now).next().is_none());
+            assert!(decoder.feed(&[0x1b, prefix], now).is_empty());
             assert_eq!(decoder.timeout(now), Some(ESCAPE_WAIT));
             assert_eq!(
-                decoder.feed(b"x", now + ESCAPE_WAIT).collect::<Vec<_>>(),
-                vec![Input::Alt(prefix), Input::Bytes(b"x".to_vec().into())]
+                decoder.feed(b"x", now + ESCAPE_WAIT),
+                [Input::Alt(prefix), bytes(b"x")]
             );
             assert!(decoder.timeout(now + ESCAPE_WAIT).is_none());
         }
@@ -250,25 +236,20 @@ mod tests {
     #[test]
     fn alt_unicode_does_not_split_a_following_ascii_key_from_its_utf8_prefix() {
         let mut decoder = Decoder::default();
-        let bytes = "\x1béx".as_bytes();
-        assert_eq!(
-            decoder.feed(bytes, Instant::now()).collect::<Vec<_>>(),
-            vec![Input::Bytes(bytes.to_vec().into())]
-        );
+        let input = "\x1béx".as_bytes();
+        assert_eq!(decoder.feed(input, Instant::now()), [bytes(input)]);
     }
 
     #[test]
     fn bracketed_paste_preserves_all_bytes_and_never_triggers_shortcuts() {
         let payload = "中\x1bf\x1bq\n文\x1b[201x".as_bytes();
-        let mut bytes = b"\x1b[200~".to_vec();
-        bytes.extend_from_slice(payload);
-        bytes.extend_from_slice(b"\x1b[201~");
-        for cut in 0..=bytes.len() {
+        let mut input = b"\x1b[200~".to_vec();
+        input.extend_from_slice(payload);
+        input.extend_from_slice(b"\x1b[201~");
+        for cut in 0..=input.len() {
             let mut decoder = Decoder::default();
-            let mut events = decoder
-                .feed(&bytes[..cut], Instant::now())
-                .collect::<Vec<_>>();
-            events.extend(decoder.feed(&bytes[cut..], Instant::now()));
+            let mut events = decoder.feed(&input[..cut], Instant::now());
+            events.extend(decoder.feed(&input[cut..], Instant::now()));
             assert_eq!(events.first(), Some(&Input::PasteStart));
             assert_eq!(events.last(), Some(&Input::PasteEnd));
             let actual: Vec<_> = events
@@ -284,54 +265,26 @@ mod tests {
     }
 
     #[test]
-    fn a_large_coalesced_burst_keeps_event_order_and_a_fragmented_tail() {
-        let now = Instant::now();
-        let mut decoder = Decoder::default();
-        let mut burst = b"\x1b[A\x1b[I\x1bs".repeat(4096);
-        burst.extend_from_slice(b"\x1b[<20;41;");
-        let events = decoder.feed(&burst, now).collect::<Vec<_>>();
-        assert_eq!(events.len(), 4096 * 3);
-        for events in events.chunks_exact(3) {
+    fn focus_and_mouse_sequences_survive_every_split() {
+        let input = b"\x1b[I\x1b[<20;41;9m\x1b[O";
+        let release = PointerEvent {
+            col: 40,
+            row: 8,
+            button: 0,
+            kind: PointerKind::Release,
+            mods: crate::input::SHIFT | crate::input::CONTROL,
+            code: 20,
+        };
+        for cut in 0..=input.len() {
+            let mut decoder = Decoder::default();
+            let mut events = decoder.feed(&input[..cut], Instant::now());
+            events.extend(decoder.feed(&input[cut..], Instant::now()));
             assert_eq!(
                 events,
                 [
-                    Input::Bytes(b"\x1b[A".to_vec().into()),
                     Input::Focus(true),
-                    Input::Alt(b's')
-                ]
-            );
-        }
-        assert_eq!(
-            decoder.feed(b"9m", now).collect::<Vec<_>>(),
-            [Input::Mouse(Mouse {
-                code: 20,
-                column: 40,
-                row: 8,
-                release: true
-            })]
-        );
-    }
-
-    #[test]
-    fn focus_and_mouse_sequences_survive_every_split() {
-        let bytes = b"\x1b[I\x1b[<20;41;9m\x1b[O";
-        for cut in 0..=bytes.len() {
-            let mut decoder = Decoder::default();
-            let mut events = decoder
-                .feed(&bytes[..cut], Instant::now())
-                .collect::<Vec<_>>();
-            events.extend(decoder.feed(&bytes[cut..], Instant::now()));
-            assert_eq!(
-                events,
-                vec![
-                    Input::Focus(true),
-                    Input::Mouse(Mouse {
-                        code: 20,
-                        column: 40,
-                        row: 8,
-                        release: true,
-                    }),
-                    Input::Focus(false),
+                    Input::Mouse(release),
+                    Input::Focus(false)
                 ]
             );
         }

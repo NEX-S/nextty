@@ -10,40 +10,31 @@ fn horizontal(character: char) -> bool {
     )
 }
 
-// Keep query search state off the common unfiltered snapshot path.
-#[inline(never)]
 fn matching_rows(text: &str, query: &str, row_ranges: &[std::ops::Range<usize>]) -> Vec<bool> {
     let finder = memchr::memmem::Finder::new(query.as_bytes());
     let mut matches = vec![false; row_ranges.len()];
     let mut offset = 0;
-    let mut first = 0;
-    let mut last = 0;
     while let Some(found) = finder.find(&text.as_bytes()[offset..]) {
         let start = offset + found;
         let end = start + query.len();
-        while first + 1 < row_ranges.len() && row_ranges[first + 1].start <= start {
-            first += 1;
-        }
-        last = last.max(first);
-        while last + 1 < row_ranges.len()
-            && (row_ranges[last + 1].start < end
-                || query.ends_with('\n') && row_ranges[last + 1].start == end)
-        {
-            last += 1;
-        }
+        let first = row_ranges.partition_point(|row| row.start <= start) - 1;
+        // A query ending in a newline also covers the row that starts right after it.
+        let last = row_ranges
+            .partition_point(|row| row.start < end || query.ends_with('\n') && row.start == end)
+            .saturating_sub(1)
+            .max(first);
         matches[first..=last].fill(true);
         let Some(next) = text[start..].chars().next() else {
             break;
         };
-        // Keep the suffix where a match could still reach another row.
-        offset = (start + next.len_utf8()).max(row_ranges[last].end.saturating_sub(query.len()));
+        offset = start + next.len_utf8();
     }
     matches
 }
 
 pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     let mut rows = Vec::new();
-    let mut wrapped_rows = Vec::new();
+    let mut wrapped_rows = Vec::<usize>::new();
     let mut omitted = Vec::<Value>::new();
     let mut matches = Vec::new();
     let cursor = screen.cursor();
@@ -51,21 +42,14 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
     let cursor_visible =
         cursor.1 != CursorShape::Hidden && (0..screen.screen_lines() as i64).contains(&cursor_row);
     if let Some(query) = query {
-        let mut text = String::with_capacity(
-            screen
-                .rows
-                .iter()
-                .map(|row| row.used() + 1)
-                .sum::<usize>()
-                .next_power_of_two(),
-        );
-        let mut row_ranges = Vec::with_capacity(screen.rows.len());
+        let mut text = String::new();
+        let mut row_ranges = Vec::new();
         for (index, row) in screen.rows.iter().enumerate() {
             let start = text.len();
             text.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
             row_ranges.push(start..text.len());
             if row.wrapped {
-                wrapped_rows.push(Value::from(index));
+                wrapped_rows.push(index);
             } else if index + 1 < screen.rows.len() {
                 text.push('\n');
             }
@@ -83,10 +67,9 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         let mut omission: Option<(&str, usize)> = None;
         for (index, row) in screen.rows.iter().enumerate() {
             if row.wrapped {
-                wrapped_rows.push(Value::from(index));
+                wrapped_rows.push(index);
             }
             rendered.clear();
-            rendered.reserve(row.used());
             rendered.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
             let text = rendered.trim_end_matches(' ');
             let reason = if cursor_visible && cursor_row == index as i64 {
@@ -128,18 +111,16 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
             "column": cursor.0.column,
             "visible": cursor_visible,
         },
+        "wrapped_rows": wrapped_rows,
+        "rows": rows,
+        "omitted": omitted,
     });
-    result["wrapped_rows"] = Value::Array(wrapped_rows);
-    result["rows"] = Value::Array(rows);
-    result["omitted"] = Value::Array(omitted);
     if query.is_some() {
-        result["matches"] = Value::Array(
-            matches
-                .iter()
-                .enumerate()
-                .filter_map(|(index, matched)| matched.then_some(Value::from(index)))
-                .collect(),
-        );
+        let matched = matches.iter().enumerate();
+        result["matches"] = matched
+            .filter(|(_, hit)| **hit)
+            .map(|(index, _)| index)
+            .collect();
     }
     result
 }
@@ -163,7 +144,7 @@ mod tests {
         );
         crate::vt::Parser::new().advance(&mut core, text.as_bytes());
         let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         screen
     }
 

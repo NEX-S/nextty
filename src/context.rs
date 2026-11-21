@@ -1,5 +1,6 @@
 use crate::core::{Flags, Point, SelectionRange, object_selection};
 use crate::screen::Screen;
+use serde::{Deserialize, Serialize};
 
 const SNAPSHOT_LIMIT: usize = 64 * 1024;
 
@@ -7,13 +8,20 @@ const SNAPSHOT_LIMIT: usize = 64 * 1024;
 pub(crate) struct Object {
     pub range: SelectionRange,
     pub text: String,
-    pub kind: &'static str,
 }
 
-#[derive(Clone, Default, PartialEq)]
-pub(crate) struct Snapshot {
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextSnapshot {
     pub text: String,
     pub incomplete: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContextItem {
+    pub label: String,
+    pub source: String,
+    pub kind: String,
+    pub snapshot: ContextSnapshot,
 }
 
 pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
@@ -26,9 +34,8 @@ pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
         return None;
     }
     let [start, end] = object_selection((i64::from(point.line), point.column), |line| {
-        Ok::<_, std::convert::Infallible>(screen.rows.get((line + offset) as usize))
-    })
-    .unwrap()?;
+        screen.rows.get((line + offset) as usize)
+    })?;
     let wide_end = screen.rows[(end.0 + offset) as usize].cells[end.1]
         .flags
         .contains(Flags::WIDE_CHAR);
@@ -45,14 +52,13 @@ pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
     let mut text = snapshot(screen, Some(range)).text;
     // A quoted link/path/IP highlights and copies the inner value, not the quotes.
     if let Some(inner) = unquote(&text)
-        && classify(inner).is_some()
+        && is_object(inner)
     {
         range.start.column += 1;
         range.end.column -= 1;
         text = inner.to_string();
     }
-    let kind = classify(&text)?;
-    Some(Object { range, text, kind })
+    is_object(&text).then_some(Object { range, text })
 }
 
 fn unquote(text: &str) -> Option<&str> {
@@ -63,38 +69,13 @@ fn unquote(text: &str) -> Option<&str> {
         .then(|| &text[1..text.len() - 1])
 }
 
-fn classify(text: &str) -> Option<&'static str> {
-    if ["https://", "http://", "ssh://", "file://"]
+fn is_object(text: &str) -> bool {
+    ["https://", "http://", "ssh://", "file://"]
         .iter()
         .any(|prefix| text.starts_with(prefix))
-    {
-        return Some("URL");
-    }
-    if is_ip(text) {
-        return Some("IP address");
-    }
-    if is_path(text) {
-        return Some("Path");
-    }
-    None
-}
-
-fn is_ip(text: &str) -> bool {
-    let (host, port) = match text.split_once(':') {
-        Some((host, port)) => (host, Some(port)),
-        None => (text, None),
-    };
-    if port.is_some_and(|port| port.is_empty() || !port.bytes().all(|c| c.is_ascii_digit())) {
-        return false;
-    }
-    let octets: Vec<&str> = host.split('.').collect();
-    octets.len() == 4
-        && octets.iter().all(|octet| {
-            !octet.is_empty()
-                && octet.len() <= 3
-                && octet.bytes().all(|c| c.is_ascii_digit())
-                && octet.parse::<u16>().is_ok_and(|n| n <= 255)
-        })
+        || text.parse::<std::net::Ipv4Addr>().is_ok()
+        || text.parse::<std::net::SocketAddrV4>().is_ok()
+        || is_path(text)
 }
 
 fn is_path(text: &str) -> bool {
@@ -104,8 +85,8 @@ fn is_path(text: &str) -> bool {
         })
 }
 
-pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapshot {
-    let mut result = Snapshot::default();
+pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> ContextSnapshot {
+    let mut result = ContextSnapshot::default();
     if screen.rows.is_empty() {
         return result;
     }
@@ -158,7 +139,7 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Snapsh
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Core, Scroll, WindowSize};
+    use crate::core::{Core, WindowSize};
     use crate::screen::Update;
 
     fn screen(columns: u16, lines: u16, text: &str) -> (Core, Screen) {
@@ -174,22 +155,17 @@ mod tests {
         );
         crate::vt::Parser::new().advance(&mut core, text.as_bytes());
         let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         (core, screen)
     }
 
-    fn assert_hover_range(
-        screen: &Screen,
-        text: &str,
-        expected: &str,
-        kind: &str,
-    ) -> std::ops::Range<usize> {
+    fn assert_hover_range(screen: &Screen, text: &str, expected: &str) -> std::ops::Range<usize> {
         let start = text[..text.find(expected).unwrap()].chars().count();
         let end = start + expected.chars().count();
         for column in start..end {
             let object = object_at(screen, Point { line: 0, column })
                 .unwrap_or_else(|| panic!("{text}, column {column}"));
-            assert_eq!((object.text.as_str(), object.kind), (expected, kind));
+            assert_eq!(object.text, expected);
             assert_eq!((object.range.start.line, object.range.end.line), (0, 0));
             assert_eq!(
                 (object.range.start.column, object.range.end.column),
@@ -201,19 +177,19 @@ mod tests {
 
     #[test]
     fn hover_highlights_only_links_paths_and_ip() {
-        for (text, kind) in [
-            ("https://example.test/a_(b)", "URL"),
-            ("http://host/path", "URL"),
-            ("ssh://user@host", "URL"),
-            ("file:///tmp/x", "URL"),
-            ("src/main.rs", "Path"),
-            ("/home/nex/vuln.c:18:7", "Path"),
-            ("192.168.1.1", "IP address"),
-            ("10.0.0.1:8080", "IP address"),
-            ("255.255.255.255", "IP address"),
+        for text in [
+            "https://example.test/a_(b)",
+            "http://host/path",
+            "ssh://user@host",
+            "file:///tmp/x",
+            "src/main.rs",
+            "/home/nex/vuln.c:18:7",
+            "192.168.1.1",
+            "10.0.0.1:8080",
+            "255.255.255.255",
         ] {
             let (_, screen) = screen(120, 3, text);
-            assert_hover_range(&screen, text, text, kind);
+            assert_hover_range(&screen, text, text);
         }
         for text in [
             "RAX",
@@ -228,6 +204,9 @@ mod tests {
             "256.1.1.1",
             "1.2.3",
             "hello",
+            "'这是一段中文'",
+            "\"中文 payload\"",
+            "'中文.rs'",
         ] {
             let (_, screen) = screen(120, 3, text);
             for column in 0..screen.rows[0].used() {
@@ -241,26 +220,24 @@ mod tests {
 
     #[test]
     fn hover_excludes_assignments_and_surrounding_punctuation() {
-        for (text, expected, kind) in [
-            ("file=src/main.rs", "src/main.rs", "Path"),
-            ("../xxx/references/*.md", "../xxx/references/*.md", "Path"),
-            ("at (main.rs:12:3).", "main.rs:12:3", "Path"),
+        for (text, expected) in [
+            ("file=src/main.rs", "src/main.rs"),
+            ("../xxx/references/*.md", "../xxx/references/*.md"),
+            ("at (main.rs:12:3).", "main.rs:12:3"),
             (
                 "url=https://host/a_(b)?x=1&y=2;",
                 "https://host/a_(b)?x=1&y=2",
-                "URL",
             ),
-            ("see https://host/path。", "https://host/path", "URL"),
-            ("┌─/tmp/hover.c────────┐", "/tmp/hover.c", "Path"),
-            ("docs/tutorial.md（现在只写了", "docs/tutorial.md", "Path"),
+            ("see https://host/path。", "https://host/path"),
+            ("┌─/tmp/hover.c────────┐", "/tmp/hover.c"),
+            ("docs/tutorial.md（现在只写了", "docs/tutorial.md"),
             (
                 "docs/captcha-training-survey.md。它说明字符数字验证码",
                 "docs/captcha-training-survey.md",
-                "Path",
             ),
         ] {
             let (_, screen) = screen(80, 3, text);
-            let range = assert_hover_range(&screen, text, expected, kind);
+            let range = assert_hover_range(&screen, text, expected);
             for column in (0..screen.rows[0].used()).filter(|column| !range.contains(column)) {
                 let object = object_at(&screen, Point { line: 0, column });
                 assert!(object.is_none(), "{text}, column {column}: {object:?}");
@@ -271,49 +248,23 @@ mod tests {
     }
 
     #[test]
-    fn quoted_objects_unwrap_and_prose_is_not_hoverable() {
-        let (_, s) = screen(80, 3, "'src/中文/main.rs'");
-        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
-        assert_eq!(
-            (object.text.as_str(), object.kind),
-            ("src/中文/main.rs", "Path")
-        );
-        assert_eq!(
-            (object.range.start.column, object.range.end.column),
-            (1, 16)
-        );
-
-        let (_, s) = screen(80, 3, "\"192.168.1.1\"");
-        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
-        assert_eq!(
-            (object.text.as_str(), object.kind),
-            ("192.168.1.1", "IP address")
-        );
-
-        let (_, s) = screen(80, 3, "\"https://host/path\"");
-        let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
-        assert_eq!(
-            (object.text.as_str(), object.kind),
-            ("https://host/path", "URL")
-        );
-
-        for text in ["'这是一段中文'", "\"中文 payload\"", "'中文.rs'"] {
+    fn quoted_objects_unwrap_to_their_inner_value() {
+        for (text, expected) in [
+            ("'src/中文/main.rs'", "src/中文/main.rs"),
+            ("\"192.168.1.1\"", "192.168.1.1"),
+            ("\"https://host/path\"", "https://host/path"),
+        ] {
             let (_, s) = screen(80, 3, text);
-            for column in 0..s.rows[0].used() {
-                assert!(
-                    object_at(&s, Point { line: 0, column }).is_none(),
-                    "{text}, column {column}"
-                );
-            }
+            let object = object_at(&s, Point { line: 0, column: 1 }).unwrap();
+            assert_eq!(object.text, expected);
+            assert_eq!(object.range.start.column, 1);
         }
     }
 
     #[test]
     fn wrapped_object_and_clipped_selection_keep_display_offset_and_unicode() {
-        let (mut core, _) = screen(10, 3, "first\r\n'中\u{301}文/payload'\r\nlast\r\nend");
-        core.scroll_display(Scroll::Delta(1));
-        let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
+        let (_, mut screen) = screen(10, 3, "'中\u{301}文/payload'\r\nlast");
+        screen.offset = 1;
         let object = object_at(
             &screen,
             Point {
@@ -323,7 +274,6 @@ mod tests {
         )
         .unwrap();
         assert_eq!(object.text, "中\u{301}文/payload");
-        assert_eq!(object.kind, "Path");
         assert_eq!(object.range.start.line, -1);
         let selected = snapshot(
             &screen,
@@ -344,7 +294,6 @@ mod tests {
         let (_, screen) = screen(20, 3, "'中/a' \x1b[8m中a\x1b[0m end");
         let object = object_at(&screen, Point { line: 0, column: 2 }).unwrap();
         assert_eq!(object.text, "中/a");
-        assert_eq!(object.kind, "Path");
         assert_eq!(snapshot(&screen, None).text, "'中/a'     end\n\n");
         assert!(object_at(&screen, Point { line: 0, column: 8 }).is_none());
     }

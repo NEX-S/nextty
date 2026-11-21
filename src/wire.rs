@@ -1,31 +1,26 @@
-//! Length-prefixed, versioned messages on an owned Unix socket.
-use crate::agent_files::{AgentChange, FileMatch, FileOperation, FileResult};
-use crate::core::{
-    Cell, Extra, Flags, Mode, Point, Row, Scroll, SelectionRange, SelectionType, Side, WindowSize,
-};
-use crate::eventfd::notify;
+//! Length-prefixed messages on an owned Unix socket.
+use crate::agent_files::FileResult;
+use crate::core::{Cell, Extra, Flags, Mode, Point, Row, SelectionRange};
 use crate::screen::Update;
-use crate::terminal::{ProcessMetadata, Shell};
-use crate::vt::{Color, CursorShape, NamedColor, PALETTE_SIZE, Rgb};
-use crate::workspace::{
-    Action, AgentEvent, AgentMessage, AgentModelPatch, Axis, BlockMarker, CommandBlock,
-    CreateOptions, Direction, HistoryCursor, HistoryPage, MAX_CELLS, MAX_COLUMNS, MAX_LINES,
-    PaneView, Snapshot, TabView, WorkspaceInfo,
-};
-use std::collections::{HashMap, VecDeque};
+use crate::vt::{Color, CursorShape, Rgb};
+use crate::workspace::{Action, AgentEvent, HistoryPage, Snapshot, WorkspaceInfo};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, Write};
-use std::os::fd::{AsRawFd, BorrowedFd, FromRawFd, OwnedFd, RawFd};
-use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::io::{self, Read, Seek, Write};
+use std::os::fd::{AsRawFd, RawFd};
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::net::UnixStream;
-use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
-pub(crate) const MAX_FRAME: usize = 32 * 1024 * 1024;
+const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
-pub(crate) const VERSION: u8 = 22;
+const COPY_CHUNK: usize = 65536;
+pub(crate) const VERSION: u8 = 25;
+/// The remote bridge's first bytes: a frame whose payload is `VERSION`, independent of `Response`.
+pub(crate) const HELLO: [u8; 5] = [1, 0, 0, 0, VERSION];
 
-pub(crate) enum Response {
+/// The daemon encodes `State` from borrowed data, so a frame needs no per-client copy.
+#[derive(Serialize, Deserialize)]
+pub enum Response<S = Option<Snapshot>, U = Vec<(u64, Update)>> {
     ScreenDirty,
     AgentInput {
         request: u64,
@@ -48,13 +43,8 @@ pub(crate) enum Response {
         result: Result<HistoryPage, String>,
     },
     Agent(AgentEvent),
-    State(Snapshot, Vec<(u64, Update)>, u64),
+    State(S, U, u64),
     List(Vec<WorkspaceInfo>),
-    Clipboard {
-        request: u64,
-        file: File,
-        incomplete: bool,
-    },
     ClipboardStore {
         primary: bool,
         text: String,
@@ -67,263 +57,137 @@ pub(crate) enum Response {
         truncated: bool,
     },
     Detached,
+    ClipboardBegin {
+        request: u64,
+        incomplete: bool,
+    },
+    ClipboardChunk(#[serde(with = "bytes")] Vec<u8>),
+    ClipboardEnd,
+    /// A finished copy; it travels as `ClipboardBegin`, chunks and `ClipboardEnd`.
+    /// Last, because serde numbers the variants after a skipped one differently when decoding.
+    #[serde(skip)]
+    Clipboard {
+        request: u64,
+        file: File,
+        incomplete: bool,
+    },
 }
-pub(crate) struct Frame(Vec<u8>);
-impl Frame {
-    pub fn len(&self) -> usize {
-        self.0.len()
+
+pub(crate) mod bytes {
+    use serde::{Deserializer, Serializer};
+
+    pub(crate) fn serialize<S: Serializer>(value: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_bytes(value)
     }
-    pub fn kind(&self) -> u8 {
-        self.0[5]
+
+    pub(crate) fn deserialize<'de, D: Deserializer<'de>>(
+        deserializer: D,
+    ) -> Result<Vec<u8>, D::Error> {
+        struct Visitor;
+        impl serde::de::Visitor<'_> for Visitor {
+            type Value = Vec<u8>;
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("bytes")
+            }
+            fn visit_bytes<E>(self, value: &[u8]) -> Result<Vec<u8>, E> {
+                Ok(value.to_vec())
+            }
+        }
+        deserializer.deserialize_byte_buf(Visitor)
     }
 }
+
+/// Paths travel as the OS's own bytes; serde's `PathBuf` would reject names that are not UTF-8.
+pub(crate) mod path {
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+    use std::ffi::OsString;
+    use std::path::{Path, PathBuf};
+
+    pub fn serialize<S: Serializer>(value: &Path, serializer: S) -> Result<S::Ok, S::Error> {
+        value.as_os_str().serialize(serializer)
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(deserializer: D) -> Result<PathBuf, D::Error> {
+        OsString::deserialize(deserializer).map(PathBuf::from)
+    }
+
+    pub mod option {
+        use super::*;
+
+        pub fn serialize<S: Serializer>(
+            value: &Option<PathBuf>,
+            serializer: S,
+        ) -> Result<S::Ok, S::Error> {
+            value.as_deref().map(Path::as_os_str).serialize(serializer)
+        }
+        pub fn deserialize<'de, D: Deserializer<'de>>(
+            deserializer: D,
+        ) -> Result<Option<PathBuf>, D::Error> {
+            Ok(Option::<OsString>::deserialize(deserializer)?.map(PathBuf::from))
+        }
+    }
+}
+
+/// One frame, or a copy whose next frame is read from its file when the socket has room.
 struct Packet {
     bytes: Vec<u8>,
-    file: Option<File>,
+    copy: Option<File>,
+    state: bool,
 }
 pub(crate) struct Peer {
-    stream: OwnedFd,
-    output_fd: Option<OwnedFd>,
-    remote: bool,
-    copy: Option<RemoteCopy>,
-    receiver: Option<ClipboardReceiver>,
+    stream: UnixStream,
+    copy: Option<IncomingCopy>,
     input: Vec<u8>,
     consumed: usize,
-    files: smallvec::SmallVec<[OwnedFd; 4]>,
     output: VecDeque<Packet>,
     output_offset: usize,
     queued: usize,
     read_error: Option<io::Error>,
 }
-struct RemoteCopy {
+struct IncomingCopy {
     request: u64,
     incomplete: bool,
-    finishing: bool,
-}
-
-enum ReceiveWork {
-    Begin,
-    Chunk(Vec<u8>),
-    End,
-}
-#[derive(Default)]
-struct ReceiveState {
-    work: Option<ReceiveWork>,
-    ready: Option<io::Result<File>>,
-    closed: bool,
-}
-struct ReceiveShared {
-    state: Mutex<ReceiveState>,
-    changed: Condvar,
-    notification: OwnedFd,
-}
-struct ClipboardReceiver(Arc<ReceiveShared>);
-impl ClipboardReceiver {
-    fn new() -> io::Result<Self> {
-        let shared = Arc::new(ReceiveShared {
-            state: Mutex::new(ReceiveState::default()),
-            changed: Condvar::new(),
-            notification: crate::eventfd::new()?,
-        });
-        let worker = Arc::clone(&shared);
-        std::thread::Builder::new()
-            .name("nextty-recv".into())
-            .spawn(move || receive_clipboard(worker))?;
-        Ok(Self(shared))
-    }
-    fn fd(&self) -> RawFd {
-        self.0.notification.as_raw_fd()
-    }
-    fn available(&self) -> bool {
-        let state = self.0.state.lock().unwrap();
-        !state.closed && state.work.is_none()
-    }
-    fn ready(&self) -> bool {
-        self.0.state.lock().unwrap().ready.is_some()
-    }
-    fn submit(&self, work: impl FnOnce() -> ReceiveWork) -> bool {
-        let mut state = self.0.state.lock().unwrap();
-        if state.closed || state.work.is_some() {
-            return false;
-        }
-        state.work = Some(work());
-        drop(state);
-        self.0.changed.notify_one();
-        true
-    }
-    fn take(&self) -> Option<io::Result<File>> {
-        self.0.state.lock().unwrap().ready.take()
-    }
-}
-impl Drop for ClipboardReceiver {
-    fn drop(&mut self) {
-        self.0.state.lock().unwrap().closed = true;
-        self.0.changed.notify_one();
-    }
-}
-fn receive_clipboard(shared: Arc<ReceiveShared>) {
-    let mut file: Option<File> = None;
-    loop {
-        let mut state = shared.state.lock().unwrap();
-        while !state.closed && state.work.is_none() {
-            state = shared.changed.wait(state).unwrap();
-        }
-        if state.closed {
-            let work = state.work.take();
-            let ready = state.ready.take();
-            drop(state);
-            drop(work);
-            drop(ready);
-            return;
-        }
-        let work = state.work.take().unwrap();
-        drop(state);
-        // Releasing the slot before IO permits one pending chunk, at most 128 KiB total.
-        let result = notify(shared.notification.as_raw_fd()).and_then(|()| match work {
-            ReceiveWork::Begin => clipboard_file().map(|created| {
-                file = Some(created);
-                None
-            }),
-            ReceiveWork::Chunk(bytes) => file.as_mut().unwrap().write_all(&bytes).map(|()| None),
-            ReceiveWork::End => file.as_mut().unwrap().rewind().map(|()| file.take()),
-        });
-        let Some(ready) = result.transpose() else {
-            continue;
-        };
-        let failed = ready.is_err();
-        if failed {
-            drop(file.take());
-        }
-        let mut state = shared.state.lock().unwrap();
-        if state.closed {
-            drop(state);
-            drop(ready);
-            continue;
-        }
-        state.ready = Some(ready);
-        let pending = if failed {
-            state.closed = true;
-            state.work.take()
-        } else {
-            None
-        };
-        drop(state);
-        drop(pending);
-        if let Err(error) = notify(shared.notification.as_raw_fd()) {
-            eprintln!("clipboard receiver: {error}");
-        }
-        if failed {
-            return;
-        }
-    }
+    file: File,
 }
 impl Peer {
     pub fn new(stream: UnixStream) -> io::Result<Self> {
-        Self::from_stream(stream, false)
-    }
-    pub fn remote(stream: UnixStream) -> io::Result<Self> {
-        Self::from_stream(stream, true)
-    }
-    fn from_stream(stream: UnixStream, remote: bool) -> io::Result<Self> {
         stream.set_nonblocking(true)?;
-        Ok(Self::from_fds(stream.into(), None, remote))
-    }
-    pub fn stdio() -> io::Result<Self> {
-        let duplicate = |fd| {
-            let copy = unsafe { BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
-            let flags = unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_GETFL) };
-            if flags < 0
-                || unsafe { libc::fcntl(copy.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) }
-                    < 0
-            {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(copy)
-        };
-        Ok(Self::from_fds(duplicate(0)?, Some(duplicate(1)?), true))
-    }
-    fn from_fds(stream: OwnedFd, output_fd: Option<OwnedFd>, remote: bool) -> Self {
-        Self {
+        Ok(Self {
             stream,
-            output_fd,
-            remote,
             copy: None,
-            receiver: None,
             input: Vec::new(),
             consumed: 0,
-            files: smallvec::SmallVec::new(),
             output: VecDeque::new(),
             output_offset: 0,
             queued: 0,
             read_error: None,
-        }
+        })
     }
     pub fn fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
-    pub fn output_fd(&self) -> RawFd {
-        self.output_fd.as_ref().unwrap_or(&self.stream).as_raw_fd()
-    }
     pub fn pending(&self) -> bool {
         !self.output.is_empty()
     }
-    pub fn receiver_fd(&self) -> RawFd {
-        self.receiver.as_ref().map_or(-1, ClipboardReceiver::fd)
-    }
-    fn receive_blocked(&self) -> bool {
-        self.copy.as_ref().is_some_and(|copy| copy.finishing)
-            || self.remote
-                && self.buffered_action()
-                && matches!(self.input.get(self.consumed + 5), Some(7..=9))
-                && self
-                    .receiver
-                    .as_ref()
-                    .is_some_and(|receiver| !receiver.available())
-    }
-    pub fn wants_read(&self) -> bool {
-        !self.receive_blocked()
-    }
     pub fn needs_poll(&self) -> bool {
-        self.receiver.as_ref().is_some_and(ClipboardReceiver::ready)
-            || !self.receive_blocked() && (self.buffered_action() || self.read_error.is_some())
-    }
-    pub fn send_hello(&mut self, version: u8) -> io::Result<()> {
-        let mut encoder = Encoder::new();
-        encoder.u8(10);
-        encoder.u8(version);
-        self.queue(encoder.0, None)
+        self.buffered_action() || self.read_error.is_some()
     }
     pub fn hello(&mut self) -> io::Result<Option<u8>> {
         self.read()?;
         let Some(packet) = packet(&self.input[self.consumed..])? else {
             return Ok(None);
         };
-        let mut decoder = Decoder::new(packet)?;
-        if decoder.u8()? != 10 || !self.files.is_empty() {
+        let [version] = *packet else {
             return Err(invalid("remote nextty did not send an SSH bridge greeting"));
-        }
-        let version = decoder.u8()?;
-        decoder.finish()?;
-        self.consumed += packet.len() + 4;
+        };
+        self.consumed += HELLO.len();
         Ok(Some(version))
     }
     pub fn send_action(&mut self, action: &Action) -> io::Result<()> {
-        // The largest fixed-size action is 30 bytes, including the frame header.
-        let mut encoder = Encoder::with_capacity(32);
-        encode_action(&mut encoder, action);
-        self.queue(encoder.0, None)
+        self.queue(encode(action)?, false)
     }
     pub fn send_input(&mut self, pane: u64, data: &[u8]) -> io::Result<()> {
         const CHUNK: usize = 65536;
-        let required = data
-            .len()
-            .checked_add(data.len().div_ceil(CHUNK).saturating_mul(18))
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "input is too large; no bytes were queued",
-                )
-            })?;
+        let required = data.len() + data.len().div_ceil(CHUNK) * 18;
         if required > MAX_PENDING {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -337,242 +201,105 @@ impl Peer {
             ));
         }
         for chunk in data.chunks(CHUNK) {
-            let mut encoder = Encoder::with_capacity(18 + chunk.len());
-            encode_input(&mut encoder, pane, chunk);
-            self.queue(encoder.0, None)?;
+            self.send_action(&Action::Input {
+                pane,
+                data: chunk.to_vec(),
+            })?;
         }
         Ok(())
     }
     pub fn send_state(
         &mut self,
-        snapshot: &Snapshot,
-        updates: &[(u64, &Update)],
-        previous: &HashMap<u64, Arc<ProcessMetadata>>,
+        snapshot: Option<&Snapshot>,
+        updates: &[(u64, Update)],
         request: u64,
-    ) -> io::Result<bool> {
-        let mut encoder = Encoder::with_capacity(256);
-        let metadata_changed = encoder.state(snapshot, updates.iter().copied(), previous, request);
-        self.queue(encoder.0, None)?;
-        Ok(metadata_changed)
+    ) -> io::Result<()> {
+        self.queue(encode(&Response::State(snapshot, updates, request))?, true)
     }
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
-        let mut encoder = Encoder::new();
-        let file = match response {
-            Response::History { request, result } => {
-                encoder.u8(16);
-                encoder.u64(request);
-                encoder.bool(result.is_ok());
-                match result {
-                    Ok(page) => {
-                        // The length, cursor, flags and optional command take at most 48 bytes.
-                        encoder.0.reserve(page.text.len() + 48);
-                        encoder.string(&page.text);
-                        encoder.cursor(page.cursor);
-                        encoder.bool(page.has_more);
-                        encoder.optional(page.matched, Encoder::bool);
-                        encoder.bool(page.incomplete);
-                        encoder.optional(page.command.as_ref(), encode_command);
-                    }
-                    Err(error) => encoder.string(&error),
-                }
-                None
-            }
-            Response::CopyError { request, error } => {
-                encoder.u8(15);
-                encoder.u64(request);
-                encoder.string(&error);
-                None
-            }
-            Response::AgentFile { request, result } => {
-                encoder.u8(17);
-                encoder.u64(request);
-                encoder.bool(result.is_ok());
-                match result {
-                    Ok(result) => encode_file_result(&mut encoder, &result),
-                    Err(error) => encoder.string(&error),
-                }
-                None
-            }
-            Response::AgentNewTab { request, result } => {
-                encoder.u8(18);
-                encoder.u64(request);
-                encoder.bool(result.is_ok());
-                match result {
-                    Ok(pane) => encoder.u64(pane),
-                    Err(error) => encoder.string(&error),
-                }
-                None
-            }
-            Response::AgentInput { request, result } => {
-                encoder.u8(14);
-                encoder.u64(request);
-                encoder.bool(result.is_ok());
-                match result {
-                    Ok(block) => encoder.optional(block, Encoder::u64),
-                    Err(error) => encoder.string(&error),
-                }
-                None
-            }
-            Response::ScreenDirty => {
-                encoder.u8(13);
-                None
-            }
-            Response::Agent(event) => {
-                encoder.u8(12);
-                encode_agent_event(&mut encoder, &event);
-                None
-            }
-            Response::State(snapshot, updates, request) => {
-                encoder.state(
-                    &snapshot,
-                    updates.iter().map(|(id, update)| (*id, update)),
-                    &HashMap::new(),
-                    request,
-                );
-                None
-            }
-            Response::List(list) => {
-                encoder.u8(2);
-                encoder.u32(list.len() as u32);
-                for item in list {
-                    encoder.string(&item.name);
-                    encoder.u32(item.tabs as u32);
-                    encoder.u32(item.panes as u32);
-                    encoder.u32(item.attached as u32);
-                }
-                None
-            }
-            Response::Clipboard {
+        if let Response::Clipboard {
+            request,
+            file,
+            incomplete,
+        } = response
+        {
+            let begin: Response = Response::ClipboardBegin {
                 request,
-                file,
                 incomplete,
-            } => {
-                encoder.u8(3);
-                encoder.u64(request);
-                encoder.bool(incomplete);
-                Some(file)
+            };
+            self.queue(encode(&begin)?, false)?;
+            self.output.push_back(Packet {
+                bytes: Vec::new(),
+                copy: Some(file),
+                state: false,
+            });
+            return Ok(());
+        }
+        self.queue(encode(&response)?, false)
+    }
+    fn queue_copy(&mut self) -> io::Result<()> {
+        let packet = self.output.front_mut().unwrap();
+        let file = packet.copy.as_mut().unwrap();
+        let mut bytes = vec![0; COPY_CHUNK];
+        let mut count = 0;
+        while count < bytes.len() {
+            match file.read(&mut bytes[count..]) {
+                Ok(0) => break,
+                Ok(n) => count += n,
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+                Err(error) => return Err(error),
             }
-            Response::Error(error) => {
-                encoder.u8(4);
-                encoder.string(&error);
-                None
-            }
-            Response::ClipboardStore { primary, text } => {
-                encoder.u8(6);
-                encoder.bool(primary);
-                encoder.string(&text);
-                None
-            }
-            Response::Search {
-                pane,
-                request,
-                count,
-                truncated,
-            } => {
-                encoder.0.reserve(22);
-                encoder.u8(11);
-                encoder.u64(pane);
-                encoder.u64(request);
-                encoder.bool(truncated);
-                encoder.u32(count);
-                None
-            }
-            Response::Detached => {
-                encoder.u8(5);
-                None
-            }
+        }
+        bytes.truncate(count);
+        let response: Response = if count != 0 {
+            Response::ClipboardChunk(bytes)
+        } else {
+            packet.copy = None;
+            Response::ClipboardEnd
         };
-        self.queue(encoder.0, file)
+        let bytes = encode(&response)?;
+        self.queued += bytes.len();
+        packet.bytes = bytes;
+        Ok(())
     }
-    pub fn begin_copy(&mut self, request: u64, incomplete: bool) -> io::Result<()> {
-        let mut encoder = Encoder::new();
-        encoder.u8(7);
-        encoder.u64(request);
-        encoder.bool(incomplete);
-        self.queue(encoder.0, None)
-    }
-    pub fn copy_chunk(&mut self, bytes: &[u8]) -> io::Result<()> {
-        let mut encoder = Encoder::with_capacity(10 + bytes.len());
-        encoder.u8(if bytes.is_empty() { 9 } else { 8 });
-        if !bytes.is_empty() {
-            encoder.bytes(bytes);
-        }
-        self.queue(encoder.0, None)
-    }
-    fn queue(&mut self, mut bytes: Vec<u8>, file: Option<File>) -> io::Result<()> {
-        if self.remote && file.is_some() {
-            return Err(invalid("file descriptors cannot cross the SSH bridge"));
-        }
-        let length = bytes.len() - 4;
+    fn queue(&mut self, bytes: Vec<u8>, state: bool) -> io::Result<()> {
         let queued = self.queued + bytes.len();
-        if length > MAX_FRAME || queued > MAX_PENDING {
+        if queued > MAX_PENDING {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "workspace socket send queue is full",
             ));
         }
-        bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
         self.queued = queued;
-        self.output.push_back(Packet { bytes, file });
+        self.output.push_back(Packet {
+            bytes,
+            copy: None,
+            state,
+        });
         Ok(())
     }
     pub fn flush(&mut self) -> io::Result<()> {
         let mut budget: usize = 256 * 1024;
-        let output_fd = self.output_fd();
-        while budget > 0
-            && let Some(packet) = self.output.front()
-        {
-            let bytes = &packet.bytes[self.output_offset..];
-            let result = if let Some(file) = &packet.file {
-                send_with_fd(
-                    output_fd,
-                    &bytes[..bytes.len().min(budget)],
-                    file.as_raw_fd(),
-                )
-            } else {
-                let count = if self.output.len() > 1 {
-                    let mut vectors = [libc::iovec {
-                        iov_base: std::ptr::null_mut(),
-                        iov_len: 0,
-                    }; 64];
-                    let mut remaining = budget;
-                    let mut count = 0;
-                    let mut offset = self.output_offset;
-                    for packet in self.output.iter().take(vectors.len()) {
-                        if packet.file.is_some() {
-                            break;
-                        }
-                        let bytes = &packet.bytes[offset..];
-                        offset = 0;
-                        let length = bytes.len().min(remaining);
-                        vectors[count] = libc::iovec {
-                            iov_base: bytes.as_ptr().cast_mut().cast(),
-                            iov_len: length,
-                        };
-                        count += 1;
-                        remaining -= length;
-                        if remaining == 0 {
-                            break;
-                        }
+        while budget > 0 {
+            // A copy produces its next frame on demand; screen state overtakes it between frames.
+            if self
+                .output
+                .front()
+                .is_some_and(|packet| packet.copy.is_some() && packet.bytes.is_empty())
+            {
+                match self.output.iter().position(|packet| packet.state) {
+                    Some(index) => {
+                        let state = self.output.remove(index).unwrap();
+                        self.output.push_front(state);
                     }
-                    unsafe { libc::writev(output_fd, vectors.as_ptr(), count as libc::c_int) }
-                } else {
-                    let bytes = &bytes[..bytes.len().min(budget)];
-                    unsafe { libc::write(output_fd, bytes.as_ptr().cast(), bytes.len()) }
-                };
-                if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok(count as usize)
+                    None => self.queue_copy()?,
                 }
+            }
+            let Some(packet) = self.output.front() else {
+                break;
             };
-            let count = match result {
-                Ok(0) => {
-                    return Err(io::Error::new(
-                        io::ErrorKind::WriteZero,
-                        "workspace socket closed while writing",
-                    ));
-                }
+            let bytes = &packet.bytes[self.output_offset..];
+            let count = match (&self.stream).write(&bytes[..bytes.len().min(budget)]) {
                 Ok(count) => count,
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                 Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
@@ -580,16 +307,15 @@ impl Peer {
             };
             self.queued -= count;
             budget -= count;
-            let mut remaining = count;
-            while remaining != 0 {
-                let packet = self.output.front_mut().unwrap();
-                let sent = remaining.min(packet.bytes.len() - self.output_offset);
-                self.output_offset += sent;
-                packet.file = None;
-                remaining -= sent;
-                if self.output_offset == packet.bytes.len() {
+            let packet = self.output.front_mut().unwrap();
+            self.output_offset += count;
+            if self.output_offset == packet.bytes.len() {
+                if packet.copy.is_some() {
+                    packet.bytes.clear();
+                }
+                self.output_offset = 0;
+                if packet.copy.is_none() {
                     self.output.pop_front();
-                    self.output_offset = 0;
                 }
             }
         }
@@ -625,51 +351,39 @@ impl Peer {
                 self.input.reserve(4096);
             }
             let available = (self.input.capacity() - self.input.len()).min(65536);
+            let fd = self.fd();
             let bytes = &mut self.input.spare_capacity_mut()[..available];
-            let result = if self.output_fd.is_some() {
-                let count = unsafe {
-                    libc::read(
-                        self.stream.as_raw_fd(),
-                        bytes.as_mut_ptr().cast(),
-                        bytes.len(),
-                    )
-                };
-                if count < 0 {
-                    Err(io::Error::last_os_error())
-                } else {
-                    Ok((count as usize, smallvec::SmallVec::new()))
-                }
-            } else {
-                receive(self.stream.as_raw_fd(), bytes)
-            };
+            let result = unsafe { libc::read(fd, bytes.as_mut_ptr().cast(), bytes.len()) };
             match result {
-                Ok((0, _)) => {
+                0 => {
                     self.read_error = Some(io::Error::new(
                         io::ErrorKind::UnexpectedEof,
                         "workspace socket closed",
                     ));
                     break;
                 }
-                Ok((count, files)) => {
-                    if self.remote && !files.is_empty() {
-                        return Err(invalid("remote messages cannot contain file descriptors"));
-                    }
-                    // recvmsg/read initialized exactly the returned prefix.
+                count if count > 0 => {
+                    let count = count as usize;
+                    // read initialized exactly the returned prefix.
                     unsafe { self.input.set_len(self.input.len() + count) };
-                    self.files.extend(files);
                     budget = budget.saturating_sub(count);
-                    if self.input.len() > MAX_PENDING || self.files.len() > 8 {
+                    if self.input.len() > MAX_PENDING {
                         return Err(invalid("workspace receive buffer exceeded its limit"));
                     }
                     if count < available && self.buffered_action() {
                         break;
                     }
                 }
-                Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
-                Err(error) => {
-                    self.read_error = Some(error);
-                    break;
+                _ => {
+                    let error = io::Error::last_os_error();
+                    match error.kind() {
+                        io::ErrorKind::WouldBlock => break,
+                        io::ErrorKind::Interrupted => (),
+                        _ => {
+                            self.read_error = Some(error);
+                            break;
+                        }
+                    }
                 }
             }
         }
@@ -677,7 +391,7 @@ impl Peer {
             && let Some(error) = self.read_error.take()
         {
             if self.copy.is_some() && error.kind() == io::ErrorKind::UnexpectedEof {
-                return Err(invalid("remote clipboard transfer ended before completion"));
+                return Err(invalid("clipboard transfer ended before completion"));
             }
             return Err(error);
         }
@@ -686,275 +400,86 @@ impl Peer {
     pub fn next_action(&mut self) -> io::Result<Option<Action>> {
         self.read()?;
         let packet = packet(&self.input[self.consumed..])?;
-        if !self.files.is_empty() {
-            return Err(invalid("client messages cannot contain file descriptors"));
-        }
         let Some(packet) = packet else {
             return Ok(None);
         };
-        let mut decoder = Decoder::new(packet)?;
-        let action = decode_action(&mut decoder)?;
-        decoder.finish()?;
+        let action = decode(packet)?;
         self.consumed += packet.len() + 4;
         Ok(Some(action))
     }
-    // The bridge checks framing here; the destination still decodes each message.
-    pub fn next_frame(&mut self) -> io::Result<Option<Frame>> {
-        self.read()?;
-        let Some(packet) = packet(&self.input[self.consumed..])? else {
-            return Ok(None);
-        };
-        Decoder::new(packet)?.u8()?;
-        let end = self.consumed + packet.len() + 4;
-        let frame = Frame(self.input[self.consumed..end].to_vec());
-        self.consumed = end;
-        Ok(Some(frame))
-    }
-    pub fn send_frame(&mut self, frame: Frame) -> io::Result<()> {
-        self.queue(frame.0, None)
-    }
-    pub fn take_clipboard(&mut self, frame: Frame) -> io::Result<(u64, File, bool)> {
-        debug_assert_eq!(frame.kind(), 3);
-        let mut decoder = Decoder::new(&frame.0[4..])?;
-        decoder.u8()?;
-        let request = decoder.u64()?;
-        let incomplete = decoder.bool()?;
-        decoder.finish()?;
-        let file = take_clipboard_file(&mut self.files)?;
-        Ok((request, file, incomplete))
-    }
-    pub fn responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
-        self.receive_responses(previous).inspect_err(|_| {
+    pub fn responses(&mut self) -> io::Result<Vec<Response>> {
+        self.receive_responses().inspect_err(|_| {
             self.copy = None;
-            self.receiver = None;
         })
     }
-    fn receive_responses(&mut self, previous: Option<&Snapshot>) -> io::Result<Vec<Response>> {
+    fn receive_responses(&mut self) -> io::Result<Vec<Response>> {
         let mut result = Vec::new();
-        if let Some(receiver) = &self.receiver
-            && let Some(ready) = receiver.take()
-        {
-            let file = ready?;
-            let copy = self.copy.take().unwrap();
-            result.push(Response::Clipboard {
-                request: copy.request,
-                file,
-                incomplete: copy.incomplete,
-            });
-            return Ok(result);
-        }
-        if self.copy.as_ref().is_some_and(|copy| copy.finishing) {
-            return Ok(result);
-        }
         self.read()?;
         while let Some(packet) = packet(&self.input[self.consumed..])? {
-            let mut d = Decoder::new(packet)?;
-            let response = match d.u8()? {
-                17 => {
-                    let request = d.u64()?;
-                    let result = if d.bool()? {
-                        Ok(decode_file_result(&mut d)?)
-                    } else {
-                        Err(d.string(65536)?)
-                    };
-                    Some(Response::AgentFile { request, result })
-                }
-                18 => {
-                    let request = d.u64()?;
-                    let result = if d.bool()? {
-                        Ok(d.u64()?)
-                    } else {
-                        Err(d.string(65536)?)
-                    };
-                    Some(Response::AgentNewTab { request, result })
-                }
-                16 => {
-                    let request = d.u64()?;
-                    let result = if d.bool()? {
-                        Ok(HistoryPage {
-                            text: d.string(crate::history::READ_LIMIT)?,
-                            cursor: d.cursor()?,
-                            has_more: d.bool()?,
-                            matched: d.optional(Decoder::bool)?,
-                            incomplete: d.bool()?,
-                            command: d.optional(decode_command)?,
-                        })
-                    } else {
-                        Err(d.string(65536)?)
-                    };
-                    Some(Response::History { request, result })
-                }
-                15 => Some(Response::CopyError {
-                    request: d.u64()?,
-                    error: d.string(65536)?,
-                }),
-                14 => {
-                    let request = d.u64()?;
-                    let result = if d.bool()? {
-                        Ok(d.optional(Decoder::u64)?)
-                    } else {
-                        Err(d.string(65536)?)
-                    };
-                    Some(Response::AgentInput { request, result })
-                }
-                13 => Some(Response::ScreenDirty),
-                12 => Some(Response::Agent(decode_agent_event(&mut d)?)),
-                1 => {
-                    let request = d.u64()?;
-                    let previous = result
-                        .iter()
-                        .rev()
-                        .find_map(|response| match response {
-                            Response::State(snapshot, _, _) => Some(snapshot),
-                            _ => None,
-                        })
-                        .or(previous);
-                    let snapshot = decode_snapshot(&mut d, previous)?;
-                    let count = d.count(1024)?;
-                    let mut updates = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        updates.push((d.u64()?, decode_update(&mut d)?));
-                    }
-                    Some(Response::State(snapshot, updates, request))
-                }
-                2 => {
-                    let count = d.count(4096)?;
-                    let mut list = Vec::with_capacity(count);
-                    for _ in 0..count {
-                        list.push(WorkspaceInfo {
-                            name: d.string(128)?,
-                            tabs: d.u32()? as usize,
-                            panes: d.u32()? as usize,
-                            attached: d.u32()? as usize,
-                        });
-                    }
-                    Some(Response::List(list))
-                }
-                3 => Some(Response::Clipboard {
-                    request: d.u64()?,
-                    incomplete: d.bool()?,
-                    file: take_clipboard_file(&mut self.files)?,
-                }),
-                4 => Some(Response::Error(d.string(65536)?)),
-                5 => {
-                    d.finish()?;
-                    self.copy = None;
-                    self.receiver = None;
-                    Some(Response::Detached)
-                }
-                6 => Some(Response::ClipboardStore {
-                    primary: d.bool()?,
-                    text: d.string(MAX_FRAME)?,
-                }),
-                11 => Some(Response::Search {
-                    pane: d.u64()?,
-                    request: d.u64()?,
-                    truncated: d.bool()?,
-                    count: d.u32()?,
-                }),
-                7 if self.remote => {
-                    let request = d.u64()?;
-                    let incomplete = d.bool()?;
-                    d.finish()?;
+            let response = decode::<Response>(packet)?;
+            self.consumed += packet.len() + 4;
+            let response = match response {
+                Response::ClipboardBegin {
+                    request,
+                    incomplete,
+                } => {
                     if self.copy.is_some() {
-                        return Err(invalid("remote clipboard transfer is already active"));
+                        return Err(invalid("clipboard transfer is already active"));
                     }
-                    if self.receiver.is_none() {
-                        self.receiver = Some(ClipboardReceiver::new()?);
-                    }
-                    if !self
-                        .receiver
-                        .as_ref()
-                        .unwrap()
-                        .submit(|| ReceiveWork::Begin)
-                    {
-                        break;
-                    }
-                    self.copy = Some(RemoteCopy {
+                    self.copy = Some(IncomingCopy {
                         request,
                         incomplete,
-                        finishing: false,
+                        file: clipboard_file()?,
                     });
                     None
                 }
-                8 if self.remote => {
-                    let bytes = d.bytes(65536)?;
-                    d.finish()?;
-                    if self.copy.is_none() {
-                        return Err(invalid("remote clipboard chunk has no start"));
-                    }
-                    if !self
-                        .receiver
-                        .as_ref()
-                        .unwrap()
-                        .submit(|| ReceiveWork::Chunk(bytes.to_vec()))
-                    {
-                        break;
-                    }
-                    None
-                }
-                9 if self.remote => {
-                    d.finish()?;
-                    let copy = self
-                        .copy
+                Response::ClipboardChunk(bytes) => {
+                    self.copy
                         .as_mut()
-                        .ok_or_else(|| invalid("remote clipboard end has no start"))?;
-                    if !self.receiver.as_ref().unwrap().submit(|| ReceiveWork::End) {
-                        break;
-                    }
-                    copy.finishing = true;
+                        .ok_or_else(|| invalid("clipboard chunk has no start"))?
+                        .file
+                        .write_all(&bytes)?;
                     None
                 }
-                _ => return Err(invalid("unknown workspace response")),
+                Response::ClipboardEnd => {
+                    let mut copy = self
+                        .copy
+                        .take()
+                        .ok_or_else(|| invalid("clipboard end has no start"))?;
+                    copy.file.rewind()?;
+                    Some(Response::Clipboard {
+                        request: copy.request,
+                        file: copy.file,
+                        incomplete: copy.incomplete,
+                    })
+                }
+                Response::Detached => {
+                    self.copy = None;
+                    Some(Response::Detached)
+                }
+                response => Some(response),
             };
-            d.finish()?;
-            self.consumed += packet.len() + 4;
             if let Some(response) = response {
                 result.push(response);
-            }
-            if self.copy.as_ref().is_some_and(|copy| copy.finishing) {
-                break;
             }
         }
         Ok(result)
     }
 }
 
-fn take_clipboard_file(files: &mut smallvec::SmallVec<[OwnedFd; 4]>) -> io::Result<File> {
-    if files.is_empty() {
-        return Err(invalid("clipboard response has no file descriptor"));
-    }
-    Ok(File::from(files.remove(0)))
-}
-
 fn clipboard_file() -> io::Result<File> {
-    let root = crate::config::cache_directory().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::NotFound,
-            "HOME or XDG_CACHE_HOME is required for remote clipboard storage",
-        )
-    })?;
-    if !root.is_absolute() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            "clipboard cache directory must be absolute",
-        ));
-    }
-    let directory = root.join("clipboard");
+    let directory = crate::config::cache_directory()
+        .ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                "HOME or XDG_CACHE_HOME is required for clipboard storage",
+            )
+        })?
+        .join("clipboard");
     std::fs::DirBuilder::new()
         .recursive(true)
         .mode(0o700)
         .create(&directory)?;
-    let metadata = std::fs::symlink_metadata(&directory)?;
-    if !metadata.is_dir()
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.mode() & 0o077 != 0
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "remote clipboard directory must be owned and private",
-        ));
-    }
     OpenOptions::new()
         .read(true)
         .write(true)
@@ -974,1943 +499,369 @@ fn packet(input: &[u8]) -> io::Result<Option<&[u8]>> {
     Ok(input.get(4..4 + length))
 }
 
-fn send_with_fd(socket: RawFd, bytes: &[u8], file: RawFd) -> io::Result<usize> {
-    let mut vector = libc::iovec {
-        iov_base: bytes.as_ptr().cast_mut().cast(),
-        iov_len: bytes.len(),
-    };
-    let mut control = [0usize; 4];
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut vector;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen =
-        unsafe { libc::CMSG_SPACE(std::mem::size_of::<RawFd>() as _) as usize };
-    unsafe {
-        let header = libc::CMSG_FIRSTHDR(&message);
-        (*header).cmsg_level = libc::SOL_SOCKET;
-        (*header).cmsg_type = libc::SCM_RIGHTS;
-        (*header).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<RawFd>() as _) as usize;
-        std::ptr::write_unaligned(libc::CMSG_DATA(header).cast::<RawFd>(), file);
-        let result = libc::sendmsg(socket, &message, libc::MSG_NOSIGNAL);
-        if result < 0 {
-            Err(io::Error::last_os_error())
-        } else {
-            Ok(result as usize)
-        }
+fn encode<T: Serialize>(value: &T) -> io::Result<Vec<u8>> {
+    // The length goes into the reserved header once the payload size is known.
+    let mut bytes = postcard::to_extend(value, vec![0; 4])
+        .map_err(|error| invalid(&format!("workspace message encoding: {error}")))?;
+    let length = bytes.len() - 4;
+    if length > MAX_FRAME {
+        return Err(io::Error::new(
+            io::ErrorKind::WouldBlock,
+            "workspace message exceeds the frame limit",
+        ));
     }
+    bytes[..4].copy_from_slice(&(length as u32).to_le_bytes());
+    Ok(bytes)
 }
-fn receive(
-    socket: RawFd,
-    bytes: &mut [std::mem::MaybeUninit<u8>],
-) -> io::Result<(usize, smallvec::SmallVec<[OwnedFd; 4]>)> {
-    let mut vector = libc::iovec {
-        iov_base: bytes.as_mut_ptr().cast(),
-        iov_len: bytes.len(),
-    };
-    let mut control = [0usize; 16];
-    let mut message: libc::msghdr = unsafe { std::mem::zeroed() };
-    message.msg_iov = &mut vector;
-    message.msg_iovlen = 1;
-    message.msg_control = control.as_mut_ptr().cast();
-    message.msg_controllen = std::mem::size_of_val(&control);
-    let result = unsafe { libc::recvmsg(socket, &mut message, libc::MSG_CMSG_CLOEXEC) };
-    if result < 0 {
-        return Err(io::Error::last_os_error());
+fn decode<'a, T: Deserialize<'a>>(bytes: &'a [u8]) -> io::Result<T> {
+    let (value, remaining) = postcard::take_from_bytes(bytes)
+        .map_err(|error| invalid(&format!("workspace message decoding: {error}")))?;
+    if !remaining.is_empty() {
+        return Err(invalid("unexpected bytes after workspace message"));
     }
-    let mut files = smallvec::SmallVec::new();
-    unsafe {
-        let mut header = libc::CMSG_FIRSTHDR(&message);
-        while !header.is_null() {
-            if (*header).cmsg_level != libc::SOL_SOCKET || (*header).cmsg_type != libc::SCM_RIGHTS {
-                return Err(invalid("unexpected workspace socket control message"));
-            }
-            let count =
-                ((*header).cmsg_len - libc::CMSG_LEN(0) as usize) / std::mem::size_of::<RawFd>();
-            let descriptors = libc::CMSG_DATA(header).cast::<RawFd>();
-            for index in 0..count {
-                files.push(OwnedFd::from_raw_fd(std::ptr::read_unaligned(
-                    descriptors.add(index),
-                )));
-            }
-            header = libc::CMSG_NXTHDR(&message, header);
-        }
-    }
-    if message.msg_flags & libc::MSG_CTRUNC != 0 {
-        return Err(invalid("workspace socket control message truncated"));
-    }
-    Ok((result as usize, files))
-}
-
-struct Encoder(Vec<u8>);
-impl Encoder {
-    fn new() -> Self {
-        // Skip the first growth from the five-byte frame header to ten bytes.
-        Self::with_capacity(10)
-    }
-    fn with_capacity(capacity: usize) -> Self {
-        // Fill the frame length in place after encoding, without copying the payload.
-        let mut bytes = Vec::with_capacity(capacity);
-        bytes.extend_from_slice(&[0, 0, 0, 0, VERSION]);
-        Self(bytes)
-    }
-    fn u8(&mut self, n: u8) {
-        self.0.push(n);
-    }
-    fn bool(&mut self, value: bool) {
-        self.u8(value as u8);
-    }
-    fn optional<T>(&mut self, value: Option<T>, write: impl FnOnce(&mut Self, T)) {
-        self.bool(value.is_some());
-        if let Some(value) = value {
-            write(self, value);
-        }
-    }
-    fn u16(&mut self, n: u16) {
-        self.0.extend_from_slice(&n.to_le_bytes());
-    }
-    fn u32(&mut self, n: u32) {
-        self.0.extend_from_slice(&n.to_le_bytes());
-    }
-    fn u64(&mut self, n: u64) {
-        self.0.extend_from_slice(&n.to_le_bytes());
-    }
-    fn cursor(&mut self, cursor: HistoryCursor) {
-        self.u64(cursor.epoch);
-        self.u64(cursor.row);
-        self.u64(cursor.offset);
-    }
-    fn state<'a>(
-        &mut self,
-        snapshot: &Snapshot,
-        updates: impl ExactSizeIterator<Item = (u64, &'a Update)>,
-        previous: &HashMap<u64, Arc<ProcessMetadata>>,
-        request: u64,
-    ) -> bool {
-        self.u8(1);
-        self.u64(request);
-        let metadata_changed = encode_snapshot(self, snapshot, previous);
-        self.u32(updates.len() as u32);
-        for (id, update) in updates {
-            self.u64(id);
-            encode_update(self, update);
-        }
-        metadata_changed
-    }
-    fn i32(&mut self, n: i32) {
-        self.0.extend_from_slice(&n.to_le_bytes());
-    }
-    fn bytes(&mut self, bytes: &[u8]) {
-        self.u32(bytes.len() as u32);
-        self.0.extend_from_slice(bytes);
-    }
-    fn string(&mut self, value: &str) {
-        self.bytes(value.as_bytes());
-    }
-    fn strings(&mut self, values: &[String]) {
-        self.u32(values.len() as u32);
-        for value in values {
-            self.string(value);
-        }
-    }
-    fn path(&mut self, value: &Path) {
-        self.bytes(value.as_os_str().as_bytes());
-    }
-    fn size(&mut self, size: WindowSize) {
-        self.u16(size.num_cols);
-        self.u16(size.num_lines);
-        self.u16(size.cell_width);
-        self.u16(size.cell_height);
-    }
-    fn point(&mut self, point: Point) {
-        self.i32(point.line);
-        self.u32(point.column as u32);
-    }
-}
-struct Decoder<'a> {
-    bytes: &'a [u8],
-}
-impl<'a> Decoder<'a> {
-    fn new(bytes: &'a [u8]) -> io::Result<Self> {
-        let mut result = Self { bytes };
-        if result.u8()? != VERSION {
-            return Err(invalid(
-                "workspace protocol version differs; terminate the old server before upgrading",
-            ));
-        }
-        Ok(result)
-    }
-    fn take(&mut self, count: usize) -> io::Result<&'a [u8]> {
-        let (bytes, remaining) = self
-            .bytes
-            .split_at_checked(count)
-            .ok_or_else(|| invalid("truncated workspace message"))?;
-        self.bytes = remaining;
-        Ok(bytes)
-    }
-    fn u8(&mut self) -> io::Result<u8> {
-        Ok(self.take(1)?[0])
-    }
-    fn bool(&mut self) -> io::Result<bool> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(invalid("invalid boolean")),
-        }
-    }
-    fn optional<T>(
-        &mut self,
-        read: impl FnOnce(&mut Self) -> io::Result<T>,
-    ) -> io::Result<Option<T>> {
-        if self.bool()? {
-            read(self).map(Some)
-        } else {
-            Ok(None)
-        }
-    }
-    fn u16(&mut self) -> io::Result<u16> {
-        Ok(u16::from_le_bytes(self.take(2)?.try_into().unwrap()))
-    }
-    fn u32(&mut self) -> io::Result<u32> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> io::Result<u64> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn cursor(&mut self) -> io::Result<HistoryCursor> {
-        Ok(HistoryCursor {
-            epoch: self.u64()?,
-            row: self.u64()?,
-            offset: self.u64()?,
-        })
-    }
-    fn i32(&mut self) -> io::Result<i32> {
-        Ok(i32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn count(&mut self, limit: usize) -> io::Result<usize> {
-        let n = self.u32()? as usize;
-        if n > limit {
-            Err(invalid("workspace field exceeds limit"))
-        } else {
-            Ok(n)
-        }
-    }
-    fn bytes(&mut self, limit: usize) -> io::Result<&'a [u8]> {
-        let count = self.count(limit)?;
-        self.take(count)
-    }
-    fn string(&mut self, limit: usize) -> io::Result<String> {
-        String::from_utf8(self.bytes(limit)?.to_vec())
-            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-    }
-    fn strings(&mut self, limit: usize) -> io::Result<Vec<String>> {
-        let count = self.count(limit)?;
-        let mut strings = Vec::with_capacity(count);
-        for _ in 0..count {
-            strings.push(self.string(65536)?);
-        }
-        Ok(strings)
-    }
-    fn path(&mut self) -> io::Result<PathBuf> {
-        Ok(PathBuf::from(std::ffi::OsString::from_vec(
-            self.bytes(65536)?.to_vec(),
-        )))
-    }
-    fn size(&mut self) -> io::Result<WindowSize> {
-        Ok(WindowSize {
-            num_cols: self.u16()?,
-            num_lines: self.u16()?,
-            cell_width: self.u16()?,
-            cell_height: self.u16()?,
-        })
-    }
-    fn point(&mut self) -> io::Result<Point> {
-        let line = self.i32()?;
-        let column = self.u32()? as usize;
-        if column > MAX_COLUMNS {
-            return Err(invalid("column exceeds terminal limit"));
-        }
-        Ok(Point { line, column })
-    }
-    fn finish(&self) -> io::Result<()> {
-        if self.bytes.is_empty() {
-            Ok(())
-        } else {
-            Err(invalid("unexpected bytes after workspace message"))
-        }
-    }
+    Ok(value)
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
-fn encode_options(e: &mut Encoder, options: &CreateOptions) {
-    e.size(options.size);
-    e.u32(options.foreground);
-    e.u32(options.background);
-    e.optional(options.directory.as_deref(), Encoder::path);
-    e.optional(options.program.as_ref(), |e, shell| {
-        e.string(&shell.program);
-        e.strings(&shell.args);
-    });
-    e.u64(options.history_capacity);
+/// Rows are sent as the text of their stored cells plus style runs, which stays small over SSH.
+#[derive(Serialize, Deserialize)]
+struct WireRow {
+    index: u16,
+    wrapped: bool,
+    used: u16,
+    text: String,
+    runs: Vec<(u16, Color, Color, u16)>,
+    extras: Vec<(u16, String, Option<Color>)>,
 }
-fn decode_options(d: &mut Decoder<'_>) -> io::Result<CreateOptions> {
-    Ok(CreateOptions {
-        size: d.size()?,
-        foreground: d.u32()?,
-        background: d.u32()?,
-        directory: d.optional(Decoder::path)?,
-        program: d.optional(|d| Ok(Shell::new(d.string(65536)?, d.strings(4096)?)))?,
-        history_capacity: d.u64()?,
-    })
+#[derive(Serialize, Deserialize)]
+struct WireUpdate {
+    size: (u16, u16),
+    cursor: (Point, CursorShape),
+    mode: u32,
+    offset: u64,
+    history: u64,
+    selection: Option<SelectionRange>,
+    /// Empty when the palette is unchanged.
+    #[serde(with = "bytes")]
+    palette: Vec<u8>,
+    rows: Vec<WireRow>,
 }
-fn encode_agent_change(e: &mut Encoder, change: &AgentChange) {
-    // Reserve before field headers can trigger an otherwise unnecessary growth.
-    e.0.reserve(29 + change.tool_id.len() + change.path.as_os_str().len() + change.diff.len());
-    e.u64(change.turn);
-    e.string(&change.tool_id);
-    e.path(&change.path);
-    e.u32(change.added);
-    e.u32(change.removed);
-    e.string(&change.diff);
-    e.bool(change.truncated);
-}
-fn decode_agent_change(d: &mut Decoder<'_>) -> io::Result<AgentChange> {
-    Ok(AgentChange {
-        turn: d.u64()?,
-        tool_id: d.string(65536)?,
-        path: d.path()?,
-        added: d.u32()?,
-        removed: d.u32()?,
-        diff: d.string(MAX_FRAME)?,
-        truncated: d.bool()?,
-    })
-}
-fn encode_agent_model(e: &mut Encoder, patch: &AgentModelPatch) {
-    e.u64(patch.session);
-    e.bool(patch.busy);
-    e.u64(patch.revision);
-    e.u64(patch.turn);
-    e.u32(patch.start);
-    e.u32(patch.prefix_bytes);
-    e.u32(patch.messages.len() as u32);
-    for message in &patch.messages {
-        e.u64(message.turn);
-        e.string(&message.role);
-        e.string(&message.text);
-        e.optional(message.id.as_deref(), Encoder::string);
-    }
-    e.u32(patch.changes_omitted);
-    e.optional(patch.changes.as_deref(), |e, changes| {
-        e.u32(changes.len() as u32);
-        for change in changes {
-            encode_agent_change(e, change);
+impl Serialize for Update {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        WireUpdate {
+            size: (self.columns as u16, self.lines as u16),
+            cursor: self.cursor,
+            mode: self.mode.bits(),
+            offset: self.offset as u64,
+            history: self.history as u64,
+            selection: self.selection,
+            palette: self.palette.as_deref().map_or_else(Vec::new, |palette| {
+                palette
+                    .iter()
+                    .flat_map(|rgb| [rgb.r, rgb.g, rgb.b])
+                    .collect()
+            }),
+            rows: self
+                .rows
+                .iter()
+                .map(|(index, row)| {
+                    // The reflow text length does not cover every styled blank or wide-wrap cell.
+                    let cells = &row.cells[..row.non_default_len()];
+                    WireRow {
+                        index: *index as u16,
+                        wrapped: row.wrapped,
+                        used: row.used() as u16,
+                        text: cells.iter().map(|cell| cell.c).collect(),
+                        runs: cells
+                            .chunk_by(|a, b| a.fg == b.fg && a.bg == b.bg && a.flags == b.flags)
+                            .map(|run| {
+                                (run.len() as u16, run[0].fg, run[0].bg, run[0].flags.bits())
+                            })
+                            .collect(),
+                        extras: row
+                            .extras()
+                            .iter()
+                            .map(|(column, extra)| {
+                                let zerowidth = extra.zerowidth.iter().collect();
+                                (*column as u16, zerowidth, extra.underline_color)
+                            })
+                            .collect(),
+                    }
+                })
+                .collect(),
         }
-    });
-    e.bytes(&patch.recovery);
-}
-fn decode_agent_model(d: &mut Decoder<'_>) -> io::Result<AgentModelPatch> {
-    Ok(AgentModelPatch {
-        session: d.u64()?,
-        busy: d.bool()?,
-        revision: d.u64()?,
-        turn: d.u64()?,
-        start: d.u32()?,
-        prefix_bytes: d.u32()?,
-        messages: {
-            let count = d.count(4096)?;
-            let mut messages = Vec::with_capacity(count);
-            for _ in 0..count {
-                messages.push(AgentMessage {
-                    turn: d.u64()?,
-                    role: d.string(65536)?,
-                    text: d.string(MAX_FRAME)?,
-                    id: d.optional(|d| d.string(65536))?,
-                });
-            }
-            messages
-        },
-        changes_omitted: d.u32()?,
-        changes: d.optional(|d| {
-            let count = d.count(65536)?;
-            let mut changes = Vec::with_capacity(count);
-            for _ in 0..count {
-                changes.push(decode_agent_change(d)?);
-            }
-            Ok(Arc::new(changes))
-        })?,
-        recovery: d.bytes(MAX_FRAME)?.to_vec(),
-    })
-}
-fn encode_agent_event(e: &mut Encoder, event: &AgentEvent) {
-    match event {
-        AgentEvent::Draft(payload) => {
-            e.u8(0);
-            e.bytes(payload);
-        }
-        AgentEvent::Model(patch) => {
-            e.u8(1);
-            encode_agent_model(e, patch);
-        }
-        AgentEvent::Request(payload) => {
-            e.u8(2);
-            e.bytes(payload);
-        }
-        AgentEvent::Start(token) => {
-            e.u8(3);
-            e.bytes(token);
-        }
-        AgentEvent::Attached => e.u8(4),
-        AgentEvent::Ready => e.u8(5),
+        .serialize(serializer)
     }
 }
-fn decode_agent_event(d: &mut Decoder<'_>) -> io::Result<AgentEvent> {
-    Ok(match d.u8()? {
-        0 => AgentEvent::Draft(d.bytes(MAX_FRAME)?.to_vec()),
-        1 => AgentEvent::Model(decode_agent_model(d)?),
-        2 => AgentEvent::Request(d.bytes(MAX_FRAME)?.to_vec()),
-        3 => AgentEvent::Start(d.bytes(64)?.to_vec()),
-        4 => AgentEvent::Attached,
-        5 => AgentEvent::Ready,
-        _ => return Err(invalid("invalid Agent event")),
-    })
-}
-
-fn encode_file_operation(e: &mut Encoder, operation: &FileOperation) {
-    match operation {
-        FileOperation::Read { offset } => {
-            e.u8(0);
-            e.u64(*offset);
-        }
-        FileOperation::Search { query } => {
-            e.u8(1);
-            e.string(query);
-        }
-        FileOperation::Edit { old_text, new_text } => {
-            e.u8(2);
-            e.optional(old_text.as_deref(), Encoder::string);
-            e.string(new_text);
-        }
-    }
-}
-fn decode_file_operation(d: &mut Decoder<'_>) -> io::Result<FileOperation> {
-    Ok(match d.u8()? {
-        0 => FileOperation::Read { offset: d.u64()? },
-        1 => FileOperation::Search {
-            query: d.string(MAX_FRAME)?,
-        },
-        2 => FileOperation::Edit {
-            old_text: d.optional(|d| d.string(MAX_FRAME))?,
-            new_text: d.string(MAX_FRAME)?,
-        },
-        _ => return Err(invalid("invalid file operation")),
-    })
-}
-fn encode_file_result(e: &mut Encoder, result: &FileResult) {
-    match result {
-        FileResult::Read {
-            path,
-            offset,
-            text,
-            next_offset,
-            has_more,
-        } => {
-            e.0.reserve(26 + path.as_os_str().len() + text.len());
-            e.u8(0);
-            e.path(path);
-            e.u64(*offset);
-            e.string(text);
-            e.u64(*next_offset);
-            e.bool(*has_more);
-        }
-        FileResult::Search {
-            path,
-            matches,
-            truncated,
-        } => {
-            e.0.reserve(
-                10 + path.as_os_str().len()
-                    + matches
-                        .iter()
-                        .map(|found| 16 + found.path.as_os_str().len() + found.text.len())
-                        .sum::<usize>(),
-            );
-            e.u8(1);
-            e.path(path);
-            e.u32(matches.len() as u32);
-            for found in matches {
-                e.path(&found.path);
-                e.u64(found.line);
-                e.string(&found.text);
-            }
-            e.bool(*truncated);
-        }
-        FileResult::Edited { change } => {
-            e.u8(2);
-            encode_agent_change(e, change);
-        }
-    }
-}
-fn decode_file_result(d: &mut Decoder<'_>) -> io::Result<FileResult> {
-    let kind = d.u8()?;
-    if kind == 2 {
-        return Ok(FileResult::Edited {
-            change: decode_agent_change(d)?,
+impl<'de> Deserialize<'de> for Update {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = WireUpdate::deserialize(deserializer)?;
+        let columns = usize::from(wire.size.0);
+        let palette = (!wire.palette.is_empty()).then(|| {
+            let (colors, _) = wire.palette.as_chunks::<3>();
+            Box::new(std::array::from_fn(|index| {
+                let [r, g, b] = colors[index];
+                Rgb { r, g, b }
+            }))
         });
-    }
-    let path = d.path()?;
-    Ok(match kind {
-        0 => FileResult::Read {
-            path,
-            offset: d.u64()?,
-            text: d.string(MAX_FRAME)?,
-            next_offset: d.u64()?,
-            has_more: d.bool()?,
-        },
-        1 => {
-            let count = d.count(65536)?;
-            let mut matches = Vec::with_capacity(count);
-            for _ in 0..count {
-                matches.push(FileMatch {
-                    path: d.path()?,
-                    line: d.u64()?,
-                    text: d.string(MAX_FRAME)?,
-                });
-            }
-            FileResult::Search {
-                path,
-                matches,
-                truncated: d.bool()?,
-            }
-        }
-        _ => return Err(invalid("invalid file result")),
-    })
-}
-
-fn encode_action(e: &mut Encoder, action: &Action) {
-    match action {
-        Action::AgentFile {
-            pane,
-            request,
-            path,
-            operation,
-        } => {
-            e.u8(37);
-            e.u64(*pane);
-            e.u64(*request);
-            e.path(path);
-            encode_file_operation(e, operation);
-        }
-        Action::CancelAgentFile { request } => {
-            e.u8(38);
-            e.u64(*request);
-        }
-        Action::AgentNewTab { pane, request } => {
-            e.u8(39);
-            e.u64(*pane);
-            e.u64(*request);
-        }
-        Action::ScreenRequest { request, wait } => {
-            e.u8(32);
-            e.u64(*request);
-            e.bool(*wait);
-        }
-        Action::AgentOpen => e.u8(27),
-        Action::AgentView(payload) => {
-            e.u8(28);
-            e.bytes(payload);
-        }
-        Action::AgentRequest(payload) => {
-            e.u8(29);
-            e.bytes(payload);
-        }
-        Action::AgentAttach { name, token } => {
-            e.u8(30);
-            e.string(name);
-            e.bytes(token);
-        }
-        Action::AgentUpdate(patch) => {
-            e.u8(31);
-            encode_agent_model(e, patch);
-        }
-        Action::AgentRemove(session) => {
-            e.u8(36);
-            e.u64(*session);
-        }
-        Action::Create { name, options } => {
-            e.u8(1);
-            e.string(name);
-            encode_options(e, options);
-        }
-        Action::Attach { name, size } => {
-            e.u8(2);
-            e.string(name);
-            e.size(*size);
-        }
-        Action::List => e.u8(3),
-        Action::Input { pane, data } => encode_input(e, *pane, data),
-        Action::AgentInput {
-            pane,
-            request,
-            generation,
-            prompt,
-            data,
-        } => {
-            e.u8(33);
-            e.u64(*pane);
-            e.u64(*request);
-            e.u64(*generation);
-            e.optional(*prompt, Encoder::u64);
-            e.bytes(data);
-        }
-        Action::CancelHistory { request } => {
-            e.u8(35);
-            e.u64(*request);
-        }
-        Action::ReadHistory {
-            pane,
-            request,
-            block,
-            cursor,
-            query,
-        } => {
-            e.u8(34);
-            e.u64(*pane);
-            e.u64(*request);
-            e.optional(*block, Encoder::u64);
-            e.optional(*cursor, Encoder::cursor);
-            e.optional(query.as_deref(), Encoder::string);
-        }
-        Action::Resize(size) => {
-            e.u8(5);
-            e.size(*size);
-        }
-        Action::Split { pane, axis } => {
-            e.u8(6);
-            e.u64(*pane);
-            e.u8(*axis as u8);
-        }
-        Action::ResizeSplit {
-            first,
-            second,
-            position,
-        } => {
-            e.u8(23);
-            e.u64(*first);
-            e.u64(*second);
-            e.u16(*position);
-        }
-        Action::NewTab { pane } => {
-            e.u8(7);
-            e.u64(*pane);
-        }
-        Action::Focus(pane) => {
-            e.u8(8);
-            e.u64(*pane);
-        }
-        Action::Navigate(direction) => {
-            e.u8(9);
-            e.u8(*direction as u8);
-        }
-        Action::Tab(delta) => {
-            e.u8(10);
-            e.i32(*delta);
-        }
-        Action::CloseTab(tab) => {
-            e.u8(22);
-            e.u64(*tab);
-        }
-        Action::ClosePane(pane) => {
-            e.u8(11);
-            e.u64(*pane);
-        }
-        Action::Scroll { pane, scroll } => {
-            e.u8(12);
-            e.u64(*pane);
-            match scroll {
-                Scroll::Delta(delta) => {
-                    e.u8(0);
-                    e.i32(*delta);
-                }
-                Scroll::Top => e.u8(1),
-                Scroll::Bottom => e.u8(2),
-            }
-        }
-        Action::SelectionStart {
-            pane,
-            point,
-            side,
-            kind,
-        } => {
-            e.u8(13);
-            e.u64(*pane);
-            e.point(*point);
-            e.u8(*side as u8);
-            e.u8(*kind as u8);
-        }
-        Action::SelectionUpdate { pane, point, side } => {
-            e.u8(14);
-            e.u64(*pane);
-            e.point(*point);
-            e.u8(*side as u8);
-        }
-        Action::CopySelection { pane, request } => {
-            e.u8(16);
-            e.u64(*pane);
-            e.u64(*request);
-        }
-        Action::PromptJump { pane, previous } => {
-            e.u8(17);
-            e.u64(*pane);
-            e.bool(*previous);
-        }
-        Action::CopyBlock {
-            pane,
-            block,
-            request,
-        } => {
-            e.u8(18);
-            e.u64(*pane);
-            e.u64(*block);
-            e.u64(*request);
-        }
-        Action::Search {
-            pane,
-            request,
-            query,
-        } => {
-            e.u8(24);
-            e.u64(*pane);
-            e.u64(*request);
-            e.string(query);
-        }
-        Action::SearchSelect {
-            pane,
-            request,
-            index,
-        } => {
-            e.u8(25);
-            e.u64(*pane);
-            e.u64(*request);
-            e.u32(*index);
-        }
-        Action::SearchCancel { pane, request } => {
-            e.u8(26);
-            e.u64(*pane);
-            e.u64(*request);
-        }
-        Action::Terminate => e.u8(19),
-        Action::Detach => e.u8(20),
-        Action::TerminateName(name) => {
-            e.u8(21);
-            e.string(name);
-        }
-    }
-}
-fn encode_input(e: &mut Encoder, pane: u64, data: &[u8]) {
-    e.u8(4);
-    e.u64(pane);
-    e.bytes(data);
-}
-fn decode_side(d: &mut Decoder<'_>) -> io::Result<Side> {
-    match d.u8()? {
-        0 => Ok(Side::Left),
-        1 => Ok(Side::Right),
-        _ => Err(invalid("invalid selection side")),
-    }
-}
-fn decode_action(d: &mut Decoder<'_>) -> io::Result<Action> {
-    Ok(match d.u8()? {
-        37 => Action::AgentFile {
-            pane: d.u64()?,
-            request: d.u64()?,
-            path: d.path()?,
-            operation: decode_file_operation(d)?,
-        },
-        38 => Action::CancelAgentFile { request: d.u64()? },
-        39 => Action::AgentNewTab {
-            pane: d.u64()?,
-            request: d.u64()?,
-        },
-        33 => Action::AgentInput {
-            pane: d.u64()?,
-            request: d.u64()?,
-            generation: d.u64()?,
-            prompt: d.optional(Decoder::u64)?,
-            data: d.bytes(MAX_FRAME)?.to_vec(),
-        },
-        35 => Action::CancelHistory { request: d.u64()? },
-        34 => Action::ReadHistory {
-            pane: d.u64()?,
-            request: d.u64()?,
-            block: d.optional(Decoder::u64)?,
-            cursor: d.optional(Decoder::cursor)?,
-            query: d.optional(|d| d.string(MAX_FRAME))?,
-        },
-        32 => Action::ScreenRequest {
-            request: d.u64()?,
-            wait: d.bool()?,
-        },
-        27 => Action::AgentOpen,
-        28 => Action::AgentView(d.bytes(MAX_FRAME)?.to_vec()),
-        29 => Action::AgentRequest(d.bytes(MAX_FRAME)?.to_vec()),
-        30 => Action::AgentAttach {
-            name: d.string(128)?,
-            token: d.bytes(64)?.to_vec(),
-        },
-        31 => Action::AgentUpdate(decode_agent_model(d)?),
-        36 => Action::AgentRemove(d.u64()?),
-        1 => Action::Create {
-            name: d.string(128)?,
-            options: decode_options(d)?,
-        },
-        2 => Action::Attach {
-            name: d.string(128)?,
-            size: d.size()?,
-        },
-        3 => Action::List,
-        4 => Action::Input {
-            pane: d.u64()?,
-            data: d.bytes(65536)?.to_vec(),
-        },
-        5 => Action::Resize(d.size()?),
-        6 => Action::Split {
-            pane: d.u64()?,
-            axis: match d.u8()? {
-                0 => Axis::LeftRight,
-                1 => Axis::TopBottom,
-                _ => return Err(invalid("invalid split axis")),
-            },
-        },
-        7 => Action::NewTab { pane: d.u64()? },
-        8 => Action::Focus(d.u64()?),
-        9 => Action::Navigate(match d.u8()? {
-            0 => Direction::Left,
-            1 => Direction::Down,
-            2 => Direction::Up,
-            3 => Direction::Right,
-            _ => return Err(invalid("invalid direction")),
-        }),
-        10 => Action::Tab(d.i32()?),
-        11 => Action::ClosePane(d.u64()?),
-        12 => Action::Scroll {
-            pane: d.u64()?,
-            scroll: match d.u8()? {
-                0 => Scroll::Delta(d.i32()?),
-                1 => Scroll::Top,
-                2 => Scroll::Bottom,
-                _ => return Err(invalid("invalid scroll operation")),
-            },
-        },
-        13 => Action::SelectionStart {
-            pane: d.u64()?,
-            point: d.point()?,
-            side: decode_side(d)?,
-            kind: match d.u8()? {
-                0 => SelectionType::Simple,
-                1 => SelectionType::Semantic,
-                2 => SelectionType::Lines,
-                _ => return Err(invalid("invalid selection kind")),
-            },
-        },
-        14 => Action::SelectionUpdate {
-            pane: d.u64()?,
-            point: d.point()?,
-            side: decode_side(d)?,
-        },
-        16 => Action::CopySelection {
-            pane: d.u64()?,
-            request: d.u64()?,
-        },
-        17 => Action::PromptJump {
-            pane: d.u64()?,
-            previous: d.bool()?,
-        },
-        18 => Action::CopyBlock {
-            pane: d.u64()?,
-            block: d.u64()?,
-            request: d.u64()?,
-        },
-        19 => Action::Terminate,
-        20 => Action::Detach,
-        21 => Action::TerminateName(d.string(128)?),
-        22 => Action::CloseTab(d.u64()?),
-        23 => Action::ResizeSplit {
-            first: d.u64()?,
-            second: d.u64()?,
-            position: d.u16()?,
-        },
-        24 => Action::Search {
-            pane: d.u64()?,
-            request: d.u64()?,
-            query: d.string(MAX_FRAME)?,
-        },
-        25 => Action::SearchSelect {
-            pane: d.u64()?,
-            request: d.u64()?,
-            index: d.u32()?,
-        },
-        26 => Action::SearchCancel {
-            pane: d.u64()?,
-            request: d.u64()?,
-        },
-        _ => return Err(invalid("unknown workspace action")),
-    })
-}
-fn encode_process(e: &mut Encoder, process: &crate::terminal::ProcessMetadata) {
-    e.strings(&process.launch_argv);
-    e.u32(process.child_pid);
-    e.u8(match process.has_children {
-        None => 0,
-        Some(false) => 1,
-        Some(true) => 2,
-    });
-    for pid in [process.foreground_pgid, process.foreground_pid] {
-        e.optional(pid, Encoder::u32);
-    }
-    e.optional(process.foreground_executable.as_deref(), Encoder::path);
-    e.optional(process.foreground_argv.as_deref(), Encoder::strings);
-    e.optional(process.foreground_cwd.as_deref(), Encoder::path);
-    e.optional(process.sampled_at_ms, Encoder::u64);
-    e.strings(&process.unavailable);
-}
-fn decode_process(d: &mut Decoder<'_>) -> io::Result<crate::terminal::ProcessMetadata> {
-    Ok(crate::terminal::ProcessMetadata {
-        launch_argv: d.strings(65536)?,
-        child_pid: d.u32()?,
-        has_children: match d.u8()? {
-            0 => None,
-            1 => Some(false),
-            2 => Some(true),
-            _ => return Err(invalid("invalid child process state")),
-        },
-        foreground_pgid: d.optional(Decoder::u32)?,
-        foreground_pid: d.optional(Decoder::u32)?,
-        foreground_executable: d.optional(Decoder::path)?,
-        foreground_argv: d.optional(|d| d.strings(65536))?,
-        foreground_cwd: d.optional(Decoder::path)?,
-        sampled_at_ms: d.optional(Decoder::u64)?,
-        unavailable: d.strings(16)?,
-    })
-}
-fn encode_command(e: &mut Encoder, command: &CommandBlock) {
-    e.u64(command.id);
-    e.bool(command.complete);
-    e.bool(command.has_output);
-    e.optional(command.elapsed_ms, Encoder::u64);
-    e.optional(command.status, Encoder::i32);
-}
-fn decode_command(d: &mut Decoder<'_>) -> io::Result<CommandBlock> {
-    Ok(CommandBlock {
-        id: d.u64()?,
-        complete: d.bool()?,
-        has_output: d.bool()?,
-        elapsed_ms: d.optional(Decoder::u64)?,
-        status: d.optional(Decoder::i32)?,
-    })
-}
-fn encode_snapshot(
-    e: &mut Encoder,
-    snapshot: &Snapshot,
-    previous: &HashMap<u64, Arc<ProcessMetadata>>,
-) -> bool {
-    let mut metadata_changed = previous.len() != snapshot.panes.len();
-    e.string(&snapshot.name);
-    e.bool(snapshot.controller);
-    e.u64(snapshot.focused);
-    e.u64(snapshot.active_tab);
-    e.u32(snapshot.tabs.len() as u32);
-    for tab in &snapshot.tabs {
-        e.u64(tab.id);
-        e.string(&tab.title);
-        e.u8(tab.activity as u8);
-    }
-    e.u32(snapshot.panes.len() as u32);
-    for pane in &snapshot.panes {
-        e.u64(pane.id);
-        e.u64(pane.tab);
-        e.u16(pane.rect.x);
-        e.u16(pane.rect.y);
-        e.u16(pane.rect.cols);
-        e.u16(pane.rect.rows);
-        e.string(&pane.title);
-        e.optional(pane.cwd.as_deref(), Encoder::path);
-        e.u64(pane.input_generation);
-        e.optional(pane.shell_prompt, Encoder::u64);
-        let process_changed = previous
-            .get(&pane.id)
-            .is_none_or(|process| !Arc::ptr_eq(process, &pane.process));
-        metadata_changed |= process_changed;
-        e.optional(
-            process_changed.then_some(pane.process.as_ref()),
-            encode_process,
-        );
-        e.u32(pane.blocks.len() as u32);
-        for block in &pane.blocks {
-            e.u64(block.id);
-            e.i32(block.line);
-            e.bool(block.complete);
-            e.optional(block.output, |e, (start, end)| {
-                e.point(start);
-                e.point(end);
-            });
-            e.optional(block.status, Encoder::i32);
-        }
-        e.u32(pane.command_blocks.len() as u32);
-        for block in &pane.command_blocks {
-            encode_command(e, block);
-        }
-    }
-    metadata_changed
-}
-fn decode_snapshot(d: &mut Decoder<'_>, previous: Option<&Snapshot>) -> io::Result<Snapshot> {
-    let name = d.string(128)?;
-    let previous = previous.filter(|snapshot| snapshot.name == name);
-    let controller = d.bool()?;
-    let focused = d.u64()?;
-    let active_tab = d.u64()?;
-    let count = d.count(1024)?;
-    let mut tabs = Vec::with_capacity(count);
-    for _ in 0..count {
-        tabs.push(TabView {
-            id: d.u64()?,
-            title: d.string(65536)?,
-            activity: match d.u8()? {
-                0 => crate::workspace::TabActivity::Idle,
-                1 => crate::workspace::TabActivity::Running,
-                2 => crate::workspace::TabActivity::Finished,
-                3 => crate::workspace::TabActivity::Failed,
-                4 => crate::workspace::TabActivity::Unknown,
-                _ => return Err(invalid("invalid tab activity")),
-            },
-        });
-    }
-    let count = d.count(1024)?;
-    let mut panes = Vec::with_capacity(count);
-    for _ in 0..count {
-        let id = d.u64()?;
-        let tab = d.u64()?;
-        let rect = crate::workspace::Rect {
-            x: d.u16()?,
-            y: d.u16()?,
-            cols: d.u16()?,
-            rows: d.u16()?,
-        };
-        let title = d.string(65536)?;
-        let cwd = d.optional(Decoder::path)?;
-        let input_generation = d.u64()?;
-        let shell_prompt = d.optional(Decoder::u64)?;
-        let process = if d.bool()? {
-            Arc::new(decode_process(d)?)
-        } else {
-            previous
-                .and_then(|snapshot| snapshot.matching_pane(panes.len(), id))
-                .map(|pane| Arc::clone(&pane.process))
-                .ok_or_else(|| invalid("pane process metadata has no prior snapshot"))?
-        };
-        let count = d.count(4096)?;
-        let mut blocks = Vec::with_capacity(count);
-        for _ in 0..count {
-            blocks.push(BlockMarker {
-                id: d.u64()?,
-                line: d.i32()?,
-                complete: d.bool()?,
-                output: d.optional(|d| Ok((d.point()?, d.point()?)))?,
-                status: d.optional(Decoder::i32)?,
-            });
-        }
-        let count = d.count(4)?;
-        let mut command_blocks = Vec::with_capacity(count);
-        for _ in 0..count {
-            command_blocks.push(decode_command(d)?);
-        }
-        panes.push(PaneView {
-            id,
-            tab,
-            rect,
-            title,
-            cwd,
-            process,
-            blocks,
-            command_blocks,
-            input_generation,
-            shell_prompt,
-        });
-    }
-    Ok(Snapshot {
-        name,
-        controller,
-        focused,
-        active_tab,
-        tabs,
-        panes,
-    })
-}
-fn encode_color(e: &mut Encoder, color: Color) {
-    match color {
-        Color::Named(name) => {
-            let [lo, hi] = (name as u16).to_le_bytes();
-            e.0.extend_from_slice(&[0, lo, hi]);
-        }
-        Color::Indexed(index) => e.0.extend_from_slice(&[1, index]),
-        Color::Spec(rgb) => e.0.extend_from_slice(&[2, rgb.r, rgb.g, rgb.b]),
-    }
-}
-fn decode_color(d: &mut Decoder<'_>) -> io::Result<Color> {
-    match d.u8()? {
-        0 => Ok(Color::Named(
-            NamedColor::from_index(d.u16()?).ok_or_else(|| invalid("invalid named color"))?,
-        )),
-        1 => Ok(Color::Indexed(d.u8()?)),
-        2 => {
-            let [r, g, b] = d.take(3)?.try_into().unwrap();
-            Ok(Color::Spec(Rgb { r, g, b }))
-        }
-        _ => Err(invalid("invalid color kind")),
-    }
-}
-// Keep the bulk palette copy out of the hot row encoder.
-#[inline(never)]
-fn encode_palette(e: &mut Encoder, palette: &[Rgb; PALETTE_SIZE]) {
-    let bytes = palette.map(|rgb| [rgb.r, rgb.g, rgb.b]);
-    e.0.extend_from_slice(bytes.as_flattened());
-}
-fn encode_update(e: &mut Encoder, update: &Update) {
-    e.u16(update.columns as u16);
-    e.u16(update.lines as u16);
-    e.point(update.cursor.0);
-    e.u8(update.cursor.1 as u8);
-    e.u32(update.mode.bits());
-    e.u64(update.offset as u64);
-    e.u64(update.history as u64);
-    e.optional(update.selection, |e, selection| {
-        e.point(selection.start);
-        e.point(selection.end);
-    });
-    e.optional(update.palette.as_deref(), encode_palette);
-    e.u32(update.rows.len() as u32);
-    for (index, row) in &update.rows {
-        e.u16(*index as u16);
-        e.bool(row.wrapped);
-        e.u16(row.used() as u16);
-        // The reflow text length does not cover every styled blank or wide-wrap cell.
-        let stored = row.non_default_len();
-        e.u16(stored as u16);
-        e.0.reserve(stored);
-        let length_at = e.0.len();
-        e.u16(0);
-        for cell in &row.cells[..stored] {
-            if cell.c.is_ascii() {
-                e.u8(cell.c as u8);
-            } else {
-                e.0.extend_from_slice(cell.c.encode_utf8(&mut [0; 4]).as_bytes());
-            }
-        }
-        let length = (e.0.len() - length_at - 2) as u16;
-        e.0[length_at..length_at + 2].copy_from_slice(&length.to_le_bytes());
-        for run in row.cells[..stored].chunk_by(|left, right| {
-            left.fg == right.fg && left.bg == right.bg && left.flags == right.flags
-        }) {
-            let style = run[0];
-            e.u16(run.len() as u16);
-            encode_color(e, style.fg);
-            encode_color(e, style.bg);
-            e.u16(style.flags.bits());
-        }
-        e.u32(row.extras().len() as u32);
-        for (column, extra) in row.extras() {
-            e.u16(*column as u16);
-            let zerowidth = extra.zerowidth.as_slice();
-            e.u32(zerowidth.iter().map(|ch| ch.len_utf8()).sum::<usize>() as u32);
-            for ch in zerowidth {
-                e.0.extend_from_slice(ch.encode_utf8(&mut [0; 4]).as_bytes());
-            }
-            e.optional(extra.underline_color, encode_color);
-        }
-    }
-}
-fn decode_update(d: &mut Decoder<'_>) -> io::Result<Update> {
-    let columns = d.u16()? as usize;
-    let lines = d.u16()? as usize;
-    if !(1..=MAX_COLUMNS).contains(&columns)
-        || lines == 0
-        || lines > MAX_LINES
-        || columns * lines > MAX_CELLS
-    {
-        return Err(invalid("invalid screen dimensions"));
-    }
-    let cursor_point = d.point()?;
-    let shape = match d.u8()? {
-        0 => CursorShape::Block,
-        1 => CursorShape::Underline,
-        2 => CursorShape::Beam,
-        3 => CursorShape::Hidden,
-        _ => return Err(invalid("invalid cursor shape")),
-    };
-    if cursor_point.column >= columns {
-        return Err(invalid("cursor exceeds screen columns"));
-    }
-    let mode = Mode::from_bits(d.u32()?).ok_or_else(|| invalid("invalid terminal mode"))?;
-    let offset = usize::try_from(d.u64()?).map_err(|_| invalid("display offset overflow"))?;
-    let history = usize::try_from(d.u64()?).map_err(|_| invalid("history size overflow"))?;
-    let selection = d.optional(|d| {
-        Ok(SelectionRange {
-            start: d.point()?,
-            end: d.point()?,
-        })
-    })?;
-    let palette = d.optional(|d| {
-        let (colors, _) = d.take(PALETTE_SIZE * 3)?.as_chunks::<3>();
-        Ok(Box::new(std::array::from_fn(|index| {
-            let [r, g, b] = colors[index];
-            Rgb { r, g, b }
-        })))
-    })?;
-    let count = d.count(lines)?;
-    let mut rows = Vec::with_capacity(count);
-    let mut seen = [0u64; MAX_LINES.div_ceil(64)];
-    for _ in 0..count {
-        let index = d.u16()? as usize;
-        let mask = 1u64 << (index & 63);
-        if index >= lines || seen[index >> 6] & mask != 0 {
-            return Err(invalid("duplicate or invalid screen row"));
-        }
-        seen[index >> 6] |= mask;
-        let wrapped = d.bool()?;
-        let used = d.u16()? as usize;
-        let stored = d.u16()? as usize;
-        if stored > columns {
-            return Err(invalid("screen row exceeds columns"));
-        }
-        let length = d.u16()? as usize;
-        if length < stored || length > stored * 4 {
-            return Err(invalid("invalid screen text length"));
-        }
-        let text = d.take(length)?;
-        let ascii = stored != 0 && length == stored;
-        // ASCII also proves UTF-8 validity; only other rows need scalar decoding.
-        let mut chars = if ascii && text.is_ascii() {
-            "".chars()
-        } else {
-            let text = std::str::from_utf8(text)
-                .map_err(|_| invalid("invalid screen character encoding"))?;
-            if ascii {
-                return Err(invalid("missing screen characters"));
-            }
-            text.chars()
-        };
-        let mut cells = Vec::with_capacity(columns);
-        while cells.len() < stored {
-            let count = d.u16()? as usize;
-            if count == 0 || count > stored - cells.len() {
-                return Err(invalid("invalid screen style run length"));
-            }
-            let fg = decode_color(d)?;
-            let bg = decode_color(d)?;
-            let flags = Flags::from_bits(d.u16()?).ok_or_else(|| invalid("invalid cell flags"))?;
-            if count == 1 {
-                let c = if ascii {
-                    char::from(text[cells.len()])
-                } else {
-                    chars
-                        .next()
-                        .ok_or_else(|| invalid("missing screen characters"))?
-                };
-                cells.push(Cell { c, fg, bg, flags });
-            } else if ascii {
-                let end = cells.len() + count;
-                cells.extend(text[cells.len()..end].iter().map(|&c| Cell {
-                    c: char::from(c),
+        let mut rows = Vec::with_capacity(wire.rows.len());
+        for row in wire.rows {
+            let index = usize::from(row.index);
+            let mut chars = row.text.chars();
+            let mut cells = Vec::with_capacity(columns);
+            for (count, fg, bg, flags) in row.runs {
+                let flags = Flags::from_bits(flags);
+                cells.extend(chars.by_ref().take(usize::from(count)).map(|c| Cell {
+                    c,
                     fg,
                     bg,
                     flags,
                 }));
-            } else {
-                let end = cells.len() + count;
-                cells.extend((&mut chars).take(count).map(|c| Cell { c, fg, bg, flags }));
-                if cells.len() != end {
-                    return Err(invalid("missing screen characters"));
-                }
             }
-        }
-        if !ascii && chars.next().is_some() {
-            return Err(invalid("screen text exceeds columns"));
-        }
-        cells.resize(columns, Cell::default());
-        let count = d.count(columns)?;
-        let mut extras = Vec::with_capacity(count);
-        for _ in 0..count {
-            let column = d.u16()? as usize;
-            let bytes = d.bytes(65536)?;
-            let zerowidth = std::str::from_utf8(bytes)
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-                .chars()
+            cells.resize(columns, Cell::default());
+            let extras = row
+                .extras
+                .into_iter()
+                .map(|(column, text, underline_color)| {
+                    let zerowidth = text.chars().collect();
+                    let extra = Extra {
+                        zerowidth,
+                        underline_color,
+                    };
+                    (usize::from(column), extra)
+                })
                 .collect();
-            let underline_color = d.optional(decode_color)?;
-            extras.push((
-                column,
-                Extra {
-                    zerowidth,
-                    underline_color,
-                },
-            ));
+            let row = Row::from_parts(cells, row.wrapped, usize::from(row.used), extras);
+            rows.push((index, row));
         }
-        let row = Row::from_parts(cells, wrapped, used, extras)
-            .ok_or_else(|| invalid("invalid screen row contents"))?;
-        rows.push((index, row));
+        Ok(Update {
+            columns,
+            lines: usize::from(wire.size.1),
+            rows,
+            cursor: wire.cursor,
+            mode: Mode::from_bits(wire.mode),
+            palette,
+            selection: wire.selection,
+            offset: wire.offset as usize,
+            history: wire.history as usize,
+        })
     }
-    Ok(Update {
-        columns,
-        lines,
-        rows,
-        cursor: (cursor_point, shape),
-        mode,
-        palette,
-        selection,
-        offset,
-        history,
-    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent_files::{AgentChange, FileMatch, FileOperation, FileResult};
+    use crate::core::WindowSize;
+    use crate::workspace::AgentModelPatch;
+    use std::os::unix::ffi::OsStringExt;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+
+    fn pair() -> (Peer, Peer) {
+        let (left, right) = UnixStream::pair().unwrap();
+        (Peer::new(left).unwrap(), Peer::new(right).unwrap())
+    }
+
+    // A child process forked by another test can hold the closed end open for a moment.
+    fn eof<T>(mut next: impl FnMut() -> io::Result<T>) -> io::Error {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if let Err(error) = next() {
+                return error;
+            }
+            assert!(std::time::Instant::now() < deadline, "no EOF");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
 
     #[test]
-    fn agent_change_snapshot_roundtrips_with_native_file_paths() {
-        let mut patch = AgentModelPatch {
+    fn messages_keep_bytes_and_native_paths() {
+        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/source-\xff".to_vec()));
+        let patch = AgentModelPatch {
             session: 3,
-            changes_omitted: 2,
-            changes: Some(
-                vec![AgentChange {
-                    turn: 9,
-                    tool_id: "9:0:0:edit-tool".into(),
-                    path: PathBuf::from("/tmp/中文.rs"),
-                    added: 2,
-                    removed: 1,
-                    diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
-                    truncated: true,
-                }]
-                .into(),
-            ),
+            changes: Some(Arc::new(vec![AgentChange {
+                path: path.clone(),
+                added: 2,
+                diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
+                ..AgentChange::default()
+            }])),
             ..AgentModelPatch::default()
         };
-        for changes in [patch.changes.clone(), None, Some(Arc::default())] {
-            patch.changes = changes;
-            let mut encoder = Encoder::new();
-            encode_agent_model(&mut encoder, &patch);
-            let mut decoder = Decoder::new(&encoder.0[4..]).unwrap();
-            assert_eq!(decode_agent_model(&mut decoder).unwrap(), patch);
-        }
-    }
-
-    #[test]
-    fn agent_workspace_actions_roundtrip() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let path = PathBuf::from(std::ffi::OsString::from_vec(b"source-\xff".to_vec()));
-        for (request, operation) in [
-            (1, FileOperation::Read { offset: 17 }),
-            (
-                2,
-                FileOperation::Search {
-                    query: "literal\nquery".into(),
-                },
-            ),
-            (
-                3,
-                FileOperation::Edit {
-                    old_text: Some("before".into()),
-                    new_text: "after\n你好".into(),
-                },
-            ),
-            (
-                4,
-                FileOperation::Edit {
-                    old_text: None,
-                    new_text: String::new(),
-                },
-            ),
-        ] {
-            sender
-                .send_action(&Action::AgentFile {
-                    pane: 19,
-                    request,
-                    path: path.clone(),
-                    operation: operation.clone(),
-                })
-                .unwrap();
-            sender.flush().unwrap();
-            let actual = receiver.next_action().unwrap().unwrap();
-            assert!(
-                matches!(actual, Action::AgentFile { pane: 19, request: actual_request, path: actual_path, operation: actual_operation } if actual_request == request && actual_path == path && actual_operation == operation)
-            );
-        }
-        sender
-            .send_action(&Action::CancelAgentFile { request: 3 })
-            .unwrap();
-        sender
-            .send_action(&Action::AgentNewTab {
-                pane: 19,
-                request: 5,
-            })
-            .unwrap();
-        sender.flush().unwrap();
-        assert!(matches!(
-            receiver.next_action().unwrap().unwrap(),
-            Action::CancelAgentFile { request: 3 }
-        ));
-        assert!(matches!(
-            receiver.next_action().unwrap().unwrap(),
-            Action::AgentNewTab {
-                pane: 19,
-                request: 5
-            }
-        ));
-    }
-
-    #[test]
-    fn agent_workspace_responses_roundtrip_over_remote_transport() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        let path = PathBuf::from(std::ffi::OsString::from_vec(b"/source-\xff".to_vec()));
-        let expected = vec![
-            (
-                1,
-                Ok(FileResult::Read {
-                    path: path.clone(),
-                    offset: 17,
-                    text: "你好\n".into(),
-                    next_offset: 24,
-                    has_more: true,
-                }),
-            ),
-            (
-                2,
-                Ok(FileResult::Search {
-                    path: path.clone(),
-                    matches: vec![FileMatch {
-                        path: path.join("a"),
-                        line: 19,
-                        text: "needle line".into(),
-                    }],
-                    truncated: true,
-                }),
-            ),
-            (
-                3,
-                Ok(FileResult::Edited {
-                    change: AgentChange {
-                        path,
-                        added: 2,
-                        removed: 1,
-                        diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
-                        ..AgentChange::default()
-                    },
-                }),
-            ),
-            (4, Err("file request cancelled".into())),
-        ];
-        for (request, result) in &expected {
-            sender
-                .send_response(Response::AgentFile {
-                    request: *request,
-                    result: result.clone(),
-                })
-                .unwrap();
-        }
-        sender
-            .send_response(Response::AgentNewTab {
-                request: 5,
-                result: Ok(27),
-            })
-            .unwrap();
-        sender
-            .send_response(Response::AgentNewTab {
-                request: 6,
-                result: Err("pane does not exist".into()),
-            })
-            .unwrap();
-        sender.flush().unwrap();
-        let mut actual = Vec::new();
-        let mut tabs = Vec::new();
-        for response in receiver.responses(None).unwrap() {
-            match response {
-                Response::AgentFile { request, result } => actual.push((request, result)),
-                Response::AgentNewTab { request, result } => tabs.push((request, result)),
-                _ => panic!("unexpected response"),
-            }
-        }
-        assert_eq!(actual, expected);
-        assert_eq!(
-            tabs,
-            vec![(5, Ok(27)), (6, Err("pane does not exist".into()))]
-        );
-    }
-
-    #[test]
-    fn process_deltas_inherit_the_latest_snapshot_in_and_across_reads() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        let mut snapshot = Snapshot {
-            name: "delta".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: Vec::new(),
-            panes: vec![PaneView {
-                id: 1,
-                tab: 1,
-                rect: crate::workspace::Rect::default(),
-                title: String::new(),
-                cwd: None,
-                process: Arc::new(ProcessMetadata {
-                    child_pid: 1,
-                    foreground_argv: Some(vec!["old".into()]),
-                    ..ProcessMetadata::default()
-                }),
-                blocks: Vec::new(),
-                command_blocks: Vec::new(),
-                input_generation: 0,
-                shell_prompt: None,
-            }],
-        };
-        let mut known = HashMap::new();
-        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
-        let full_size = sender.queued;
-        known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
-        assert!(sender.queued - full_size < full_size);
-        sender
-            .send_response(Response::Error("marker".into()))
-            .unwrap();
-        snapshot.panes[0].process = Arc::new(ProcessMetadata {
-            child_pid: 1,
-            foreground_argv: Some(vec!["new".into()]),
-            ..ProcessMetadata::default()
-        });
-        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
-        known.insert(1, Arc::clone(&snapshot.panes[0].process));
-        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
-        sender.flush().unwrap();
-        let responses = receiver.responses(None).unwrap();
-        let [
-            Response::State(first, _, _),
-            Response::State(second, _, _),
-            Response::Error(_),
-            Response::State(changed, _, _),
-            Response::State(last, _, _),
-        ] = responses.as_slice()
-        else {
-            panic!("state sequence changed")
-        };
-        assert!(Arc::ptr_eq(
-            &first.panes[0].process,
-            &second.panes[0].process
-        ));
-        assert_eq!(
-            first.panes[0].process.foreground_argv.as_ref().unwrap(),
-            &["old"]
-        );
-        assert_eq!(
-            changed.panes[0].process.foreground_argv.as_ref().unwrap(),
-            &["new"]
-        );
-        assert!(Arc::ptr_eq(
-            &changed.panes[0].process,
-            &last.panes[0].process
-        ));
-        assert!(!sender.send_state(&snapshot, &[], &known, 0).unwrap());
-        sender.flush().unwrap();
-        let next = receiver.responses(Some(last)).unwrap();
-        let Response::State(next, _, _) = &next[0] else {
-            panic!("state not delivered")
-        };
-        assert!(Arc::ptr_eq(&last.panes[0].process, &next.panes[0].process));
-        known.insert(2, Arc::new(ProcessMetadata::default()));
-        assert!(sender.send_state(&snapshot, &[], &known, 0).unwrap());
-    }
-
-    #[test]
-    fn remote_state_preserves_process_metadata_and_unknown_fields() {
-        let expected = crate::terminal::ProcessMetadata {
-            launch_argv: vec!["gdb".into(), "--args".into(), "sudo".into()],
-            child_pid: 21,
-            has_children: None,
-            foreground_pgid: Some(22),
-            foreground_pid: Some(22),
-            foreground_executable: Some("/usr/bin/gdb".into()),
-            foreground_argv: Some(vec!["gdb".into(), "".into(), "调试".into()]),
-            foreground_cwd: None,
-            sampled_at_ms: Some(123456),
-            unavailable: vec!["foreground cwd: Permission denied (os error 13)".into()],
-        };
-        let command_blocks = vec![
-            CommandBlock {
-                id: 42,
-                complete: false,
-                status: Some(7),
-                has_output: true,
-                elapsed_ms: Some(1250),
-            },
-            CommandBlock {
-                id: 43,
-                complete: false,
-                status: None,
-                has_output: false,
-                elapsed_ms: None,
-            },
-        ];
-        let snapshot = Snapshot {
-            name: "remote".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: Vec::new(),
-            panes: vec![PaneView {
-                id: 1,
-                tab: 1,
-                rect: crate::workspace::Rect::default(),
-                title: "debugger".into(),
-                cwd: None,
-                process: Arc::new(expected.clone()),
-                blocks: Vec::new(),
-                command_blocks: command_blocks.clone(),
-                input_generation: 23,
-                shell_prompt: Some(44),
-            }],
-        };
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender
-            .send_response(Response::State(snapshot, Vec::new(), 0))
-            .unwrap();
-        sender.flush().unwrap();
-        receiver.read().unwrap();
-        let responses = receiver.responses(None).unwrap();
-        let Response::State(snapshot, _, _) = &responses[0] else {
-            panic!("state not delivered")
-        };
-        assert_eq!(*snapshot.panes[0].process, expected);
-        assert_eq!(snapshot.panes[0].input_generation, 23);
-        assert_eq!(snapshot.panes[0].shell_prompt, Some(44));
-        assert_eq!(snapshot.panes[0].command_blocks, command_blocks);
-    }
-
-    #[test]
-    fn history_response_preserves_eof_cursor_search_and_command_facts() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        let cursor = HistoryCursor {
-            epoch: 7,
-            row: 21,
-            offset: 5,
-        };
-        for (request, matched) in [None, Some(false), Some(true)].into_iter().enumerate() {
-            sender
-                .send_response(Response::History {
-                    request: request as u64,
-                    result: Ok(HistoryPage {
-                        text: "中ab".into(),
-                        cursor,
-                        has_more: false,
-                        matched,
-                        incomplete: true,
-                        command: Some(CommandBlock {
-                            id: 9,
-                            complete: true,
-                            status: Some(7),
-                            has_output: true,
-                            elapsed_ms: Some(1250),
-                        }),
-                    }),
-                })
-                .unwrap();
-        }
-        sender.flush().unwrap();
-        let responses = receiver.responses(None).unwrap();
-        assert_eq!(responses.len(), 3);
-        for (response, matched) in responses.iter().zip([None, Some(false), Some(true)]) {
-            let Response::History {
-                result: Ok(page), ..
-            } = response
-            else {
-                panic!("history page not delivered")
-            };
-            assert_eq!(page.text, "中ab");
-            assert_eq!(page.cursor, cursor);
-            assert!(!page.has_more);
-            assert_eq!(page.matched, matched);
-            assert!(page.incomplete);
-            assert_eq!(page.command.as_ref().unwrap().status, Some(7));
-        }
-    }
-    #[test]
-    fn search_results_follow_remote_greeting_without_clipboard_state() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender.send_hello(1).unwrap();
-        sender.flush().unwrap();
-        assert_eq!(receiver.hello().unwrap(), Some(1));
-        sender
-            .send_response(Response::Search {
-                pane: 3,
-                request: 4,
-                count: 10_000,
-                truncated: true,
-            })
-            .unwrap();
-        sender.flush().unwrap();
-        receiver.read().unwrap();
-        let responses = receiver.responses(None).unwrap();
-        assert!(matches!(
-            &responses[..],
-            [Response::Search {
-                pane: 3,
-                request: 4,
-                count: 10_000,
-                truncated: true
-            }]
-        ));
-    }
-    #[test]
-    fn bulk_receive_storage_is_reused_until_small_messages_resume() {
-        fn transfer(sender: &mut Peer, receiver: &mut Peer, expected: &str) {
-            sender
-                .send_response(Response::ClipboardStore {
-                    primary: false,
-                    text: expected.into(),
-                })
-                .unwrap();
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-            loop {
-                sender.flush().unwrap();
-                let messages = receiver.responses(None).unwrap();
-                if !messages.is_empty() {
-                    assert_eq!(messages.len(), 1);
-                    assert!(
-                        matches!(&messages[0], Response::ClipboardStore { text, .. } if text == expected)
-                    );
-                    break;
-                }
-                assert!(
-                    std::time::Instant::now() < deadline,
-                    "message transfer stalled"
-                );
-            }
-        }
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let large = "x".repeat(1024 * 1024);
-        transfer(&mut sender, &mut receiver, &large);
-        assert!(receiver.responses(None).unwrap().is_empty());
-        let capacity = receiver.input.capacity();
-        transfer(&mut sender, &mut receiver, &large);
-        assert!(receiver.responses(None).unwrap().is_empty());
-        assert_eq!(receiver.input.capacity(), capacity);
-        transfer(&mut sender, &mut receiver, "done");
-        assert!(receiver.responses(None).unwrap().is_empty());
-        assert!(receiver.input.capacity() < capacity / 2);
-    }
-
-    #[test]
-    fn partial_and_coalesced_frames_roundtrip() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        sender
-            .send_action(&Action::Input {
+        let actions = [
+            Action::Input {
                 pane: 42,
-                data: "你好\u{1b}[A".as_bytes().to_vec(),
-            })
-            .unwrap();
-        sender.send_action(&Action::List).unwrap();
+                data: "中e\u{301}\x1b[A".as_bytes().to_vec(),
+            },
+            Action::AgentFile {
+                pane: 1,
+                request: 2,
+                path: path.clone(),
+                operation: FileOperation::Search {
+                    query: "needle".into(),
+                },
+            },
+            Action::AgentUpdate(patch),
+        ];
+        let (mut sender, mut receiver) = pair();
+        for action in &actions {
+            sender.send_action(action).unwrap();
+        }
         sender.flush().unwrap();
-        let first = receiver.next_action().unwrap().unwrap();
-        let second = receiver.next_action().unwrap().unwrap();
-        assert!(
-            matches!(first, Action::Input { pane: 42, data } if data == "你好\u{1b}[A".as_bytes())
-        );
-        assert!(matches!(second, Action::List));
+        for action in &actions {
+            let received = receiver.next_action().unwrap().unwrap();
+            assert_eq!(format!("{received:?}"), format!("{action:?}"));
+        }
+        let results = [
+            Ok(FileResult::Read {
+                path: path.clone(),
+                offset: 17,
+                text: "你好\n".into(),
+                next_offset: 24,
+                has_more: true,
+            }),
+            Ok(FileResult::Search {
+                path: path.clone(),
+                matches: vec![FileMatch {
+                    path: path.join("a"),
+                    line: 19,
+                    text: "needle line".into(),
+                }],
+                truncated: true,
+            }),
+            Err("file request cancelled".into()),
+        ];
+        for (request, result) in results.iter().enumerate() {
+            let result = result.clone();
+            receiver
+                .send_response(Response::AgentFile {
+                    request: request as u64,
+                    result,
+                })
+                .unwrap();
+        }
+        receiver.flush().unwrap();
+        let received = sender.responses().unwrap();
+        assert_eq!(received.len(), results.len());
+        for (response, expected) in received.into_iter().zip(results) {
+            let Response::AgentFile { result, .. } = response else {
+                panic!("unexpected response");
+            };
+            assert_eq!(result, expected);
+        }
     }
+
     #[test]
-    fn coalesced_actions_preserve_a_fragmented_trailing_frame_and_final_eof() {
+    fn coalesced_and_fragmented_frames_arrive_in_order_before_eof() {
         let (mut left, right) = UnixStream::pair().unwrap();
         let mut receiver = Peer::new(right).unwrap();
-        let mut encoder = Encoder::new();
-        encode_action(&mut encoder, &Action::List);
-        let mut frame = encoder.0;
-        let length = (frame.len() - 4) as u32;
-        frame[..4].copy_from_slice(&length.to_le_bytes());
+        let frame = encode(&Action::Input {
+            pane: 3,
+            data: b"fragment".to_vec(),
+        })
+        .unwrap();
         left.write_all(&frame.repeat(256)).unwrap();
         left.write_all(&frame[..2]).unwrap();
         for _ in 0..256 {
             assert!(matches!(
                 receiver.next_action().unwrap(),
-                Some(Action::List)
+                Some(Action::Input { pane: 3, .. })
             ));
         }
         assert!(receiver.next_action().unwrap().is_none());
-        left.write_all(&frame[2..]).unwrap();
+        left.write_all(&frame[2..8]).unwrap();
+        assert!(receiver.next_action().unwrap().is_none());
+        left.write_all(&frame[8..]).unwrap();
         drop(left);
         assert!(matches!(
             receiver.next_action().unwrap(),
-            Some(Action::List)
+            Some(Action::Input { pane: 3, data }) if data == b"fragment"
         ));
         assert_eq!(
-            receiver.next_action().err().unwrap().kind(),
+            eof(|| receiver.next_action()).kind(),
             io::ErrorKind::UnexpectedEof
         );
     }
+
     #[test]
-    fn framed_relay_preserves_bytes_fragments_and_final_eof() {
-        let (mut source, input) = UnixStream::pair().unwrap();
-        let (output, sink) = UnixStream::pair().unwrap();
-        let mut relay_input = Peer::remote(input).unwrap();
-        let mut relay_output = Peer::new(output).unwrap();
-        let mut receiver = Peer::new(sink).unwrap();
-        let mut encoder = Encoder::new();
-        encode_action(
-            &mut encoder,
-            &Action::Input {
-                pane: 42,
-                data: "中e\u{301}\x1b[A".as_bytes().to_vec(),
-            },
-        );
-        let mut bytes = encoder.0;
-        let length = (bytes.len() - 4) as u32;
-        bytes[..4].copy_from_slice(&length.to_le_bytes());
-        source.write_all(&bytes[..2]).unwrap();
-        assert!(relay_input.next_frame().unwrap().is_none());
-        source.write_all(&bytes[2..8]).unwrap();
-        assert!(relay_input.next_frame().unwrap().is_none());
-        source.write_all(&bytes[8..]).unwrap();
-        source.write_all(&bytes[..3]).unwrap();
-        let frame = relay_input.next_frame().unwrap().unwrap();
-        assert_eq!(frame.kind(), 4);
-        relay_output.send_frame(frame).unwrap();
-        assert_eq!(relay_output.output.front().unwrap().bytes, bytes);
-        assert!(relay_input.next_frame().unwrap().is_none());
-        source.write_all(&bytes[3..]).unwrap();
-        drop(source);
-        relay_output
-            .send_frame(relay_input.next_frame().unwrap().unwrap())
-            .unwrap();
+    fn complete_final_message_is_delivered_before_eof() {
+        let (mut sender, mut receiver) = pair();
+        sender.send_response(Response::Detached).unwrap();
+        sender.flush().unwrap();
+        drop(sender);
+        assert!(matches!(
+            receiver.responses().unwrap().as_slice(),
+            [Response::Detached]
+        ));
         assert_eq!(
-            relay_input.next_frame().err().unwrap().kind(),
+            eof(|| receiver.responses()).kind(),
             io::ErrorKind::UnexpectedEof
         );
-        relay_output.flush().unwrap();
-        for _ in 0..2 {
-            assert!(matches!(
-                receiver.next_action().unwrap(),
-                Some(Action::Input { pane: 42, data }) if data == "中e\u{301}\x1b[A".as_bytes()
-            ));
-        }
     }
+
     #[test]
-    fn framed_relay_checks_lengths_versions_and_remote_descriptors() {
-        for bytes in [
-            0u32.to_le_bytes().to_vec(),
-            (MAX_FRAME as u32 + 1).to_le_bytes().to_vec(),
-            vec![2, 0, 0, 0, VERSION + 1, 1],
-            vec![1, 0, 0, 0, VERSION],
-        ] {
-            let (mut source, input) = UnixStream::pair().unwrap();
-            source.write_all(&bytes).unwrap();
-            assert_eq!(
-                Peer::remote(input)
-                    .unwrap()
-                    .next_frame()
-                    .err()
-                    .unwrap()
-                    .kind(),
-                io::ErrorKind::InvalidData
+    fn large_input_is_chunked_in_order_and_rejected_atomically_when_too_large() {
+        let (mut sender, mut receiver) = pair();
+        let data: Vec<_> = (0..200000).map(|i| (i % 251) as u8).collect();
+        sender.send_input(9, &data).unwrap();
+        let mut received = Vec::new();
+        while received.len() < data.len() {
+            sender.flush().unwrap();
+            while let Some(action) = receiver.next_action().unwrap() {
+                let Action::Input { pane, data } = action else {
+                    panic!("wrong action");
+                };
+                assert_eq!(pane, 9);
+                assert!(data.len() <= 65536);
+                received.extend(data);
+            }
+        }
+        assert_eq!(received, data);
+        assert!(sender.send_input(9, &vec![0; MAX_PENDING]).is_err());
+        assert!(!sender.pending());
+    }
+
+    #[test]
+    fn updates_roundtrip_through_the_row_codec() {
+        let mut core = crate::core::Core::new(
+            WindowSize {
+                num_cols: 4096,
+                num_lines: 3,
+                cell_width: 0,
+                cell_height: 0,
+            },
+            0xcccccc,
+            0x202020,
+        );
+        let mut parser = crate::vt::Parser::new();
+        parser.advance(
+            &mut core,
+            "\x1b[1;31mA中e\u{301}\x1b[0m plain\r\n\x1b[1;4]\x1b]133;P;1\x07".as_bytes(),
+        );
+        for column in 0..2000 {
+            parser.advance(
+                &mut core,
+                format!("\x1b[38;2;{};{};0m中", column % 256, column / 16 % 256).as_bytes(),
             );
         }
-        let (source, input) = UnixStream::pair().unwrap();
-        let mut source = Peer::new(source).unwrap();
-        source
-            .send_response(Response::Clipboard {
-                request: 7,
-                file: File::open("Cargo.toml").unwrap(),
-                incomplete: false,
-            })
-            .unwrap();
-        source.flush().unwrap();
-        let error = Peer::remote(input).unwrap().next_frame().err().unwrap();
-        assert!(
-            error
-                .to_string()
-                .contains("cannot contain file descriptors")
-        );
-    }
-    #[test]
-    fn framed_clipboard_uses_the_local_descriptor() {
-        let (source, input) = UnixStream::pair().unwrap();
-        let mut source = Peer::new(source).unwrap();
-        let mut receiver = Peer::new(input).unwrap();
-        source
-            .send_response(Response::Clipboard {
-                request: 91,
-                file: File::open("Cargo.toml").unwrap(),
-                incomplete: true,
-            })
-            .unwrap();
-        source.flush().unwrap();
-        let frame = receiver.next_frame().unwrap().unwrap();
-        assert_eq!(frame.kind(), 3);
-        let (request, mut file, incomplete) = receiver.take_clipboard(frame).unwrap();
-        assert_eq!(request, 91);
-        assert!(incomplete);
-        use std::io::Read;
-        let mut text = String::new();
-        file.read_to_string(&mut text).unwrap();
-        assert!(text.starts_with("[package]"));
-        assert!(receiver.files.is_empty());
-    }
-    #[test]
-    fn clipboard_file_descriptor_is_transferred_without_copying_payload() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let file = File::open("Cargo.toml").unwrap();
-        sender
-            .send_response(Response::Clipboard {
-                request: 7,
-                file,
-                incomplete: true,
-            })
-            .unwrap();
-        sender.flush().unwrap();
-        let response = receiver.responses(None).unwrap().pop().unwrap();
-        if let Response::Clipboard {
-            request,
-            mut file,
-            incomplete,
-        } = response
-        {
-            use std::io::Read;
-            let mut text = String::new();
-            file.read_to_string(&mut text).unwrap();
-            assert!(text.starts_with("[package]"));
-            assert_eq!(request, 7);
-            assert!(incomplete);
-        } else {
-            panic!("wrong response");
+        let original = Update::capture(&core, true);
+        let bytes = encode(&original).unwrap();
+        let decoded: Update = decode(&bytes[4..]).unwrap();
+        assert_eq!(decoded.rows.len(), original.rows.len());
+        for ((_, left), (_, right)) in original.rows.iter().zip(&decoded.rows) {
+            assert_eq!(left.cells, right.cells);
+            assert_eq!(left.extras(), right.extras());
+            assert_eq!((left.used(), left.wrapped), (right.used(), right.wrapped));
         }
+        assert_eq!(decoded.palette, original.palette);
+        assert_eq!(decoded.cursor, original.cursor);
     }
+
     #[test]
-    fn remote_clipboard_is_streamed_past_the_frame_limit() {
+    fn copies_stream_in_order_beside_state_frames_and_past_the_frame_limit() {
         let directory = std::env::current_dir().unwrap().join(format!(
-            "target/remote-ssh-20261024/transport/wire-copy-{}-{}",
+            "target/wire-copy-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -2918,691 +869,116 @@ mod tests {
                 .as_nanos(),
         ));
         std::fs::create_dir_all(&directory).unwrap();
-        let result = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "wire::tests::remote_clipboard_child",
-                "--nocapture",
-            ])
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "wire::tests::copy_stream_child", "--nocapture"])
             .env("NEXTTY_TEST_COPY", "1")
             .env("XDG_CACHE_HOME", &directory)
             .status()
             .unwrap();
-        assert!(result.success());
         std::fs::remove_dir_all(directory).unwrap();
+        assert!(status.success());
     }
+
+    // Runs in a child process: copies are staged in the cache directory it is given.
     #[test]
-    fn remote_clipboard_child() {
+    fn copy_stream_child() {
+        use std::os::unix::fs::MetadataExt;
         if std::env::var_os("NEXTTY_TEST_COPY").is_none() {
             return;
         }
-        use std::io::Read;
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::remote(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender.begin_copy(97, true).unwrap();
-        sender.flush().unwrap();
-        assert!(receiver.responses(None).unwrap().is_empty());
-        let bytes: Vec<u8> = (0..65536).map(|index| (index % 251) as u8).collect();
-        for _ in 0..600 {
-            sender.copy_chunk(&bytes).unwrap();
-            sender.flush().unwrap();
-            assert!(receiver.responses(None).unwrap().is_empty());
-            while receiver.buffered_action() {
-                if !receiver.needs_poll() {
-                    wait_receiver(&receiver);
-                }
-                assert!(receiver.responses(None).unwrap().is_empty());
+        let file = |chunks: usize| {
+            let mut file = clipboard_file().unwrap();
+            let bytes: Vec<u8> = (0..65536).map(|index| (index % 251) as u8).collect();
+            for _ in 0..chunks {
+                file.write_all(&bytes).unwrap();
             }
-            assert!(sender.queued <= bytes.len() + 10);
-            assert!(receiver.input.len() <= bytes.len() + 10);
-        }
-        sender.copy_chunk(&[]).unwrap();
-        sender.flush().unwrap();
-        let response = remote_response(&mut receiver).unwrap().pop().unwrap();
-        let Response::Clipboard {
-            request,
-            mut file,
-            incomplete,
-        } = response
-        else {
-            panic!("wrong response");
+            file.rewind().unwrap();
+            file
         };
-        assert_eq!(request, 97);
-        assert!(incomplete);
-        assert_eq!(file.metadata().unwrap().len(), 600 * 65536);
-        assert_eq!(file.metadata().unwrap().nlink(), 0);
-        let mut buffer = [0; 65536];
-        for _ in 0..600 {
-            file.read_exact(&mut buffer).unwrap();
-            assert_eq!(&buffer, bytes.as_slice());
-        }
-        assert_eq!(file.read(&mut buffer).unwrap(), 0);
-        sender.begin_copy(98, false).unwrap();
-        sender.copy_chunk(&[]).unwrap();
+        let drain = |sender: &mut Peer, receiver: &mut Peer, count: usize| {
+            let mut responses = Vec::new();
+            while responses.len() < count {
+                sender.flush().unwrap();
+                responses.extend(receiver.responses().unwrap());
+            }
+            responses
+        };
+
+        // A copy several frames long: screen state overtakes it, everything else stays in order.
+        let (mut sender, mut receiver) = pair();
         sender
-            .send_response(Response::Error("after clipboard".into()))
-            .unwrap();
-        sender.flush().unwrap();
-        assert!(matches!(
-            remote_response(&mut receiver).unwrap().as_slice(),
-            [Response::Clipboard {
-                request: 98,
+            .send_response(Response::Clipboard {
+                request: 1,
+                file: file(48),
                 incomplete: false,
-                ..
-            }]
-        ));
-        assert!(receiver.needs_poll());
-        assert!(
-            matches!(receiver.responses(None).unwrap().as_slice(), [Response::Error(message)] if message == "after clipboard")
-        );
-        sender.begin_copy(99, false).unwrap();
-        sender.copy_chunk(b"partial").unwrap();
-        sender.flush().unwrap();
-        assert!(receiver.responses(None).unwrap().is_empty());
-        let receiving = Arc::downgrade(&receiver.receiver.as_ref().unwrap().0);
-        drop(sender);
-        let error = remote_response(&mut receiver).err().unwrap();
-        assert!(error.to_string().contains("before completion"));
-        drop(receiver);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        while receiving.strong_count() != 0 {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "clipboard receiver did not finish cleanup"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(1));
-        }
-
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::remote(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender.begin_copy(100, false).unwrap();
-        sender.copy_chunk(b"complete before EOF").unwrap();
-        sender.copy_chunk(&[]).unwrap();
-        sender.flush().unwrap();
-        drop(sender);
-        let response = remote_response(&mut receiver).unwrap().pop().unwrap();
-        let Response::Clipboard {
-            request, mut file, ..
-        } = response
-        else {
-            panic!("wrong response")
-        };
-        assert_eq!(request, 100);
-        let mut text = String::new();
-        file.read_to_string(&mut text).unwrap();
-        assert_eq!(text, "complete before EOF");
-        assert_eq!(
-            receiver.responses(None).err().unwrap().kind(),
-            io::ErrorKind::UnexpectedEof
-        );
-
-        let directory =
-            PathBuf::from(std::env::var_os("XDG_CACHE_HOME").unwrap()).join("nextty/clipboard");
-        std::fs::remove_dir(&directory).unwrap();
-        File::create(&directory).unwrap();
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::remote(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender.begin_copy(101, false).unwrap();
-        sender.copy_chunk(&[]).unwrap();
-        sender.flush().unwrap();
-        assert_eq!(
-            remote_response(&mut receiver).err().unwrap().kind(),
-            io::ErrorKind::AlreadyExists
-        );
-        let leftovers: Vec<_> = std::fs::read_dir(std::env::var_os("XDG_CACHE_HOME").unwrap())
-            .unwrap()
-            .collect();
-        assert_eq!(leftovers.len(), 1);
-    }
-    fn wait_receiver(receiver: &Peer) {
-        let mut fds = [
-            libc::pollfd {
-                fd: if receiver.wants_read() {
-                    receiver.fd()
-                } else {
-                    -1
-                },
-                events: libc::POLLIN,
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: receiver.receiver_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
-        assert!(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, 5000) } > 0);
-        if fds[1].revents != 0 {
-            crate::eventfd::consume_notification(fds[1].fd).unwrap();
-        }
-    }
-    fn remote_response(receiver: &mut Peer) -> io::Result<Vec<Response>> {
-        loop {
-            let responses = receiver.responses(None)?;
-            if !responses.is_empty() {
-                return Ok(responses);
-            }
-            if !receiver.needs_poll() {
-                wait_receiver(receiver);
-            }
-        }
-    }
-    #[test]
-    fn remote_clipboard_rejects_missing_start_and_local_stream_tags() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::remote(left).unwrap();
-        let mut receiver = Peer::remote(right).unwrap();
-        sender.copy_chunk(b"orphan").unwrap();
-        sender.flush().unwrap();
-        assert!(
-            receiver
-                .responses(None)
-                .err()
-                .unwrap()
-                .to_string()
-                .contains("no start")
-        );
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::remote(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        sender.begin_copy(1, false).unwrap();
-        sender.flush().unwrap();
-        assert!(receiver.responses(None).is_err());
-    }
-    #[test]
-    fn malformed_boundary_is_rejected() {
-        assert!(Decoder::new(&[255]).is_err());
-        let mut decoder = Decoder::new(&[VERSION, 2]).unwrap();
-        assert!(decoder.bool().is_err());
-        let mut encoder = Encoder::new();
-        encoder.u8(6);
-        encoder.u64(1);
-        encoder.u8(7);
-        assert!(decode_action(&mut Decoder::new(&encoder.0[4..]).unwrap()).is_err());
-    }
-    #[test]
-    fn fragmented_header_and_body_wait_for_complete_frame() {
-        let (mut left, right) = UnixStream::pair().unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let mut encoder = Encoder::new();
-        encode_action(
-            &mut encoder,
-            &Action::Input {
-                pane: 3,
-                data: b"fragment".to_vec(),
-            },
-        );
-        let mut packet = encoder.0;
-        let length = (packet.len() - 4) as u32;
-        packet[..4].copy_from_slice(&length.to_le_bytes());
-        left.write_all(&packet[..2]).unwrap();
-        assert!(receiver.next_action().unwrap().is_none());
-        left.write_all(&packet[2..8]).unwrap();
-        assert!(receiver.next_action().unwrap().is_none());
-        left.write_all(&packet[8..]).unwrap();
-        assert!(
-            matches!(receiver.next_action().unwrap(), Some(Action::Input { pane: 3, data }) if data == b"fragment")
-        );
-    }
-    #[test]
-    fn styled_unicode_screen_roundtrip_preserves_color_roles_and_extras() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 12,
-                num_lines: 3,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        crate::vt::Parser::new().advance(
-            &mut core,
-            "\u{1b}[1;31mA中e\u{301}\u{1b}[0m plain".as_bytes(),
-        );
-        let original = Update::capture(&core, true);
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &original);
-        let decoded = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-        assert_eq!(decoded.rows[0].1.cells, original.rows[0].1.cells);
-        assert_eq!(decoded.rows[0].1.extras(), original.rows[0].1.extras());
-        assert_eq!(decoded.palette, original.palette);
-        assert_eq!(decoded.cursor, original.cursor);
-        assert_eq!(decoded.mode, original.mode);
-        assert_eq!(
-            decoded.rows[0].1.cells[0].bg,
-            Color::Named(crate::vt::NamedColor::Background)
-        );
-    }
-    #[test]
-    fn sparse_and_many_style_runs_preserve_every_cell_and_extra() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 4096,
-                num_lines: 2,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        let mut parser = crate::vt::Parser::new();
-        for column in 0..4096 {
-            parser.advance(
-                &mut core,
-                format!(
-                    "\x1b[38;2;{};{};{}m中",
-                    column % 256,
-                    column / 16 % 256,
-                    column / 256 % 256
-                )
-                .as_bytes(),
-            );
-        }
-        let mut original = Update::capture(&core, true);
-        let mut cells = vec![Cell::default(); 4096];
-        cells[0].c = 'A';
-        cells[4095].bg = Color::Indexed(3);
-        original.rows[1].1 = Row::from_parts(
-            cells,
-            false,
-            1,
-            vec![(
-                3072,
-                Extra {
-                    zerowidth: vec!['\u{301}'].into(),
-                    underline_color: Some(Color::Indexed(12)),
-                },
-            )],
-        )
-        .unwrap();
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &original);
-        let decoded = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-        for ((_, left), (_, right)) in original.rows.iter().zip(&decoded.rows) {
-            assert_eq!(left.cells, right.cells);
-            assert_eq!(left.extras(), right.extras());
-            assert_eq!(left.used(), right.used());
-            assert_eq!(left.wrapped, right.wrapped);
-        }
-        // Entirely default tails are restored, independently of the text used count.
-        original.rows[1].1.cells[4095] = Cell::default();
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &original);
-        let decoded = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-        assert_eq!(decoded.rows[1].1.cells, original.rows[1].1.cells);
-        assert_eq!(decoded.rows[1].1.extras(), original.rows[1].1.extras());
-    }
-
-    #[test]
-    fn malformed_text_runs_and_truncated_updates_are_rejected() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 12,
-                num_lines: 2,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        crate::vt::Parser::new().advance(&mut core, b"payload");
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &Update::capture(&core, true));
-        let bytes = &encoder.0[4..];
-        for end in 0..bytes.len() {
-            let result = Decoder::new(&bytes[..end]).and_then(|mut d| decode_update(&mut d));
-            assert!(result.is_err(), "accepted truncated update at {end}");
-        }
-        let text_at = bytes
-            .windows(7)
-            .position(|bytes| bytes == b"payload")
+            })
             .unwrap();
-        let mut invalid_utf8 = bytes.to_vec();
-        invalid_utf8[text_at] = 0xff;
-        assert!(decode_update(&mut Decoder::new(&invalid_utf8).unwrap()).is_err());
-        let mut empty_run = bytes.to_vec();
-        empty_run[text_at - 2..text_at].fill(0);
-        assert!(decode_update(&mut Decoder::new(&empty_run).unwrap()).is_err());
-        let mut oversized_run = bytes.to_vec();
-        oversized_run[text_at - 2..text_at].copy_from_slice(&8u16.to_le_bytes());
-        assert!(decode_update(&mut Decoder::new(&oversized_run).unwrap()).is_err());
-        let style_at = text_at + 7;
-        let mut empty_style = bytes.to_vec();
-        empty_style[style_at..style_at + 2].fill(0);
-        assert!(decode_update(&mut Decoder::new(&empty_style).unwrap()).is_err());
-        let mut oversized_style = bytes.to_vec();
-        oversized_style[style_at..style_at + 2].copy_from_slice(&8u16.to_le_bytes());
-        assert!(decode_update(&mut Decoder::new(&oversized_style).unwrap()).is_err());
-    }
-
-    #[test]
-    fn one_column_content_screen_roundtrips_after_a_narrow_split() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 1,
-                num_lines: 2,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        crate::vt::Parser::new().advance(&mut core, b"x");
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &Update::capture(&core, true));
-        let update = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-        let mut screen = crate::screen::Screen::default();
-        screen.apply(update).unwrap();
-        assert_eq!(screen.columns(), 1);
-        assert_eq!(screen.row(0).cells[0].c, 'x');
-    }
-
-    #[test]
-    fn screen_preserves_prompt_flags_and_explicit_right_prompt() {
-        for scope in [1, 2] {
-            let mut core = crate::core::Core::new(
-                WindowSize {
-                    num_cols: 8,
-                    num_lines: 2,
-                    cell_width: 0,
-                    cell_height: 0,
-                },
-                0xcccccc,
-                0x202020,
-            );
-            crate::vt::Parser::new().advance(
-                &mut core,
-                format!("\x1b[1;5H\x1b]133;P;{scope}\x07main\x1b]133;P;0\x07").as_bytes(),
-            );
-            let mut encoder = Encoder::new();
-            encode_update(&mut encoder, &Update::capture(&core, true));
-            assert_eq!(encoder.0[4], VERSION);
-            let update = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-            assert!(update.rows[0].1.cells[7].flags.contains(Flags::PROMPT));
-            assert_eq!(
-                update.rows[0].1.cells[7]
-                    .flags
-                    .contains(Flags::RIGHT_PROMPT),
-                scope == 2
-            );
-        }
-    }
-
-    fn deliver_screen(
-        core: &crate::core::Core,
-        screen: &mut crate::screen::Screen,
-        full: bool,
-    ) -> bool {
-        let update = Update::capture(core, full);
-        let has_palette = update.palette.is_some();
-        let mut encoder = Encoder::new();
-        encode_update(&mut encoder, &update);
-        let decoded = decode_update(&mut Decoder::new(&encoder.0[4..]).unwrap()).unwrap();
-        assert_eq!(decoded.palette, update.palette);
-        screen.apply(decoded).unwrap();
-        has_palette
-    }
-
-    #[test]
-    fn sparse_updates_inherit_palette_and_resize_requires_a_complete_palette() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 8,
-                num_lines: 3,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xc0c1c2,
-            0x202122,
-        );
-        let mut parser = crate::vt::Parser::new();
-        let mut screen = crate::screen::Screen::default();
-        assert!(deliver_screen(&core, &mut screen, true));
-        let original = screen.palette;
-        core.reset_damage();
-        parser.advance(&mut core, b"xy");
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.palette, original);
-        assert_eq!(screen.row(0).cells[1].c, 'y');
-
-        core.reset_damage();
-        screen.reset_damage();
-        core.selection_start(
-            Point { line: 0, column: 0 },
-            Side::Left,
-            SelectionType::Simple,
-        );
-        assert!(Update::capture(&core, false).rows.is_empty());
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.dirty_rows().count(), 0);
-        core.selection_update(Point { line: 0, column: 1 }, Side::Right);
-        assert!(Update::capture(&core, false).rows.is_empty());
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.dirty_rows().collect::<Vec<_>>(), [0]);
-        assert_eq!(core.selection_to_string().as_deref(), Some("xy"));
-        let selection = screen.selection_range();
-        assert!(selection.is_some());
-        core.reset_damage();
-        parser.advance(&mut core, b"\x1b[1;4H\x1b[?25l");
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.palette, original);
-        assert_eq!(screen.selection_range(), selection);
-        assert_eq!(screen.cursor(), core.cursor());
-        assert_eq!(screen.mode(), core.mode());
-        screen.reset_damage();
-        assert!(core.clear_selection());
-        assert!(Update::capture(&core, false).rows.is_empty());
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.selection_range(), None);
-        assert_eq!(screen.dirty_rows().collect::<Vec<_>>(), [0]);
-        screen.reset_damage();
-        assert!(!core.clear_selection());
-        assert!(!deliver_screen(&core, &mut screen, false));
-        assert_eq!(screen.dirty_rows().count(), 0);
-        core.reset_damage();
-        assert!(
-            deliver_screen(&core, &mut screen, true),
-            "forced full captures must carry the palette even without damage"
-        );
-
-        core.resize(WindowSize {
-            num_cols: 10,
-            num_lines: 4,
-            cell_width: 0,
-            cell_height: 0,
-        });
-        let mut missing_palette = Update::capture(&core, false);
-        assert!(missing_palette.palette.take().is_some());
-        assert_eq!(
-            screen.apply(missing_palette).unwrap_err().kind(),
-            io::ErrorKind::InvalidData
-        );
-        assert_eq!(
-            screen.columns(),
-            8,
-            "a malformed resize must not partially apply"
-        );
-        assert!(deliver_screen(&core, &mut screen, false));
-        assert_eq!((screen.columns(), screen.screen_lines()), (10, 4));
-        assert_eq!(screen.palette, original);
-    }
-
-    #[test]
-    fn every_palette_set_reset_and_terminal_reset_reaches_the_frontend() {
-        let mut core = crate::core::Core::new(
-            WindowSize {
-                num_cols: 8,
-                num_lines: 3,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xc0c1c2,
-            0x202122,
-        );
-        let mut screen = crate::screen::Screen::default();
-        let mut parser = crate::vt::Parser::new();
-        deliver_screen(&core, &mut screen, true);
-        let original = screen.palette;
-        for sequence in [
-            "\x1b]4;1;#112233;17;#445566;255;#778899\x07",
-            "\x1b]10;#102030;#405060;#708090\x07",
-            "\x1b]104;1\x07",
-            "\x1b]104\x07",
-            "\x1b]110\x07",
-            "\x1b]111\x07",
-            "\x1b]112\x07",
-            "\x1b]4;1;#abcdef\x07\x1b]10;#123456\x07\x1bc",
-        ] {
-            core.reset_damage();
-            parser.advance(&mut core, sequence.as_bytes());
-            assert!(
-                deliver_screen(&core, &mut screen, false),
-                "missing palette after {sequence:?}"
-            );
-            for index in 0..PALETTE_SIZE {
-                let color = if index < 256 {
-                    Color::Indexed(index as u8)
-                } else {
-                    Color::Named(NamedColor::from_index(index as u16).unwrap())
-                };
-                assert_eq!(
-                    screen.color(color),
-                    core.color(color),
-                    "palette slot {index} after {sequence:?}"
-                );
-            }
-            core.reset_damage();
-            parser.advance(&mut core, b"\x1b]4;1;?\x07\x1b]10;?\x07");
-            assert!(
-                !deliver_screen(&core, &mut screen, false),
-                "queries do not change the palette"
-            );
-        }
-        assert_eq!(screen.palette, original);
-    }
-
-    #[test]
-    fn complete_final_message_is_delivered_before_eof() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
+        sender.send_state(None, &[], 7).unwrap();
         sender.send_response(Response::Detached).unwrap();
         sender.flush().unwrap();
-        drop(sender);
+        assert!(sender.pending(), "the copy must not finish in one flush");
+        let first = receiver.responses().unwrap();
+        assert!(matches!(first.as_slice(), [Response::State(None, _, 7)]));
+        let mut rest = first;
+        rest.extend(drain(&mut sender, &mut receiver, 3 - rest.len()));
         assert!(matches!(
-            receiver.responses(None).unwrap().as_slice(),
-            [Response::Detached]
+            rest.as_slice(),
+            [
+                Response::State(..),
+                Response::Clipboard {
+                    request: 1,
+                    incomplete: false,
+                    ..
+                },
+                Response::Detached
+            ]
         ));
-        assert!(
-            matches!(receiver.responses(None), Err(error) if error.kind() == io::ErrorKind::UnexpectedEof)
-        );
-    }
-    #[test]
-    fn large_input_is_chunked_in_order_and_rejected_atomically_when_too_large() {
-        let (left, right) = UnixStream::pair().unwrap();
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        let data: Vec<_> = (0..200000).map(|i| (i % 251) as u8).collect();
-        sender.send_input(9, &data).unwrap();
-        let mut received = Vec::new();
-        while received.len() < data.len() {
-            sender.flush().unwrap();
-            while let Some(action) = receiver.next_action().unwrap() {
-                if let Action::Input { pane, data } = action {
-                    assert_eq!(pane, 9);
-                    assert!(data.len() <= 65536);
-                    received.extend(data);
-                } else {
-                    panic!("wrong action");
-                }
-            }
+
+        // More than MAX_FRAME crosses in chunks, into an unlinked file.
+        let (mut sender, mut receiver) = pair();
+        sender
+            .send_response(Response::Clipboard {
+                request: 2,
+                file: file(600),
+                incomplete: true,
+            })
+            .unwrap();
+        let Some(Response::Clipboard {
+            request: 2,
+            file: mut copy,
+            incomplete: true,
+        }) = drain(&mut sender, &mut receiver, 1).pop()
+        else {
+            panic!("missing copy");
+        };
+        assert_eq!(copy.metadata().unwrap().len(), 600 * 65536);
+        assert_eq!(copy.metadata().unwrap().nlink(), 0);
+        let mut chunk = [0; 65536];
+        for _ in 0..600 {
+            copy.read_exact(&mut chunk).unwrap();
+            assert_eq!(chunk[250..253], [250, 0, 1]);
         }
-        assert_eq!(received, data);
-        assert!(sender.send_input(9, &vec![0; MAX_PENDING]).is_err());
-        assert!(!sender.pending());
-    }
-    #[test]
-    fn queued_frames_preserve_order_and_descriptors_across_short_writes() {
-        use std::io::Read;
-        use std::time::{Duration, Instant};
-        let (left, right) = UnixStream::pair().unwrap();
-        let capacity: libc::c_int = 4096;
-        assert_eq!(
-            unsafe {
-                libc::setsockopt(
-                    left.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_SNDBUF,
-                    (&capacity as *const libc::c_int).cast(),
-                    std::mem::size_of_val(&capacity) as libc::socklen_t,
-                )
+
+        // A sender that disappears mid-copy is an error, not a short copy.
+        let (mut sender, mut receiver) = pair();
+        let frames: [Response; 2] = [
+            Response::ClipboardBegin {
+                request: 3,
+                incomplete: false,
             },
-            0
-        );
-        let mut sender = Peer::new(left).unwrap();
-        let mut receiver = Peer::new(right).unwrap();
-        for index in 0..80 {
-            sender
-                .send_response(Response::Error(format!(
-                    "{index}:{}",
-                    "x".repeat(12000 + index)
-                )))
-                .unwrap();
-            if matches!(index, 20 | 60) {
-                sender
-                    .send_response(Response::Clipboard {
-                        request: index as u64,
-                        file: File::open(if index == 20 {
-                            "/dev/zero"
-                        } else {
-                            "/dev/null"
-                        })
-                        .unwrap(),
-                        incomplete: false,
-                    })
-                    .unwrap();
-            }
+            Response::ClipboardChunk(b"partial".to_vec()),
+        ];
+        for response in frames {
+            sender.queue(encode(&response).unwrap(), false).unwrap();
         }
         sender.flush().unwrap();
-        assert!(
-            sender.pending(),
-            "small socket must backpressure the sender"
-        );
-        let mut responses = Vec::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while sender.pending() || responses.len() < 82 {
-            assert!(Instant::now() < deadline, "queued responses did not drain");
-            responses.extend(receiver.responses(None).unwrap());
-            sender.flush().unwrap();
-        }
-        let mut responses = responses.into_iter();
-        for index in 0..80 {
-            assert!(matches!(responses.next(), Some(Response::Error(text))
-                if text == format!("{index}:{}", "x".repeat(12000 + index))));
-            if matches!(index, 20 | 60) {
-                let Some(Response::Clipboard {
-                    request,
-                    mut file,
-                    incomplete,
-                }) = responses.next()
-                else {
-                    panic!("missing clipboard descriptor");
-                };
-                assert_eq!(request, index as u64);
-                assert!(!incomplete);
-                let mut byte = [9];
-                if index == 20 {
-                    assert_eq!(file.read(&mut byte).unwrap(), 1);
-                    assert_eq!(byte, [0]);
-                } else {
-                    assert_eq!(file.read(&mut byte).unwrap(), 0);
-                }
+        drop(sender);
+        let error = loop {
+            match receiver.responses() {
+                Ok(responses) => assert!(responses.is_empty()),
+                Err(error) => break error,
             }
-        }
-        assert!(responses.next().is_none());
+        };
+        assert!(error.to_string().contains("before completion"));
     }
 }

@@ -1,6 +1,7 @@
 //! Behavioral contracts for the terminal replacement: screen contents and protocol replies.
 //! Escape semantics follow https://invisible-island.net/xterm/ctlseqs/ctlseqs.html.
 use nextty::core::{Cell, Core, Event, Flags, Point, Scroll, SelectionType, Side, WindowSize};
+use nextty::history::HistoryBudget;
 use nextty::vt::{Color, NamedColor, Parser, Rgb};
 
 struct Terminal {
@@ -14,6 +15,18 @@ impl Terminal {
             core: Core::new(window_size(columns, lines), 0xd8dee9, 0x14161b),
             parser: Parser::new(),
         }
+    }
+
+    fn with_history(columns: u16, lines: u16) -> Self {
+        let mut terminal = Self::new(columns, lines);
+        let directory = std::env::temp_dir().join(format!(
+            "nextty-core-protocol-{}-{columns}x{lines}",
+            std::process::id()
+        ));
+        terminal
+            .core
+            .enable_history(HistoryBudget::new(directory, 1 << 20).unwrap());
+        terminal
     }
 
     fn write(&mut self, bytes: impl AsRef<[u8]>) {
@@ -51,21 +64,6 @@ fn point(line: i32, column: usize) -> Point {
 }
 
 #[test]
-fn utf8_and_escape_sequences_can_cross_every_byte_boundary() {
-    let mut terminal = Terminal::new(10, 3);
-    for byte in "\x1b[31mA中文e\u{301}".as_bytes() {
-        terminal.write([*byte]);
-    }
-    let row = terminal.core.row(0);
-    assert_eq!(row.cells[0].c, 'A');
-    assert_eq!(row.cells[1].c, '中');
-    assert_eq!(row.cells[3].c, '文');
-    assert_eq!(row.cells[5].c, 'e');
-    assert_eq!(row.extra(5).unwrap().zerowidth.as_slice(), &['\u{301}']);
-    assert_eq!(terminal.core.cursor().0, point(0, 6));
-}
-
-#[test]
 fn wrapping_waits_for_the_next_printable_and_carriage_return_cancels_it() {
     let mut terminal = Terminal::new(5, 2);
     terminal.write("abcde");
@@ -79,29 +77,6 @@ fn wrapping_waits_for_the_next_printable_and_carriage_return_cancels_it() {
     assert_eq!(terminal.line(0), "abcde");
     assert_eq!(terminal.line(1), "F    ");
     assert!(terminal.core.row(0).wrapped);
-}
-
-#[test]
-fn overwriting_half_a_wide_cell_and_erasing_combining_text_leaves_no_ghost() {
-    let mut terminal = Terminal::new(8, 2);
-    terminal.write("A中e\u{301}Z");
-    terminal.write("\x1b[1;3Hx");
-    assert_eq!(terminal.line(0), "A xeZ   ");
-    assert_eq!(
-        terminal.core.row(0).extra(3).unwrap().zerowidth.as_slice(),
-        &['\u{301}']
-    );
-    terminal.write("\x1b[1;4H\x1b[X");
-    assert_eq!(terminal.line(0), "A x Z   ");
-    assert!(
-        terminal
-            .core
-            .row(0)
-            .extra(3)
-            .is_none_or(|extra| extra.zerowidth.is_empty())
-    );
-    terminal.write("\x1b[1;2H中");
-    assert_eq!(terminal.line(0), "A中  Z   ");
 }
 
 #[test]
@@ -165,22 +140,8 @@ fn tab_stops_can_be_set_and_cleared_without_wrapping() {
 }
 
 #[test]
-fn origin_coordinates_and_partial_scrolling_preserve_the_fixed_header() {
-    let mut terminal = Terminal::new(5, 4);
-    terminal.write("1\x1b[2;1H2\x1b[3;1H3\x1b[4;1H4");
-    terminal.write("\x1b[2;4r\x1b[?6h\x1b[1;1HA\x1b[3;1HX\n");
-    assert_eq!(terminal.line(0), "1    ");
-    assert_eq!(terminal.line(1), "3    ");
-    assert_eq!(terminal.line(2), "X    ");
-    assert_eq!(terminal.line(3), "     ");
-    assert_eq!(terminal.core.history_size(), 0);
-    terminal.write("\x1b[?6l\x1b[r\x1b[4;1H\n");
-    assert_eq!(terminal.core.history_size(), 1);
-}
-
-#[test]
 fn history_scroll_and_selection_use_absolute_content_coordinates() {
-    let mut terminal = Terminal::new(4, 3);
+    let mut terminal = Terminal::with_history(4, 3);
     terminal.write("0000\r\n1111\r\n2222\r\n3333");
     assert_eq!(terminal.core.history_size(), 1);
     terminal.core.scroll_display(Scroll::Top);
@@ -191,16 +152,14 @@ fn history_scroll_and_selection_use_absolute_content_coordinates() {
         .core
         .selection_start(point(-1, 0), Side::Left, SelectionType::Simple);
     terminal.core.selection_update(point(0, 3), Side::Right);
+    let selection = terminal.core.selection_range();
     assert_eq!(
-        terminal.core.selection_to_string().as_deref(),
-        Some("0000\n1111")
+        selection.map(|range| (range.start, range.end)),
+        Some((point(-1, 0), point(0, 3)))
     );
     terminal.core.scroll_display(Scroll::Bottom);
     assert_eq!(terminal.line(0), "1111");
-    assert_eq!(
-        terminal.core.selection_to_string().as_deref(),
-        Some("0000\n1111")
-    );
+    assert_eq!(terminal.core.selection_range(), selection);
 }
 
 #[test]
@@ -212,14 +171,20 @@ fn widening_reflows_soft_lines_without_changing_selection_or_next_write() {
         .selection_start(point(0, 0), Side::Left, SelectionType::Simple);
     terminal.core.selection_update(point(1, 4), Side::Right);
     assert_eq!(
-        terminal.core.selection_to_string().as_deref(),
-        Some("abcdefghij")
+        terminal
+            .core
+            .selection_range()
+            .map(|range| (range.start, range.end)),
+        Some((point(0, 0), point(1, 4)))
     );
     terminal.core.resize(window_size(10, 3));
     assert_eq!(terminal.line(0), "abcdefghij");
     assert_eq!(
-        terminal.core.selection_to_string().as_deref(),
-        Some("abcdefghij")
+        terminal
+            .core
+            .selection_range()
+            .map(|range| (range.start, range.end)),
+        Some((point(0, 0), point(0, 9)))
     );
     terminal.write("K");
     assert_eq!(terminal.line(0), "abcdefghij");

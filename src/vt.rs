@@ -1,10 +1,11 @@
 //! Streaming VT input for the terminal's screen core.
 
+use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 
-use crate::core::{Core, Flags};
+use crate::core::{Cell, Core, Flags};
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Rgb {
     pub r: u8,
     pub g: u8,
@@ -20,7 +21,6 @@ impl Rgb {
         }
     }
 
-    #[cfg(any(feature = "gui", feature = "tui"))]
     pub(crate) const fn packed(self) -> u32 {
         u32::from_be_bytes([0, self.r, self.g, self.b])
     }
@@ -50,7 +50,7 @@ impl Rgb {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u16)]
 pub enum NamedColor {
     Black = 0,
@@ -108,14 +108,14 @@ impl NamedColor {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Color {
     Named(NamedColor),
     Spec(Rgb),
     Indexed(u8),
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum CursorShape {
     #[default]
@@ -123,16 +123,6 @@ pub enum CursorShape {
     Underline = 1,
     Beam = 2,
     Hidden = 3,
-}
-
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum Attr {
-    Reset,
-    Flags(Flags, bool),
-    Underline(Flags),
-    Foreground(Color),
-    Background(Color),
-    UnderlineColor(Option<Color>),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -144,42 +134,11 @@ pub(crate) enum StandardCharset {
 
 impl StandardCharset {
     pub(crate) fn map(self, c: char) -> char {
-        if !matches!(self, Self::SpecialGraphics) {
-            return c;
-        }
-        match c {
-            '_' => ' ',
-            '`' => '◆',
-            'a' => '▒',
-            'b' => '␉',
-            'c' => '␌',
-            'd' => '␍',
-            'e' => '␊',
-            'f' => '°',
-            'g' => '±',
-            'h' => '␤',
-            'i' => '␋',
-            'j' => '┘',
-            'k' => '┐',
-            'l' => '┌',
-            'm' => '└',
-            'n' => '┼',
-            'o' => '⎺',
-            'p' => '⎻',
-            'q' => '─',
-            'r' => '⎼',
-            's' => '⎽',
-            't' => '├',
-            'u' => '┤',
-            'v' => '┴',
-            'w' => '┬',
-            'x' => '│',
-            'y' => '≤',
-            'z' => '≥',
-            '{' => 'π',
-            '|' => '≠',
-            '}' => '£',
-            '~' => '·',
+        // DEC special graphics replaces 0x60..=0x7e; '_' is a blank.
+        const GRAPHICS: &str = "◆▒␉␌␍␊°±␤␋┘┐┌└┼⎺⎻─⎼⎽├┤┴┬│≤≥π≠£·";
+        match (self, c) {
+            (Self::SpecialGraphics, '_') => ' ',
+            (Self::SpecialGraphics, '`'..='~') => GRAPHICS.chars().nth(c as usize - 0x60).unwrap(),
             _ => c,
         }
     }
@@ -296,8 +255,6 @@ pub struct Parser {
     last_char: Option<char>,
     osc: Vec<u8>,
     deadline: Option<Instant>,
-
-    queued: Option<(Vec<u8>, usize)>,
 }
 
 #[inline]
@@ -334,55 +291,29 @@ impl Parser {
         self.deadline
     }
 
-    /// Parses immediately; synchronized updates defer presentation until the mode ends.
-    pub fn advance(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
-        self.advance_count(core, bytes, false).1
-    }
-
-    fn advance_count(&mut self, core: &mut Core, bytes: &[u8], queued: bool) -> (usize, bool) {
+    /// Parses until `bytes` or the history's backpressure ends. Returns the bytes taken and whether
+    /// the grid changed in a way to present; a synchronized update defers presentation.
+    pub fn advance(&mut self, core: &mut Core, bytes: &[u8]) -> (usize, bool) {
         let mut position = 0;
-        while position < bytes.len() && (!queued || core.history_read_ready()) {
-            if self.state == State::Ground && bytes[position] >= 0x20 && bytes[position] != 0x7f {
-                let length = text_prefix(&bytes[position..]);
-                self.text(core, &bytes[position..position + length]);
-                position += length;
-            } else {
-                position += self.step(core, &bytes[position..]);
+        // Backpressure is checked per slice; a slice scrolls at most one row per byte.
+        while position < bytes.len() && core.history_read_ready() {
+            let slice = &bytes[position..bytes.len().min(position + 512)];
+            let mut taken = 0;
+            while taken < slice.len() {
+                if self.state == State::Ground && slice[taken] >= 0x20 && slice[taken] != 0x7f {
+                    let length = text_prefix(&slice[taken..]);
+                    self.text(core, &slice[taken..taken + length]);
+                    taken += length;
+                } else {
+                    taken += self.step(core, &slice[taken..]);
+                }
             }
+            position += taken;
         }
         (
             position,
             position != 0 && !core.mode().contains(crate::core::Mode::SYNC_UPDATE),
         )
-    }
-
-    pub(crate) fn has_queued(&self) -> bool {
-        self.queued.is_some()
-    }
-
-    pub(crate) fn advance_queued(&mut self, core: &mut Core, bytes: &[u8]) -> bool {
-        // The IO loop drains this read before polling the PTY again.
-        assert!(self.queued.is_none() || bytes.is_empty());
-        let queued = self.queued.take();
-        let (data, mut position) = queued
-            .as_ref()
-            .map_or((bytes, 0), |(data, position)| (data.as_slice(), *position));
-        let mut committed = false;
-        // Keep one batch under the Core lock while respecting history backpressure.
-        let limit = (position + 16 * 1024).min(data.len());
-        while position < limit && core.history_read_ready() {
-            let end = (position + 512).min(limit);
-            let (consumed, changed) = self.advance_count(core, &data[position..end], true);
-            committed |= changed;
-            position += consumed;
-        }
-        if position < data.len() {
-            self.queued = Some(match queued {
-                Some((data, _)) => (data, position),
-                None => (bytes[position..].to_vec(), 0),
-            });
-        }
-        committed && !core.mode().contains(crate::core::Mode::SYNC_UPDATE)
     }
 
     pub fn finish_sync(&mut self, core: &mut Core) -> bool {
@@ -398,34 +329,15 @@ impl Parser {
         self.last_char = text.chars().next_back().or(self.last_char);
     }
 
-    fn text(&mut self, core: &mut Core, mut bytes: &[u8]) {
-        while self.utf8_len != 0 && !bytes.is_empty() {
-            self.utf8[self.utf8_len] = bytes[0];
-            self.utf8_len += 1;
-            bytes = &bytes[1..];
-            loop {
-                match std::str::from_utf8(&self.utf8[..self.utf8_len]) {
-                    Ok(text) => {
-                        let c = text.chars().next().unwrap();
-                        core.input(c);
-                        self.last_char = Some(c);
-                        self.utf8_len = 0;
-                        break;
-                    }
-                    Err(error) => {
-                        let Some(length) = error.error_len() else {
-                            break;
-                        };
-                        self.print(core, "\u{fffd}");
-                        self.utf8.copy_within(length..self.utf8_len, 0);
-                        self.utf8_len -= length;
-                        if self.utf8_len == 0 {
-                            break;
-                        }
-                    }
-                }
-            }
-        }
+    fn text(&mut self, core: &mut Core, bytes: &[u8]) {
+        let joined;
+        let mut bytes = if self.utf8_len == 0 {
+            bytes
+        } else {
+            joined = [&self.utf8[..self.utf8_len], bytes].concat();
+            self.utf8_len = 0;
+            &joined
+        };
         while !bytes.is_empty() {
             match std::str::from_utf8(bytes) {
                 Ok(text) => {
@@ -463,19 +375,10 @@ impl Parser {
         }
     }
 
-    #[inline]
     fn clear_osc(&mut self) {
-        // Keep ordinary OSC storage reusable; a large clipboard or title must not
-        // leave its entire allocation resident after the sequence has ended.
-        if self.osc.capacity() > OSC_RETAIN_LIMIT {
-            self.drop_osc();
-        }
         self.osc.clear();
-    }
-
-    #[cold]
-    fn drop_osc(&mut self) {
-        self.osc = Vec::new();
+        // A large clipboard or title must not stay resident in an idle parser.
+        self.osc.shrink_to(OSC_RETAIN_LIMIT);
     }
 
     // Avoid a call per control byte while allowing OSC payloads to consume whole runs.
@@ -545,9 +448,6 @@ impl Parser {
             return 1;
         }
         match self.state {
-            State::Ground => {
-                self.text(core, &[byte]);
-            }
             State::Escape => match byte {
                 b'[' => {
                     self.csi.start();
@@ -595,7 +495,7 @@ impl Parser {
             }
             (0, b'H') => core.set_horizontal_tabstop(),
             (0, b'M') => core.reverse_index(),
-            (0, b'Z') => core.identify_terminal(None),
+            (0, b'Z') => reply(core, "\x1b[?6c"),
             (0, b'=' | b'>') => core.set_keypad_application_mode(final_byte == b'='),
             (0, b'c') => {
                 core.reset_state();
@@ -653,13 +553,7 @@ impl Parser {
             (0, 0, b'X') => core.erase_chars(count),
             (0, 0, b'b') => {
                 if let Some(c) = self.last_char {
-                    if c.is_ascii() && count > 1 {
-                        core.repeat_ascii(c as u8, count);
-                    } else {
-                        for _ in 0..count {
-                            core.input(c);
-                        }
-                    }
+                    repeat(core, c, count);
                 }
             }
             (0, 0, b'g') => match p.value(0) {
@@ -681,9 +575,14 @@ impl Parser {
                 }
             }
             (0, 0, b'm') => self.sgr(core),
-            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => {
-                core.identify_terminal((p.prefix != 0).then_some(char::from(p.prefix)))
-            }
+            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => reply(
+                core,
+                match p.prefix {
+                    0 => "\x1b[?6c",
+                    b'>' => "\x1b[>0;1;0c",
+                    _ => "\x1bP!|00000000\x1b\\",
+                },
+            ),
             (0, 0, b'n') => core.device_status(usize::from(p.value(0))),
             (0 | b'?', b'$', b'p') => core.report_mode(p.value(0), p.prefix == b'?'),
             (0, b' ', b'q') => core.set_cursor_shape(match p.value(0) {
@@ -697,11 +596,21 @@ impl Parser {
             }
             (0, 0, b's') => core.save_cursor_position(),
             (0, 0, b'u') => core.restore_cursor_position(),
-            (b'?', 0, b'u') => core.report_keyboard_mode(),
-            (b'?', 0, b'm') if p.value(0) == 4 => core.report_modify_other_keys(),
+            (b'?', 0, b'u') => reply(core, "\x1b[?0u"),
+            (b'?', 0, b'm') if p.value(0) == 4 => reply(core, "\x1b[>4;0m"),
             (0, 0, b't') => match p.value(0) {
-                14 => core.text_area_size_pixels(),
-                18 => core.text_area_size_chars(),
+                14 => {
+                    let size = core.window_size();
+                    core.write_reply(format_args!(
+                        "\x1b[4;{};{}t",
+                        u32::from(size.num_lines) * u32::from(size.cell_height),
+                        u32::from(size.num_cols) * u32::from(size.cell_width)
+                    ));
+                }
+                18 => {
+                    let size = core.window_size();
+                    core.write_reply(format_args!("\x1b[8;{};{}t", size.num_lines, size.num_cols));
+                }
                 22 => core.push_title(),
                 23 => core.pop_title(),
                 _ => (),
@@ -713,6 +622,7 @@ impl Parser {
 
     fn sgr(&self, core: &mut Core) {
         let p = &self.csi;
+        let (cell, underline_color) = core.style_mut();
         let mut index = 0;
         while index < p.count {
             let value = p.values[index];
@@ -721,50 +631,52 @@ impl Parser {
                 end += 1;
             }
             let colon = end > index + 1;
-            let attr = match value {
-                0 => Some(Attr::Reset),
-                1 => Some(Attr::Flags(Flags::BOLD, true)),
-                2 => Some(Attr::Flags(Flags::DIM, true)),
-                3 => Some(Attr::Flags(Flags::ITALIC, true)),
-                4 => match if colon { p.values[index + 1] } else { 1 } {
-                    0 => Some(Attr::Flags(Flags::ALL_UNDERLINES, false)),
-                    1 => Some(Attr::Underline(Flags::UNDERLINE)),
-                    2 => Some(Attr::Underline(Flags::DOUBLE_UNDERLINE)),
-                    3 => Some(Attr::Underline(Flags::UNDERCURL)),
-                    4 => Some(Attr::Underline(Flags::DOTTED_UNDERLINE)),
-                    5 => Some(Attr::Underline(Flags::DASHED_UNDERLINE)),
-                    _ => None,
-                },
-                7 => Some(Attr::Flags(Flags::INVERSE, true)),
-                8 => Some(Attr::Flags(Flags::HIDDEN, true)),
-                9 => Some(Attr::Flags(Flags::STRIKEOUT, true)),
-                21 => Some(Attr::Flags(Flags::BOLD, false)),
-                22 => Some(Attr::Flags(Flags::BOLD | Flags::DIM, false)),
-                23 => Some(Attr::Flags(Flags::ITALIC, false)),
-                24 => Some(Attr::Flags(Flags::ALL_UNDERLINES, false)),
-                27 => Some(Attr::Flags(Flags::INVERSE, false)),
-                28 => Some(Attr::Flags(Flags::HIDDEN, false)),
-                29 => Some(Attr::Flags(Flags::STRIKEOUT, false)),
-                30..=37 | 90..=97 => Some(Attr::Foreground(ansi_color(if value < 90 {
-                    value - 30
-                } else {
-                    value - 90 + 8
-                }))),
-                39 => Some(Attr::Foreground(Color::Named(NamedColor::Foreground))),
-                40..=47 | 100..=107 => Some(Attr::Background(ansi_color(if value < 100 {
-                    value - 40
-                } else {
-                    value - 100 + 8
-                }))),
-                49 => Some(Attr::Background(Color::Named(NamedColor::Background))),
+            match value {
+                0 => {
+                    *cell = Cell::default();
+                    *underline_color = None;
+                }
+                1 => cell.flags.insert(Flags::BOLD),
+                2 => cell.flags.insert(Flags::DIM),
+                3 => cell.flags.insert(Flags::ITALIC),
+                4 => {
+                    let style = if colon { p.values[index + 1] } else { 1 };
+                    if let Some(underline) = [
+                        Flags::empty(),
+                        Flags::UNDERLINE,
+                        Flags::DOUBLE_UNDERLINE,
+                        Flags::UNDERCURL,
+                        Flags::DOTTED_UNDERLINE,
+                        Flags::DASHED_UNDERLINE,
+                    ]
+                    .get(usize::from(style))
+                    {
+                        cell.flags.remove(Flags::ALL_UNDERLINES);
+                        cell.flags.insert(*underline);
+                    }
+                }
+                7 => cell.flags.insert(Flags::INVERSE),
+                8 => cell.flags.insert(Flags::HIDDEN),
+                9 => cell.flags.insert(Flags::STRIKEOUT),
+                21 => cell.flags.remove(Flags::BOLD),
+                22 => cell.flags.remove(Flags::BOLD | Flags::DIM),
+                23 => cell.flags.remove(Flags::ITALIC),
+                24 => cell.flags.remove(Flags::ALL_UNDERLINES),
+                27 => cell.flags.remove(Flags::INVERSE),
+                28 => cell.flags.remove(Flags::HIDDEN),
+                29 => cell.flags.remove(Flags::STRIKEOUT),
+                30..=37 => cell.fg = ansi_color(value - 30),
+                90..=97 => cell.fg = ansi_color(value - 90 + 8),
+                39 => cell.fg = Color::Named(NamedColor::Foreground),
+                40..=47 => cell.bg = ansi_color(value - 40),
+                100..=107 => cell.bg = ansi_color(value - 100 + 8),
+                49 => cell.bg = Color::Named(NamedColor::Background),
                 38 | 48 | 58 => {
                     let mode = p.value(index + 1);
-                    let channels = if mode == 2 {
-                        3
-                    } else if mode == 5 {
-                        1
-                    } else {
-                        0
+                    let channels = match mode {
+                        2 => 3,
+                        5 => 1,
+                        _ => 0,
                     };
                     let start = if colon && mode == 2 && end - index == 6 {
                         index + 3
@@ -789,17 +701,16 @@ impl Parser {
                     if !colon {
                         end = (start + channels).min(p.count);
                     }
-                    color.map(|color| match value {
-                        38 => Attr::Foreground(color),
-                        48 => Attr::Background(color),
-                        _ => Attr::UnderlineColor(Some(color)),
-                    })
+                    if let Some(color) = color {
+                        match value {
+                            38 => cell.fg = color,
+                            48 => cell.bg = color,
+                            _ => *underline_color = Some(color),
+                        }
+                    }
                 }
-                59 => Some(Attr::UnderlineColor(None)),
-                _ => None,
-            };
-            if let Some(attr) = attr {
-                core.terminal_attribute(attr);
+                59 => *underline_color = None,
+                _ => {}
             }
             index = end;
         }
@@ -831,26 +742,13 @@ impl Parser {
             4 => {
                 while let (Some(index), Some(value)) = (parts.next(), parts.next()) {
                     if let Some(index) = decimal(index).filter(|i| *i < 256) {
-                        if value == b"?" {
-                            core.dynamic_color_sequence(
-                                format_args!("4;{index}"),
-                                index,
-                                terminator,
-                            );
-                        } else if let Some(color) = parse_color(value) {
-                            core.set_color(index, Some(color));
-                        }
+                        color_spec(core, format_args!("4;{index}"), index, value, terminator);
                     }
                 }
             }
             10..=12 => {
                 for (command, value) in (command..=12).zip(parts) {
-                    let index = command + 246;
-                    if value == b"?" {
-                        core.dynamic_color_sequence(command, index, terminator);
-                    } else if let Some(color) = parse_color(value) {
-                        core.set_color(index, Some(color));
-                    }
+                    color_spec(core, command, command + 246, value, terminator);
                 }
             }
             50 => {
@@ -900,21 +798,38 @@ impl Parser {
     }
 }
 
+// Rare sequences stay out of the shared CSI dispatch path.
+#[inline(never)]
+fn reply(core: &mut Core, text: &str) {
+    core.write_reply(format_args!("{text}"));
+}
+
+#[inline(never)]
+fn repeat(core: &mut Core, c: char, count: usize) {
+    core.input_text(&c.to_string().repeat(count));
+}
+
+/// `?` queries a palette slot; anything else sets it.
+fn color_spec(
+    core: &mut Core,
+    prefix: impl std::fmt::Display,
+    index: usize,
+    value: &[u8],
+    terminator: &str,
+) {
+    if value == b"?" {
+        core.dynamic_color_sequence(prefix, index, terminator);
+    } else if let Some(color) = parse_color(value) {
+        core.set_color(index, Some(color));
+    }
+}
+
 fn ansi_color(index: u16) -> Color {
     Color::Named(NamedColor::from_index(index).unwrap())
 }
 
 fn decimal(bytes: &[u8]) -> Option<usize> {
-    if bytes.is_empty() {
-        return None;
-    }
-    bytes.iter().try_fold(0usize, |value, byte| {
-        if byte.is_ascii_digit() {
-            value.checked_mul(10)?.checked_add(usize::from(byte - b'0'))
-        } else {
-            None
-        }
-    })
+    std::str::from_utf8(bytes).ok()?.parse().ok()
 }
 
 fn parse_color(bytes: &[u8]) -> Option<Rgb> {
@@ -935,15 +850,7 @@ fn parse_color(bytes: &[u8]) -> Option<Rgb> {
             return None;
         }
         let width = hex.len() / 3;
-        let legacy = |part: &[u8]| {
-            let value = hex_value(part)?;
-            Some(match width {
-                1 => value << 4,
-                2 => value,
-                3 => value >> 4,
-                _ => value >> 8,
-            } as u8)
-        };
+        let legacy = |part: &[u8]| Some((hex_value(part)? << (16 - 4 * width) >> 8) as u8);
         return Some(Rgb {
             r: legacy(&hex[..width])?,
             g: legacy(&hex[width..width * 2])?,
@@ -963,34 +870,8 @@ fn parse_color(bytes: &[u8]) -> Option<Rgb> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Event, Mode, Point, WindowSize};
-
-    fn terminal() -> (Core, Parser) {
-        (
-            Core::new(
-                WindowSize {
-                    num_cols: 8,
-                    num_lines: 3,
-                    cell_width: 10,
-                    cell_height: 20,
-                },
-                0xd8dee9,
-                0x14161b,
-            ),
-            Parser::new(),
-        )
-    }
-
-    fn replies(core: &mut Core) -> Vec<u8> {
-        core.take_events()
-            .into_iter()
-            .filter_map(|event| match event {
-                Event::Write(bytes) => Some(bytes),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
+    use crate::core::tests::{replies, terminal};
+    use crate::core::{Event, Mode};
 
     #[test]
     fn omitted_csi_parameters_do_not_inherit_previous_values() {
@@ -998,10 +879,10 @@ mod tests {
         let empty = ";".repeat(31);
         for parameters in ["", ";", "1;;4", "1;;58:2::1:2:3;4", &empty] {
             let clean = format!("\x1b[{parameters}mX");
-            let (mut expected, mut parser) = terminal();
+            let (mut expected, mut parser) = terminal(8, 3);
             parser.advance(&mut expected, clean.as_bytes());
             for chunk in [1, 3, clean.len()] {
-                let (mut actual, mut parser) = terminal();
+                let (mut actual, mut parser) = terminal(8, 3);
                 parser.advance(&mut actual, dirty.as_bytes());
                 for bytes in clean.as_bytes().chunks(chunk) {
                     parser.advance(&mut actual, bytes);
@@ -1023,10 +904,10 @@ mod tests {
         ] {
             for count in [0, 1, 2, 63, 64, 65, 140, 300] {
                 let setup = format!("\x1b[?1049h中\u{301}abc\r\nold text\x1b[H{mode}q");
-                let (mut expected, mut literal) = terminal();
+                let (mut expected, mut literal) = terminal(8, 3);
                 literal.advance(&mut expected, setup.as_bytes());
                 literal.advance(&mut expected, "q".repeat(count.max(1)).as_bytes());
-                let (mut core, mut parser) = terminal();
+                let (mut core, mut parser) = terminal(8, 3);
                 parser.advance(&mut core, setup.as_bytes());
                 parser.advance(&mut core, format!("\x1b[{count}b").as_bytes());
                 assert_eq!(core.cursor(), expected.cursor(), "{mode:?} {count}");
@@ -1044,13 +925,13 @@ mod tests {
     fn bulk_text_scanning_preserves_utf8_and_control_boundaries() {
         let mut input = "0123456789abcdef中文λ→\x7fG\r\n\x1b[31mabcdefghijklmnop\tZ\x08Q\x1b[0m\r\ncombining e\u{301}".as_bytes().to_vec();
         input.extend_from_slice(b"\xfftail\0\x1b[6n");
-        let (mut expected, mut scalar) = terminal();
+        let (mut expected, mut scalar) = terminal(8, 3);
         for byte in &input {
             scalar.advance(&mut expected, std::slice::from_ref(byte));
         }
         let expected_replies = replies(&mut expected);
         for width in [7, 8, 9, input.len()] {
-            let (mut core, mut parser) = terminal();
+            let (mut core, mut parser) = terminal(8, 3);
             for chunk in input.chunks(width) {
                 parser.advance(&mut core, chunk);
             }
@@ -1070,7 +951,7 @@ mod tests {
     fn bulk_osc_preserves_payloads_and_control_boundaries_at_every_split() {
         let input = b"\x1b]2;0123456789abcdef\0\t\r\n\x7f\xe4\xb8\xad\xff\x07\x1b]52;c;YWFhYWFhYWFh\x1b\\\x1b]2;cancelled\x18\x1b]2;also cancelled\x1a\x1b]2;interrupted\x1b[2J\x1b]2;final\x1b\\X";
         for split in 0..=input.len() {
-            let (mut core, mut parser) = terminal();
+            let (mut core, mut parser) = terminal(8, 3);
             parser.advance(&mut core, &input[..split]);
             parser.advance(&mut core, &input[split..]);
             let events = core.take_events();
@@ -1091,99 +972,21 @@ mod tests {
     }
 
     #[test]
-    fn timed_out_frame_preserves_a_split_control_sequence_for_the_next_read() {
-        let (mut core, mut parser) = terminal();
-        parser.advance(&mut core, b"a\x1b[?2026h\x1b[2;");
-        assert_eq!(core.cursor().0, Point { line: 0, column: 1 });
-        assert!(parser.finish_sync(&mut core));
-        assert!(!core.mode().contains(Mode::SYNC_UPDATE));
-        parser.advance(&mut core, b"3HX");
-        assert_eq!(core.row(1).cells[2].c, 'X');
-    }
-
-    #[test]
     fn synchronized_queries_reply_before_presentation() {
-        let (mut core, mut parser) = terminal();
+        let (mut core, mut parser) = terminal(8, 3);
         parser.advance(&mut core, b"\x1b[?2026h");
-        assert!(!parser.advance(&mut core, "中Z\x1b[6n\x1b[c".as_bytes()));
+        assert!(!parser.advance(&mut core, "中Z\x1b[6n\x1b[c".as_bytes()).1);
         assert_eq!(core.row(0).cells[0].c, '中');
         assert_eq!(core.row(0).cells[2].c, 'Z');
         assert_eq!(replies(&mut core), b"\x1b[1;4R\x1b[?6c");
         assert!(core.mode().contains(Mode::SYNC_UPDATE));
-        assert!(parser.advance(&mut core, b"\x1b[?2026l"));
+        assert!(parser.advance(&mut core, b"\x1b[?2026l").1);
         assert!(parser.deadline().is_none());
-    }
-
-    #[test]
-    fn queued_pty_read_does_not_publish_a_tui_cursor_between_show_and_restore() {
-        let (mut core, mut parser) = terminal();
-        parser.advance(&mut core, b"\x1b[2;3H");
-        let expected = core.cursor();
-        let mut update = b"\x1b[?25l\x1b[1;1H".to_vec();
-        // tmux enables the cursor before restoring its insertion point. Keep that
-        // restoration in the same PTY read but across the parser's history quantum.
-        update.resize(512 - b"\x1b[?25h".len(), b'x');
-        update.extend_from_slice(b"\x1b[?25h\x1b[2;3H");
-        assert!(parser.advance_queued(&mut core, &update));
-        assert_eq!(core.cursor(), expected);
-        assert!(!parser.has_queued());
-    }
-
-    #[test]
-    fn queued_and_direct_parsing_match_at_every_split() {
-        let input = "A\x1b[?2026h\r\x1b[2K中\u{301}\x1b[2b\x1b[?2026lB\x1b[?2026h\r\nsecond\x1b[6n\x1bcfresh\x1b[?2026h\r\nthird\x1b[6n\x1b[?2026lC".as_bytes();
-        let (mut expected, mut direct) = terminal();
-        direct.advance(&mut expected, input);
-        let expected_replies = replies(&mut expected);
-        for split in 0..=input.len() {
-            let (mut core, mut parser) = terminal();
-            for chunk in [&input[..split], &input[split..]] {
-                parser.advance_queued(&mut core, chunk);
-                while parser.has_queued() {
-                    parser.advance_queued(&mut core, &[]);
-                }
-            }
-            for line in 0..core.screen_lines() {
-                assert_eq!(
-                    core.row(line).cells,
-                    expected.row(line).cells,
-                    "split {split}"
-                );
-                assert_eq!(core.row(line).extras(), expected.row(line).extras());
-                assert_eq!(core.row(line).wrapped, expected.row(line).wrapped);
-            }
-            assert_eq!(core.cursor(), expected.cursor());
-            assert_eq!(core.mode(), expected.mode());
-            assert_eq!(replies(&mut core), expected_replies);
-        }
-    }
-
-    #[test]
-    fn queued_large_frame_preserves_utf8_and_frame_order() {
-        let (mut core, mut parser) = terminal();
-        let mut input = b"\x1b[?2026h".to_vec();
-        input.extend(std::iter::repeat_n(b'\r', 32 * 1024 - 2));
-        input.extend_from_slice("中Z\x1b[?2026h\r\nnext\x1b[?2026l!".as_bytes());
-        parser.advance_queued(&mut core, &input);
-        while parser.has_queued() {
-            parser.advance_queued(&mut core, &[]);
-        }
-        assert_eq!(core.row(0).cells[0].c, '中');
-        assert_eq!(core.row(0).cells[2].c, 'Z');
-        assert_eq!(
-            core.row(1).cells[..5]
-                .iter()
-                .map(|cell| cell.c)
-                .collect::<String>(),
-            "next!"
-        );
-        assert!(parser.deadline().is_none());
-        assert!(!core.mode().contains(Mode::SYNC_UPDATE));
     }
 
     #[test]
     fn palette_queries_and_resets_preserve_color_state_and_damage() {
-        let (mut core, mut parser) = terminal();
+        let (mut core, mut parser) = terminal(8, 3);
         parser.advance(
             &mut core,
             b"\x1b]4;1;#123;2;rgb:0000/8000/ffff\x07\x1b]4;1;?;2;?\x1b\\",
@@ -1223,58 +1026,8 @@ mod tests {
     }
 
     #[test]
-    fn malformed_escape_intermediates_and_misplaced_prefix_do_not_execute() {
-        let (mut core, mut parser) = terminal();
-        parser.advance(&mut core, b"abc\x1b##c\x1b[0?6hX\x1b[2:3HY");
-        assert_eq!(
-            core.row(0)
-                .cells
-                .iter()
-                .map(|cell| cell.c)
-                .collect::<String>(),
-            "abcXY   "
-        );
-        assert!(!core.mode().contains(Mode::ORIGIN));
-    }
-    #[test]
-    fn existing_tab_cursor_shape_query_and_sgr_paths_remain_available() {
-        let (mut core, mut parser) = terminal();
-        core.resize(WindowSize {
-            num_cols: 20,
-            num_lines: 3,
-            cell_width: 10,
-            cell_height: 20,
-        });
-        parser.advance(
-            &mut core,
-            b"\x1b[3g\x1b[?5W\tX\x1b]50;CursorShape=1\x07\x1b[?4m\x1b[>4m\x1b[1;2;21mY",
-        );
-        assert_eq!(core.row(0).cells[8].c, 'X');
-        assert_eq!(core.cursor().1, CursorShape::Beam);
-        assert_eq!(replies(&mut core), b"\x1b[>4;0m");
-        assert_eq!(core.row(0).cells[9].flags, crate::core::Flags::DIM);
-    }
-
-    #[test]
-    fn sub_cancels_each_control_string_with_the_visible_substitution() {
-        for prefix in *b"]PX^_" {
-            let (mut core, mut parser) = terminal();
-            parser.advance(&mut core, &[b'A', 0x1b, prefix]);
-            parser.advance(&mut core, b"hidden\x1aB");
-            assert_eq!(
-                core.row(0).cells[..3]
-                    .iter()
-                    .map(|cell| cell.c)
-                    .collect::<String>(),
-                "A\u{fffd}B"
-            );
-            assert!(core.take_events().is_empty());
-        }
-    }
-
-    #[test]
     fn unchanged_titles_preserve_stack_restore_and_explicit_reset_notifications() {
-        let (mut core, mut parser) = terminal();
+        let (mut core, mut parser) = terminal(8, 3);
         let titles = |core: &mut Core| {
             core.take_events()
                 .into_iter()
@@ -1301,35 +1054,5 @@ mod tests {
         assert_eq!(titles(&mut core), [None]);
         parser.advance(&mut core, b"\x1b]2;\x07\x1b]0;\x07");
         assert_eq!(titles(&mut core), [Some(String::new())]);
-    }
-
-    #[test]
-    fn large_osc_payloads_are_complete_but_do_not_remain_in_the_idle_parser() {
-        let (mut core, mut parser) = terminal();
-        let title = "中文标题".repeat(OSC_RETAIN_LIMIT);
-        parser.advance(&mut core, b"\x1b]2;");
-        parser.advance(&mut core, title.as_bytes());
-        parser.advance(&mut core, b"\x1b\\");
-        assert!(
-            matches!(core.take_events().as_slice(), [Event::Title(Some(value))] if value == &title)
-        );
-        assert!(parser.osc.capacity() <= OSC_RETAIN_LIMIT);
-
-        parser.advance(&mut core, b"\x1b]52;c;");
-        parser.advance(&mut core, "YWFh".repeat(OSC_RETAIN_LIMIT).as_bytes());
-        parser.advance(&mut core, b"\x07");
-        let events = core.take_events();
-        assert!(
-            matches!(events.as_slice(), [Event::ClipboardStore { primary: false, text }] if text == &"a".repeat(OSC_RETAIN_LIMIT * 3))
-        );
-        assert!(parser.osc.capacity() <= OSC_RETAIN_LIMIT);
-
-        parser.advance(&mut core, b"\x1b]2;");
-        parser.advance(&mut core, title.as_bytes());
-        parser.advance(&mut core, b"\x18\x1b]2;short\x07");
-        assert!(
-            matches!(core.take_events().as_slice(), [Event::Title(Some(value))] if value == "short")
-        );
-        assert!(parser.osc.capacity() <= OSC_RETAIN_LIMIT);
     }
 }

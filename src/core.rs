@@ -1,21 +1,21 @@
 use crate::history::{
-    BATCH, History, HistoryConfig, HistoryCopy, HistoryCursor, HistoryPage, HistoryRead, Reflow,
-    Reply,
+    BATCH, HOT_ROWS, History, HistoryBudget, HistoryCopy, HistoryCopyRequest, HistoryCursor,
+    HistoryPage, HistoryRead, HistorySearch, Reply,
 };
 use crate::vt::{
-    Attr, ClearMode, Color, CursorShape, LineClearMode, NamedColor, PALETTE_SIZE, Rgb,
-    StandardCharset,
+    ClearMode, Color, CursorShape, LineClearMode, NamedColor, PALETTE_SIZE, Rgb, StandardCharset,
 };
 use crate::{base64::decode_utf8, width::scalar_width};
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
-use std::os::fd::BorrowedFd;
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMarker {
     pub id: u64,
     pub line: i32,
@@ -23,7 +23,7 @@ pub struct BlockMarker {
     pub status: Option<i32>,
     pub output: Option<(Point, Point)>,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandBlock {
     pub id: u64,
     pub complete: bool,
@@ -32,6 +32,7 @@ pub struct CommandBlock {
     pub elapsed_ms: Option<u64>,
 }
 
+#[derive(Default)]
 struct Block {
     id: u64,
     prompt: BlockPoint,
@@ -52,6 +53,14 @@ impl Block {
             && self.output.is_none_or(|point| point.row >= first)
     }
 
+    fn points_mut(&mut self) -> impl Iterator<Item = &mut BlockPoint> {
+        std::iter::once(&mut self.prompt).chain(
+            [&mut self.command, &mut self.output, &mut self.end]
+                .into_iter()
+                .flatten(),
+        )
+    }
+
     fn metadata(&self, first: u64) -> CommandBlock {
         CommandBlock {
             id: self.id,
@@ -68,51 +77,47 @@ impl Block {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
 struct BlockPoint {
     row: u64,
     column: usize,
 }
 
+impl BlockPoint {
+    fn at(self, base: u64) -> Point {
+        Point {
+            line: line_offset(self.row, base),
+            column: self.column,
+        }
+    }
+}
+
+/// Line of absolute row `row` in a view whose first screen line is row `base`.
+fn line_offset(row: u64, base: u64) -> i32 {
+    (i128::from(row) - i128::from(base)).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
+}
+
+type Request = Box<dyn FnOnce(&Core) + Send>;
+
 struct DiskHistory {
     io: History,
-    // Main-screen geometry stays unchanged while the alternate screen is resized.
-    size: WindowSize,
     first: u64,
     hot_start: u64,
+    // Rows that left the hot area and are not with the writer yet.
     spool: VecDeque<Row>,
+    requests: VecDeque<Request>,
     epoch: u64,
     layout_epoch: u64,
     page_start: u64,
     page: Vec<Row>,
-    requested: Option<u64>,
+    requested: Option<Range<u64>>,
     blank: Row,
-    desired_size: Option<WindowSize>,
-    resizing: Option<PendingResize>,
-    clear: HistoryClear,
+    // The archive is being emptied; replies about its old contents are stale.
+    clearing: bool,
+    // The archive failed and was dropped; rows that leave the hot area are discarded.
+    failed: bool,
 }
 
-#[derive(PartialEq, Eq)]
-enum HistoryClear {
-    Idle,
-    Queued,
-    Requested,
-}
-
-struct PendingResize {
-    size: WindowSize,
-    selection: ResizeSelection,
-    block_points: Vec<(u64, [Option<usize>; 4])>,
-    at_bottom: bool,
-    viewport_changed: bool,
-}
-
-enum ResizeSelection {
-    Reflow(Option<Selection>),
-    Restore(SearchAnchor),
-}
-
-const HISTORY_LIMIT: usize = 10_000;
 const DEFAULT_PALETTE: [Rgb; 256] = {
     const ANSI: [u32; 16] = [
         0x252932, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
@@ -140,7 +145,7 @@ const DEFAULT_PALETTE: [Rgb; 256] = {
     colors
 };
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSize {
     pub num_cols: u16,
     pub num_lines: u16,
@@ -148,14 +153,14 @@ pub struct WindowSize {
     pub cell_height: u16,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct Point {
     pub line: i32,
     pub column: usize,
 }
 
 macro_rules! bitset {
-    ($name:ident, $bits:ty, $mask:expr) => {
+    ($name:ident, $bits:ty) => {
         #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
         #[repr(transparent)]
         pub struct $name($bits);
@@ -164,12 +169,8 @@ macro_rules! bitset {
             pub const fn bits(self) -> $bits {
                 self.0
             }
-            pub const fn from_bits(bits: $bits) -> Option<Self> {
-                if bits & !$mask == 0 {
-                    Some(Self(bits))
-                } else {
-                    None
-                }
+            pub const fn from_bits(bits: $bits) -> Self {
+                Self(bits)
             }
             pub const fn contains(self, other: Self) -> bool {
                 self.0 & other.0 == other.0
@@ -201,8 +202,8 @@ macro_rules! bitset {
     };
 }
 
-bitset!(Flags, u16, 0x7fff);
-bitset!(Mode, u32, 0x1ffff);
+bitset!(Flags, u16);
+bitset!(Mode, u32);
 
 impl Flags {
     pub const BOLD: Self = Self(1 << 0);
@@ -219,22 +220,12 @@ impl Flags {
     pub const WIDE_CHAR: Self = Self(1 << 11);
     pub const WIDE_CHAR_SPACER: Self = Self(1 << 12);
     pub const PROMPT: Self = Self(1 << 13);
-    pub const RIGHT_PROMPT: Self = Self(1 << 14);
     pub const ALL_UNDERLINES: Self = Self(
         Self::UNDERLINE.0
             | Self::DOUBLE_UNDERLINE.0
             | Self::UNDERCURL.0
             | Self::DOTTED_UNDERLINE.0
             | Self::DASHED_UNDERLINE.0,
-    );
-    #[cfg(any(feature = "gui", feature = "tui"))]
-    pub(crate) const TEXT_STYLE: Self = Self(
-        Self::BOLD.0
-            | Self::ITALIC.0
-            | Self::DIM.0
-            | Self::INVERSE.0
-            | Self::ALL_UNDERLINES.0
-            | Self::STRIKEOUT.0,
     );
     pub const fn empty() -> Self {
         Self(0)
@@ -252,16 +243,15 @@ impl Mode {
     pub const MOUSE_MODE: Self =
         Self(Self::MOUSE_CLICK.0 | Self::MOUSE_DRAG.0 | Self::MOUSE_MOTION.0);
     pub const SGR_MOUSE: Self = Self(1 << 6);
-    pub const UTF8_MOUSE: Self = Self(1 << 7);
-    pub const ALT_SCREEN: Self = Self(1 << 8);
-    pub const ALTERNATE_SCROLL: Self = Self(1 << 9);
-    pub const INSERT: Self = Self(1 << 10);
-    pub const ORIGIN: Self = Self(1 << 11);
-    pub const LINE_WRAP: Self = Self(1 << 12);
-    pub const SHOW_CURSOR: Self = Self(1 << 13);
-    pub const LINE_FEED_NEW_LINE: Self = Self(1 << 14);
-    pub const APP_KEYPAD: Self = Self(1 << 15);
-    pub const SYNC_UPDATE: Self = Self(1 << 16);
+    pub const ALT_SCREEN: Self = Self(1 << 7);
+    pub const ALTERNATE_SCROLL: Self = Self(1 << 8);
+    pub const INSERT: Self = Self(1 << 9);
+    pub const ORIGIN: Self = Self(1 << 10);
+    pub const LINE_WRAP: Self = Self(1 << 11);
+    pub const SHOW_CURSOR: Self = Self(1 << 12);
+    pub const LINE_FEED_NEW_LINE: Self = Self(1 << 13);
+    pub const APP_KEYPAD: Self = Self(1 << 14);
+    pub const SYNC_UPDATE: Self = Self(1 << 15);
 }
 
 fn ansi_mode(mode: u16) -> Option<Mode> {
@@ -281,7 +271,6 @@ fn private_mode(mode: u16) -> Option<Mode> {
         1002 => Mode::MOUSE_DRAG,
         1003 => Mode::MOUSE_MOTION,
         1004 => Mode::FOCUS_IN_OUT,
-        1005 => Mode::UTF8_MOUSE,
         1006 => Mode::SGR_MOUSE,
         1007 => Mode::ALTERNATE_SCROLL,
         2004 => Mode::BRACKETED_PASTE,
@@ -349,6 +338,7 @@ pub struct Row {
     pub cells: Vec<Cell>,
     pub wrapped: bool,
     pub(crate) used: usize,
+    pub(crate) revision: u64,
     // Column order avoids scanning unrelated extras for cell access and erasure.
     pub(crate) extras: Option<Arc<Vec<(usize, Extra)>>>,
 }
@@ -358,26 +348,15 @@ impl Row {
         cells: Vec<Cell>,
         wrapped: bool,
         used: usize,
-        mut extras: Vec<(usize, Extra)>,
-    ) -> Option<Self> {
-        if cells.is_empty()
-            || used > cells.len()
-            || extras.iter().any(|(column, _)| *column >= cells.len())
-        {
-            return None;
-        }
-        if !extras.windows(2).all(|pair| pair[0].0 < pair[1].0) {
-            extras.sort_unstable_by_key(|(column, _)| *column);
-            if extras.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-                return None;
-            }
-        }
-        Some(Self {
+        extras: Vec<(usize, Extra)>,
+    ) -> Self {
+        Self {
             cells,
             wrapped,
             used,
+            revision: 0,
             extras: (!extras.is_empty()).then(|| Arc::new(extras)),
-        })
+        }
     }
     pub fn used(&self) -> usize {
         self.used
@@ -401,11 +380,7 @@ impl Row {
     }
 
     pub(crate) fn clear_all_extras(&mut self) {
-        if let Some(extras) = self.extras.as_mut().and_then(Arc::get_mut) {
-            extras.clear();
-        } else {
-            self.extras = None;
-        }
+        self.extras = None;
     }
 
     pub(crate) fn cells_with_extras(
@@ -450,11 +425,33 @@ impl Row {
             })
     }
 
+    /// Text of columns `start..end`: clipped to the used cells and widened back to the lead
+    /// cell of a wide character, optionally without prompt cells.
+    pub(crate) fn text(
+        &self,
+        start: usize,
+        end: usize,
+        skip_prompt: bool,
+    ) -> impl Iterator<Item = char> {
+        let start = if start < self.cells.len() {
+            self.leading_column(start)
+        } else {
+            start
+        };
+        let end = end.min(self.used);
+        self.characters(start.min(end)..end)
+            .filter(move |(column, _)| {
+                !skip_prompt || !self.cells[*column].flags.contains(Flags::PROMPT)
+            })
+            .map(|(_, ch)| ch)
+    }
+
     pub(crate) fn new(columns: usize, blank: Cell) -> Self {
         Self {
             cells: vec![blank; columns],
             wrapped: false,
             used: 0,
+            revision: 0,
             extras: None,
         }
     }
@@ -469,34 +466,21 @@ impl Row {
 
     pub(crate) fn extra_mut(&mut self, column: usize) -> &mut Extra {
         let extras = self.extras_mut();
-        let index = match extras.last() {
-            Some((last, _)) if *last == column => extras.len() - 1,
-            Some((last, _)) if *last > column => {
-                match extras.binary_search_by_key(&column, |(column, _)| *column) {
-                    Ok(index) => index,
-                    Err(index) => {
-                        return &mut extras.insert_mut(index, (column, Extra::default())).1;
-                    }
-                }
-            }
-            _ => return &mut extras.push_mut((column, Extra::default())).1,
-        };
+        let index = extras
+            .binary_search_by_key(&column, |(column, _)| *column)
+            .unwrap_or_else(|index| {
+                extras.insert(index, (column, Extra::default()));
+                index
+            });
         &mut extras[index].1
     }
 
     pub(crate) fn clear_extras(&mut self, start: usize, end: usize) {
         let extras = self.extras();
-        if extras.last().is_none_or(|(column, _)| *column < start) {
-            return;
-        }
         let first = extras.partition_point(|(column, _)| *column < start);
         let last = extras.partition_point(|(column, _)| *column < end);
         if first != last {
-            if first == 0 && last == extras.len() {
-                self.clear_all_extras();
-            } else {
-                self.extras_mut().drain(first..last);
-            }
+            self.extras_mut().drain(first..last);
         }
     }
 
@@ -599,19 +583,19 @@ impl Row {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
 pub enum Scroll {
     Delta(i32),
     Top,
     Bottom,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum Side {
     Left = 0,
     Right = 1,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum SelectionType {
     Simple = 0,
@@ -705,23 +689,20 @@ pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
     Ok(())
 }
 
-#[cfg(any(feature = "gui", feature = "tui", test))]
-pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
+pub(crate) fn object_selection<R: std::borrow::Borrow<Row>>(
     point: (i64, usize),
-    mut row: impl FnMut(i64) -> Result<Option<R>, E>,
-) -> Result<Option<[(i64, usize); 2]>, E> {
+    row: impl Fn(i64) -> Option<R>,
+) -> Option<[(i64, usize); 2]> {
     // Bound work on one user gesture, even for output containing enormous soft-wrapped lines.
     const LIMIT: usize = 4096;
-    let Some(anchor_row) = row(point.0)? else {
-        return Ok(None);
-    };
+    let anchor_row = row(point.0)?;
     if point.1 >= anchor_row.borrow().used() {
-        return Ok(None);
+        return None;
     }
     let mut first = point.0;
     let mut before = point.1;
     while before < LIMIT {
-        let Some(previous) = row(first - 1)? else {
+        let Some(previous) = row(first - 1) else {
             break;
         };
         let previous = previous.borrow();
@@ -731,18 +712,11 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
         before += previous.used();
         first -= 1;
     }
-    // Allow for wide glyphs without shifting Vec's power-of-two growth steps.
-    let capacity = anchor_row
-        .borrow()
-        .used()
-        .min(LIMIT * 2)
-        .div_ceil(2)
-        .next_power_of_two();
-    let mut cells = Vec::with_capacity(capacity);
+    let mut cells = Vec::new();
     let mut anchor = None;
     let mut line = first;
     let right_limited = 'rows: loop {
-        let Some(current) = row(line)? else {
+        let Some(current) = row(line) else {
             break false;
         };
         let current = current.borrow();
@@ -777,9 +751,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
         }
         line += 1;
     };
-    let Some(anchor) = anchor else {
-        return Ok(None);
-    };
+    let anchor = anchor?;
     let mut quote = None;
     let mut escaped = false;
     for (index, &(ch, _)) in cells.iter().enumerate() {
@@ -790,7 +762,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
         } else if let Some((delimiter, start)) = quote {
             if ch == delimiter {
                 if (start..=index).contains(&anchor) {
-                    return Ok(Some([cells[start].1, cells[index].1]));
+                    return Some([cells[start].1, cells[index].1]);
                 }
                 quote = None;
             }
@@ -811,7 +783,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
             || matches!(ch, '\u{2500}'..='\u{257f}')
     };
     if boundary(cells[anchor].0) {
-        return Ok(Some([cells[anchor].1; 2]));
+        return Some([cells[anchor].1; 2]);
     }
     let mut start = anchor;
     let mut end = anchor + 1;
@@ -822,7 +794,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
         end += 1;
     }
     if start == 0 && before >= LIMIT || end == cells.len() && right_limited {
-        return Ok(None);
+        return None;
     }
     if !cells[start..end].iter().any(|&(ch, _)| ch == '/')
         && let Some(register_start) = (start..=anchor).rfind(|&index| cells[index].0 == '%')
@@ -834,7 +806,7 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
                 .take_while(|(ch, _)| ch.is_ascii_alphanumeric())
                 .count();
         if anchor < register_end {
-            return Ok(Some([cells[register_start].1, cells[register_end - 1].1]));
+            return Some([cells[register_start].1, cells[register_end - 1].1]);
         }
     }
     while start < end && matches!(cells[start].0, '(' | '[' | '{' | '=') {
@@ -865,12 +837,12 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>, E>(
         }
     }
     if !(start..end).contains(&anchor) {
-        return Ok(Some([cells[anchor].1; 2]));
+        return Some([cells[anchor].1; 2]);
     }
-    Ok(Some([cells[start].1, cells[end - 1].1]))
+    Some([cells[start].1, cells[end - 1].1])
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionRange {
     pub start: Point,
     pub end: Point,
@@ -987,8 +959,7 @@ impl SearchAnchor {
             return None;
         }
         self.selection.map(|mut selection| {
-            let delta = (i128::from(base) - i128::from(self.base))
-                .clamp(i32::MIN as i128, i32::MAX as i128) as i32;
+            let delta = line_offset(base, self.base);
             selection.start.line = selection.start.line.saturating_sub(delta);
             selection.end.line = selection.end.line.saturating_sub(delta);
             selection
@@ -1004,32 +975,27 @@ pub struct Core {
     scroll_top: usize,
     scroll_bottom: usize,
     tabs: Vec<bool>,
-    dirty: Vec<bool>,
+    revision: u64,
+    revision_pending: bool,
+    full_revision: u64,
     selection: Option<Selection>,
     cursor_shape: CursorShape,
     foreground: u32,
     background: u32,
     colors: [Option<Rgb>; PALETTE_SIZE],
-    // Cleared with row damage; scrolled frames damage every row without a new palette.
-    palette_dirty: bool,
+    palette_revision: u64,
     events: Vec<Event>,
     title: Option<String>,
     titles: Vec<Option<Box<str>>>,
-
     history: Option<DiskHistory>,
-
+    // Rows that left the hot area, kept to be cleared and scrolled in again.
+    recycled: VecDeque<Row>,
     blocks: VecDeque<Block>,
-
     next_block: u64,
-
     prompt_scope: Flags,
-
     block_origin: u64,
-
     directory: Option<PathBuf>,
-
     input_generation: u64,
-
     prompt_dirty: bool,
 }
 
@@ -1046,31 +1012,26 @@ impl Core {
             scroll_top: 0,
             scroll_bottom: lines,
             tabs: (0..columns).map(|x| x != 0 && x % 8 == 0).collect(),
-            dirty: vec![true; lines],
+            revision: 0,
+            revision_pending: true,
+            full_revision: 0,
             selection: None,
             cursor_shape: CursorShape::Block,
             foreground,
             background,
             colors: [None; PALETTE_SIZE],
-            palette_dirty: true,
+            palette_revision: 0,
             events: Vec::new(),
             title: None,
             titles: Vec::new(),
-
             history: None,
-
+            recycled: VecDeque::new(),
             blocks: VecDeque::new(),
-
             next_block: 1,
-
             prompt_scope: Flags::empty(),
-
             block_origin: 0,
-
             directory: None,
-
             input_generation: 0,
-
             prompt_dirty: false,
         }
     }
@@ -1082,7 +1043,7 @@ impl Core {
         usize::from(self.size.num_lines)
     }
     fn hot_history_size(&self) -> usize {
-        self.active.rows.len() - self.screen_lines()
+        self.active.rows.len().saturating_sub(self.screen_lines())
     }
     pub fn history_size(&self) -> usize {
         if !self.mode.contains(Mode::ALT_SCREEN)
@@ -1102,14 +1063,9 @@ impl Core {
     }
     pub fn row(&self, viewport_row: usize) -> &Row {
         let line = viewport_row as i32 - self.display_offset() as i32;
-        if let Some(row) = self.absolute_row(line) {
-            return row;
-        }
-
-        if let Some(history) = &self.history {
-            return &history.blank;
-        }
-        unreachable!("visible row outside the screen")
+        self.absolute_row(line)
+            .or_else(|| self.history.as_ref().map(|history| &history.blank))
+            .expect("visible row outside the screen")
     }
 
     pub(crate) fn screen_row(&self, line: usize) -> &Row {
@@ -1135,32 +1091,56 @@ impl Core {
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
-    pub fn dirty_rows(&self) -> impl Iterator<Item = usize> + '_ {
-        self.dirty
-            .iter()
-            .enumerate()
-            .filter_map(|(y, dirty)| dirty.then_some(y))
+    pub(crate) fn window_size(&self) -> WindowSize {
+        self.size
+    }
+    pub(crate) fn row_versions(&self) -> Vec<u64> {
+        (0..self.screen_lines())
+            .map(|index| self.row(index).revision)
+            .collect()
     }
     pub fn reset_damage(&mut self) {
-        self.dirty.fill(false);
-        self.palette_dirty = false;
+        self.revision_pending = true;
     }
-    pub(crate) fn palette_dirty(&self) -> bool {
-        self.palette_dirty
+    fn damage_palette(&mut self) {
+        self.palette_revision = self.next_revision();
+        self.damage_all();
     }
+    pub(crate) fn palette_revision(&self) -> u64 {
+        self.palette_revision
+    }
+    pub(crate) fn full_revision(&self) -> u64 {
+        self.full_revision
+    }
+    #[inline(always)]
+    fn next_revision(&mut self) -> u64 {
+        if self.revision_pending {
+            self.revision += 1;
+            self.revision_pending = false;
+        }
+        self.revision
+    }
+    #[inline(always)]
     fn damage_all(&mut self) {
-        self.dirty.fill(true);
+        self.full_revision = self.next_revision();
     }
+    // Scrolled back, the live screen's last `display_offset` lines are outside the view.
+    #[inline(always)]
     fn damage_range(&mut self, start: usize, end: usize) {
-        let offset = self.display_offset();
-        let start = (start + offset).min(self.dirty.len());
-        let end = (end + offset).min(self.dirty.len());
-        self.dirty[start..end].fill(true);
+        let end = end.min(self.screen_lines().saturating_sub(self.display_offset()));
+        if start < end {
+            let revision = self.next_revision();
+            let base = self.hot_history_size();
+            for row in self.active.rows.range_mut(base + start..base + end) {
+                row.revision = revision;
+            }
+        }
     }
+    #[inline(always)]
     fn damage_line(&mut self, line: usize) {
-        let viewport = line + self.display_offset();
-        if let Some(dirty) = self.dirty.get_mut(viewport) {
-            *dirty = true;
+        if line + self.display_offset() < self.screen_lines() {
+            let revision = self.next_revision();
+            self.screen_row_mut(line).revision = revision;
         }
     }
     fn screen_row_mut(&mut self, line: usize) -> &mut Row {
@@ -1226,13 +1206,11 @@ impl Core {
         let history = !down && top == 0 && !self.mode.contains(Mode::ALT_SCREEN);
         for _ in 0..count {
             if history {
-                let disk = self.history.is_some();
-
-                let mut recycled = if !disk && self.hot_history_size() == HISTORY_LIMIT {
-                    self.active.rows.pop_front().unwrap()
-                } else {
-                    Row::new(self.columns(), blank)
-                };
+                let mut recycled = self
+                    .recycled
+                    .pop_front()
+                    .filter(|row| row.cells.len() == self.columns())
+                    .unwrap_or_else(|| Row::new(self.columns(), blank));
                 recycled.clear(blank);
                 let base = self.hot_history_size();
                 self.active.rows.insert(base + bottom, recycled);
@@ -1277,13 +1255,6 @@ impl Core {
     }
 
     fn set_display_offset(&mut self, offset: usize) -> bool {
-        if let Some(pending) = self
-            .history
-            .as_mut()
-            .and_then(|history| history.resizing.as_mut())
-        {
-            pending.viewport_changed = true;
-        }
         if offset != self.display_offset() {
             self.active.offset = offset;
 
@@ -1337,33 +1308,16 @@ impl Core {
         true
     }
     pub fn clear_selection(&mut self) -> bool {
-        if let Some(pending) = self
-            .history
-            .as_mut()
-            .and_then(|history| history.resizing.as_mut())
-        {
-            match &mut pending.selection {
-                ResizeSelection::Reflow(selection) => *selection = None,
-                ResizeSelection::Restore(anchor) => anchor.selection = None,
-            }
-        }
         self.selection.take().is_some()
     }
     pub fn selection_range(&self) -> Option<SelectionRange> {
         let selection = self.selection?;
-        let ((mut start, start_side), (mut end, end_side)) = if selection.start < selection.end
-            || selection.start == selection.end && selection.start_side == Side::Left
-        {
-            (
-                (selection.start, selection.start_side),
-                (selection.end, selection.end_side),
-            )
-        } else {
-            (
-                (selection.end, selection.end_side),
-                (selection.start, selection.start_side),
-            )
-        };
+        let mut ends = [
+            (selection.start, selection.start_side),
+            (selection.end, selection.end_side),
+        ];
+        ends.sort_by_key(|&(point, side)| (point, side == Side::Right));
+        let [(mut start, start_side), (mut end, end_side)] = ends;
         let columns = self.columns();
         let source_row =
             |line: i64| Ok::<_, std::convert::Infallible>(self.absolute_row(line as i32));
@@ -1418,76 +1372,30 @@ impl Core {
         }
         (start <= end).then_some(SelectionRange { start, end })
     }
-    pub fn selection_to_string(&self) -> Option<String> {
-        let range = self.selection_range()?;
-        let mut text = String::new();
-        for line in range.start.line..=range.end.line {
-            let row = self.absolute_row(line)?;
-            let start = if line == range.start.line {
-                range.start.column
-            } else {
-                0
-            };
-            let end = if line == range.end.line {
-                range.end.column + 1
-            } else {
-                self.columns()
-            }
-            .min(row.used);
-            text.extend(
-                row.characters(start..end)
-                    .filter(|(column, _)| !row.cells[*column].flags.contains(Flags::PROMPT))
-                    .map(|(_, ch)| ch),
-            );
-            if line != range.end.line && !row.wrapped {
-                text.push('\n');
-            }
-        }
-        Some(text)
-    }
-
-    fn set_alternate(&mut self, enabled: bool, clear: bool, save: bool) {
+    /// `fresh` is mode 1049: save the cursor, enter a cleared screen, restore the cursor on exit.
+    fn set_alternate(&mut self, enabled: bool, fresh: bool) {
         if enabled == self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
-        if enabled && save {
+        if enabled && fresh {
             self.active.saved = self.active.cursor;
-        }
-        if enabled && clear {
             self.inactive.clear();
         }
         std::mem::swap(&mut self.active, &mut self.inactive);
         self.mode.set(Mode::ALT_SCREEN, enabled);
-        if !enabled && save {
+        if !enabled && fresh {
             self.active.cursor = self.active.saved;
         }
         self.scroll_top = 0;
         self.scroll_bottom = self.screen_lines();
         self.selection = None;
         self.damage_all();
-        if !enabled && let Some(history) = &self.history {
-            if history.size != self.size {
-                self.finish_resize(history.size);
-            }
-            self.start_history_resize();
+        if !enabled {
+            self.request_history_page();
         }
     }
 
     pub fn resize(&mut self, size: WindowSize) {
-        if let Some(history) = &mut self.history {
-            history.desired_size = Some(size);
-            if self.mode.contains(Mode::ALT_SCREEN) {
-                if size != self.size {
-                    self.active
-                        .resize_alternate(usize::from(size.num_cols), usize::from(size.num_lines));
-                    self.selection = None;
-                    self.finish_resize(size);
-                }
-            } else {
-                self.start_history_resize();
-            }
-            return;
-        }
         assert!(size.num_cols > 0 && size.num_lines > 0);
         let old_columns = self.columns();
         let old_lines = self.screen_lines();
@@ -1497,21 +1405,46 @@ impl Core {
             self.size = size;
             return;
         }
-        let main_selection = if !self.mode.contains(Mode::ALT_SCREEN) {
-            self.selection.take()
-        } else {
-            None
-        };
-        let (main, alternate) = if self.mode.contains(Mode::ALT_SCREEN) {
+        let old_base = self.block_origin;
+        let alt = self.mode.contains(Mode::ALT_SCREEN);
+        let main_selection = if alt { None } else { self.selection.take() };
+        let (main, alternate) = if alt {
             (&mut self.inactive, &mut self.active)
         } else {
             (&mut self.active, &mut self.inactive)
         };
+        let old_hot = main.rows.len() - old_lines;
+        let hot_start = old_base - old_hot as u64;
+        let cold_view_top =
+            (main.offset > old_hot).then(|| old_base.saturating_sub(main.offset as u64));
+        if cold_view_top.is_some() {
+            main.offset = 0;
+        }
         let mut points = vec![main.cursor.logical_point(), main.saved.logical_point()];
         if let Some(selection) = main_selection {
             points.extend([selection.start, selection.end]);
         }
-        let mapped = resize_screen(main, old_columns, old_lines, columns, lines, &points);
+        let block_start = points.len();
+        let mut block_points = Vec::new();
+        for point in self
+            .blocks
+            .iter_mut()
+            .flat_map(Block::points_mut)
+            .filter(|point| point.row >= hot_start)
+        {
+            points.push(point.at(old_base));
+            block_points.push(point);
+        }
+        let retained = self.history.as_ref().map_or(0, |_| HOT_ROWS);
+        let mapped = resize_screen(
+            main,
+            old_columns,
+            old_lines,
+            columns,
+            lines,
+            &points,
+            retained,
+        );
         for (cursor, point) in [&mut main.cursor, &mut main.saved].into_iter().zip(&mapped) {
             cursor.point = Point {
                 column: point.column.min(columns - 1),
@@ -1524,30 +1457,40 @@ impl Core {
             selection.end = mapped[3];
             self.selection = Some(selection);
         }
+        let new_base = hot_start + main.rows.len() as u64 - lines as u64;
+        for (point, mapped) in block_points.into_iter().zip(&mapped[block_start..]) {
+            *point = BlockPoint {
+                row: (new_base as i64 + i64::from(mapped.line)) as u64,
+                column: mapped.column,
+            };
+        }
+        self.block_origin = new_base;
+        if let Some(top) = cold_view_top {
+            main.offset = new_base.saturating_sub(top) as usize;
+        }
+        if let Some(history) = &mut self.history {
+            history.layout_epoch += 1;
+            history.page.clear();
+            history.requested = None;
+            history.blank = Row::new(columns, Cell::default());
+        }
         alternate.resize_alternate(columns, lines);
-        if self.mode.contains(Mode::ALT_SCREEN) {
+        if alt {
             self.selection = None;
         }
-        self.finish_resize(size);
-    }
-
-    fn finish_resize(&mut self, size: WindowSize) {
-        let columns = usize::from(size.num_cols);
-        let lines = usize::from(size.num_lines);
         self.size = size;
         self.tabs.truncate(columns);
         self.tabs
             .extend((self.tabs.len()..columns).map(|column| column != 0 && column % 8 == 0));
         self.scroll_top = 0;
         self.scroll_bottom = lines;
-        self.dirty.clear();
-        self.dirty.resize(lines, true);
         // A resized frontend screen is rebuilt and needs the palette again.
-        self.palette_dirty = true;
+        self.damage_palette();
+        self.request_history_page();
     }
 
     #[inline]
-    fn write_reply(&mut self, reply: std::fmt::Arguments<'_>) {
+    pub(crate) fn write_reply(&mut self, reply: std::fmt::Arguments<'_>) {
         if let Some(Event::Write(previous)) = self.events.last_mut() {
             if let Some(text) = reply.as_str() {
                 previous.extend_from_slice(text.as_bytes());
@@ -1566,107 +1509,86 @@ impl Core {
             6 => {
                 self.active.cursor.origin = enabled;
                 self.goto(0, 0);
-                return;
             }
             47 | 1047 => {
-                self.set_alternate(enabled, false, false);
+                self.set_alternate(enabled, false);
                 if mode == 1047 && !enabled {
                     self.inactive.clear();
                 }
-                return;
             }
-            1048 => {
-                if enabled {
-                    self.save_cursor_position();
-                } else {
-                    self.restore_cursor_position();
-                }
-                return;
-            }
-            1049 => {
-                self.set_alternate(enabled, enabled, true);
-                return;
-            }
+            1048 if enabled => self.save_cursor_position(),
+            1048 => self.restore_cursor_position(),
+            1049 => self.set_alternate(enabled, true),
             3 => {
                 self.scroll_top = 0;
                 self.scroll_bottom = self.screen_lines();
                 self.clear_screen(ClearMode::All);
                 self.goto(0, 0);
-                return;
             }
-            _ => {}
+            _ => {
+                let Some(flag) = private_mode(mode) else {
+                    return;
+                };
+                if enabled && flag.intersects(Mode::MOUSE_MODE) {
+                    self.mode.remove(Mode::MOUSE_MODE);
+                }
+                self.mode.set(flag, enabled);
+            }
         }
-        let Some(flag) = private_mode(mode) else {
-            return;
-        };
-        if enabled && flag.intersects(Mode::MOUSE_MODE) {
-            self.mode.remove(Mode::MOUSE_MODE);
-        }
-        self.mode.set(flag, enabled);
     }
 }
 
-pub(crate) struct RowReflow {
+struct RowReflow {
+    output: VecDeque<Row>,
     row: Row,
     column: usize,
-    pub(crate) count: u64,
-    pub(crate) points: Vec<Option<(u64, usize)>>,
-    pub(crate) view_top: Option<u64>,
+    points: Vec<Point>,
+    view_top: Option<u64>,
     old_columns: usize,
     source_view_top: u64,
     last_wrapped: bool,
 }
 impl RowReflow {
-    pub(crate) fn new(old_columns: usize, columns: usize, points: usize, view_top: u64) -> Self {
+    fn new(old_columns: usize, columns: usize, points: usize, view_top: u64) -> Self {
         Self {
+            output: VecDeque::new(),
             row: Row::new(columns, Cell::default()),
             column: 0,
-            count: 0,
-            points: vec![None; points],
+            points: vec![Point::default(); points],
             view_top: None,
             old_columns,
             source_view_top: view_top,
             last_wrapped: false,
         }
     }
-    fn emit(&mut self, wrapped: bool) -> Row {
+    fn emit(&mut self, wrapped: bool) {
         let columns = self.row.cells.len();
         let mut row = std::mem::replace(&mut self.row, Row::new(columns, Cell::default()));
         row.wrapped = wrapped;
+        self.output.push_back(row);
         self.column = 0;
-        self.count += 1;
-        row
     }
-    pub(crate) fn finish(&mut self) -> Option<Row> {
-        (self.column != 0 || self.last_wrapped).then(|| self.emit(false))
+    fn finish(&mut self) {
+        if self.column != 0 || self.last_wrapped {
+            self.emit(false);
+        }
     }
-    pub(crate) fn row<E>(
-        &mut self,
-        id: u64,
-        row: Row,
-        anchors: &[(u64, usize, usize)],
-        anchor: &mut usize,
-        emit: &mut impl FnMut(Row) -> Result<(), E>,
-    ) -> Result<Vec<Cell>, E> {
+    /// Records the output position of the anchors that sit at source column `source`.
+    fn mark(&mut self, anchors: &[(u64, usize, usize)], limit: usize, source: usize) {
+        for &(_, column, index) in anchors {
+            if column.min(limit) == source {
+                self.points[index] = Point {
+                    line: self.output.len() as i32,
+                    column: self.column,
+                };
+            }
+        }
+    }
+    /// Reflows source row `id`; `anchors` are the tracked points in it.
+    fn row(&mut self, id: u64, row: Row, anchors: &[(u64, usize, usize)]) {
         let columns = self.row.cells.len();
         if id == self.source_view_top {
-            self.view_top = Some(self.count);
-        }
-        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line < id) {
-            *anchor += 1;
-        }
-        let begin = *anchor;
-        while anchors.get(*anchor).is_some_and(|(line, _, _)| *line == id) {
-            *anchor += 1;
-        }
-        let anchors = &anchors[begin..*anchor];
-        if self.old_columns == columns {
-            for (_, column, index) in anchors {
-                self.points[*index] = Some((self.count, *column));
-            }
-            self.count += 1;
-            emit(row)?;
-            return Ok(Vec::new());
+            self.view_top = Some(self.output.len() as u64);
         }
         let mut used = row.used();
         if !row.wrapped {
@@ -1679,6 +1601,7 @@ impl RowReflow {
             }
         }
         used = used.min(self.old_columns);
+        let limit = if row.wrapped { row.used } else { used };
         let mut extras = row
             .extras
             .map(Arc::unwrap_or_clone)
@@ -1690,13 +1613,9 @@ impl RowReflow {
             if (cell.flags.contains(Flags::WIDE_CHAR) && self.column + 1 == columns && columns > 1)
                 || self.column == columns
             {
-                emit(self.emit(true))?;
+                self.emit(true);
             }
-            for (_, column, index) in anchors {
-                if (*column).min(if row.wrapped { row.used } else { used }) == source {
-                    self.points[*index] = Some((self.count, self.column));
-                }
-            }
+            self.mark(anchors, limit, source);
             let extra = extras
                 .next_if(|(column, _)| *column == source)
                 .map(|(_, extra)| extra);
@@ -1715,16 +1634,11 @@ impl RowReflow {
             }
             self.column += 1;
         }
-        for (_, column, index) in anchors {
-            if (*column).min(if row.wrapped { row.used } else { used }) == used {
-                self.points[*index] = Some((self.count, self.column));
-            }
-        }
+        self.mark(anchors, limit, used);
         self.last_wrapped = row.wrapped;
         if !row.wrapped {
-            emit(self.emit(false))?;
+            self.emit(false);
         }
-        Ok(row.cells)
     }
 }
 
@@ -1735,57 +1649,49 @@ fn resize_screen(
     columns: usize,
     lines: usize,
     points: &[Point],
+    history_rows: usize,
 ) -> Vec<Point> {
     let old_history = screen.rows.len() - old_lines;
-    let anchors = points.iter().enumerate().map(|(index, point)| {
-        (
-            (old_history as i64 + i64::from(point.line)).max(0) as u64,
-            point.column,
-            index,
-        )
-    });
-    let old_view_top = screen.rows.len() - old_lines - screen.offset;
-    let mut flow = RowReflow::new(old_columns, columns, points.len(), old_view_top as u64);
+    let mut anchors: Vec<_> = points
+        .iter()
+        .enumerate()
+        .map(|(index, point)| {
+            (
+                (old_history as i64 + i64::from(point.line)).max(0) as u64,
+                point.column,
+                index,
+            )
+        })
+        .collect();
+    let old_view_top = (old_history - screen.offset) as u64;
     let rows = std::mem::take(&mut screen.rows);
-    let mut output;
-    if old_columns == columns {
-        output = rows;
+    let (mut output, mut mapped, mapped_view_top) = if old_columns == columns {
+        let mut output = rows;
         let removed = old_lines
             .saturating_sub(lines)
             .min(old_lines - 1 - screen.cursor.point.line as usize);
         output.truncate(output.len() - removed);
-        flow.view_top = Some(old_view_top as u64);
-        for (row, column, index) in anchors {
-            flow.points[index] = Some((row, column));
-        }
-    } else {
-        let mut anchors: Vec<_> = anchors.collect();
-        anchors.sort_unstable();
-        output = VecDeque::new();
-        let mut anchor = 0;
-        for (id, row) in rows.into_iter().enumerate() {
-            flow.row(id as u64, row, &anchors, &mut anchor, &mut |row| {
-                output.push_back(row);
-                Ok::<_, std::convert::Infallible>(())
-            })
-            .unwrap();
-        }
-        if let Some(row) = flow.finish() {
-            output.push_back(row);
-        }
-    }
-    let mut mapped: Vec<_> = flow
-        .points
-        .into_iter()
-        .map(|point| {
-            let (line, column) = point.unwrap();
-            Point {
-                line: line as i32,
+        let mapped = anchors
+            .iter()
+            .map(|&(row, column, _)| Point {
+                line: row as i32,
                 column,
-            }
-        })
-        .collect();
-    let mapped_view_top = flow.view_top.unwrap() as usize;
+            })
+            .collect();
+        (output, mapped, old_view_top)
+    } else {
+        anchors.sort_unstable();
+        let mut flow = RowReflow::new(old_columns, columns, points.len(), old_view_top);
+        let mut rest = anchors.as_slice();
+        for (id, row) in rows.into_iter().enumerate() {
+            let (here, tail) = rest.split_at(rest.partition_point(|anchor| anchor.0 <= id as u64));
+            rest = tail;
+            flow.row(id as u64, row, here);
+        }
+        flow.finish();
+        (flow.output, flow.points, flow.view_top.unwrap())
+    };
+    let mapped_view_top = mapped_view_top as usize;
     while old_columns != columns
         && output.len() > lines
         && output.back().is_some_and(|row| row.used == 0)
@@ -1801,7 +1707,7 @@ fn resize_screen(
     while output.len() < lines {
         output.push_back(Row::new(columns, Cell::default()));
     }
-    let limit = HISTORY_LIMIT + lines;
+    let limit = history_rows + lines;
     let discarded = output.len().saturating_sub(limit);
     output.drain(..discarded);
     let new_history = output.len() - lines;
@@ -1891,20 +1797,9 @@ impl Core {
                 };
             }
             if let Some(color) = underline_color {
-                let extras = row.extras_mut();
-                let insert = extras.partition_point(|(column, _)| *column < point.column);
-                extras.splice(
-                    insert..insert,
-                    (point.column..end).map(|column| {
-                        (
-                            column,
-                            Extra {
-                                underline_color: Some(color),
-                                ..Extra::default()
-                            },
-                        )
-                    }),
-                );
+                for column in point.column..end {
+                    row.extra_mut(column).underline_color = Some(color);
+                }
             }
             self.finish_write(end);
             text = &text[length..];
@@ -1949,20 +1844,10 @@ impl Core {
         0
     }
 
-    // Keep the REP buffer out of the shared CSI dispatch path.
-    #[inline(never)]
-    pub(crate) fn repeat_ascii(&mut self, byte: u8, count: usize) {
-        let bytes = [byte; 64];
-        let text = std::str::from_utf8(&bytes).unwrap();
-        for start in (0..count).step_by(text.len()) {
-            self.input_text(&text[..(count - start).min(text.len())]);
-        }
-    }
-
     pub(crate) fn input(&mut self, c: char) {
         let charset = self.active.cursor.charsets[self.active.cursor.charset];
         let c = charset.map(c);
-        let width = usize::from(scalar_width(c)).min(2).min(self.columns());
+        let width = usize::from(scalar_width(c)).min(self.columns());
         let point = self.active.cursor.point;
         if width == 0 {
             let mut line = point.line as usize;
@@ -2095,22 +1980,19 @@ impl Core {
         }
     }
     pub(crate) fn move_tabs(&mut self, count: u16, forward: bool) {
-        let mut column = self.active.cursor.point.column;
-        if count != 0 {
-            let range = if forward {
-                column + 1..self.columns()
-            } else {
-                0..column
-            };
-            let mut stops = range.filter(|x| self.tabs[*x]);
-            let count = usize::from(count - 1);
-            column = if forward {
-                stops.nth(count).unwrap_or(self.columns() - 1)
-            } else {
-                stops.nth_back(count).unwrap_or(0)
-            };
-        }
-        self.goto_col(column);
+        let column = self.active.cursor.point.column;
+        let range = if forward {
+            column + 1..self.columns()
+        } else {
+            0..column
+        };
+        let mut stops = range.filter(|x| self.tabs[*x]);
+        let count = usize::from(count - 1);
+        self.goto_col(if forward {
+            stops.nth(count).unwrap_or(self.columns() - 1)
+        } else {
+            stops.nth_back(count).unwrap_or(0)
+        });
     }
     pub(crate) fn set_horizontal_tabstop(&mut self) {
         let column = self.active.cursor.point.column;
@@ -2295,23 +2177,9 @@ impl Core {
     pub(crate) fn set_cursor_shape(&mut self, shape: CursorShape) {
         self.cursor_shape = shape;
     }
-    pub(crate) fn terminal_attribute(&mut self, attr: Attr) {
+    pub(crate) fn style_mut(&mut self) -> (&mut Cell, &mut Option<Color>) {
         let cursor = &mut self.active.cursor;
-        let flags = &mut cursor.template.flags;
-        match attr {
-            Attr::Reset => {
-                cursor.template = Cell::default();
-                cursor.underline_color = None;
-            }
-            Attr::Flags(value, enabled) => flags.set(value, enabled),
-            Attr::Underline(value) => {
-                flags.remove(Flags::ALL_UNDERLINES);
-                flags.insert(value);
-            }
-            Attr::Foreground(color) => cursor.template.fg = color,
-            Attr::Background(color) => cursor.template.bg = color,
-            Attr::UnderlineColor(color) => cursor.underline_color = color,
-        }
+        (&mut cursor.template, &mut cursor.underline_color)
     }
     pub(crate) fn set_mode(&mut self, mode: u16, enabled: bool) {
         if let Some(flag) = ansi_mode(mode) {
@@ -2325,8 +2193,11 @@ impl Core {
         let mut events = std::mem::take(&mut self.events);
 
         let history = self.history.take();
+        let revision = self.revision;
         *self = Self::new(self.size, self.foreground, self.background);
-
+        // Frontends compare revisions, so a reset must not repeat an old one.
+        self.revision = revision;
+        self.damage_palette();
         self.history = history;
         self.clear_disk_history();
         events.push(Event::Title(None));
@@ -2343,14 +2214,6 @@ impl Core {
         }
         self.goto(0, 0);
         self.damage_all();
-    }
-    pub(crate) fn identify_terminal(&mut self, intermediate: Option<char>) {
-        match intermediate {
-            None => self.write_reply(format_args!("\x1b[?6c")),
-            Some('>') => self.write_reply(format_args!("\x1b[>0;1;0c")),
-            Some('=') => self.write_reply(format_args!("\x1bP!|00000000\x1b\\")),
-            _ => {}
-        }
     }
     pub(crate) fn device_status(&mut self, status: usize) {
         match status {
@@ -2390,10 +2253,7 @@ impl Core {
             && *slot != color
         {
             *slot = color;
-            if !self.palette_dirty {
-                self.palette_dirty = true;
-                self.damage_all();
-            }
+            self.damage_palette();
         }
     }
     pub(crate) fn dynamic_color_sequence(
@@ -2439,75 +2299,60 @@ impl Core {
             self.set_title(title.map(|title| Cow::Owned(title.into_string())));
         }
     }
-    pub(crate) fn text_area_size_pixels(&mut self) {
-        self.write_reply(format_args!(
-            "\x1b[4;{};{}t",
-            u32::from(self.size.num_lines) * u32::from(self.size.cell_height),
-            u32::from(self.size.num_cols) * u32::from(self.size.cell_width)
-        ));
-    }
-    pub(crate) fn text_area_size_chars(&mut self) {
-        let size = self.size;
-        self.write_reply(format_args!("\x1b[8;{};{}t", size.num_lines, size.num_cols));
-    }
-    pub(crate) fn report_keyboard_mode(&mut self) {
-        self.write_reply(format_args!("\x1b[?0u"));
-    }
-    pub(crate) fn report_modify_other_keys(&mut self) {
-        self.write_reply(format_args!("\x1b[>4;0m"));
-    }
 }
 
+// A view this far outside the cached cold rows loads a new page, so scrolling does not show blanks.
+const PAGE_MARGIN: u64 = 256;
+
 impl Core {
-    pub fn enable_history(&mut self, config: HistoryConfig) -> io::Result<()> {
+    pub fn enable_history(&mut self, budget: Arc<HistoryBudget>) {
         self.history = Some(DiskHistory {
-            io: History::new(config)?,
-            size: self.size,
+            io: History::new(budget),
             first: 0,
             hot_start: 0,
             spool: VecDeque::new(),
+            requests: VecDeque::new(),
             epoch: 0,
             layout_epoch: 0,
             page_start: 0,
             page: Vec::new(),
             requested: None,
             blank: Row::new(self.columns(), Cell::default()),
-            desired_size: None,
-            resizing: None,
-            clear: HistoryClear::Idle,
+            clearing: false,
+            failed: false,
         });
         self.spill_history();
-        Ok(())
     }
-    pub fn history_event_fd(&self) -> Option<std::os::fd::RawFd> {
-        self.history.as_ref().map(|history| history.io.event_fd())
-    }
-    pub(crate) fn resize_pending(&self) -> bool {
-        !self.mode.contains(Mode::ALT_SCREEN)
-            && self
-                .history
-                .as_ref()
-                .is_some_and(|history| history.desired_size.is_some() || history.resizing.is_some())
+    pub(crate) fn history_budget(&self) -> Option<Arc<HistoryBudget>> {
+        self.history
+            .as_ref()
+            .map(|history| history.io.budget().clone())
     }
     pub(crate) fn history_read_ready(&self) -> bool {
         self.mode.contains(Mode::ALT_SCREEN)
-            || self.history.as_ref().is_none_or(|history| {
-                history.spool.len() < 64
-                    && history.resizing.is_none()
-                    && history.desired_size.is_none()
-            })
+            || self
+                .history
+                .as_ref()
+                .is_none_or(|history| history.spool.len() < 64)
     }
     fn spill_history(&mut self) {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
         let lines = self.screen_lines();
-        if let Some(history) = &mut self.history {
-            while self.active.rows.len() > lines + history.io.hot_rows {
-                history
-                    .spool
-                    .push_back(self.active.rows.pop_front().unwrap());
-                history.hot_start += 1;
+        let Some(history) = &mut self.history else {
+            let excess = self.active.rows.len().saturating_sub(lines);
+            self.recycled.extend(self.active.rows.drain(..excess));
+            return;
+        };
+        while self.active.rows.len() > lines + HOT_ROWS {
+            let row = self.active.rows.pop_front().unwrap();
+            history.hot_start += 1;
+            if history.failed {
+                history.first = history.hot_start;
+                self.recycled.push_back(row);
+            } else {
+                history.spool.push_back(row);
             }
         }
         self.flush_history(false);
@@ -2516,26 +2361,17 @@ impl Core {
         let Some(history) = &mut self.history else {
             return;
         };
-        if history.clear != HistoryClear::Idle {
-            if history.clear == HistoryClear::Queued {
-                match history.io.clear() {
-                    Ok(()) => history.clear = HistoryClear::Requested,
-                    Err(error) if error.kind() == io::ErrorKind::WouldBlock => (),
-                    Err(error) => self.events.push(Event::HistoryError(error)),
-                }
-            }
+        if history.clearing || history.failed {
             return;
         }
-        while history.spool.len() >= BATCH || (final_batch && !history.spool.is_empty()) {
+        while !history.io.busy()
+            && (history.spool.len() >= BATCH || final_batch && !history.spool.is_empty())
+        {
             let count = history.spool.len().min(BATCH);
             let start = history.hot_start - history.spool.len() as u64;
-            let rows = history.spool.drain(..count).collect();
-            if let Err(rows) = history.io.append(start, rows) {
-                for row in rows.into_iter().rev() {
-                    history.spool.push_front(row);
-                }
-                break;
-            }
+            history
+                .io
+                .append(start, history.spool.drain(..count).collect());
         }
     }
     fn request_history_page(&mut self) {
@@ -2548,330 +2384,134 @@ impl Core {
         let Some(history) = &mut self.history else {
             return;
         };
-        if history.resizing.is_some() {
-            return;
-        }
         if offset <= hot_history {
             history.requested = None;
             return;
         }
-        let start = history
+        let top = history
             .hot_start
             .saturating_sub((offset - hot_history) as u64)
             .max(history.first);
-        let count = lines.min((history.hot_start - start) as usize);
-        if history.page_start == start && history.page.len() >= count {
+        let bottom = (top + lines as u64).min(history.hot_start);
+        let load = |margin: u64| {
+            (
+                top.saturating_sub(margin).max(history.first),
+                (bottom + margin).min(history.hot_start),
+            )
+        };
+        let (need_start, need_end) = load(PAGE_MARGIN / 4);
+        let covered = |range: &Range<u64>| range.start <= need_start && need_end <= range.end;
+        let cached = history.page_start..history.page_start + history.page.len() as u64;
+        if covered(&cached) || history.requested.as_ref().is_some_and(covered) {
             return;
         }
-        if history.requested == Some(start) {
-            return;
-        }
-        if history.spool.is_empty() && history.io.page(history.epoch + 1, start, count) {
+        // Rows still in the spool are not on disk yet.
+        if history.spool.is_empty() {
+            let (start, end) = load(PAGE_MARGIN);
             history.epoch += 1;
-            history.requested = Some(start);
+            history
+                .io
+                .page(history.epoch, start, (end - start) as usize);
+            history.requested = Some(start..end);
         }
     }
-    pub(crate) fn poll_history(&mut self, read_notification: bool) -> io::Result<bool> {
+    pub(crate) fn poll_history(&mut self) -> bool {
+        let Some(history) = &mut self.history else {
+            return false;
+        };
         let mut changed = false;
         let mut page_loaded = false;
-        let mut notified = false;
-        let mut reflow = None;
         let mut failure = None;
-        if let Some(history) = &mut self.history {
-            notified = read_notification && history.io.drain()?;
-            history.io.check_budget();
-            for reply in history.io.poll() {
-                match reply {
-                    Reply::Stored { first } => {
-                        if history.clear != HistoryClear::Idle {
-                            continue;
-                        }
-                        changed |= history.first != first;
-                        history.first = first;
-                    }
-                    Reply::Cleared => {
-                        history.clear = HistoryClear::Idle;
+        for reply in history.io.poll() {
+            match reply {
+                Reply::Stored(rows) => self.recycled.extend(rows),
+                Reply::First(first) if !history.clearing && !history.failed => {
+                    changed |= history.first != first;
+                    history.first = first;
+                }
+                Reply::First(_) => (),
+                Reply::Cleared => {
+                    history.clearing = false;
+                    changed = true;
+                }
+                Reply::Page { epoch, start, rows } => {
+                    if history.requested.is_some() && history.epoch == epoch {
+                        history.page_start = start;
+                        history.page = rows;
+                        history.requested = None;
                         changed = true;
+                        page_loaded = true;
                     }
-                    Reply::Page {
-                        epoch,
-                        start,
-                        first,
-                        rows,
-                    } => {
-                        if history.requested.is_some() && history.epoch == epoch {
-                            history.first = history.first.max(first);
-                            history.page_start = start;
-                            history.page = rows;
-                            history.requested = None;
-                            changed = true;
-                            page_loaded = true;
-                        }
-                    }
-                    Reply::Reflow {
-                        rows,
-                        first,
-                        hot_start,
-                        points,
-                        view_top,
-                    } => reflow = Some((rows, first, hot_start, points, view_top)),
-                    Reply::Error(error) => {
-                        failure = Some(error);
-                        break;
-                    }
+                }
+                Reply::Error(error) => {
+                    failure = Some(error);
+                    break;
                 }
             }
         }
         if let Some(error) = failure {
-            let history = self.history.take().unwrap();
-            let active_size = self.size;
-            let size = history
-                .desired_size
-                .or(history.resizing.map(|pending| pending.size));
-            let lines = usize::from(history.size.num_lines);
-            let main = if self.mode.contains(Mode::ALT_SCREEN) {
-                &mut self.inactive
-            } else {
-                &mut self.active
-            };
-            for row in history.spool.into_iter().rev() {
-                main.rows.push_front(row);
-            }
-            main.rows
-                .drain(..main.rows.len().saturating_sub(HISTORY_LIMIT + lines));
-            main.offset = main.offset.min(main.rows.len() - lines);
-            self.selection = None;
-            history.io.shutdown();
-            self.size = history.size;
-            self.trim_blocks();
-            self.resize(size.unwrap_or(active_size));
-            self.damage_all();
-            self.events.push(Event::HistoryError(io::Error::new(
-                error.kind(),
-                format!("disk history disabled; retained history is incomplete: {error}"),
-            )));
-            return Ok(true);
-        }
-        if let Some((rows, first, hot_start, points, view_top)) = reflow {
-            self.finish_history_resize(rows, first, hot_start, points, view_top);
-            changed = true;
+            self.history_failed(error);
+            return true;
         }
         if changed {
             let offset = self.active.offset.min(self.history_size());
             if page_loaded || offset != self.active.offset {
                 self.damage_all();
+                if let Some(history) = &mut self.history {
+                    for row in &mut history.page {
+                        row.revision = self.revision;
+                    }
+                }
             }
             self.active.offset = offset;
-            if self
-                .history
-                .as_ref()
-                .is_none_or(|history| history.resizing.is_none())
-            {
-                self.trim_blocks();
-            }
+            self.trim_blocks();
         }
-        self.flush_history(true);
-        self.start_history_resize();
+        self.flush_history_requests();
         self.request_history_page();
-        Ok(changed || notified)
+        changed
     }
-    fn start_history_resize(&mut self) {
-        if self.mode.contains(Mode::ALT_SCREEN) {
-            return;
-        }
-        let Some(history) = &self.history else { return };
-        if history.resizing.is_some()
-            || history.clear != HistoryClear::Idle
-            || !history.spool.is_empty()
-        {
-            return;
-        }
-        let Some(size) = history.desired_size else {
-            return;
-        };
-        if size.num_cols == self.size.num_cols && size.num_lines == self.size.num_lines {
-            self.size = size;
-            let history = self.history.as_mut().unwrap();
-            history.size = size;
-            history.desired_size = None;
-            return;
-        }
-        let main = self.main_screen();
-        let base = history.hot_start + main.rows.len() as u64 - self.screen_lines() as u64;
-        let absolute = |point: Point| {
-            (
-                base.saturating_add_signed(i64::from(point.line)),
-                point.column,
-            )
-        };
-        let mut points = vec![
-            absolute(main.cursor.logical_point()),
-            absolute(main.saved.logical_point()),
-        ];
-        let selection = self.selection;
-        if let Some(selection) = selection {
-            points.extend([absolute(selection.start), absolute(selection.end)]);
-        }
-        let block_points = self
-            .blocks
-            .iter()
-            .map(|block| {
-                let mut indices = [None; 4];
-                for (index, point) in [Some(block.prompt), block.command, block.output, block.end]
-                    .into_iter()
-                    .enumerate()
-                {
-                    if let Some(point) = point {
-                        indices[index] = Some(points.len());
-                        points.push((point.row, point.column));
-                    }
-                }
-                (block.id, indices)
-            })
-            .collect();
-        let request = Reflow {
-            hot_start: history.hot_start,
-            hot: main.rows.iter().cloned().collect(),
-            points,
-            old_columns: self.columns(),
-            old_lines: self.screen_lines(),
-            columns: usize::from(size.num_cols),
-            lines: usize::from(size.num_lines),
-            view_top: base.saturating_sub(main.offset as u64),
-            keep_rows: history.io.hot_rows + usize::from(size.num_lines),
-        };
-        let at_bottom = main.offset == 0;
+    /// A failed archive is dropped. The hot rows stay, so copying and searching still work on
+    /// them, and rows that leave the hot area are discarded from now on.
+    fn history_failed(&mut self, error: io::Error) {
         let history = self.history.as_mut().unwrap();
-        if history.io.reflow(request).is_ok() {
-            history.resizing = Some(PendingResize {
-                size,
-                selection: ResizeSelection::Reflow(selection),
-                block_points,
-                at_bottom,
-                viewport_changed: false,
-            });
-            history.desired_size = None;
-            history.requested = None;
-            history.epoch += 1;
-            history.layout_epoch += 1;
-        }
-    }
-    fn finish_history_resize(
-        &mut self,
-        rows: VecDeque<Row>,
-        first: u64,
-        hot_start: u64,
-        points: Vec<Option<(u64, usize)>>,
-        view_top: u64,
-    ) {
-        let history = self.history.as_mut().unwrap();
-        let Some(pending) = history.resizing.take() else {
-            return;
-        };
-        let columns = usize::from(pending.size.num_cols);
-        let lines = usize::from(pending.size.num_lines);
-        let base = hot_start + rows.len() as u64 - lines as u64;
-        let point = |value: Option<(u64, usize)>| {
-            value.map(|(line, column)| Point {
-                line: (line as i64 - base as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32,
-                column,
-            })
-        };
-        let (main, alternate) = if self.mode.contains(Mode::ALT_SCREEN) {
-            (&mut self.inactive, &mut self.active)
-        } else {
-            (&mut self.active, &mut self.inactive)
-        };
-        main.rows = rows;
-        for (cursor, mapped) in [&mut main.cursor, &mut main.saved].into_iter().zip(&points) {
-            cursor.point = point(*mapped).unwrap_or_default();
-            cursor.point.line = cursor.point.line.clamp(0, lines as i32 - 1);
-            cursor.wrap_pending = cursor.point.column == columns;
-            cursor.point.column = cursor.point.column.min(columns - 1);
-        }
-        main.offset = if pending.viewport_changed {
-            main.offset
-                .min((hot_start - first) as usize + main.rows.len() - lines)
-        } else if pending.at_bottom {
-            0
-        } else {
-            base.saturating_sub(view_top.max(first)) as usize
-        };
-        self.selection = match pending.selection {
-            ResizeSelection::Reflow(selection) => selection.and_then(|mut selection| {
-                selection.start = point(points[2])?;
-                selection.end = point(points[3])?;
-                Some(selection)
-            }),
-            ResizeSelection::Restore(anchor) => anchor.selection_at(base, columns),
-        };
-        for (id, indices) in pending.block_points {
-            if let Some(block) = self.blocks.iter_mut().find(|block| block.id == id) {
-                let convert = |index: Option<usize>| {
-                    index
-                        .and_then(|index| points[index])
-                        .map(|(row, column)| BlockPoint { row, column })
-                };
-                if let Some(prompt) = convert(indices[0]) {
-                    block.prompt = prompt;
-                } else {
-                    block.incomplete = true;
-                    block.prompt = BlockPoint {
-                        row: first,
-                        column: 0,
-                    };
-                }
-                for (target, index, output) in [
-                    (&mut block.command, indices[1], false),
-                    (&mut block.output, indices[2], true),
-                    (&mut block.end, indices[3], false),
-                ] {
-                    if index.is_some() {
-                        let mapped = convert(index);
-                        if mapped.is_none() {
-                            block.incomplete = true;
-                        }
-                        *target = mapped.or_else(|| {
-                            output.then_some(BlockPoint {
-                                row: first,
-                                column: 0,
-                            })
-                        });
-                    }
-                }
-            }
-        }
-        alternate.resize_alternate(columns, lines);
-        if self.mode.contains(Mode::ALT_SCREEN) {
-            self.selection = None;
-        }
-        self.block_origin = base;
-        history.first = first;
-        history.hot_start = hot_start;
+        history.io.clear();
+        history.failed = true;
+        history.clearing = false;
+        history.spool.clear();
+        history.first = history.hot_start;
         history.page.clear();
         history.requested = None;
-        history.blank = Row::new(columns, Cell::default());
-        history.size = pending.size;
-        self.finish_resize(pending.size);
+        history.layout_epoch += 1;
+        let lines = self.screen_lines();
+        let main = if self.mode.contains(Mode::ALT_SCREEN) {
+            &mut self.inactive
+        } else {
+            &mut self.active
+        };
+        main.offset = main.offset.min(main.rows.len() - lines);
+        self.trim_blocks();
+        self.damage_all();
+        self.flush_history_requests();
+        self.events.push(Event::HistoryError(io::Error::new(
+            error.kind(),
+            format!("disk history disabled; retained history is incomplete: {error}"),
+        )));
     }
     fn clear_disk_history(&mut self) {
-        if let Some(history) = &mut self.history {
-            history.size = self.size;
-            let desired_size = history
-                .desired_size
-                .or_else(|| history.resizing.as_ref().map(|pending| pending.size));
-            history.clear = HistoryClear::Queued;
-            history.first = 0;
-            history.hot_start = 0;
-            history.spool.clear();
-            history.page.clear();
-            history.requested = None;
-            history.epoch += 1;
-            history.layout_epoch += 1;
-            history.resizing = None;
-            history.desired_size = desired_size;
+        let Some(history) = &mut self.history else {
+            return;
+        };
+        history.first = 0;
+        history.hot_start = 0;
+        history.spool.clear();
+        history.page.clear();
+        history.requested = None;
+        history.epoch += 1;
+        history.layout_epoch += 1;
+        if !history.failed {
+            history.clearing = true;
+            history.io.clear();
         }
-        self.flush_history(true);
     }
 }
 
@@ -2891,11 +2531,8 @@ impl Core {
         }
         let block = self.blocks.back()?;
         let command = block.command?;
-        let cursor = BlockPoint {
-            row: self.block_origin + self.active.cursor.point.line as u64,
-            column: self.active.cursor.logical_point().column,
-        };
-        (block.output.is_none() && block.end.is_none() && command == cursor).then_some(block.id)
+        (block.output.is_none() && block.end.is_none() && command == self.cursor_block_point())
+            .then_some(block.id)
     }
 
     pub fn shell_editing(&self) -> bool {
@@ -2910,7 +2547,7 @@ impl Core {
         self.directory.as_deref()
     }
     pub(crate) fn set_directory_uri(&mut self, uri: &[u8]) {
-        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::ffi::OsStringExt;
         let Some(uri) = uri.strip_prefix(b"file://") else {
             return;
         };
@@ -2918,40 +2555,18 @@ impl Core {
             return;
         };
         let host = &uri[..slash];
-        if !host.is_empty() && host != b"localhost" {
-            let mut name = [0u8; 256];
-            if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } != 0 {
-                return;
-            }
-            let end = name
-                .iter()
-                .position(|byte| *byte == 0)
-                .unwrap_or(name.len());
-            if host != &name[..end] {
-                return;
-            }
-        }
-        let path = &uri[slash..];
-        let escapes = memchr::memchr_iter(b'%', path).count();
-        if escapes == 0 {
-            if !path.contains(&0)
-                && self
-                    .directory
-                    .as_ref()
-                    .is_none_or(|directory| directory.as_os_str().as_bytes() != path)
-            {
-                self.directory = Some(PathBuf::from(std::ffi::OsString::from_vec(path.to_vec())));
-            }
+        if !matches!(host, b"" | b"localhost")
+            && !std::fs::read("/proc/sys/kernel/hostname")
+                .is_ok_and(|name| name.trim_ascii_end() == host)
+        {
             return;
         }
-        let mut decoded = Vec::with_capacity(path.len().saturating_sub(escapes * 2));
-        let mut bytes = path.iter().copied();
+        let mut decoded = Vec::with_capacity(uri.len() - slash);
+        let mut bytes = uri[slash..].iter().copied();
         while let Some(byte) = bytes.next() {
             let byte = if byte == b'%' {
-                let Some(high) = bytes.next().and_then(|b| (b as char).to_digit(16)) else {
-                    return;
-                };
-                let Some(low) = bytes.next().and_then(|b| (b as char).to_digit(16)) else {
+                let mut digit = || bytes.next().and_then(|b| (b as char).to_digit(16));
+                let (Some(high), Some(low)) = (digit(), digit()) else {
                     return;
                 };
                 (high * 16 + low) as u8
@@ -2973,9 +2588,6 @@ impl Core {
             match status {
                 Some(b"1" | b"2") => {
                     self.prompt_scope = Flags::PROMPT;
-                    if status == Some(b"2") {
-                        self.prompt_scope.insert(Flags::RIGHT_PROMPT);
-                    }
                     let point = self.active.cursor.point;
                     let row = self.screen_row_mut(point.line as usize);
                     // Cursor-positioned right prompts own their blank padding too.
@@ -2991,15 +2603,15 @@ impl Core {
             }
             return;
         }
-        match marker {
-            b"A" => self.prompt_scope = Flags::PROMPT,
-            b"B" | b"C" | b"D" => self.prompt_scope = Flags::empty(),
-            _ => return,
+        if !matches!(marker, b"A" | b"B" | b"C" | b"D") {
+            return;
         }
-        let point = BlockPoint {
-            row: self.block_origin + self.active.cursor.point.line as u64,
-            column: self.active.cursor.logical_point().column,
+        self.prompt_scope = if marker == b"A" {
+            Flags::PROMPT
+        } else {
+            Flags::empty()
         };
+        let point = self.cursor_block_point();
         match marker {
             b"A" => {
                 // Repainting the same prompt must not grow metadata indefinitely.
@@ -3026,13 +2638,7 @@ impl Core {
                 self.blocks.push_back(Block {
                     id: self.next_block,
                     prompt: point,
-                    command: None,
-                    output: None,
-                    end: None,
-                    status: None,
-                    incomplete: false,
-                    started: None,
-                    finished: None,
+                    ..Block::default()
                 });
                 self.prompt_dirty = false;
                 self.next_block += 1;
@@ -3064,38 +2670,45 @@ impl Core {
                         .and_then(|s| s.parse().ok());
                 }
             }
-            _ => return,
+            _ => {}
         }
         self.trim_blocks();
+    }
+    fn cursor_block_point(&self) -> BlockPoint {
+        let cursor = &self.main_screen().cursor;
+        BlockPoint {
+            row: self.block_origin + cursor.point.line as u64,
+            column: cursor.logical_point().column,
+        }
     }
     fn shift_blocks(&mut self, top: usize, bottom: usize, delta: i32) {
         let low = self.block_origin + top as u64;
         let high = self.block_origin + bottom as u64;
         for block in &mut self.blocks {
-            for point in std::iter::once(&mut block.prompt).chain(
-                [&mut block.command, &mut block.output, &mut block.end]
-                    .into_iter()
-                    .flatten(),
-            ) {
-                if point.row >= low && point.row < high {
-                    let moved = point.row.saturating_add_signed(i64::from(delta));
-                    if moved < low || moved >= high {
-                        block.incomplete = true;
-                    }
-                    point.row = moved.clamp(low, high - 1);
-                }
+            let mut escaped = false;
+            for point in block
+                .points_mut()
+                .filter(|point| (low..high).contains(&point.row))
+            {
+                let moved = point.row.saturating_add_signed(i64::from(delta));
+                escaped |= !(low..high).contains(&moved);
+                point.row = moved.clamp(low, high - 1);
             }
+            block.incomplete |= escaped;
         }
     }
-    fn trim_blocks(&mut self) {
-        let history = self.history.as_ref().map_or_else(
-            || self.main_screen().rows.len() - self.screen_lines(),
-            |history| {
-                (history.hot_start - history.first) as usize + self.main_screen().rows.len()
-                    - usize::from(history.size.num_lines)
+    /// Id of the oldest row still retained.
+    fn first_row(&self) -> u64 {
+        self.history.as_ref().map_or_else(
+            || {
+                let hot = self.main_screen().rows.len() - self.screen_lines();
+                self.block_origin.saturating_sub(hot as u64)
             },
-        );
-        let first = self.block_origin.saturating_sub(history as u64);
+            |history| history.first,
+        )
+    }
+    fn trim_blocks(&mut self) {
+        let first = self.first_row();
         while self
             .blocks
             .front()
@@ -3104,7 +2717,7 @@ impl Core {
             self.blocks.pop_front();
         }
         // Repeated prompt redraws cannot grow metadata without retained terminal rows.
-        let limit = history.saturating_add(self.screen_lines()).max(1);
+        let limit = (self.block_origin - first) as usize + self.screen_lines();
         self.blocks.drain(..self.blocks.len().saturating_sub(limit));
     }
     pub(crate) fn latest_command_status(&self) -> Option<Option<i32>> {
@@ -3115,14 +2728,7 @@ impl Core {
             .map(|block| block.status)
     }
     pub fn recent_command_blocks(&self) -> Vec<CommandBlock> {
-        let main = self.main_screen();
-        let first = self.history.as_ref().map_or_else(
-            || {
-                self.block_origin
-                    .saturating_sub((main.rows.len() - self.screen_lines()) as u64)
-            },
-            |history| history.first,
-        );
+        let first = self.first_row();
         self.blocks
             .range(self.blocks.len().saturating_sub(4)..)
             .map(|block| block.metadata(first))
@@ -3136,7 +2742,7 @@ impl Core {
             .block_origin
             .saturating_sub(self.display_offset() as u64);
         let bottom = top + self.screen_lines() as u64;
-        let first = self.block_origin.saturating_sub(self.history_size() as u64);
+        let first = self.first_row();
         let begin = self
             .blocks
             .partition_point(|block| block.prompt.row < top)
@@ -3147,21 +2753,12 @@ impl Core {
             .filter(|block| block.end.is_none_or(|end| end.row >= top))
             .map(|block| BlockMarker {
                 id: block.id,
-                line: (block.prompt.row.max(top) as i64 - self.block_origin as i64) as i32,
+                line: line_offset(block.prompt.row.max(top), self.block_origin),
                 complete: block.is_complete(first),
                 status: block.status,
                 output: block.output.map(|start| {
-                    let end = block.end.unwrap_or(BlockPoint {
-                        row: self.block_origin + self.active.cursor.point.line as u64,
-                        column: self.active.cursor.logical_point().column,
-                    });
-                    let point = |point: BlockPoint| Point {
-                        line: (i128::from(point.row) - i128::from(self.block_origin))
-                            .clamp(i128::from(i32::MIN), i128::from(i32::MAX))
-                            as i32,
-                        column: point.column,
-                    };
-                    (point(start), point(end))
+                    let end = block.end.unwrap_or_else(|| self.cursor_block_point());
+                    (start.at(self.block_origin), end.at(self.block_origin))
                 }),
             })
             .collect()
@@ -3221,57 +2818,31 @@ impl Core {
             .min(self.history_size() as u64) as usize;
         self.set_display_offset(offset);
         self.selection = anchor.selection_at(base, self.columns());
-        if let Some(pending) = self
-            .history
-            .as_mut()
-            .and_then(|history| history.resizing.as_mut())
-        {
-            pending.selection = ResizeSelection::Restore(anchor);
-        }
         self.damage_all();
     }
     pub(crate) fn search(
         &mut self,
         query: &str,
         cancelled: &Arc<AtomicBool>,
-        wake: BorrowedFd<'_>,
-    ) -> io::Result<mpsc::Receiver<io::Result<crate::search::SearchResult>>> {
-        let alternate = self.mode.contains(Mode::ALT_SCREEN);
-        if !alternate {
-            self.prepare_history_read()?;
-        }
-        let history = self.history.as_ref().ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::Unsupported,
-                "pane search requires workspace history",
-            )
-        })?;
-        let hot_start = if alternate { 0 } else { history.hot_start };
-        // Search reads only used cells; leave styled blank tails out of its snapshot.
-        let hot = self
-            .active
-            .rows
-            .iter()
-            .map(|row| {
-                let used = row.used();
-                let extras = row.extras();
-                let end = extras.partition_point(|(column, _)| *column < used);
-                Row::from_parts(
-                    row.cells[..used.max(1)].to_vec(),
-                    row.wrapped,
-                    used,
-                    extras[..end].to_vec(),
-                )
-                .unwrap()
-            })
-            .collect();
-        history.io.search(
-            query.to_owned(),
-            (hot_start, hot),
-            (self.columns(), alternate),
-            Arc::clone(cancelled),
-            wake.try_clone_to_owned()?,
-        )
+    ) -> mpsc::Receiver<io::Result<crate::search::SearchResult>> {
+        let query = query.to_owned();
+        let cancelled = Arc::clone(cancelled);
+        self.submit(move |core, sender| {
+            let history = core.history.as_ref().unwrap();
+            let alternate = core.mode.contains(Mode::ALT_SCREEN);
+            history.io.search(
+                HistorySearch {
+                    query,
+                    hot_start: if alternate { 0 } else { history.hot_start },
+                    hot: core.active.rows.iter().cloned().collect(),
+                    columns: core.columns(),
+                    alternate,
+                    cancelled,
+                },
+                sender.clone(),
+            );
+            Ok(())
+        })
     }
     pub(crate) fn search_select(
         &mut self,
@@ -3303,7 +2874,7 @@ impl Core {
         self.set_display_offset(offset);
         self.selection_start(
             Point {
-                line: (i128::from(found.start_row) - i128::from(base)) as i32,
+                line: line_offset(found.start_row, base),
                 column: usize::from(found.start_column),
             },
             Side::Left,
@@ -3311,7 +2882,7 @@ impl Core {
         );
         self.selection_update(
             Point {
-                line: (i128::from(found.end_row) - i128::from(base)) as i32,
+                line: line_offset(found.end_row, base),
                 column: usize::from(found.end_column.saturating_sub(1)),
             },
             Side::Right,
@@ -3330,29 +2901,72 @@ impl Core {
         let start = block.output.ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "command has no output marker")
         })?;
-        let main = self.main_screen();
-        let end = block.end.unwrap_or(BlockPoint {
-            row: self.block_origin + main.cursor.point.line as u64,
-            column: main.cursor.logical_point().column,
-        });
+        let end = block.end.unwrap_or_else(|| self.cursor_block_point());
         Ok((block, start, end))
     }
-    pub fn copy_block(&mut self, id: u64) -> io::Result<mpsc::Receiver<io::Result<HistoryCopy>>> {
-        self.prepare_history_read()?;
-        let (block, start, end) = self.block_output(id)?;
-        let main = self.main_screen();
-        let history = self.disk_history()?;
-        let first = history.first;
-        let incomplete = block.incomplete || block.prompt.row < first || start.row < first;
-        let (hot_start, hot) = Self::copy_rows(&main.rows, history.hot_start, start.row, end.row);
-        history.io.copy(
-            (start.row, start.column),
-            (end.row, end.column),
-            hot_start,
-            hot,
-            None,
-            incomplete,
-        )
+    pub fn copy_block(&mut self, id: u64) -> mpsc::Receiver<io::Result<HistoryCopy>> {
+        self.submit(move |core, sender| {
+            let (block, start, end) = core.block_output(id)?;
+            let history = core.history.as_ref().unwrap();
+            let (hot_start, hot) = Self::copy_rows(
+                &core.main_screen().rows,
+                history.hot_start,
+                start.row,
+                end.row,
+            );
+            history.io.copy(
+                HistoryCopyRequest {
+                    start: (start.row, start.column),
+                    end: (end.row, end.column),
+                    hot_start,
+                    hot,
+                    kind: None,
+                    incomplete: block.incomplete
+                        || block.prompt.row < history.first
+                        || start.row < history.first,
+                    in_memory: history.failed,
+                },
+                sender.clone(),
+            );
+            Ok(())
+        })
+    }
+
+    pub fn copy_selection(&mut self) -> mpsc::Receiver<io::Result<HistoryCopy>> {
+        self.submit(|core, sender| {
+            let range = core
+                .selection_range()
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no selection"))?;
+            let history = core.history.as_ref().unwrap();
+            let hot_start = if core.mode.contains(Mode::ALT_SCREEN) {
+                0
+            } else {
+                history.hot_start
+            };
+            let base = hot_start + core.hot_history_size() as u64;
+            let start = (
+                base.saturating_add_signed(i64::from(range.start.line)),
+                range.start.column,
+            );
+            let end = (
+                base.saturating_add_signed(i64::from(range.end.line)),
+                range.end.column + 1,
+            );
+            let (hot_start, hot) = Self::copy_rows(&core.active.rows, hot_start, start.0, end.0);
+            history.io.copy(
+                HistoryCopyRequest {
+                    start,
+                    end,
+                    hot_start,
+                    hot,
+                    kind: core.selection.map(|selection| selection.kind),
+                    incomplete: false,
+                    in_memory: history.failed,
+                },
+                sender.clone(),
+            );
+            Ok(())
+        })
     }
 
     pub fn read_history(
@@ -3360,193 +2974,139 @@ impl Core {
         block: Option<u64>,
         cursor: Option<HistoryCursor>,
         query: Option<&str>,
-    ) -> io::Result<(mpsc::Receiver<io::Result<HistoryPage>>, Arc<AtomicBool>)> {
-        self.prepare_history_read()?;
-        let history = self.disk_history()?;
-        if cursor.is_some_and(|cursor| cursor.epoch != history.layout_epoch) {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "History cursor is stale after terminal resize or clear; read again without a cursor",
-            ));
-        }
-        let main = self.main_screen();
-        let (start, end, incomplete, command) = if let Some(id) = block {
-            let (block, start, end) = self.block_output(id)?;
-            let bounded_end = end.max(start);
-            (
-                (start.row, start.column),
-                (bounded_end.row, bounded_end.column),
-                block.incomplete || block.prompt.row < history.first || end < start,
-                Some(block.metadata(history.first)),
-            )
-        } else {
-            let cursor_row = self.block_origin + main.cursor.point.line as u64;
-            let last_used = main
-                .rows
-                .iter()
-                .rposition(|row| row.used() != 0)
-                .map_or(cursor_row, |index| history.hot_start + index as u64);
-            (
-                (0, 0),
-                (
-                    cursor_row.max(last_used),
-                    usize::from(history.size.num_cols),
-                ),
-                history.first != 0,
-                None,
-            )
-        };
-        let cursor = cursor.unwrap_or(HistoryCursor {
-            epoch: history.layout_epoch,
-            row: start.0,
-            offset: 0,
-        });
-        if cursor.row < start.0 || cursor.row > end.0 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidInput,
-                "History cursor is outside the requested command or history range",
-            ));
-        }
-        let (hot_start, hot) = Self::copy_rows(&main.rows, history.hot_start, cursor.row, end.0);
+    ) -> (mpsc::Receiver<io::Result<HistoryPage>>, Arc<AtomicBool>) {
         let cancelled = Arc::new(AtomicBool::new(false));
-        let receiver = history.io.read(HistoryRead {
-            start,
-            end,
-            hot_start,
-            hot,
-            cursor,
-            query: query.map(str::to_owned),
-            incomplete,
-            command,
-            cancelled: Arc::clone(&cancelled),
-        })?;
-        Ok((receiver, cancelled))
+        let query = query.map(str::to_owned);
+        let flag = Arc::clone(&cancelled);
+        let receiver = self.submit(move |core, sender| {
+            let history = core.history.as_ref().unwrap();
+            if cursor.is_some_and(|cursor| cursor.epoch != history.layout_epoch) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "History cursor is stale after terminal resize or clear; read again without a cursor",
+                ));
+            }
+            let main = core.main_screen();
+            let (start, end, incomplete, command) = if let Some(id) = block {
+                let (block, start, end) = core.block_output(id)?;
+                let bounded_end = end.max(start);
+                (
+                    (start.row, start.column),
+                    (bounded_end.row, bounded_end.column),
+                    block.incomplete || block.prompt.row < history.first || end < start,
+                    Some(block.metadata(history.first)),
+                )
+            } else {
+                let cursor_row = core.cursor_block_point().row;
+                let last_used = main
+                    .rows
+                    .iter()
+                    .rposition(|row| row.used() != 0)
+                    .map_or(cursor_row, |index| history.hot_start + index as u64);
+                (
+                    (0, 0),
+                    (cursor_row.max(last_used), core.columns()),
+                    history.first != 0,
+                    None,
+                )
+            };
+            let cursor = cursor.unwrap_or(HistoryCursor {
+                epoch: history.layout_epoch,
+                row: start.0,
+                offset: 0,
+            });
+            if cursor.row < start.0 || cursor.row > end.0 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "History cursor is outside the requested command or history range",
+                ));
+            }
+            let (hot_start, hot) =
+                Self::copy_rows(&main.rows, history.hot_start, cursor.row, end.0);
+            history.io.read(
+                HistoryRead {
+                    start,
+                    end,
+                    hot_start,
+                    hot,
+                    cursor,
+                    query,
+                    incomplete,
+                    command,
+                    cancelled: flag,
+                },
+                sender.clone(),
+            );
+            Ok(())
+        });
+        (receiver, cancelled)
     }
 }
 
 impl Core {
     fn copy_rows(rows: &VecDeque<Row>, hot_start: u64, start: u64, end: u64) -> (u64, Vec<Row>) {
-        let count = rows.len() as u64;
-        let from = start.saturating_sub(hot_start).min(count) as usize;
-        let to = end.saturating_add(1).saturating_sub(hot_start).min(count) as usize;
+        let count = rows.len();
+        let index = |id: u64| id.saturating_sub(hot_start).min(count as u64) as usize;
+        // Line and word selections may widen over soft-wrapped rows.
+        let mut from = index(start);
+        while from > 0 && rows[from - 1].wrapped {
+            from -= 1;
+        }
         // A running command may move its cursor above its output marker.
+        let mut to = index(end.saturating_add(1)).max(from).max(1);
+        while to < count && rows[to - 1].wrapped {
+            to += 1;
+        }
         (
             hot_start + from as u64,
-            rows.range(from..to.max(from)).cloned().collect(),
+            rows.range(from..to).cloned().collect(),
         )
     }
 
-    fn disk_history(&self) -> io::Result<&DiskHistory> {
-        self.history.as_ref().ok_or_else(|| {
-            io::Error::new(io::ErrorKind::Unsupported, "disk history is not enabled")
+    /// Requests wait while the rows they describe are still moving to disk, or a frame is
+    /// half drawn.
+    fn history_read_blocked(&mut self) -> bool {
+        self.flush_history(true);
+        self.history.as_ref().is_some_and(|history| {
+            self.mode.contains(Mode::SYNC_UPDATE) || !history.spool.is_empty() || history.clearing
         })
     }
 
-    fn prepare_history_read(&mut self) -> io::Result<()> {
-        self.flush_history(true);
-        if self.mode.contains(Mode::SYNC_UPDATE)
-            || self.history.as_ref().is_some_and(|history| {
-                !history.spool.is_empty()
-                    || history.clear != HistoryClear::Idle
-                    || history.resizing.is_some()
-                    || (history.desired_size.is_some() && !self.mode.contains(Mode::ALT_SCREEN))
-            })
-        {
-            return Err(io::ErrorKind::WouldBlock.into());
+    fn submit<T: Send + 'static>(
+        &mut self,
+        run: impl FnOnce(&Core, &mpsc::Sender<io::Result<T>>) -> io::Result<()> + Send + 'static,
+    ) -> mpsc::Receiver<io::Result<T>> {
+        let (sender, receiver) = mpsc::channel();
+        let task: Request = Box::new(move |core| {
+            if let Err(error) = run(core, &sender) {
+                let _ = sender.send(Err(error));
+            }
+        });
+        if self.history_read_blocked() {
+            self.history.as_mut().unwrap().requests.push_back(task);
+        } else {
+            task(self);
         }
-        Ok(())
+        receiver
     }
-    pub fn copy_selection(&mut self) -> io::Result<mpsc::Receiver<io::Result<HistoryCopy>>> {
-        self.prepare_history_read()?;
-        let range = self
-            .selection_range()
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no selection"))?;
-        let history = self.disk_history()?;
-        let hot_start = if self.mode.contains(Mode::ALT_SCREEN) {
-            0
-        } else {
-            history.hot_start
-        };
-        let base = hot_start + self.hot_history_size() as u64;
-        let start = (
-            base.saturating_add_signed(i64::from(range.start.line)),
-            range.start.column,
-        );
-        let end = (
-            base.saturating_add_signed(i64::from(range.end.line)),
-            range.end.column + 1,
-        );
-        let kind = self.selection.map(|selection| selection.kind);
-        // Word/line expansion may cross an uncached history-page boundary. Keep
-        // its hot context, including the archive boundary at zero in alternate mode.
-        let (hot_start, hot) = if self.mode.contains(Mode::ALT_SCREEN) {
-            (hot_start, self.active.rows.iter().cloned().collect())
-        } else if kind == Some(SelectionType::Simple) {
-            Self::copy_rows(&self.active.rows, hot_start, start.0, end.0)
-        } else {
-            let count = self.active.rows.len();
-            let mut from = start.0.saturating_sub(hot_start).min(count as u64) as usize;
-            let mut to = end
-                .0
-                .saturating_add(1)
-                .saturating_sub(hot_start)
-                .min(count as u64) as usize;
-            while from > 0 && self.active.rows[from - 1].wrapped {
-                from -= 1;
-            }
-            // A cold selection may expand into the first retained logical line.
-            to = to.max(1).min(count);
-            while to < count && self.active.rows[to - 1].wrapped {
-                to += 1;
-            }
-            (
-                hot_start + from as u64,
-                self.active
-                    .rows
-                    .range(from..to.max(from))
-                    .cloned()
-                    .collect(),
-            )
-        };
-        history.io.copy(start, end, hot_start, hot, kind, false)
+
+    /// Submits the requests that waited for a half-drawn frame or for rows on their way to disk.
+    pub(crate) fn flush_history_requests(&mut self) {
+        while !self.history_read_blocked() {
+            let Some(task) = self
+                .history
+                .as_mut()
+                .and_then(|history| history.requests.pop_front())
+            else {
+                break;
+            };
+            task(self);
+        }
     }
 }
 
 #[cfg(test)]
-fn settle_history(core: &mut Core) {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-    loop {
-        core.poll_history(true).unwrap();
-        let main = core.main_screen();
-        let cursor = HistoryCursor {
-            epoch: core.history.as_ref().unwrap().layout_epoch,
-            row: core.block_origin + main.cursor.point.line as u64,
-            offset: 0,
-        };
-        match core.read_history(None, Some(cursor), None) {
-            Ok((receiver, _)) => {
-                receiver
-                    .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
-                    .unwrap()
-                    .unwrap();
-                core.poll_history(true).unwrap();
-                return;
-            }
-            Err(error) => assert_eq!(error.kind(), io::ErrorKind::WouldBlock),
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "history worker barrier stalled"
-        );
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
-}
-
-#[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[cfg(test)]
 mod disk_tests;
-
-#[cfg(test)]
-mod history_boundary_tests;

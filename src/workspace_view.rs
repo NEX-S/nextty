@@ -1,31 +1,29 @@
-use crate::input::PasteTarget;
-use crate::input::keysym;
-use crate::panel::mix_color;
+use crate::input::{KeyResult, PasteTarget, keysym};
+use crate::panel::{mix_color, rect};
 
 mod agent_ui;
 mod render;
 
 use crate::files::FileFocus;
 
-use crate::{agent::panel::AgentAction, workspace_view::agent_ui::AgentScroll};
+use crate::agent::panel::AgentAction;
 use crate::{
     config::Config,
     context,
     core::{Mode, Point, Scroll, SelectionType, Side, WindowSize},
-    error::{Error, Result},
-    ui::{ClosePrompt, Focus, Ui},
+    ui::{ClosePrompt, Focus, TabHit, Ui, WHEEL_LINES},
     width::text_width,
-    workspace::{Action, Axis, Client, ClientEvent, PaneId, SplitDrag, TabId},
+    workspace::{Action, Axis, Client, PaneId, Response, SplitDrag},
 };
 use crate::{
     input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
-    native::trace::{Trace, monotonic},
+    native::trace::Trace,
     native::{self, Event, Line, Renderer, Run, Window},
     paint::{Frame, LineCache, text_columns},
 };
 use std::{
     collections::{HashMap, VecDeque},
-    io::Write,
+    io::Result,
     time::{Duration, Instant},
 };
 
@@ -35,21 +33,6 @@ enum DeferredInput {
     Paste(PasteTarget, bool),
 }
 
-fn close_layout(width: f32, height: f32, cell: (f32, f32)) -> [(f32, f32, f32, f32); 3] {
-    let w = (cell.0 * 62.).min(width * 0.9);
-    let h = (cell.1 * 9.).min(height * 0.9);
-    let x = (width - w) * 0.5;
-    let y = (height - h) * 0.5;
-    let padding = cell.0.min(w * 0.1);
-    let button_w = (w - padding * 3.) * 0.5;
-    let button_h = (cell.1 * 2.).min(h * 0.25);
-    [
-        (x, y, w, h),
-        (x + padding, y + h * 0.5, button_w, button_h),
-        (x + padding * 2. + button_w, y + h * 0.5, button_w, button_h),
-    ]
-}
-
 struct CachedText {
     color: u32,
     flags: u32,
@@ -57,28 +40,28 @@ struct CachedText {
     used: bool,
 }
 
-#[derive(Default)]
-struct TextCache {
+/// The renderer plus the shaped lines of UI text, which are kept while they keep being drawn.
+struct Painter {
+    // Lines must drop before the renderer that shaped them.
     lines: HashMap<Box<str>, Vec<CachedText>>,
+    renderer: Renderer,
 }
 
-impl TextCache {
-    fn draw(&mut self, renderer: &Renderer, text: &str, x: f32, y: f32, color: u32) -> Result<()> {
-        if text.is_empty() {
-            return Ok(());
+impl std::ops::Deref for Painter {
+    type Target = Renderer;
+    fn deref(&self) -> &Renderer {
+        &self.renderer
+    }
+}
+
+impl Painter {
+    fn text(&mut self, text: &str, x: f32, y: f32, color: u32) {
+        if !text.is_empty() {
+            self.text_flags(text, x, y, color, 0);
         }
-        self.draw_flags(renderer, text, x, y, color, 0)
     }
 
-    fn draw_flags(
-        &mut self,
-        renderer: &Renderer,
-        text: &str,
-        x: f32,
-        y: f32,
-        color: u32,
-        flags: u32,
-    ) -> Result<()> {
+    fn text_flags(&mut self, text: &str, x: f32, y: f32, color: u32, flags: u32) {
         let entry = if let Some(entry) = self.lines.get_mut(text).and_then(|entries| {
             entries
                 .iter_mut()
@@ -86,16 +69,14 @@ impl TextCache {
         }) {
             entry
         } else {
-            let line = renderer.shape(
-                text,
-                &[Run {
-                    start: 0,
-                    end: text.len() as u32,
-                    color,
-                    flags,
-                }],
-                &text_columns(text),
-            )?;
+            let end = text.len() as u32;
+            let run = Run {
+                start: 0,
+                end,
+                color,
+                flags,
+            };
+            let line = self.renderer.shape(text, &[run], &text_columns(text));
             self.lines
                 .entry(text.into())
                 .or_default()
@@ -107,10 +88,10 @@ impl TextCache {
                 })
         };
         entry.used = true;
-        renderer.line(&entry.line, x, y);
-        Ok(())
+        self.renderer.line(&entry.line, x, y);
     }
-    fn finish(&mut self) {
+
+    fn end_frame(&mut self) {
         self.lines.retain(|_, entries| {
             entries.retain_mut(|entry| std::mem::take(&mut entry.used));
             !entries.is_empty()
@@ -118,11 +99,17 @@ impl TextCache {
     }
 }
 
-const CHROME: u32 = (crate::panel::CHROME << 8) | 255;
-const BORDER: u32 = (crate::panel::BORDER << 8) | 255;
-const INK: u32 = (crate::panel::INK << 8) | 255;
-const MUTED: u32 = (crate::panel::MUTED << 8) | 255;
-const ACCENT: u32 = (crate::panel::ACCENT << 8) | 255;
+const fn opaque(color: u32) -> u32 {
+    (color << 8) | 255
+}
+
+const CHROME: u32 = opaque(crate::panel::CHROME);
+const BORDER: u32 = opaque(crate::panel::BORDER);
+const INK: u32 = opaque(crate::panel::INK);
+const MUTED: u32 = opaque(crate::panel::MUTED);
+const ACCENT: u32 = opaque(crate::panel::ACCENT);
+const DANGER: u32 = 0xe87575ff;
+const WARNING: u32 = 0xfe9b30ff;
 const PADDING: f32 = 16.;
 const TERMINAL_PADDING: f32 = 4.;
 
@@ -134,18 +121,32 @@ struct GuiLayout {
     side: f32,
     width: f32,
     height: f32,
+    panels: crate::ui::PanelLayout,
 }
 
 impl GuiLayout {
-    fn new(width: f32, height: f32, cell: (f32, f32), agent_width: Option<f32>) -> Self {
+    fn new(
+        width: f32,
+        height: f32,
+        cell: (f32, f32),
+        agent_width: Option<f32>,
+        files_open: bool,
+    ) -> Self {
         let side_width = agent_width.map_or(0., |width_px| width_px.min(width * 0.62));
+        let side = width - side_width;
+        let panels = crate::ui::PanelLayout::new(
+            (((side - TERMINAL_PADDING * 2.) / cell.0) as u16).max(2),
+            (side / cell.0) as u16,
+            files_open,
+        );
         Self {
-            left: 0.,
+            left: f32::from(panels.file_width) * cell.0,
             top: cell.1,
             footer: height - cell.1 - 12.,
-            side: width - side_width,
+            side,
             width,
             height,
+            panels,
         }
     }
     fn origin(self, cell: (f32, f32)) -> (f32, f32) {
@@ -156,7 +157,7 @@ impl GuiLayout {
     }
     fn size(self, cell: (f32, f32)) -> WindowSize {
         WindowSize {
-            num_cols: (((self.side - self.left - TERMINAL_PADDING * 2.) / cell.0) as u16).max(2),
+            num_cols: self.panels.terminal_columns,
             num_lines: (((self.footer - self.top - TERMINAL_PADDING * 2.) / cell.1) as u16)
                 .saturating_add(1)
                 .max(2),
@@ -190,8 +191,9 @@ impl GuiLayout {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ScrollTarget {
     Pane(PaneId),
-
-    Agent(AgentScroll),
+    Transcript,
+    Editor,
+    Preview,
 }
 
 #[derive(Clone, Copy)]
@@ -218,6 +220,22 @@ impl Scrollbar {
             visible,
             offset,
         })
+    }
+    /// The bar along the right edge of a cell-grid rectangle showing `rect.rows` of `total` lines.
+    fn in_rect(
+        target: ScrollTarget,
+        rect: crate::workspace::Rect,
+        cell: (f32, f32),
+        total: usize,
+        offset: usize,
+    ) -> Option<Self> {
+        let bounds = (
+            f32::from(rect.x + rect.cols) * cell.0 - 3.,
+            f32::from(rect.y) * cell.1,
+            3.,
+            f32::from(rect.rows) * cell.1,
+        );
+        Self::new(target, bounds, total, usize::from(rect.rows), offset)
     }
     fn maximum(self) -> usize {
         self.total - self.visible
@@ -253,17 +271,11 @@ struct ScrollbarDrag {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuiAction {
-    Resources,
-
     Monitor(crate::monitor::Action),
-    NewTab,
-    CloseTab(TabId),
-    Tab(i32),
-    SelectTab(usize),
+    Tab(TabHit),
     Minimize,
     Maximize,
     Close,
-
     Agent(crate::agent::panel::AgentAction),
 }
 
@@ -314,8 +326,7 @@ pub struct WorkspaceView {
     client: Client,
     ui: Ui,
     caches: HashMap<PaneId, PaneCache>,
-    text: TextCache,
-    renderer: Renderer,
+    painter: Painter,
     window: Window,
     config: Config,
     cell: (f32, f32),
@@ -337,14 +348,10 @@ pub struct WorkspaceView {
     scrollbar_drag: Option<ScrollbarDrag>,
     maximized: bool,
     hovered: Option<(PaneId, crate::context::Object)>,
-
     hovered_block: Option<(PaneId, u64)>,
     hover_cell: Option<(PaneId, Point)>,
-    hovered_control: Option<GuiHit>,
     control_hits: Vec<GuiHit>,
-
     trace: Option<Trace>,
-
     agent: agent_ui::AgentState,
 }
 
@@ -361,13 +368,15 @@ impl WorkspaceView {
         let mut view = Self {
             client,
             ui,
-            renderer,
+            painter: Painter {
+                lines: HashMap::new(),
+                renderer,
+            },
             window,
             config,
             cell,
             scale,
             caches: HashMap::new(),
-            text: TextCache::default(),
             dirty: true,
             running: true,
             focused: false,
@@ -381,18 +390,14 @@ impl WorkspaceView {
             preedit: String::new(),
             paste: None,
             deferred: VecDeque::new(),
-
             agent: agent_ui::AgentState::default(),
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             maximized: false,
             hovered: None,
-
             hovered_block: None,
             hover_cell: None,
-            hovered_control: None,
             control_hits: Vec::new(),
-
             trace,
         };
         view.resize()?;
@@ -402,10 +407,7 @@ impl WorkspaceView {
         let mut events = Vec::new();
         let mut pollfds = Vec::new();
         while self.running {
-            let ready = self.renderer.ready()?;
-            if ready && let Some(trace) = &mut self.trace {
-                trace.record_swap(self.renderer.swap_time())?;
-            }
+            let ready = self.painter.ready()?;
             let mut timeout = if self.dirty && ready && self.window.ready() {
                 0
             } else {
@@ -413,7 +415,7 @@ impl WorkspaceView {
             };
             if let Some(until) = self.ui.deadline() {
                 let remaining =
-                    crate::poll::timeout_millis(until.saturating_duration_since(Instant::now()));
+                    crate::sys::timeout_millis(until.saturating_duration_since(Instant::now()));
                 timeout = if timeout < 0 {
                     remaining
                 } else {
@@ -429,33 +431,28 @@ impl WorkspaceView {
             pollfds.extend([
                 self.client.pollfd(),
                 libc::pollfd {
-                    fd: self.renderer.fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
-                libc::pollfd {
-                    fd: self.client.receiver_fd(),
+                    fd: self.painter.fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 },
             ]);
             pollfds.extend(self.ui.fds());
             self.window.wait(&mut pollfds, timeout, &mut events)?;
-            if pollfds[2].revents != 0 {
-                crate::eventfd::consume_notification(pollfds[2].fd)?;
-            }
             if pollfds[0].revents & libc::POLLOUT != 0 {
                 self.client.flush()?;
             }
             for event in events.drain(..) {
-                self.event(event)?;
+                let panels = self.ui.panel_state();
+                self.handle(event)?;
+                if panels != self.ui.panel_state() {
+                    self.resize()?;
+                }
             }
             self.client.flush()?;
             let previous = self.client.snapshot().map(|s| (s.focused, s.controller));
             let responses = if pollfds[0].revents
                 & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
                 != 0
-                || pollfds[2].revents != 0
                 || self.client.needs_poll()
             {
                 self.client.poll()?
@@ -464,11 +461,9 @@ impl WorkspaceView {
             };
             for event in responses {
                 match event {
-                    ClientEvent::Updated => {
+                    Response::ScreenDirty => {
                         self.dirty = true;
-                        if self.ui.search.open {
-                            self.ui.search.observe(&mut self.client)?;
-                        }
+                        self.ui.search.observe(&mut self.client)?;
                         let current = self.client.snapshot().map(|s| (s.focused, s.controller));
                         if previous != current {
                             for (pane, _) in previous.into_iter().chain(current) {
@@ -477,24 +472,22 @@ impl WorkspaceView {
                                 }
                             }
                             if let Some(snapshot) = self.client.snapshot() {
-                                self.window.title(&format!(
-                                    "nextty — {}{}{}",
-                                    snapshot.name,
-                                    if self.client.is_remote() {
-                                        " · SSH"
-                                    } else {
-                                        ""
-                                    },
-                                    if snapshot.controller {
-                                        ""
-                                    } else {
-                                        " · read-only"
-                                    }
-                                ))?;
+                                let ssh = if self.client.is_remote() {
+                                    " · SSH"
+                                } else {
+                                    ""
+                                };
+                                let access = if snapshot.controller {
+                                    ""
+                                } else {
+                                    " · read-only"
+                                };
+                                let title = format!("nextty — {}{ssh}{access}", snapshot.name);
+                                self.window.title(&title)?;
                             }
                         }
                     }
-                    ClientEvent::Clipboard {
+                    Response::Clipboard {
                         request,
                         file,
                         incomplete,
@@ -507,7 +500,7 @@ impl WorkspaceView {
                             "Copied"
                         });
                     }
-                    ClientEvent::Search {
+                    Response::Search {
                         pane,
                         request,
                         count,
@@ -517,34 +510,28 @@ impl WorkspaceView {
                             &mut self.client,
                             pane,
                             request,
-                            count,
+                            count as usize,
                             truncated,
                         )?;
                     }
-                    ClientEvent::Error(error) | ClientEvent::CopyError { error, .. } => {
+                    Response::Error(error) | Response::CopyError { error, .. } => {
                         self.message(error)
                     }
-                    ClientEvent::Detached => self.running = false,
-                    ClientEvent::List(_)
-                    | ClientEvent::AgentInput { .. }
-                    | ClientEvent::AgentFile { .. }
-                    | ClientEvent::AgentNewTab { .. }
-                    | ClientEvent::History { .. } => (),
-                    ClientEvent::ClipboardStore { primary, text } => {
+                    Response::Detached => self.running = false,
+                    Response::ClipboardStore { primary, text } => {
                         self.window.selection(primary, &text)
                     }
+                    _ => (),
                 }
             }
 
-            self.poll_agent_events(&pollfds)?;
-            self.refresh_hover();
-
-            let (_, changed) = self.ui.service(&self.client, &pollfds)?;
+            let revision = self.ui.agent.active().model.revision;
+            let (changed, messages_changed) =
+                self.ui.service(&mut self.client, &self.config, &pollfds)?;
             self.dirty |= changed;
-            if self.running && self.dirty && self.renderer.ready()? && self.window.ready() {
-                if let Some(trace) = &mut self.trace {
-                    trace.record_swap(self.renderer.swap_time())?;
-                }
+            self.agent_refresh(revision, messages_changed);
+            self.refresh_hover();
+            if self.running && self.dirty && self.painter.ready()? && self.window.ready() {
                 self.draw()?;
                 self.dirty = false;
                 self.client.request_screen()?;
@@ -555,98 +542,56 @@ impl WorkspaceView {
             self.ui.poll_agent(&mut self.client, &self.config)?;
         }
         self.client.flush()?;
-        self.renderer.finish()?;
-        if let Some(trace) = &mut self.trace {
-            trace.output.get_mut().draining = true;
-            trace.record_swap(self.renderer.swap_time())?;
-            trace.finish()?;
-        }
-        Ok(())
+        self.painter.finish()
     }
 
     fn message(&mut self, text: impl Into<String>) {
         self.ui.message(text);
         self.dirty = true;
     }
-    fn action(&mut self, action: Action) -> Result<()> {
-        if matches!(
-            &action,
-            Action::Split { .. }
-                | Action::NewTab { .. }
-                | Action::Focus(_)
-                | Action::Navigate(_)
-                | Action::Tab(_)
-                | Action::ClosePane(_)
-                | Action::CloseTab(_)
-        ) {
-            self.ui.search.close(&mut self.client)?;
-            self.ui.focus = Focus::Terminal;
-
-            self.ui.cancel_rewind();
-
-            if !matches!(action, Action::Focus(_)) && std::mem::take(&mut self.ui.files_open) {
-                self.resize()?;
-            }
-            self.dirty = true;
+    fn damage_cursor(&mut self) {
+        if let Some(pane) = self.client.focused()
+            && let Some(screen) = self.client.screen_mut(pane)
+        {
+            screen.damage_cursor();
         }
-        self.client.send(action)?;
-        Ok(())
-    }
-    fn active(&self) -> Option<PaneId> {
-        self.client.snapshot().map(|s| s.focused)
-    }
-    fn controller(&self) -> bool {
-        self.client.snapshot().is_some_and(|s| s.controller)
-    }
-    fn mode(&self, pane: PaneId) -> Mode {
-        self.client
-            .screens()
-            .get(&pane)
-            .map_or(Mode::NONE, |s| s.mode())
     }
     fn input(&mut self, pane: PaneId, data: Vec<u8>) -> Result<()> {
-        if !self.controller() {
+        if !self.client.controller() {
             return Ok(());
         }
         if self.paste.is_some() {
             self.deferred.push_back(DeferredInput::Bytes(pane, data));
             return Ok(());
         }
-        self.action(Action::Input { pane, data })?;
-        if let Some(trace) = &mut self.trace {
-            writeln!(trace.output, "write_queued {:.9}", monotonic())?;
-        }
-        Ok(())
+        self.client.send(Action::Input { pane, data })
     }
     fn resize(&mut self) -> Result<()> {
         self.ui.search.close(&mut self.client)?;
         self.hover_cell = None;
         self.hovered = None;
-
         self.hovered_block = None;
-        self.action(Action::Resize(self.layout().size(self.cell)))?;
+        self.client
+            .send(Action::Resize(self.layout().size(self.cell)))?;
         self.dirty = true;
         Ok(())
     }
-    fn event(&mut self, event: Event) -> Result<()> {
+    fn handle(&mut self, event: Event) -> Result<()> {
         if let Some(trace) = &mut self.trace {
             trace.event(&event)?;
         }
 
-        if self.agent_event(&event) {
-            return Ok(());
-        }
         match event.kind {
             native::WINDOW_STATE => {
-                self.maximized = event.code & 8 != 0;
+                self.maximized = event.code != 0;
                 self.dirty = true;
             }
             native::KEY => self.key(event.code, event.modifiers, &event.text)?,
             native::TEXT => {
-                if self.ui.close_prompt.is_some()
-                    || self.preview_open()
-                    || self.ui.file_preview_open()
-                {
+                if self.ui.agent.active().rewind_target.is_some() {
+                    self.ui.cancel_rewind();
+                }
+                if self.ui.modal() || self.preview_open() {
                     return Ok(());
                 }
                 self.clear_preedit();
@@ -662,64 +607,37 @@ impl WorkspaceView {
                     }
                     return Ok(());
                 }
-                if let Some(pane) = self.active() {
+                if let Some(pane) = self.client.focused() {
                     self.input(pane, event.text.into_bytes())?;
                 }
             }
             native::PREEDIT => {
+                if self.ui.agent.open && matches!(self.ui.focus, Focus::Output | Focus::Controls) {
+                    return Ok(());
+                }
                 if self.ui.resources.open && self.ui.focus == Focus::Monitor {
                     self.preedit.clear();
                     return Ok(());
                 }
-                if self.ui.close_prompt.is_some()
-                    || self.preview_open()
-                    || self.ui.file_preview_open()
-                {
+                if self.ui.modal() || self.preview_open() {
                     return Ok(());
-                }
-                let start = if event.start < 0 {
-                    event.text.len()
-                } else {
-                    event.start as usize
-                };
-                let end = if event.end < 0 {
-                    event.text.len()
-                } else {
-                    event.end as usize
-                };
-                if !event.text.is_char_boundary(start) || !event.text.is_char_boundary(end) {
-                    return Err(Error::msg("invalid IME preedit offset"));
                 }
                 self.preedit = event.text;
                 self.dirty = true;
-                if let Some(pane) = self.active()
-                    && let Some(screen) = self.client.screen_mut(pane)
-                {
-                    screen.damage_cursor();
-                }
+                self.damage_cursor();
             }
             native::RESIZE => self.resize()?,
             native::EXPOSE => self.dirty = true,
-            native::CLOSE => {
-                self.open_close();
-            }
+            native::CLOSE => self.open_close(),
             native::FOCUS => {
                 self.focused = event.code != 0;
-                if let Some(pane) = self.active() {
-                    if self.mode(pane).contains(Mode::FOCUS_IN_OUT) {
-                        self.input(
-                            pane,
-                            if self.focused {
-                                b"\x1b[I".to_vec()
-                            } else {
-                                b"\x1b[O".to_vec()
-                            },
-                        )?;
-                    }
-                    if let Some(screen) = self.client.screen_mut(pane) {
-                        screen.damage_cursor();
-                    }
+                if let Some(pane) = self.client.focused()
+                    && self.client.mode(pane).contains(Mode::FOCUS_IN_OUT)
+                {
+                    let report: &[u8] = if self.focused { b"\x1b[I" } else { b"\x1b[O" };
+                    self.input(pane, report.to_vec())?;
                 }
+                self.damage_cursor();
                 self.dirty = true;
             }
             native::MOTION => {
@@ -730,7 +648,6 @@ impl WorkspaceView {
                 self.hover_cell = None;
                 self.hovered = None;
                 self.hovered_block = None;
-                self.hovered_control = None;
                 self.dirty = true;
             }
             native::BUTTON => {
@@ -754,16 +671,12 @@ impl WorkspaceView {
     fn clear_preedit(&mut self) {
         if !self.preedit.is_empty() {
             self.preedit.clear();
-            if let Some(pane) = self.active()
-                && let Some(screen) = self.client.screen_mut(pane)
-            {
-                screen.damage_cursor();
-            }
+            self.damage_cursor();
             self.dirty = true;
         }
     }
 
-    fn workspace_key(&mut self, pane: PaneId, symbol: u32, modifiers: u32) -> Result<bool> {
+    fn workspace_key(&mut self, symbol: u32, modifiers: u32) -> Result<bool> {
         if modifiers & (native::ALT | native::CONTROL | native::SUPER) != native::ALT {
             return Ok(false);
         }
@@ -771,95 +684,29 @@ impl WorkspaceView {
             return Ok(true);
         }
         let key = match symbol {
-            keysym::RETURN | keysym::KP_ENTER => Some('\r'),
-            _ => symbol_char(symbol).map(|c| c.to_ascii_lowercase()),
+            keysym::RETURN | keysym::KP_ENTER => '\r',
+            _ => match symbol_char(symbol) {
+                Some(key) => key.to_ascii_lowercase(),
+                None => return Ok(false),
+            },
         };
-        match key {
-            Some('m') => {
-                self.ui.search.close(&mut self.client)?;
-                self.gui_action(GuiAction::Resources)?;
-                return Ok(true);
-            }
-            Some('/') => {
-                if self.ui.search.open {
-                    self.ui.search.close(&mut self.client)?;
-                } else {
-                    self.ui.search.begin(&mut self.client, pane)?;
-                }
-                self.dirty = true;
-                return Ok(true);
-            }
-            Some('c') => {
-                self.copy_block(pane, None)?;
-                return Ok(true);
-            }
-
-            Some('f') => {
-                self.ui.search.close(&mut self.client)?;
-                self.open_files(pane)?;
-                return Ok(true);
-            }
-            _ => (),
-        }
-        let Some(action) = key.and_then(|key| crate::ui::workspace_action(key, pane)) else {
-            return Ok(false);
-        };
-        if self.controller() {
-            self.action(action)?;
-        }
-        Ok(true)
+        let handled = self.ui.alt(&mut self.client, key)?;
+        self.dirty |= handled;
+        Ok(handled)
     }
     fn key(&mut self, symbol: u32, modifiers: u32, text: &str) -> Result<()> {
-        if self.ui.file_preview_open() {
+        if self.ui.modal() {
             self.panel_key(symbol, modifiers, "")?;
             return Ok(());
         }
-        if let Some(prompt) = self.ui.close_prompt.as_mut() {
-            let terminate = prompt.terminate;
-            match symbol {
-                keysym::RETURN | keysym::KP_ENTER => self.choose_close(terminate)?,
-                keysym::ESCAPE => {
-                    self.ui.close_prompt = None;
-                    self.dirty = true;
-                }
-                keysym::LEFT => {
-                    prompt.terminate = true;
-                    self.dirty = true;
-                }
-                keysym::RIGHT => {
-                    prompt.terminate = false;
-                    self.dirty = true;
-                }
-                keysym::TAB | keysym::LEFT_TAB => {
-                    prompt.terminate = !terminate;
-                    self.dirty = true;
-                }
-                _ => {
-                    if symbol_char(symbol).is_some_and(|c| c == 'x' || c == 'X') {
-                        self.choose_close(true)?;
-                    }
-                }
-            }
-            return Ok(());
-        }
-        let Some(pane) = self.active() else {
+        let Some(pane) = self.client.focused() else {
             return Ok(());
         };
         if modifiers == native::ALT && symbol_char(symbol) == Some('q') {
             self.running = false;
             return Ok(());
         }
-        if modifiers == native::ALT && symbol_char(symbol) == Some('a') {
-            if !self.composition_finished() {
-                return Ok(());
-            }
-            self.ui.search.close(&mut self.client)?;
-            self.ui.toggle_agent();
-            self.resize()?;
-            return Ok(());
-        }
-
-        if self.workspace_key(pane, symbol, modifiers)? {
+        if self.workspace_key(symbol, modifiers)? {
             return Ok(());
         }
 
@@ -913,36 +760,28 @@ impl WorkspaceView {
                 _ => None,
             };
             if let Some(scroll) = scroll {
-                return self.action(Action::Scroll { pane, scroll });
+                return self.client.send(Action::Scroll { pane, scroll });
             }
         }
         if self.preedit.is_empty()
-            && let Some(data) = key_bytes(symbol, modifiers, text, || self.mode(pane))
+            && let Some(data) = key_bytes(symbol, modifiers, text, || self.client.mode(pane))
         {
             self.input(pane, data)?;
         }
         Ok(())
     }
     fn panel_key(&mut self, symbol: u32, modifiers: u32, text: &str) -> Result<bool> {
-        use crate::input::{Key, KeyResult};
+        use crate::input::Key;
         let mut viewport = (1, 1);
         if self.ui.files_open && self.ui.focus == Focus::Files {
             let layout = self.layout();
-            let preview = self.ui.file_preview_open();
-            let rect = if preview {
-                self.file_preview_layout(layout)
-            } else {
-                self.file_rect(layout)
-            };
-            viewport = (
-                usize::from(rect.cols),
-                usize::from(rect.rows.saturating_sub(if preview { 5 } else { 0 })),
-            );
+            viewport = self
+                .ui
+                .file_viewport(self.file_rect(layout), self.file_preview_layout(layout));
         } else if let Some(layout) = self.editor_viewport() {
             viewport = (layout.columns, layout.rows);
         }
 
-        let panels = self.ui.panel_state();
         let action = self.ui.key(
             &mut self.client,
             Key {
@@ -954,57 +793,27 @@ impl WorkspaceView {
         )?;
         match action {
             KeyResult::Unhandled => return Ok(false),
-            KeyResult::Copy(text, _cut) => {
-                self.window.selection(false, &text);
-
-                if _cut {
-                    self.ui.agent.insert(self.ui.agent.active().id, "").unwrap();
-                }
-            }
+            KeyResult::Copy(text) => self.window.selection(false, &text),
             KeyResult::Paste => {
                 if let Some(target) = self.ui.paste_target() {
                     self.request_paste(target, false);
                 }
             }
+            KeyResult::Quit => self.running = false,
             KeyResult::Handled => (),
-        }
-        if panels != self.ui.panel_state() {
-            self.resize()?;
         }
         self.dirty = true;
         Ok(true)
     }
 
     fn copy(&mut self, pane: PaneId, primary: bool) -> Result<()> {
-        self.action(Action::CopySelection {
+        self.client.send(Action::CopySelection {
             pane,
             request: u64::from(primary),
         })
     }
-
-    fn copy_block(&mut self, pane: PaneId, block: Option<u64>) -> Result<()> {
-        let block = block.or_else(|| {
-            self.client
-                .snapshot()?
-                .pane(pane)?
-                .blocks
-                .iter()
-                .rfind(|b| b.output.is_some())
-                .map(|b| b.id)
-        });
-        if let Some(block) = block {
-            self.action(Action::CopyBlock {
-                pane,
-                block,
-                request: 0,
-            })?;
-        } else {
-            self.message("No command output to copy");
-        }
-        Ok(())
-    }
     fn paste(&mut self, pane: PaneId, primary: bool) {
-        if !self.controller() {
+        if !self.client.controller() {
             return;
         }
         if !self.composition_finished() {
@@ -1022,7 +831,7 @@ impl WorkspaceView {
         } else {
             PasteTarget::Pane {
                 pane,
-                bracketed: self.mode(pane).contains(Mode::BRACKETED_PASTE),
+                bracketed: self.client.mode(pane).contains(Mode::BRACKETED_PASTE),
             }
         };
         self.request_paste(target, primary);
@@ -1041,7 +850,7 @@ impl WorkspaceView {
             return Ok(());
         };
         match target {
-            PasteTarget::Pane { pane, bracketed } => self.action(Action::Input {
+            PasteTarget::Pane { pane, bracketed } => self.client.send(Action::Input {
                 pane,
                 data: paste_bytes(text, bracketed),
             })?,
@@ -1053,7 +862,9 @@ impl WorkspaceView {
                 DeferredInput::Text(target, text) => {
                     self.ui.paste(&mut self.client, target, &text)?
                 }
-                DeferredInput::Bytes(pane, data) => self.action(Action::Input { pane, data })?,
+                DeferredInput::Bytes(pane, data) => {
+                    self.client.send(Action::Input { pane, data })?
+                }
                 DeferredInput::Paste(target, primary) => {
                     self.request_paste(target, primary);
                     break;
@@ -1071,24 +882,55 @@ impl WorkspaceView {
                 .width
                 .unwrap_or(self.cell.0 * 36. + PADDING * 2.)
         });
-        let mut layout = GuiLayout::new(width as f32, height as f32, self.cell, agent_width);
-
-        if self.ui.files_open {
-            layout.left = f32::from(crate::file_panel::sidebar_width(
-                (layout.side / self.cell.0) as u16,
-            )) * self.cell.0;
-        }
+        let mut layout = GuiLayout::new(
+            width as f32,
+            height as f32,
+            self.cell,
+            agent_width,
+            self.ui.files_open,
+        );
         if self.ui.resources.open {
             let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
             layout.footer -= f32::from(self.ui.resources.rows(total)) * self.cell.1 + 6.;
         }
         layout
     }
+    fn cell(&self) -> (u16, u16) {
+        (
+            (self.pointer.0 / self.cell.0) as u16,
+            (self.pointer.1 / self.cell.1) as u16,
+        )
+    }
+    fn close_rect(&self) -> crate::workspace::Rect {
+        let (width, height, _) = self.window.size();
+        crate::ui::close_rect(
+            (width as f32 / self.cell.0) as u16,
+            (height as f32 / self.cell.1) as u16,
+        )
+    }
+    fn tab_bar(
+        &self,
+        snapshot: &crate::workspace::Snapshot,
+        layout: GuiLayout,
+    ) -> crate::ui::TabBar {
+        let columns = ((layout.width - self.control_width()) / self.cell.0) as u16;
+        crate::ui::tab_bar(
+            snapshot,
+            columns,
+            if self.client.is_remote() { "SSH" } else { "" },
+        )
+    }
+    fn control_at(&self, point: (f32, f32)) -> Option<GuiHit> {
+        self.control_hits
+            .iter()
+            .rfind(|hit| hit.contains(point))
+            .copied()
+    }
     fn preview_open(&self) -> bool {
         self.ui.agent.active().context.preview.is_some()
     }
     fn scrollbar_visible(&self, target: ScrollTarget) -> bool {
-        self.preview_open() == (target == ScrollTarget::Agent(AgentScroll::Preview))
+        self.preview_open() == (target == ScrollTarget::Preview)
     }
     fn hit(&self, captured: Option<PaneId>) -> Option<(PaneId, Point, Side)> {
         let layout = self.layout();
@@ -1124,62 +966,44 @@ impl WorkspaceView {
             },
         ))
     }
+    /// The pane under the pointer, or the one a drag or mouse report keeps capturing.
+    fn captured_hit(&self) -> Option<(PaneId, Point, Side)> {
+        let captured = self.selecting.map(|drag| drag.pane).or(self.reported_pane);
+        captured
+            .and_then(|pane| self.hit(Some(pane)))
+            .or_else(|| self.hit(None))
+    }
     fn refresh_hover(&mut self) {
         let layout = self.layout();
-        {
-            let top = layout.footer + 6.;
-            let pointer = (self.ui.resources.open
-                && !self.preview_open()
-                && self.ui.close_prompt.is_none()
-                && (PADDING..layout.width - PADDING).contains(&self.pointer.0)
-                && (top..layout.height - self.cell.1 - 12.).contains(&self.pointer.1))
-            .then(|| {
-                (
-                    ((self.pointer.0 - PADDING) / self.cell.0) as u16,
-                    ((self.pointer.1 - top) / self.cell.1).floor() as i32,
-                )
-            });
-            if self.ui.resources.pointer != pointer {
-                self.ui.resources.pointer = pointer;
-                self.dirty = true;
-            }
+        let unobstructed = self.ui.close_prompt.is_none() && !self.preview_open();
+        let monitor = self.ui.resources.open && unobstructed;
+        let top = layout.footer + 6.;
+        let pointer = (monitor
+            && (PADDING..layout.width - PADDING).contains(&self.pointer.0)
+            && (top..layout.height - self.cell.1 - 12.).contains(&self.pointer.1))
+        .then(|| {
+            (
+                ((self.pointer.0 - PADDING) / self.cell.0) as u16,
+                ((self.pointer.1 - top) / self.cell.1).floor() as i32,
+            )
+        });
+        if self.ui.resources.pointer != pointer {
+            self.ui.resources.pointer = pointer;
+            self.dirty = true;
         }
-
-        let monitor_divider = self.ui.resources.open
-            && self.ui.close_prompt.is_none()
-            && !self.preview_open()
-            && (self.ui.resources.dragging || (self.pointer.1 - layout.footer).abs() <= 5.);
-        let horizontal = {
-            {
-                let divider = !self.ui.files_open
-                    && (self.agent.drag.is_some()
-                        || (self.ui.close_prompt.is_none()
-                            && !self.preview_open()
-                            && layout.divider_contains(self.pointer)));
-                if divider != self.agent.divider_hover {
-                    self.agent.divider_hover = divider;
-                    self.dirty = true;
-                }
-                divider
-            }
-        };
-        self.window.resize_cursor(horizontal, monitor_divider);
+        let monitor_divider =
+            monitor && (self.ui.resources.dragging || (self.pointer.1 - layout.footer).abs() <= 5.);
+        let agent_divider = !self.ui.files_open
+            && (self.agent.drag.is_some()
+                || (unobstructed && layout.divider_contains(self.pointer)));
+        self.window.resize_cursor(agent_divider, monitor_divider);
 
         let hit = self.hit(None).map(|(pane, point, _)| (pane, point));
-        {
-            let block = hit.and_then(|(pane, point)| self.block_at(pane, point));
-            if block != self.hovered_block {
-                self.hovered_block = block;
-                self.dirty = true;
-            }
-        }
-        let control = self
-            .control_hits
-            .iter()
-            .rfind(|hit| hit.contains(self.pointer))
-            .copied();
-        if self.hovered_control != control {
-            self.hovered_control = control;
+        let block = hit
+            .filter(|_| self.ui.close_prompt.is_none())
+            .and_then(|(pane, point)| crate::ui::block_at(&self.client, pane, point));
+        if block != self.hovered_block {
+            self.hovered_block = block;
             self.dirty = true;
         }
         let changed_row = hit.is_some_and(|(pane, point)| {
@@ -1213,90 +1037,27 @@ impl WorkspaceView {
         if !matches!(action, GuiAction::Agent(_)) {
             self.ui.agent.active_mut().context.menu = false;
         }
-
         match action {
-            GuiAction::Resources => {
-                self.ui.toggle_monitor();
-                self.resize()?;
-            }
-
-            GuiAction::Monitor(action) => {
-                let files_open = std::mem::take(&mut self.ui.files_open);
-                let open = self.ui.resources.open;
-                self.ui.resources.action(action);
-                self.ui.monitor_jump(&mut self.client)?;
-                self.ui.focus = if self.ui.resources.open {
-                    Focus::Monitor
-                } else {
-                    Focus::Terminal
-                };
-                if open != self.ui.resources.open || files_open {
-                    self.resize()?;
-                }
-            }
-            GuiAction::CloseTab(tab) => {
-                if self.composition_finished()
-                    && self.controller()
-                    && let Some(target) = self.client.snapshot().and_then(|snapshot| {
-                        snapshot.tabs.iter().find(|candidate| candidate.id == tab)
-                    })
-                    && self.ui.request_close_tab(target)
-                {
-                    self.action(Action::CloseTab(tab))?;
-                }
-            }
-            GuiAction::Tab(direction) => {
-                if self.controller() {
-                    self.ui.focus = Focus::Terminal;
-                    self.action(Action::Tab(direction))?;
-                }
-            }
-            GuiAction::SelectTab(index) => {
-                if self.composition_finished()
-                    && let Some(snapshot) = self.client.snapshot()
-                {
-                    let active = snapshot
-                        .tabs
-                        .iter()
-                        .position(|tab| tab.id == snapshot.active_tab)
-                        .unwrap_or(0);
-                    self.action(Action::Tab(index as i32 - active as i32))?;
-                }
-            }
-            GuiAction::NewTab => {
-                if self.composition_finished()
-                    && self.controller()
-                    && let Some(pane) = self.active()
-                {
-                    self.action(Action::NewTab { pane })?;
+            GuiAction::Monitor(action) => self.ui.monitor_action(&mut self.client, action)?,
+            GuiAction::Tab(hit) => {
+                if self.composition_finished() && self.client.controller() {
+                    self.ui.tab_click(&mut self.client, hit)?;
                 }
             }
             GuiAction::Minimize => self.window.minimize(),
             GuiAction::Maximize => self.window.maximize(!self.maximized),
             GuiAction::Close => self.open_close(),
-
             GuiAction::Agent(action) => {
-                if !self.agent_action(action)? {
+                if !self.agent_action(action) {
                     return Ok(());
                 }
             }
         }
         self.control_hits.clear();
-        self.hovered_control = None;
         self.dirty = true;
         Ok(())
     }
 
-    fn block_at(&self, id: PaneId, point: Point) -> Option<(PaneId, u64)> {
-        if self.ui.close_prompt.is_some() {
-            return None;
-        }
-
-        let pane = self.client.snapshot()?.pane(id)?;
-        let screen = self.client.screens().get(&id)?;
-        let row = (point.line + screen.display_offset() as i32) as usize;
-        screen.row_output(pane, row).map(|block| (id, block.id))
-    }
     fn mouse(
         &mut self,
         pane: PaneId,
@@ -1306,7 +1067,7 @@ impl WorkspaceView {
         modifiers: u32,
         count: usize,
     ) -> Result<()> {
-        let mode = self.mode(pane);
+        let mode = self.client.mode(pane);
         let y = (point.line + self.client.screens()[&pane].display_offset() as i32).max(0) as usize;
         let code = button
             + u8::from(modifiers & native::SHIFT != 0) * 4
@@ -1321,55 +1082,49 @@ impl WorkspaceView {
     fn button(&mut self, button: u32, pressed: bool, modifiers: u32) -> Result<()> {
         if self.ui.file_preview_open() {
             if pressed && button == 1 {
-                let rect = self.file_preview_layout(self.layout());
-                let column = (self.pointer.0 / self.cell.0) as u16;
-                let row = (self.pointer.1 / self.cell.1) as u16;
-                if !rect.contains(column, row)
-                    || crate::panel::popup_close(rect).contains(column, row)
-                {
-                    self.ui.files.as_mut().unwrap().focus_list();
-                    self.dirty = true;
-                }
+                self.file_press();
             }
             return Ok(());
         }
         if !pressed {
             return self.button_release(button, modifiers);
         }
-        if self.ui.close_prompt.is_some() {
-            if button == 1 {
-                let (width, height, _) = self.window.size();
-                let rects = close_layout(width as f32, height as f32, self.cell);
-                for (terminate, &(x, y, w, h)) in [true, false].into_iter().zip(&rects[1..]) {
-                    if self.pointer.0 >= x
-                        && self.pointer.0 < x + w
-                        && self.pointer.1 >= y
-                        && self.pointer.1 < y + h
-                    {
-                        self.choose_close(terminate)?;
-                        break;
-                    }
+        if let Some(prompt) = self.ui.close_prompt {
+            let (column, row) = self.cell();
+            if button == 1
+                && let Some(terminate) =
+                    crate::ui::close_hit(self.close_rect(), prompt, column, row)
+            {
+                if let KeyResult::Quit = self.ui.choose_close(&mut self.client, terminate)? {
+                    self.running = false;
                 }
+                self.dirty = true;
             }
             return Ok(());
         }
         let layout = self.layout();
         if self.pointer.1 < layout.top
-            && let Some(action) = self
-                .control_hits
-                .iter()
-                .find(|hit| {
-                    hit.contains(self.pointer)
-                        && matches!(
-                            hit.action,
+            && let Some(action) =
+                self.control_at(self.pointer)
+                    .map(|hit| hit.action)
+                    .filter(|action| {
+                        matches!(
+                            action,
                             GuiAction::Minimize | GuiAction::Maximize | GuiAction::Close
                         )
-                })
-                .map(|hit| hit.action)
+                    })
         {
             if button == 1 {
                 self.gui_action(action)?;
             }
+            return Ok(());
+        }
+        if button == 1
+            && self.pointer.1 < layout.top
+            && let Some(snapshot) = self.client.snapshot()
+            && let Some(hit) = self.tab_bar(snapshot, layout).at(snapshot, self.cell().0)
+        {
+            self.gui_action(GuiAction::Tab(hit))?;
             return Ok(());
         }
         if button == 1
@@ -1411,32 +1166,23 @@ impl WorkspaceView {
 
         if self.ui.files_open && self.pointer.0 < layout.left {
             self.ui.focus = Focus::Files;
-            let rect = self.file_rect(layout);
-            if button == 1
-                && let Some(files) = &mut self.ui.files
-                && let Some(index) = crate::file_panel::Layout::new(rect, files).entry_at(
-                    files,
-                    (self.pointer.0 / self.cell.0) as u16,
-                    (self.pointer.1 / self.cell.1) as u16,
-                )
-            {
-                files.move_selection(index as isize - files.selection() as isize);
-                files.focus_preview();
-                self.dirty = true;
+            if button == 1 {
+                self.file_press();
             }
             return Ok(());
         }
-        if let Some(action) = self
-            .control_hits
-            .iter()
-            .rfind(|hit| hit.contains(self.pointer))
-            .map(|hit| hit.action)
-        {
+        if let Some(action) = crate::ui::agent_hit(&self.agent.hits, self.cell().0, self.cell().1) {
             if self.agent_control_button(button, action, modifiers)? {
                 return Ok(());
             }
             if button == 1 {
-                self.gui_action(action)?;
+                self.gui_action(GuiAction::Agent(action))?;
+            }
+            return Ok(());
+        }
+        if let Some(hit) = self.control_at(self.pointer) {
+            if button == 1 {
+                self.gui_action(hit.action)?;
             }
             return Ok(());
         }
@@ -1452,7 +1198,7 @@ impl WorkspaceView {
         }
         if button == 1
             && layout.terminal_contains(self.pointer)
-            && self.controller()
+            && self.client.controller()
             && self.preedit.is_empty()
         {
             let (column, row) = layout.pointer_cell(self.cell, self.pointer);
@@ -1478,11 +1224,16 @@ impl WorkspaceView {
                 self.message("Copied");
                 return Ok(());
             }
-            if let Some((_, block)) = self.block_at(pane, point) {
-                self.copy_block(pane, Some(block))?;
+            if let Some((_, block)) = crate::ui::block_at(&self.client, pane, point) {
+                self.client.send(Action::CopyBlock {
+                    pane,
+                    block,
+                    request: 0,
+                })?;
                 return Ok(());
             }
-            if modifiers & native::ALT != 0 || !self.mode(pane).intersects(Mode::MOUSE_MODE) {
+            if modifiers & native::ALT != 0 || !self.client.mode(pane).intersects(Mode::MOUSE_MODE)
+            {
                 self.paste(pane, false);
                 return Ok(());
             }
@@ -1495,32 +1246,32 @@ impl WorkspaceView {
             return Ok(());
         }
 
-        if button == 1 && std::mem::take(&mut self.ui.resources.dragging) {
-            self.refresh_hover();
-            return Ok(());
-        }
-
-        if button == 1 && self.scrollbar_drag.take().is_some() {
-            self.dirty = true;
-            return Ok(());
-        }
-        if button == 1 && self.split_drag.take().is_some() {
-            return Ok(());
-        }
-        if button == 1
-            && let Some(drag) = self.selecting.take()
-        {
-            if let Some((_, point, side)) = self.hit(Some(drag.pane)) {
-                self.action(Action::SelectionUpdate {
-                    pane: drag.pane,
-                    point,
-                    side,
-                })?;
-                if drag.kind != SelectionType::Simple || point != drag.point || side != drag.side {
-                    self.copy(drag.pane, true)?;
-                }
+        if button == 1 {
+            if std::mem::take(&mut self.ui.resources.dragging) {
+                self.refresh_hover();
+                return Ok(());
             }
-            return Ok(());
+            if self.scrollbar_drag.take().is_some() {
+                self.dirty = true;
+                return Ok(());
+            }
+            if self.split_drag.take().is_some() {
+                return Ok(());
+            }
+            if let Some(drag) = self.selecting.take() {
+                if let Some((_, point, side)) = self.hit(Some(drag.pane)) {
+                    let pane = drag.pane;
+                    self.client
+                        .send(Action::SelectionUpdate { pane, point, side })?;
+                    if drag.kind != SelectionType::Simple
+                        || point != drag.point
+                        || side != drag.side
+                    {
+                        self.copy(pane, true)?;
+                    }
+                }
+                return Ok(());
+            }
         }
         if (1..=3).contains(&button) && self.reported_buttons & (1 << (button - 1)) != 0 {
             self.reported_buttons &= !(1 << (button - 1));
@@ -1540,56 +1291,43 @@ impl WorkspaceView {
     fn footer_button(&mut self, button: u32) -> Result<bool> {
         let layout = self.layout();
         if self.ui.resources.open && (self.pointer.1 - layout.footer).abs() <= 5. && button == 1 {
-            if std::mem::take(&mut self.ui.files_open) {
-                self.resize()?;
-            }
-            self.ui.resources.dragging = true;
-            self.ui.focus = Focus::Monitor;
+            self.ui.monitor_drag();
             self.dirty = true;
             self.refresh_hover();
             return Ok(true);
         }
-        if self.pointer.1 >= layout.footer {
-            if let Some(action) = self
-                .control_hits
-                .iter()
-                .rfind(|hit| hit.contains(self.pointer))
-                .map(|hit| hit.action)
-            {
-                if button == 1 {
-                    self.gui_action(action)?;
-                } else if button == 2
-                    && action == GuiAction::Monitor(crate::monitor::Action::Search)
-                {
-                    self.gui_action(action)?;
-                    self.request_paste(PasteTarget::Monitor, true);
-                }
-            }
-            return Ok(true);
+        if self.pointer.1 < layout.footer {
+            self.ui.focus = Focus::Terminal;
+            self.ui.resources.searching = false;
+            return Ok(false);
         }
-        self.ui.focus = Focus::Terminal;
-        self.ui.resources.searching = false;
-        Ok(false)
+        if let Some(hit) = self.control_at(self.pointer) {
+            let search = hit.action == GuiAction::Monitor(crate::monitor::Action::Search);
+            if button == 1 || button == 2 && search {
+                self.gui_action(hit.action)?;
+            }
+            if button == 2 && search {
+                self.request_paste(PasteTarget::Monitor, true);
+            }
+        }
+        Ok(true)
     }
 
     fn terminal_button(&mut self, button: u32, modifiers: u32) -> Result<()> {
-        if !self.controller() {
+        if !self.client.controller() {
             return Ok(());
         }
-        let hit = self
-            .reported_pane
-            .and_then(|pane| self.hit(Some(pane)))
-            .or_else(|| self.hit(None));
-        let Some((pane, point, side)) = hit else {
+        let Some((pane, point, side)) = self.captured_hit() else {
             return Ok(());
         };
-        if self.active() != Some(pane) {
+        if self.client.focused() != Some(pane) {
             if !self.preedit.is_empty() {
                 return Ok(());
             }
-            self.action(Action::Focus(pane))?;
+            self.ui.act(&mut self.client, Action::Focus(pane))?;
+            self.dirty = true;
         }
-        let mode = self.mode(pane);
+        let mode = self.client.mode(pane);
         if mode.intersects(Mode::MOUSE_MODE)
             && modifiers & native::ALT == 0
             && (1..=3).contains(&button)
@@ -1630,7 +1368,7 @@ impl WorkspaceView {
                 side,
                 kind,
             });
-            self.action(Action::SelectionStart {
+            self.client.send(Action::SelectionStart {
                 pane,
                 point,
                 side,
@@ -1643,7 +1381,10 @@ impl WorkspaceView {
         let layout = self.layout();
         let previous = std::mem::replace(&mut self.pointer, pointer);
         let hovered_bar = |point| self.scrollbars.iter().position(|bar| bar.contains(point));
-        if hovered_bar(previous) != hovered_bar(pointer) {
+        let hovered_control = |point| self.control_at(point).map(|hit| hit.action);
+        if hovered_bar(previous) != hovered_bar(pointer)
+            || hovered_control(previous) != hovered_control(pointer)
+        {
             self.dirty = true;
         }
         if self.ui.close_prompt.is_some() {
@@ -1687,20 +1428,17 @@ impl WorkspaceView {
                 Axis::LeftRight => column != old_column,
                 Axis::TopBottom => row != old_row,
             } {
-                self.action(drag.action(column, row))?;
+                self.client.send(drag.action(column, row))?;
             }
             return Ok(());
         }
         self.refresh_hover();
-        let captured = self.selecting.map(|drag| drag.pane).or(self.reported_pane);
-        let hit = captured
-            .and_then(|pane| self.hit(Some(pane)))
-            .or_else(|| self.hit(None));
-        if let Some((pane, point, side)) = hit {
+        if let Some((pane, point, side)) = self.captured_hit() {
             if self.selecting.is_some_and(|drag| drag.pane == pane) {
-                self.action(Action::SelectionUpdate { pane, point, side })?;
+                self.client
+                    .send(Action::SelectionUpdate { pane, point, side })?;
             } else {
-                let mode = self.mode(pane);
+                let mode = self.client.mode(pane);
                 if modifiers & native::ALT == 0
                     && (mode.contains(Mode::MOUSE_MOTION)
                         || mode.contains(Mode::MOUSE_DRAG) && self.reported_buttons != 0)
@@ -1735,7 +1473,7 @@ impl WorkspaceView {
         match target {
             ScrollTarget::Pane(pane) if changed => {
                 if offset == drag.bar.maximum() {
-                    self.action(Action::Scroll {
+                    self.client.send(Action::Scroll {
                         pane,
                         scroll: Scroll::Top,
                     })?;
@@ -1745,47 +1483,42 @@ impl WorkspaceView {
             }
             ScrollTarget::Pane(_) => return Ok(()),
 
-            ScrollTarget::Agent(target) => match target {
-                AgentScroll::Transcript => self.ui.agent.active_mut().model.scroll = offset,
-                AgentScroll::Editor => {
-                    self.ui.agent.active_mut().editor_scroll = Some(drag.bar.maximum() - offset)
+            ScrollTarget::Transcript => self.ui.agent.active_mut().model.scroll = offset,
+            ScrollTarget::Editor => {
+                self.ui.agent.active_mut().editor_scroll = Some(drag.bar.maximum() - offset)
+            }
+            ScrollTarget::Preview => {
+                if let Some(preview) = &mut self.ui.agent.active_mut().context.preview {
+                    preview.scroll = drag.bar.maximum() - offset;
                 }
-                AgentScroll::Preview => {
-                    if let Some(crate::agent::panel::ContextPreview { scroll, .. }) =
-                        &mut self.ui.agent.active_mut().context.preview
-                    {
-                        *scroll = drag.bar.maximum() - offset;
-                    }
-                }
-            },
+            }
         }
         self.dirty = true;
         Ok(())
     }
     fn scroll(&mut self, amount: f32, modifiers: u32) -> Result<()> {
+        self.scroll_remainder += amount;
+        let lines = self.scroll_remainder.trunc() as i32;
+        self.scroll_remainder -= lines as f32;
+        if lines == 0 {
+            return Ok(());
+        }
+        let step = lines as isize * WHEEL_LINES as isize;
         if self.ui.file_preview_open() {
-            let rect = self.file_preview_layout(self.layout());
-            self.ui.files.as_mut().unwrap().scroll(
-                -amount.round() as isize,
-                usize::from(crate::panel::popup_body(rect).rows),
-            );
-            self.dirty = true;
+            self.file_wheel(step);
             return Ok(());
         }
         if self.scrollbar_drag.is_some() {
             return Ok(());
         }
 
-        if self.agent_scroll(amount) {
+        if self.agent_scroll(-step) {
             return Ok(());
         }
 
         if self.ui.resources.open && self.pointer.1 >= self.layout().footer {
-            self.ui.resources.scroll = if amount > 0. {
-                self.ui.resources.scroll.saturating_sub(3)
-            } else {
-                self.ui.resources.scroll.saturating_add(3)
-            };
+            let scroll = &mut self.ui.resources.scroll;
+            *scroll = scroll.saturating_add_signed(-step);
             self.dirty = true;
             return Ok(());
         }
@@ -1794,23 +1527,13 @@ impl WorkspaceView {
         }
 
         if self.ui.files_open && self.pointer.0 < self.layout().left {
-            let rect = self.file_rect(self.layout());
-            if let Some(files) = &mut self.ui.files {
-                files.scroll(-amount.round() as isize, usize::from(rect.rows));
-            }
-            self.dirty = true;
+            self.file_wheel(step);
             return Ok(());
         }
         let Some((pane, point, _)) = self.hit(None) else {
             return Ok(());
         };
-        self.scroll_remainder += amount;
-        let lines = self.scroll_remainder.trunc() as i32;
-        self.scroll_remainder -= lines as f32;
-        if lines == 0 {
-            return Ok(());
-        }
-        let mode = self.mode(pane);
+        let mode = self.client.mode(pane);
         if mode.intersects(Mode::MOUSE_MODE) && modifiers & native::ALT == 0 {
             self.mouse(
                 pane,
@@ -1824,10 +1547,11 @@ impl WorkspaceView {
             && mode.contains(Mode::ALTERNATE_SCROLL)
             && modifiers & native::ALT == 0
         {
-            let bytes = if lines > 0 { b"\x1bOA" } else { b"\x1bOB" };
+            let bytes = if lines > 0 { *b"\x1b[A" } else { *b"\x1b[B" };
+            let bytes = crate::ui::cursor_bytes(bytes, mode);
             self.input(pane, bytes.repeat(lines.unsigned_abs() as usize * 3))?;
         } else {
-            self.action(Action::Scroll {
+            self.client.send(Action::Scroll {
                 pane,
                 scroll: Scroll::Delta(lines.saturating_mul(3)),
             })?;
@@ -1835,21 +1559,20 @@ impl WorkspaceView {
         Ok(())
     }
     fn draw(&mut self) -> Result<()> {
-        let begin = self.trace.as_ref().map(|_| monotonic());
-        let (width, height, scale) = self.window.size();
+        let scale = self.window.size().2;
         if scale != self.scale {
             self.scale = scale;
             self.caches.clear();
-            self.text.lines.clear();
+            self.painter.lines.clear();
         }
         let background =
             (self.config.background << 8) | (self.config.background_opacity * 255.).round() as u32;
-        self.renderer.begin(background)?;
+        self.painter.begin(background);
         let layout = self.layout();
         let (grid_x, grid_y) = layout.origin(self.cell);
         self.control_hits.clear();
         self.scrollbars.clear();
-        self.chrome(layout)?;
+        self.chrome(layout);
         let terminal_input = self.ui.close_prompt.is_none()
             && !self.ui.search.open
             && self.ui.focus == Focus::Terminal;
@@ -1885,7 +1608,7 @@ impl WorkspaceView {
                 if w <= 0. || h <= 0. {
                     continue;
                 }
-                self.renderer.clip(origin.0, origin.1, w, h)?;
+                self.painter.clip(origin.0, origin.1, w, h);
                 let active = pane.id == snapshot.focused && self.focused && snapshot.controller;
                 let cache = self.caches.entry(pane.id).or_default();
                 if let Some(screen) = screens.get_mut(&pane.id) {
@@ -1919,27 +1642,26 @@ impl WorkspaceView {
                             && (!terminal_input || !self.preedit.is_empty()),
                     );
                     if frame.background >> 8 != self.config.background {
-                        self.renderer.clear(
+                        self.painter.clear(
                             (frame.background & !255)
                                 | (self.config.background_opacity * 255.).round() as u32,
-                        )?;
+                        );
                     }
 
                     if let Some((id, block)) = self.hovered_block
                         && id == pane.id
                     {
-                        for row in screen.block_row_range(pane, block) {
+                        for row in 0..screen.screen_lines() {
                             if screen
                                 .row_output(pane, row)
                                 .is_some_and(|current| current.id == block)
                             {
-                                self.renderer.rect(
+                                self.painter.rect(
                                     origin.0,
                                     origin.1 + row as f32 * self.cell.1,
                                     w,
                                     self.cell.1,
                                     0x262626ff,
-                                    false,
                                 );
                             }
                         }
@@ -1948,10 +1670,10 @@ impl WorkspaceView {
                         self.cell,
                         active,
                         &mut cache.lines,
-                        &self.renderer,
+                        &self.painter,
                         origin,
                         (w, h),
-                    )?;
+                    );
                     if let Some((id, object)) = &self.hovered
                         && *id == pane.id
                     {
@@ -1974,7 +1696,7 @@ impl WorkspaceView {
                             let x = origin.0 + first as f32 * self.cell.0;
                             let y = origin.1 + row as f32 * self.cell.1;
                             let w = last.saturating_sub(first) as f32 * self.cell.0;
-                            self.renderer.rect(x, y, w, self.cell.1, 0x45605266, false);
+                            self.painter.rect(x, y, w, self.cell.1, 0x45605266);
                         }
                     }
                     if pane.id == snapshot.focused && terminal_input {
@@ -1982,28 +1704,21 @@ impl WorkspaceView {
                         let y = origin.1 + ime_row as f32 * self.cell.1;
                         if !self.preedit.is_empty() {
                             let count = text_width(&self.preedit) as f32;
-                            self.renderer.rect(
+                            self.painter.rect(
                                 x,
                                 y,
                                 self.cell.0 * count,
                                 self.cell.1,
-                                (self.config.background << 8) | 255,
-                                false,
+                                opaque(self.config.background),
                             );
-                            self.text.draw(
-                                &self.renderer,
-                                &self.preedit,
-                                x,
-                                y,
-                                (self.config.foreground << 8) | 255,
-                            )?;
-                            self.renderer.rect(
+                            self.painter
+                                .text(&self.preedit, x, y, opaque(self.config.foreground));
+                            self.painter.rect(
                                 x,
                                 y + self.cell.1 - 2.,
                                 self.cell.0 * count,
                                 1.,
                                 0x9c8fdcff,
-                                false,
                             );
                         }
                         // Anchor to the insertion point while the IME replaces its preedit text.
@@ -2015,7 +1730,7 @@ impl WorkspaceView {
                         );
                     }
                 }
-                self.renderer.clip(0., 0., 0., 0.)?;
+                self.painter.clip(0., 0., 0., 0.);
             }
             // Meet at gutter centers so nested splits share continuous dividers.
             for pane in &snapshot.panes {
@@ -2027,93 +1742,72 @@ impl WorkspaceView {
                 let end_y = f32::from(rect.y + rect.rows)
                     + if rect.y + rect.rows < bottom { 0.5 } else { 0. };
                 if pane.rect.x > 0 {
-                    self.renderer.rect(
+                    self.painter.rect(
                         grid_x + left * self.cell.0,
                         grid_y + top * self.cell.1,
                         1.,
                         (end_y - top) * self.cell.1,
                         0x303030ff,
-                        false,
                     );
                 }
                 if pane.rect.y > 1 {
-                    self.renderer.rect(
+                    self.painter.rect(
                         grid_x + left * self.cell.0,
                         grid_y + top * self.cell.1,
                         (end_x - left) * self.cell.0,
                         1.,
                         0x303030ff,
-                        false,
                     );
                 }
             }
         }
-        self.draw_window_controls(layout)?;
-        self.footer(layout)?;
-        self.renderer
-            .clip(0., layout.top, layout.width, layout.footer - layout.top)?;
-        let divider = (mix_color(self.config.foreground, self.config.background, 24) << 8) | 255;
+        self.draw_window_controls(layout);
+        self.footer(layout);
+        self.painter
+            .clip(0., layout.top, layout.width, layout.footer - layout.top);
+        let divider = opaque(mix_color(
+            self.config.foreground,
+            self.config.background,
+            24,
+        ));
+        let height = layout.footer - layout.top;
         if self.ui.files_open {
             let x = (self.file_rect(layout).cols as f32 - 0.5) * self.cell.0;
-            self.renderer.rect(
-                x,
-                layout.top,
-                1.,
-                layout.footer - layout.top,
-                divider,
-                false,
-            );
+            self.painter.rect(x, layout.top, 1., height, divider);
         }
-
         if self.ui.agent.open {
             let x = ((layout.side / self.cell.0).floor() + 0.5) * self.cell.0;
-            self.renderer.rect(
-                x,
-                layout.top,
-                1.,
-                layout.footer - layout.top,
-                divider,
-                false,
-            );
+            self.painter.rect(x, layout.top, 1., height, divider);
         }
-        self.renderer.clip(0., 0., 0., 0.)?;
+        self.painter.clip(0., 0., 0., 0.);
 
         if self.ui.files_open && !self.ui.file_preview_open() {
-            self.draw_files(layout)?;
+            self.draw_files(layout);
         }
         self.draw_agent(layout)?;
-        self.draw_scrollbars()?;
+        self.draw_scrollbars();
         if self.ui.file_preview_open() {
-            self.draw_files(layout)?;
+            self.draw_files(layout);
         }
         if self.ui.search.open {
-            self.draw_search(layout)?;
+            self.draw_search(layout);
         }
-        if self.ui.close_prompt.is_some() {
-            self.draw_close(width as f32, height as f32)?;
+        if let Some(prompt) = self.ui.close_prompt {
+            let name = self.client.snapshot().map_or("", |s| s.name.as_str());
+            let pointer = Some(self.cell());
+            let grid =
+                crate::ui::close_grid(prompt, name, self.close_rect(), pointer, &self.config);
+            self.draw_panel(&grid);
         }
-        self.text.finish();
-        let prepared = begin.map(|_| monotonic());
-        self.renderer.present()?;
+        self.painter.end_frame();
+        self.painter.present();
         if let Some(trace) = &mut self.trace {
             let marker = self
                 .client
                 .snapshot()
                 .and_then(|snapshot| self.client.screens().get(&snapshot.focused))
-                .map(|screen| {
-                    let cell = screen.row(0).cells[0];
-                    let color = screen.color(cell.bg);
-                    (cell.c as u32, color.packed())
-                })
-                .unwrap_or((0, 0));
-            trace.frame(
-                begin.unwrap(),
-                prepared.unwrap(),
-                marker,
-                (width, height, scale),
-                !self.preedit.is_empty(),
-                self.focused,
-            );
+                .map_or(0, |screen| screen.color(screen.row(0).cells[0].bg).packed());
+            trace.frame(marker, self.focused)?;
         }
         Ok(())
     }
@@ -2125,61 +1819,42 @@ impl WorkspaceView {
         });
         self.dirty = true;
     }
-    fn choose_close(&mut self, terminate: bool) -> Result<()> {
-        if let Some(tab) = self.ui.close_prompt.unwrap().tab {
-            self.ui.close_prompt = None;
-            self.dirty = true;
-            if terminate {
-                self.action(Action::CloseTab(tab))?;
-            }
-        } else if terminate {
-            self.action(Action::Terminate)?;
-        } else {
-            self.running = false;
-        }
-        Ok(())
+    fn file_press(&mut self) {
+        let layout = self.layout();
+        let (column, row) = self.cell();
+        self.ui.file_press(
+            self.file_rect(layout),
+            self.file_preview_layout(layout),
+            column,
+            row,
+        );
+        self.dirty = true;
     }
-
-    fn open_files(&mut self, pane: PaneId) -> Result<()> {
-        if self.client.is_remote() {
-            self.message("Files are unavailable in remote sessions");
-            return Ok(());
-        }
-        self.ui.files_open = !self.ui.files_open;
-        self.ui.focus = if self.ui.files_open {
-            Focus::Files
-        } else {
-            Focus::Terminal
-        };
-        if self.ui.files_open {
-            let directory = self
-                .client
-                .snapshot()
-                .and_then(|snapshot| snapshot.pane(pane))
-                .and_then(|p| p.cwd.clone())
-                .map_or_else(std::env::current_dir, Ok)?;
-            self.ui.load_files(directory)?;
-        }
-        self.preedit.clear();
-        self.resize()
+    fn file_wheel(&mut self, step: isize) {
+        let layout = self.layout();
+        self.ui.file_wheel(
+            -step,
+            self.file_rect(layout),
+            self.file_preview_layout(layout),
+        );
+        self.dirty = true;
     }
-
     fn file_rect(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        crate::workspace::Rect {
-            x: 0,
-            y: 1,
-            cols: (layout.left / self.cell.0) as u16,
-            rows: (((layout.footer - layout.top) / self.cell.1) as u16).max(1),
-        }
+        rect(
+            0,
+            1,
+            layout.panels.file_width,
+            (((layout.footer - layout.top) / self.cell.1) as u16).max(1),
+        )
     }
 
     fn file_preview_layout(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        crate::file_panel::preview_rect(crate::workspace::Rect {
-            x: 0,
-            y: 1,
-            cols: (layout.width / self.cell.0) as u16,
-            rows: ((layout.footer - layout.top) / self.cell.1) as u16,
-        })
+        crate::file_panel::preview_rect(rect(
+            0,
+            1,
+            (layout.width / self.cell.0) as u16,
+            ((layout.footer - layout.top) / self.cell.1) as u16,
+        ))
     }
 }
 
@@ -2206,165 +1881,21 @@ mod layout_tests {
         let mut left = PaneCache::default();
         let mut right = PaneCache::default();
         parser.advance(&mut core, b"\x1b[3;5H");
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         assert_eq!(left.ime_position(&screen), (4, 2));
         parser.advance(&mut core, b"\x1b[9;7H");
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         assert_eq!(right.ime_position(&screen), (6, 8));
 
         parser.advance(&mut core, b"\x1b[?25l\x1b[12;40H");
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         assert_eq!(left.ime_position(&screen), (4, 2));
         assert_eq!(right.ime_position(&screen), (6, 8));
 
         parser.advance(&mut core, b"\x1b[?25h\x1b[10;8H");
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         assert_eq!(right.ime_position(&screen), (7, 9));
         assert_eq!(left.ime_cursor, Some(Point { line: 2, column: 4 }));
-    }
-
-    #[test]
-    #[ignore = "requires a Wayland session"]
-    fn preview_keys_do_not_suppress_later_input_or_ime_commits() {
-        use crate::{
-            core::Core,
-            screen::Update,
-            wire::Peer,
-            workspace::{PaneView, Rect, Snapshot},
-        };
-        use std::os::unix::net::UnixListener;
-
-        let directory =
-            std::env::temp_dir().join(format!("nextty-gui-input-{}", std::process::id()));
-        std::fs::create_dir(&directory).unwrap();
-        std::fs::write(directory.join("a-file"), "preview text").unwrap();
-        let socket = directory.join("workspace.sock");
-        let listener = UnixListener::bind(&socket).unwrap();
-        let mut client = Client::connect(&socket).unwrap();
-        let mut server = Peer::new(listener.accept().unwrap().0).unwrap();
-        std::fs::remove_file(socket).unwrap();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 10,
-            cell_height: 22,
-        };
-        let core = Core::new(size, 0xcccccc, 0x202020);
-        server
-            .send_state(
-                &Snapshot {
-                    name: "input".into(),
-                    controller: true,
-                    focused: 1,
-                    active_tab: 1,
-                    tabs: Vec::new(),
-                    panes: vec![PaneView {
-                        id: 1,
-                        tab: 1,
-                        rect: Rect {
-                            x: 0,
-                            y: 1,
-                            cols: 80,
-                            rows: 24,
-                        },
-                        title: "shell".into(),
-                        cwd: Some(directory.clone()),
-                        blocks: Vec::new(),
-                        command_blocks: Vec::new(),
-                        input_generation: 0,
-                        shell_prompt: None,
-                        process: Default::default(),
-                    }],
-                },
-                &[(1, &Update::capture(&core, true))],
-                &Default::default(),
-                0,
-            )
-            .unwrap();
-        server.flush().unwrap();
-        while client.snapshot().is_none() {
-            client.poll().unwrap();
-            if client.snapshot().is_none() {
-                let mut fd = libc::pollfd {
-                    fd: client.receiver_fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                assert!(unsafe { libc::poll(&mut fd, 1, 5000) } > 0);
-            }
-        }
-        let config = Config {
-            font_family: "monospace".into(),
-            ..Config::default()
-        };
-        let mut view = WorkspaceView::new(client, config).unwrap();
-        let event = |kind, code, modifiers, text: &str| Event {
-            kind,
-            code,
-            modifiers,
-            text: text.into(),
-            x: 0.,
-            y: 0.,
-            start: 0,
-            end: 0,
-        };
-        view.event(event(native::KEY, u32::from('f'), native::ALT, "f"))
-            .unwrap();
-        let files = view.ui.files.as_mut().unwrap();
-        while files.selected().is_none() {
-            let mut fd = libc::pollfd {
-                fd: files.fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert!(unsafe { libc::poll(&mut fd, 1, 5000) } > 0);
-            files.drain_notification().unwrap();
-            files.poll();
-        }
-        view.event(event(native::KEY, keysym::RIGHT, 0, ""))
-            .unwrap();
-        assert!(view.ui.file_preview_open());
-        view.event(event(native::KEY, u32::from('x'), 0, "x"))
-            .unwrap();
-        view.event(event(native::KEY, keysym::ESCAPE, 0, ""))
-            .unwrap();
-        view.event(event(native::KEY, u32::from('f'), native::ALT, "f"))
-            .unwrap();
-        assert!(!view.ui.files_open);
-        view.event(event(native::KEY, u32::from('x'), 0, "x"))
-            .unwrap();
-        view.event(event(native::KEY, u32::from('x'), 0, "x"))
-            .unwrap();
-        view.event(event(native::KEY, u32::from('z'), native::ALT, "z"))
-            .unwrap();
-        view.event(event(native::KEY, u32::from('a'), native::CONTROL, ""))
-            .unwrap();
-        view.event(event(native::PREEDIT, 0, 0, "é")).unwrap();
-        view.event(event(native::TEXT, 0, 0, "é")).unwrap();
-        assert!(view.preedit.is_empty());
-        view.client.flush().unwrap();
-        let mut input = Vec::new();
-        while let Some(action) = server.next_action().unwrap() {
-            if let Action::Input { pane, data } = action {
-                assert_eq!(pane, 1);
-                input.extend(data);
-            }
-        }
-        assert_eq!(input, "xx\x1bz\x01é".as_bytes());
-
-        view.ui.agent.open = true;
-        view.ui.focus = Focus::Editor;
-        view.event(event(native::KEY, 0x0100_4e2d, 0, "中"))
-            .unwrap();
-        view.event(event(native::TEXT, 0, 0, "文")).unwrap();
-        let target = PasteTarget::Agent(view.ui.agent.active().id);
-        view.paste = Some(target);
-        view.event(event(native::KEY, u32::from('x'), 0, "x"))
-            .unwrap();
-        view.event(event(native::PASTE, 0, 0, "先")).unwrap();
-        assert_eq!(view.ui.agent.active().model.input, "中文先x");
-        drop(view);
-        std::fs::remove_dir_all(directory).unwrap();
     }
 
     #[test]
@@ -2377,32 +1908,5 @@ mod layout_tests {
         assert_eq!(bar.offset_at(27., 7.), 900);
         assert_eq!(bar.offset_at(227., 7.), 0);
         assert!(Scrollbar::new(ScrollTarget::Pane(1), (10., 20., 3., 200.), 100, 100, 0).is_none());
-        let layout = GuiLayout::new(1200., 768., (10., 22.), Some(392.));
-        assert_eq!(layout.side, 808.);
-        assert!(layout.divider_contains((814., 100.)));
-        assert!(!layout.divider_contains((817., 100.)));
-    }
-
-    #[test]
-    fn chrome_and_sidebar_keep_grid_coordinates_and_pty_size_in_sync() {
-        let cell = (10., 22.);
-        let layout = GuiLayout::new(1200., 768., cell, Some(392.));
-        let size = layout.size(cell);
-        assert_eq!((size.num_cols, size.num_lines), (80, 33));
-        assert_eq!(layout.top, cell.1);
-        let (x, y) = layout.origin(cell);
-        assert!(layout.terminal_contains((x, y + cell.1)));
-        assert!(!layout.terminal_contains((x, layout.top - 1.)));
-        assert!(!layout.terminal_contains((layout.side + 1., y + cell.1)));
-        assert!(!layout.terminal_contains((x, layout.footer + 1.)));
-        let terminal_bottom = y + size.num_lines as f32 * cell.1;
-        assert!(terminal_bottom <= layout.footer - 4.);
-        assert!(layout.footer - 4. - terminal_bottom < cell.1);
-        assert_eq!(x, 4.);
-        assert_eq!(y + cell.1, layout.top + 4.);
-        let closed = GuiLayout::new(1200., 768., cell, None);
-        assert_eq!(closed.origin(cell), layout.origin(cell));
-        assert_eq!(closed.size(cell).num_lines, size.num_lines);
-        assert_eq!(closed.size(cell).num_cols, 119);
     }
 }

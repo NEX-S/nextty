@@ -37,7 +37,7 @@ impl Integration {
         let integration = Self { directory };
         if zsh {
             let script = integration.directory.join("integration.zsh");
-            fs::write(&script, ZSH)?;
+            fs::write(&script, [CWD, ZSH].concat())?;
             fs::write(integration.directory.join(".zshenv"), ZSHENV)?;
             command.env("NEXTTY_INTEGRATION", script);
             if let Some(original) = std::env::var_os("ZDOTDIR") {
@@ -48,7 +48,7 @@ impl Integration {
             command.env("ZDOTDIR", &integration.directory);
         } else {
             let script = integration.directory.join("bashrc");
-            fs::write(&script, BASH)?;
+            fs::write(&script, [BASH, CWD].concat())?;
             command.arg("--rcfile").arg(script).arg("-i");
         }
         Ok(Some(integration))
@@ -79,22 +79,23 @@ _nextty_initialize() {
 }
 add-zsh-hook precmd _nextty_initialize
 "#;
-const ZSH: &str = r#"# ZLE otherwise keeps an unused cell after the right prompt.
-ZLE_RPROMPT_INDENT=0
-_nextty_cwd() {
-  local LC_ALL=C value=$PWD char
+/// Reports the working directory as an OSC 7 URI; shared by both shells.
+const CWD: &str = r#"_nextty_cwd() {
+  local LC_ALL=C value=$PWD char index
   if [[ $value != *[^a-zA-Z0-9/._~-]* ]]; then
     printf '\033]7;file://localhost%s\007' "$value"
   else
     printf '\033]7;file://localhost'
-    local index
-    for ((index=1; index<=${#value}; index++)); do
-      char=${value[index]}
+    for ((index=0; index<${#value}; index++)); do
+      char=${value:$index:1}
       case $char in [a-zA-Z0-9/._~-]) printf '%s' "$char" ;; *) printf '%%%02X' "'$char" ;; esac
     done
     printf '\007'
   fi
 }
+"#;
+const ZSH: &str = r#"# ZLE otherwise keeps an unused cell after the right prompt.
+ZLE_RPROMPT_INDENT=0
 _nextty_precmd() {
   local nextty_exit_status=$?
   if [[ $_nextty_executing == 1 ]]; then printf '\033]133;D;%s\007' "$nextty_exit_status"; fi
@@ -123,18 +124,7 @@ _nextty_precmd() {
   local nextty_exit_status=$?
   if [[ $_nextty_executing == 1 ]]; then printf '\033]133;D;%s\007' "$nextty_exit_status"; fi
   _nextty_executing=1
-  local LC_ALL=C value=$PWD char
-  if [[ $value != *[^a-zA-Z0-9/._~-]* ]]; then
-    printf '\033]7;file://localhost%s\007' "$value"
-  else
-    printf '\033]7;file://localhost'
-    local index
-    for ((index=0; index<${#value}; index++)); do
-      char=${value:index:1}
-      case $char in [a-zA-Z0-9/._~-]) printf '%s' "$char" ;; *) printf '%%%02X' "'$char" ;; esac
-    done
-    printf '\007'
-  fi
+  _nextty_cwd
   local begin=$'\[\e]133;A\a\]' end=$'\[\e]133;B\a\]'
   PS1=${PS1#"$begin"}
   PS1=${PS1%"$end"}
@@ -157,7 +147,7 @@ PS0=$'\e]133;C\a'${PS0-}
 mod tests {
     use super::*;
     use crate::core::{Flags, WindowSize};
-    use crate::terminal::{Shell, Terminal};
+    use crate::terminal::Shell;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -175,7 +165,7 @@ mod tests {
         fs::write(
             &script,
             format!(
-                "autoload -Uz add-zsh-hook\nsetopt PROMPT_SUBST\nPROMPT=' • '\nRPROMPT='%F{{#555555}}%~${{vcs_info_msg_0_}}%f'\nvcs_info_msg_0_=' 󱐋 main'\n{ZSH}"
+                "autoload -Uz add-zsh-hook\nsetopt PROMPT_SUBST\nPROMPT=' • '\nRPROMPT='%F{{#555555}}%~${{vcs_info_msg_0_}}%f'\nvcs_info_msg_0_=' 󱐋 main'\n{CWD}{ZSH}"
             ),
         ).unwrap();
         let mut size = WindowSize {
@@ -184,7 +174,7 @@ mod tests {
             cell_width: 8,
             cell_height: 16,
         };
-        let terminal = Terminal::new(
+        let mut terminal = crate::terminal::tests::new(
             Some(Shell::new("zsh".into(), vec!["-dfi".into()])),
             Some(PathBuf::from("/")),
             size,
@@ -196,90 +186,59 @@ mod tests {
         terminal
             .write(format!("source {}\n", quote(&script)).into_bytes())
             .unwrap();
-        let prompt = |cwd: &Path, columns: usize, previous: Option<i32>| {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            loop {
-                {
-                    let core = terminal.core.lock().unwrap();
-                    let cursor = core.cursor().0;
-                    let row = core.row(cursor.line as usize);
-                    let text: String = row.cells.iter().map(|cell| cell.c).collect();
-                    if core.current_directory() == Some(cwd)
-                        && core.columns() == columns
-                        && previous != Some(cursor.line)
-                        && text.ends_with("main")
-                    {
-                        assert_eq!(cursor.column, 3, "ZLE must restore the editing cursor");
-                        assert!(
-                            row.cells[columns - 4..].iter().all(|cell| cell
-                                .flags
-                                .contains(Flags::PROMPT | Flags::RIGHT_PROMPT))
-                        );
-                        return cursor.line;
-                    }
-                    assert!(
-                        Instant::now() < deadline,
-                        "right prompt did not reach column {columns}; cwd={:?}, cursor={cursor:?}, row={text:?}",
-                        core.current_directory()
-                    );
-                }
-                std::thread::sleep(Duration::from_millis(5));
-            }
-        };
-        let row = prompt(Path::new("/"), 200, None);
+        let row = prompt(&mut terminal, Path::new("/"), 200, None);
         terminal.write(b"\n".as_slice()).unwrap();
-        prompt(Path::new("/"), 200, Some(row));
+        prompt(&mut terminal, Path::new("/"), 200, Some(row));
         terminal
             .write(format!("cd {}\n", quote(&long_cwd)).into_bytes())
             .unwrap();
-        prompt(&long_cwd, 200, None);
+        prompt(&mut terminal, &long_cwd, 200, None);
         size.num_cols = 160;
         terminal.resize(size).unwrap();
-        prompt(&long_cwd, 160, None);
+        prompt(&mut terminal, &long_cwd, 160, None);
         terminal.write(b"cd /\n".as_slice()).unwrap();
-        prompt(Path::new("/"), 160, None);
+        prompt(&mut terminal, Path::new("/"), 160, None);
         size.num_cols = 40;
         terminal.resize(size).unwrap();
-        let row = prompt(Path::new("/"), 40, None);
+        let row = prompt(&mut terminal, Path::new("/"), 40, None);
         terminal.write(b"\n".as_slice()).unwrap();
-        prompt(Path::new("/"), 40, Some(row));
+        prompt(&mut terminal, Path::new("/"), 40, Some(row));
     }
 
-    #[test]
-    fn empty_cache_home_uses_home() {
-        if std::env::var_os("NEXTTY_EMPTY_CACHE_HOME_TEST").is_some() {
-            let root = PathBuf::from(std::env::var_os("HOME").unwrap()).join(".cache/nextty/shell");
-            for shell in ["bash", "zsh"] {
-                let mut command = Command::new(shell);
-                let integration = Integration::prepare(&mut command).unwrap().unwrap();
-                assert!(root.is_dir(), "shell integration must use the HOME cache");
-                assert!(!Path::new("nextty").exists());
-                drop(integration);
-                assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+    fn prompt(
+        terminal: &mut crate::terminal::Terminal,
+        cwd: &Path,
+        columns: usize,
+        previous: Option<i32>,
+    ) -> i32 {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            {
+                let core = &terminal.core;
+                let cursor = core.cursor().0;
+                let row = core.row(cursor.line as usize);
+                let text: String = row.cells.iter().map(|cell| cell.c).collect();
+                if core.current_directory() == Some(cwd)
+                    && core.columns() == columns
+                    && previous != Some(cursor.line)
+                    && text.ends_with("main")
+                {
+                    assert_eq!(cursor.column, 3, "ZLE must restore the editing cursor");
+                    assert!(
+                        row.cells[columns - 4..]
+                            .iter()
+                            .all(|cell| cell.flags.contains(Flags::PROMPT))
+                    );
+                    return cursor.line;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "right prompt did not reach column {columns}; cwd={:?}, cursor={cursor:?}, row={text:?}",
+                    core.current_directory()
+                );
             }
-            return;
+            crate::terminal::tests::drive(terminal);
+            std::thread::sleep(Duration::from_millis(5));
         }
-        let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join(format!(
-            "target/empty-shell-cache-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let fixture = Integration { directory };
-        let home = fixture.directory.join("home");
-        let cwd = fixture.directory.join("workspace");
-        fs::create_dir_all(&home).unwrap();
-        fs::create_dir(&cwd).unwrap();
-        let status = Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "shell_integration::tests::empty_cache_home_uses_home",
-            ])
-            .env("NEXTTY_EMPTY_CACHE_HOME_TEST", "1")
-            .env("XDG_CACHE_HOME", "")
-            .env("HOME", &home)
-            .current_dir(cwd)
-            .status()
-            .unwrap();
-        assert!(status.success());
     }
 }

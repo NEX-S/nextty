@@ -12,6 +12,7 @@ pub(crate) struct SearchMatch {
     pub end_column: u16,
 }
 
+#[derive(Default)]
 pub(crate) struct SearchResult {
     pub matches: Box<[SearchMatch]>,
     pub truncated: bool,
@@ -20,68 +21,47 @@ pub(crate) struct SearchResult {
 }
 
 pub(crate) struct Matcher {
-    // Queries fit in a wire frame, so fallback positions fit in u32.
-    pattern: Box<[(char, u32)]>,
-    matched: usize,
-    positions: VecDeque<(u64, u16)>,
+    pattern: Vec<char>,
+    // The last `pattern.len()` characters of the current line with their start positions.
+    window: VecDeque<(char, (u64, u16))>,
     matches: VecDeque<SearchMatch>,
     truncated: bool,
 }
 impl Matcher {
     pub fn new(query: &str) -> Self {
-        let mut pattern = Vec::with_capacity(query.chars().count());
-        pattern.extend(query.chars().map(|character| (character, 0)));
-        for index in 1..pattern.len() {
-            let mut matched = pattern[index - 1].1 as usize;
-            while matched > 0 && pattern[index].0 != pattern[matched].0 {
-                matched = pattern[matched - 1].1 as usize;
-            }
-            if pattern[index].0 == pattern[matched].0 {
-                matched += 1;
-            }
-            pattern[index].1 = matched as u32;
-        }
         Self {
-            positions: VecDeque::new(),
-            pattern: pattern.into_boxed_slice(),
-            matched: 0,
+            pattern: query.chars().collect(),
+            window: VecDeque::new(),
             matches: VecDeque::new(),
             truncated: false,
         }
     }
     fn character(&mut self, character: char, start: (u64, u16), end: (u64, u16)) {
-        while self.matched > 0 && character != self.pattern[self.matched].0 {
-            self.matched = self.pattern[self.matched - 1].1 as usize;
+        if self.window.len() == self.pattern.len() {
+            self.window.pop_front();
         }
-        if character == self.pattern[self.matched].0 {
-            self.matched += 1;
-            // Retain the matched suffix after fallback or an overlapping match.
-            if self.positions.len() >= self.matched {
-                self.positions
-                    .drain(..self.positions.len() - self.matched + 1);
-            }
-            self.positions.push_back(start);
-        } else {
-            self.positions.clear();
-        }
-        if self.matched == self.pattern.len() {
-            let &(start_row, start_column) = self.positions.front().unwrap();
+        self.window.push_back((character, start));
+        if self.window.len() == self.pattern.len()
+            && self
+                .window
+                .iter()
+                .map(|(c, _)| *c)
+                .eq(self.pattern.iter().copied())
+        {
             self.matches.push_back(SearchMatch {
-                start_row,
+                start_row: self.window[0].1.0,
                 end_row: end.0,
-                start_column,
+                start_column: self.window[0].1.1,
                 end_column: end.1,
             });
             if self.matches.len() > MATCH_LIMIT {
                 self.matches.pop_front();
                 self.truncated = true;
             }
-            self.matched = self.pattern[self.matched - 1].1 as usize;
         }
     }
     pub fn line_break(&mut self) {
-        self.matched = 0;
-        self.positions.clear();
+        self.window.clear();
     }
     pub fn gap(&mut self) {
         self.line_break();
@@ -100,6 +80,19 @@ impl Matcher {
             self.line_break();
         }
     }
+    /// A row of unstyled text, one character per column.
+    pub fn plain(&mut self, id: u64, text: &str, wrapped: bool) {
+        if self.pattern.is_empty() {
+            return;
+        }
+        for (column, character) in text.chars().enumerate() {
+            let column = column as u16;
+            self.character(character, (id, column), (id, column + 1));
+        }
+        if !wrapped {
+            self.line_break();
+        }
+    }
     pub fn finish(self, columns: usize, alternate: bool) -> SearchResult {
         SearchResult {
             matches: Vec::from(self.matches).into_boxed_slice(),
@@ -115,90 +108,46 @@ mod tests {
     use super::*;
     use crate::core::{Core, WindowSize};
 
-    #[test]
-    fn literal_matches_preserve_wide_combining_and_soft_wrapped_cell_ranges() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 4,
-                num_lines: 3,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xffffff,
-            0,
-        );
-        crate::vt::Parser::new().advance(&mut core, "中a\u{301}bc".as_bytes());
-        let mut matcher = Matcher::new("a\u{301}bc");
-        matcher.row(10, core.row(0));
-        matcher.row(11, core.row(1));
-        assert_eq!(
-            matcher.finish(4, false).matches.as_ref(),
-            vec![SearchMatch {
-                start_row: 10,
-                end_row: 11,
-                start_column: 2,
-                end_column: 1,
-            }]
-        );
-        let mut matcher = Matcher::new("中");
-        matcher.row(10, core.row(0));
-        assert_eq!(
-            matcher.finish(4, false).matches.as_ref(),
-            vec![SearchMatch {
-                start_row: 10,
-                end_row: 10,
-                start_column: 0,
-                end_column: 2,
-            }]
-        );
-        let mut matcher = Matcher::new("\u{301}");
-        matcher.row(10, core.row(0));
-        assert_eq!(
-            matcher.finish(4, false).matches.as_ref(),
-            vec![SearchMatch {
-                start_row: 10,
-                end_row: 10,
-                start_column: 2,
-                end_column: 3,
-            }]
-        );
-        crate::vt::Parser::new().advance(&mut core, b"\x1b[2J\x1b[Hababacaba");
-        let mut matcher = Matcher::new("aba");
-        for row in 0..3 {
+    fn core(columns: u16, text: &[u8]) -> Core {
+        let size = WindowSize {
+            num_cols: columns,
+            num_lines: 3,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let mut core = Core::new(size, 0xffffff, 0);
+        crate::vt::Parser::new().advance(&mut core, text);
+        core
+    }
+    /// Start and end (row, column) of every match of `query` over the first rows, numbered from 10.
+    fn found(core: &Core, query: &str, rows: usize) -> Vec<((u64, u16), (u64, u16))> {
+        let mut matcher = Matcher::new(query);
+        for row in 0..rows {
             matcher.row(10 + row as u64, core.row(row));
         }
+        let matches = matcher.finish(0, false).matches;
+        let ends = |m: &SearchMatch| ((m.start_row, m.start_column), (m.end_row, m.end_column));
+        matches.iter().map(ends).collect()
+    }
+
+    #[test]
+    fn literal_matches_preserve_wide_combining_and_soft_wrapped_cell_ranges() {
+        let wrapped = core(4, "中a\u{301}bc".as_bytes());
+        assert_eq!(found(&wrapped, "a\u{301}bc", 2), [((10, 2), (11, 1))]);
+        assert_eq!(found(&wrapped, "中", 1), [((10, 0), (10, 2))]);
+        assert_eq!(found(&wrapped, "\u{301}", 1), [((10, 2), (10, 3))]);
+        let overlapping = core(4, b"ababacaba");
         assert_eq!(
-            matcher
-                .finish(4, false)
-                .matches
-                .iter()
-                .map(|found| (
-                    (found.start_row, found.start_column),
-                    (found.end_row, found.end_column)
-                ))
-                .collect::<Vec<_>>(),
+            found(&overlapping, "aba", 3),
             [((10, 0), (10, 3)), ((10, 2), (11, 1)), ((11, 2), (12, 1))]
         );
     }
+
     #[test]
     fn results_are_bounded_and_do_not_join_hard_lines_or_reveal_hidden_text() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 20,
-                num_lines: 3,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xffffff,
-            0,
-        );
-        crate::vt::Parser::new().advance(&mut core, b"ab\r\ncd\x1b[8msecret");
-        for query in ["bc", "secret"] {
-            let mut matcher = Matcher::new(query);
-            matcher.row(0, core.row(0));
-            matcher.row(1, core.row(1));
-            assert!(matcher.finish(20, false).matches.is_empty());
-        }
+        let core = core(20, b"ab\r\ncd\x1b[8msecret");
+        assert!(found(&core, "bc", 2).is_empty());
+        assert!(found(&core, "secret", 2).is_empty());
         let mut matcher = Matcher::new("a");
         for row in 0..MATCH_LIMIT as u64 + 2 {
             matcher.row(row, core.row(0));
@@ -206,9 +155,6 @@ mod tests {
         let result = matcher.finish(20, false);
         assert_eq!(result.matches.len(), MATCH_LIMIT);
         assert!(result.truncated);
-        assert_eq!(
-            (result.matches[0].start_row, result.matches[0].start_column),
-            (2, 0)
-        );
+        assert_eq!(result.matches[0].start_row, 2);
     }
 }

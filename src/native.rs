@@ -1,6 +1,6 @@
 pub(crate) mod trace;
 
-use crate::error::{Error, Result};
+use std::io::{self, Result};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
     ptr::NonNull,
@@ -19,12 +19,10 @@ pub const FOCUS: i32 = 7;
 pub const RESIZE: i32 = 8;
 pub const CLOSE: i32 = 9;
 pub const PASTE: i32 = 10;
-pub const FRAME: i32 = 11;
-pub const EXPOSE: i32 = 12;
-pub const PRESENTED: i32 = 13;
-pub const WINDOW_STATE: i32 = 14;
-pub const FRAME_RATE: i32 = 15;
-pub const POINTER_LEAVE: i32 = 16;
+pub const EXPOSE: i32 = 11;
+pub const PRESENTED: i32 = 12;
+pub const WINDOW_STATE: i32 = 13;
+pub const POINTER_LEAVE: i32 = 14;
 
 #[repr(C)]
 struct RawEvent {
@@ -36,7 +34,6 @@ struct RawEvent {
     text: *const c_char,
     length: usize,
     start: c_int,
-    end: c_int,
 }
 
 pub struct Event {
@@ -47,7 +44,6 @@ pub struct Event {
     pub y: f64,
     pub text: String,
     pub start: i32,
-    pub end: i32,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -73,11 +69,8 @@ unsafe extern "C" {
     ) -> c_int;
     fn nt_window_size(window: *mut c_void, width: *mut c_int, height: *mut c_int, scale: *mut f64);
     fn nt_window_title(window: *mut c_void, title: *const c_char);
-
     fn nt_window_minimize(window: *mut c_void);
-
     fn nt_window_maximize(window: *mut c_void, maximized: c_int);
-
     fn nt_window_resize_cursor(window: *mut c_void, enabled: c_int);
     fn nt_window_cursor_rect(window: *mut c_void, x: c_int, y: c_int, width: c_int, height: c_int);
     fn nt_window_set_selection(
@@ -87,7 +80,6 @@ unsafe extern "C" {
         len: usize,
     );
     fn nt_window_paste(window: *mut c_void, primary: c_int);
-
     fn nt_window_set_selection_file(window: *mut c_void, primary: c_int, fd: c_int);
     fn nt_window_frame_ready(window: *mut c_void) -> c_int;
     fn nt_renderer_new(window: *mut c_void, family: *const c_char, font_size: f32) -> *mut c_void;
@@ -103,10 +95,9 @@ unsafe extern "C" {
         columns: *const u16,
     ) -> *mut c_void;
     fn nt_line_free(line: *mut c_void);
-    fn nt_renderer_begin(renderer: *mut c_void, background: u32) -> c_int;
-
-    fn nt_renderer_clear(renderer: *mut c_void, background: u32) -> c_int;
-    fn nt_renderer_clip(renderer: *mut c_void, x: f32, y: f32, width: f32, height: f32) -> c_int;
+    fn nt_renderer_begin(renderer: *mut c_void, background: u32);
+    fn nt_renderer_clear(renderer: *mut c_void, background: u32);
+    fn nt_renderer_clip(renderer: *mut c_void, x: f32, y: f32, width: f32, height: f32);
     fn nt_renderer_rect(
         renderer: *mut c_void,
         x: f32,
@@ -116,7 +107,6 @@ unsafe extern "C" {
         color: u32,
         wave: c_int,
     );
-
     fn nt_renderer_stroke(
         renderer: *mut c_void,
         x1: f32,
@@ -126,7 +116,6 @@ unsafe extern "C" {
         width: f32,
         color: u32,
     );
-
     fn nt_renderer_tab(
         renderer: *mut c_void,
         x: f32,
@@ -137,15 +126,14 @@ unsafe extern "C" {
         color: u32,
     );
     fn nt_renderer_line(renderer: *mut c_void, line: *mut c_void, x: f32, y: f32);
-    fn nt_renderer_present(renderer: *mut c_void) -> c_int;
+    fn nt_renderer_present(renderer: *mut c_void);
     fn nt_renderer_ready(renderer: *mut c_void) -> c_int;
     fn nt_renderer_finish(renderer: *mut c_void) -> c_int;
     fn nt_renderer_fd(renderer: *mut c_void) -> c_int;
-    fn nt_renderer_swap_time(renderer: *mut c_void) -> f64;
 }
 
-fn message(pointer: *const c_char) -> Error {
-    Error::msg(
+fn message(pointer: *const c_char) -> io::Error {
+    io::Error::other(
         unsafe { CStr::from_ptr(pointer) }
             .to_string_lossy()
             .into_owned(),
@@ -154,7 +142,7 @@ fn message(pointer: *const c_char) -> Error {
 
 pub struct Window(NonNull<c_void>);
 pub struct Renderer(NonNull<c_void>);
-pub struct Line(NonNull<c_void>);
+pub struct Line(*mut c_void);
 
 impl Window {
     pub fn new(width: i32, height: i32) -> Result<Self> {
@@ -169,26 +157,18 @@ impl Window {
         timeout: i32,
         events: &mut Vec<Event>,
     ) -> Result<()> {
-        struct Collected<'a> {
-            events: &'a mut Vec<Event>,
-            error: Option<Error>,
-        }
         unsafe extern "C" fn collect(data: *mut c_void, event: *const RawEvent) {
-            let output = unsafe { &mut *data.cast::<Collected<'_>>() };
+            let events = unsafe { &mut *data.cast::<Vec<Event>>() };
             let event = unsafe { &*event };
             let text = if event.length == 0 {
                 String::new()
             } else {
-                let bytes = unsafe { std::slice::from_raw_parts(event.text.cast(), event.length) };
-                match std::str::from_utf8(bytes) {
-                    Ok(text) => text.to_owned(),
-                    Err(error) => {
-                        output.error = Some(Error::context("platform text is not UTF-8", error));
-                        return;
-                    }
-                }
+                String::from_utf8_lossy(unsafe {
+                    std::slice::from_raw_parts(event.text.cast(), event.length)
+                })
+                .into_owned()
             };
-            output.events.push(Event {
+            events.push(Event {
                 kind: event.kind,
                 code: event.code,
                 modifiers: event.modifiers,
@@ -196,13 +176,8 @@ impl Window {
                 y: event.y,
                 text,
                 start: event.start,
-                end: event.end,
             });
         }
-        let mut output = Collected {
-            events,
-            error: None,
-        };
         let result = unsafe {
             nt_window_wait(
                 self.0.as_ptr(),
@@ -210,12 +185,9 @@ impl Window {
                 sources.len(),
                 timeout,
                 collect,
-                (&mut output as *mut Collected<'_>).cast(),
+                (events as *mut Vec<Event>).cast(),
             )
         };
-        if let Some(error) = output.error {
-            return Err(error);
-        }
         if result < 0 {
             return Err(message(unsafe { nt_window_error(self.0.as_ptr()) }));
         }
@@ -231,7 +203,7 @@ impl Window {
         unsafe { nt_window_frame_ready(self.0.as_ptr()) != 0 }
     }
     pub fn title(&self, text: &str) -> Result<()> {
-        let text = CString::new(text).map_err(|error| Error::context("window title", error))?;
+        let text = CString::new(text)?;
         unsafe { nt_window_title(self.0.as_ptr(), text.as_ptr()) };
         Ok(())
     }
@@ -272,7 +244,7 @@ impl Window {
 
 impl Renderer {
     pub fn new(window: &Window, family: &str, font_size: f32) -> Result<Self> {
-        let family = CString::new(family).map_err(|error| Error::context("font_family", error))?;
+        let family = CString::new(family)?;
         NonNull::new(unsafe { nt_renderer_new(window.0.as_ptr(), family.as_ptr(), font_size) })
             .map(Self)
             .ok_or_else(|| message(unsafe { nt_renderer_error(std::ptr::null_mut()) }))
@@ -282,8 +254,8 @@ impl Renderer {
         unsafe { nt_renderer_metrics(self.0.as_ptr(), &mut width, &mut height) };
         (width, height)
     }
-    pub fn shape(&self, text: &str, runs: &[Run], columns: &[u16]) -> Result<Line> {
-        NonNull::new(unsafe {
+    pub fn shape(&self, text: &str, runs: &[Run], columns: &[u16]) -> Line {
+        Line(unsafe {
             nt_line_new(
                 self.0.as_ptr(),
                 text.as_ptr().cast(),
@@ -297,21 +269,22 @@ impl Renderer {
                 },
             )
         })
-        .map(Line)
-        .ok_or_else(|| message(unsafe { nt_renderer_error(self.0.as_ptr()) }))
     }
-    pub fn begin(&self, background: u32) -> Result<()> {
-        self.check(unsafe { nt_renderer_begin(self.0.as_ptr(), background) })
+    pub fn begin(&self, background: u32) {
+        unsafe { nt_renderer_begin(self.0.as_ptr(), background) };
     }
 
-    pub fn clear(&self, background: u32) -> Result<()> {
-        self.check(unsafe { nt_renderer_clear(self.0.as_ptr(), background) })
+    pub fn clear(&self, background: u32) {
+        unsafe { nt_renderer_clear(self.0.as_ptr(), background) };
     }
-    pub fn clip(&self, x: f32, y: f32, width: f32, height: f32) -> Result<()> {
-        self.check(unsafe { nt_renderer_clip(self.0.as_ptr(), x, y, width, height) })
+    pub fn clip(&self, x: f32, y: f32, width: f32, height: f32) {
+        unsafe { nt_renderer_clip(self.0.as_ptr(), x, y, width, height) };
     }
-    pub fn rect(&self, x: f32, y: f32, width: f32, height: f32, color: u32, wave: bool) {
-        unsafe { nt_renderer_rect(self.0.as_ptr(), x, y, width, height, color, wave.into()) };
+    pub fn rect(&self, x: f32, y: f32, width: f32, height: f32, color: u32) {
+        unsafe { nt_renderer_rect(self.0.as_ptr(), x, y, width, height, color, 0) };
+    }
+    pub fn undercurl(&self, x: f32, y: f32, width: f32, height: f32, color: u32) {
+        unsafe { nt_renderer_rect(self.0.as_ptr(), x, y, width, height, color, 1) };
     }
 
     pub fn stroke(&self, from: (f32, f32), to: (f32, f32), width: f32, color: u32) {
@@ -332,7 +305,7 @@ impl Renderer {
         };
     }
     pub fn line(&self, line: &Line, x: f32, y: f32) {
-        unsafe { nt_renderer_line(self.0.as_ptr(), line.0.as_ptr(), x, y) };
+        unsafe { nt_renderer_line(self.0.as_ptr(), line.0, x, y) };
     }
     pub fn fd(&self) -> i32 {
         unsafe { nt_renderer_fd(self.0.as_ptr()) }
@@ -343,27 +316,20 @@ impl Renderer {
             ready => Ok(ready != 0),
         }
     }
-    pub fn swap_time(&self) -> f64 {
-        unsafe { nt_renderer_swap_time(self.0.as_ptr()) }
-    }
     pub fn finish(&self) -> Result<()> {
-        self.check(unsafe { nt_renderer_finish(self.0.as_ptr()) })
-    }
-    pub fn present(&self) -> Result<()> {
-        self.check(unsafe { nt_renderer_present(self.0.as_ptr()) })
-    }
-    fn check(&self, result: i32) -> Result<()> {
-        if result == 0 {
-            Err(message(unsafe { nt_renderer_error(self.0.as_ptr()) }))
-        } else {
-            Ok(())
+        match unsafe { nt_renderer_finish(self.0.as_ptr()) } {
+            0 => Err(message(unsafe { nt_renderer_error(self.0.as_ptr()) })),
+            _ => Ok(()),
         }
+    }
+    pub fn present(&self) {
+        unsafe { nt_renderer_present(self.0.as_ptr()) };
     }
 }
 
 impl Drop for Line {
     fn drop(&mut self) {
-        unsafe { nt_line_free(self.0.as_ptr()) }
+        unsafe { nt_line_free(self.0) }
     }
 }
 impl Drop for Renderer {

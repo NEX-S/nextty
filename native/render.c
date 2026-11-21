@@ -14,7 +14,6 @@
 #include <pthread.h>
 #include <sys/eventfd.h>
 #include <errno.h>
-#include <time.h>
 #include <unistd.h>
 
 typedef struct NtVkUpload NtVkUpload;
@@ -125,7 +124,6 @@ typedef struct {
     pthread_mutex_t lock;
     pthread_cond_t changed;
     int fd, state, stopping, started, initialized;
-    int64_t end;
     const char *family;
     NtLine *retired;
 } Swap;
@@ -204,19 +202,13 @@ static int finish_raster(NtRenderer *r, cairo_t *cr, cairo_surface_t *surface) {
            fail(r, "Cairo glyph raster: %s", cairo_status_to_string(status));
 }
 
-static int add_op(NtRenderer *r, Op op) {
+static void add_op(NtRenderer *r, Op op) {
     Frame *f = &r->frame;
     if (f->op_count == f->op_capacity) {
-        size_t capacity = f->op_capacity ? f->op_capacity * 2 : 32;
-        if (capacity < f->op_capacity || capacity > SIZE_MAX / sizeof(Op))
-            return fail(r, "GPU frame has too many operations");
-        Op *ops = realloc(f->ops, capacity * sizeof *ops);
-        if (!ops) return fail(r, "Cannot allocate GPU frame operations");
-        f->ops = ops;
-        f->op_capacity = capacity;
+        f->op_capacity = f->op_capacity ? f->op_capacity * 2 : 32;
+        f->ops = realloc(f->ops, f->op_capacity * sizeof *f->ops);
     }
     f->ops[f->op_count++] = op;
-    return 1;
 }
 
 static int flush_quads(NtRenderer *r);
@@ -243,21 +235,14 @@ static int reset_atlases(NtRenderer *r) {
 }
 
 static int set_scale(NtRenderer *r, double scale) {
-    if (!isfinite(scale) || scale <= 0 || !isfinite(r->font_size * scale))
-        return fail(r, "Invalid window/font scale %.6g", scale);
     if (r->scale == scale) return 1;
-    if (!reset_atlases(r) || !nt_fonts_scale(r->fonts, scale)) return 0;
+    if (!reset_atlases(r)) return 0;
+    nt_fonts_scale(r->fonts, scale);
     r->scale = scale;
     return 1;
 }
 
-static int64_t submission_time(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (int64_t)ts.tv_sec * 1000000000 + ts.tv_nsec;
-}
-
-static int reserve_quads(NtRenderer *r, size_t count);
+static void reserve_quads(NtRenderer *r, size_t count);
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y);
 
 #define VK_CHECK(call) do { \
@@ -295,7 +280,6 @@ static void vk_image_barrier(NtRenderer *r, VkImage image,
 static int vk_create_atlas(NtRenderer *r, int color, int size) {
     NtVulkan *v = &r->vk;
     NtVkAtlas *atlas = calloc(1, sizeof *atlas);
-    if (!atlas) return fail(r, "Cannot allocate Vulkan glyph atlas");
     if (v->atlas[color]) {
         v->atlas[color]->next = v->retired;
         v->retired = v->atlas[color];
@@ -387,7 +371,6 @@ static int vk_upload_space(NtRenderer *r, VkDeviceSize size, NtVkUpload **buffer
         *upload = (NtVkUpload){.next = upload->next};
     } else {
         upload = calloc(1, sizeof *upload);
-        if (!upload) return fail(r, "Cannot allocate Vulkan upload buffer");
         *link = upload;
     }
     upload->size = capacity;
@@ -460,8 +443,6 @@ static void vk_begin_rendering(NtRenderer *r) {
 static int flush_quads(NtRenderer *r) {
     size_t count = r->quad_count;
     if (!count) return 1;
-    if (count > UINT32_MAX || count > SIZE_MAX / sizeof(Quad))
-        return fail(r, "Vulkan quad batch is too large");
     NtVulkan *v = &r->vk;
     for (int i = 0; i < 2; ++i) {
         NtVkAtlas *atlas = v->atlas[i];
@@ -621,7 +602,6 @@ static int vk_create_swapchain(NtRenderer *r, VkExtent2D requested) {
     uint32_t count;
     VK_CHECK(vkGetPhysicalDeviceSurfaceFormatsKHR(v->physical, v->surface, &count, NULL));
     VkSurfaceFormatKHR *formats = malloc(count * sizeof *formats);
-    if (!formats) return fail(r, "Cannot allocate Vulkan surface formats");
     VkResult result = vkGetPhysicalDeviceSurfaceFormatsKHR(v->physical, v->surface, &count, formats);
     VkSurfaceFormatKHR format = {VK_FORMAT_UNDEFINED, VK_COLOR_SPACE_SRGB_NONLINEAR_KHR};
     for (uint32_t i = 0; result == VK_SUCCESS && i < count; ++i) {
@@ -665,7 +645,6 @@ static int vk_create_swapchain(NtRenderer *r, VkExtent2D requested) {
     v->images = calloc(v->image_count, sizeof *v->images);
     v->views = calloc(v->image_count, sizeof *v->views);
     v->presented = calloc(v->image_count, sizeof *v->presented);
-    if (!v->images || !v->views || !v->presented) return fail(r, "Cannot allocate Vulkan swapchain images");
     VK_CHECK(vkGetSwapchainImagesKHR(v->device, v->swapchain, &v->image_count, v->images));
     for (uint32_t i = 0; i < v->image_count; ++i) {
         VkImageViewCreateInfo view = {
@@ -714,7 +693,6 @@ static int gpu_init(NtRenderer *r) {
     uint32_t count;
     VK_CHECK(vkEnumeratePhysicalDevices(v->instance, &count, NULL));
     VkPhysicalDevice *devices = malloc(count * sizeof *devices);
-    if (!devices) return fail(r, "Cannot allocate Vulkan physical devices");
     VkResult result = vkEnumeratePhysicalDevices(v->instance, &count, devices);
     int selected_score = 0;
     for (uint32_t i = 0; result == VK_SUCCESS && i < count; ++i) {
@@ -731,7 +709,6 @@ static int gpu_init(NtRenderer *r) {
         uint32_t families;
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &families, NULL);
         VkQueueFamilyProperties *queues = malloc(families * sizeof *queues);
-        if (!queues) { free(devices); return fail(r, "Cannot allocate Vulkan queue families"); }
         vkGetPhysicalDeviceQueueFamilyProperties(devices[i], &families, queues);
         for (uint32_t j = 0; j < families; ++j) {
             VkBool32 present;
@@ -902,7 +879,7 @@ static int replay(NtRenderer *r) {
             break;
         }
         case OP_QUAD:
-            if (!reserve_quads(r, r->quad_count + 1)) return 0;
+            reserve_quads(r, r->quad_count + 1);
             r->quads[r->quad_count++] = op->quad;
             break;
         case OP_LINE:
@@ -1011,12 +988,10 @@ static void *submit(void *data) {
         }
         if (s->stopping) break;
         pthread_mutex_unlock(&s->lock);
-        s->end = 0;
         if (!r->vk.instance) {
             if (initialized) gpu_init(r);
         } else if (replay(r)) {
             gpu_present(r);
-            s->end = submission_time();
         }
         pthread_mutex_lock(&s->lock);
         s->state = SWAP_DONE;
@@ -1061,7 +1036,6 @@ static int start_submission(NtRenderer *r) {
 }
 
 int nt_renderer_fd(NtRenderer *r) { return r->swap.fd; }
-double nt_renderer_swap_time(NtRenderer *r) { return (double)r->swap.end / 1e9; }
 
 int nt_renderer_ready(NtRenderer *r) {
     Swap *s = &r->swap;
@@ -1093,12 +1067,7 @@ int nt_renderer_finish(NtRenderer *r) {
 
 NtRenderer *nt_renderer_new(NtWindow *window, const char *family, float font_size) {
     creation_error[0] = 0;
-    if (!*family || !isfinite(font_size) || font_size <= 0) {
-        fail(NULL, "Renderer requires a window, font family, and finite positive font size");
-        return NULL;
-    }
     NtRenderer *r = calloc(1, sizeof *r);
-    if (!r) { fail(NULL, "Cannot allocate terminal renderer"); return NULL; }
     r->window = window;
     r->font_size = font_size;
     r->atlas_size[0] = 512;
@@ -1152,23 +1121,12 @@ NtLine *nt_line_new(NtRenderer *r, const char *text, size_t length,
                     const NtRun *runs, size_t run_count,
                     const uint16_t *columns) {
     size_t stride = columns ? sizeof *columns + 1 : 1;
-    if (length > INT_MAX || length > (SIZE_MAX - sizeof(LineInput)) / stride ||
-        run_count > (SIZE_MAX - sizeof(LineInput) - length * stride) / sizeof *runs) {
-        fail(r, "Shaped line is too large");
-        return NULL;
-    }
     NtLine *line = calloc(1, sizeof *line);
-    if (!line) { fail(r, "Cannot allocate terminal line"); return NULL; }
     line->renderer = r;
     line->references = 1;
     if (!length) return line;
     size_t run_bytes = run_count * sizeof *runs;
     LineInput *input = malloc(sizeof *input + run_bytes + length * stride);
-    if (!input) {
-        fail(r, "Cannot allocate terminal line input");
-        free(line);
-        return NULL;
-    }
     line->input = input;
     input->length = length;
     input->run_count = run_count;
@@ -1196,18 +1154,11 @@ static Quad make_quad(float x, float y, float width, float height, uint32_t colo
         (unsigned char)(color >> 8), (unsigned char)color}, .mode = mode };
 }
 
-static int reserve_quads(NtRenderer *r, size_t count) {
+static void reserve_quads(NtRenderer *r, size_t count) {
     if (count > r->quad_capacity) {
-        size_t capacity = r->quad_capacity ? r->quad_capacity * 2 : 1024;
-        if (capacity < count) capacity = count;
-        if (capacity < r->quad_capacity || capacity > SIZE_MAX / sizeof(Quad))
-            return fail(r, "GPU rectangle batch is too large");
-        Quad *quads = realloc(r->quads, capacity * sizeof *quads);
-        if (!quads) return fail(r, "Cannot allocate GPU rectangle batch");
-        r->quads = quads;
-        r->quad_capacity = capacity;
+        r->quad_capacity = r->quad_capacity * 2 > count ? r->quad_capacity * 2 : count;
+        r->quads = realloc(r->quads, r->quad_capacity * sizeof *r->quads);
     }
-    return 1;
 }
 
 static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
@@ -1279,41 +1230,36 @@ static CachedGlyph *cached_glyph(NtRenderer *r, const NtFontGlyph *glyph) {
     return entry;
 }
 
-int nt_renderer_clear(NtRenderer *r, uint32_t background) {
-    if (r->error[0]) return 0;
-    return add_op(r, (Op){.kind = OP_CLEAR, .background = background});
+void nt_renderer_clear(NtRenderer *r, uint32_t background) {
+    add_op(r, (Op){.kind = OP_CLEAR, .background = background});
 }
 
-int nt_renderer_begin(NtRenderer *r, uint32_t background) {
-    r->error[0] = 0;
+void nt_renderer_begin(NtRenderer *r, uint32_t background) {
     Frame *f = &r->frame;
     clear_frame(f);
     nt_window_size(r->window, &f->width, &f->height, &f->scale);
-    if (f->width <= 0 || f->height <= 0) return fail(r, "Cannot render an empty window");
     nt_window_prepare_frame(r->window);
-    return nt_renderer_clear(r, background);
+    nt_renderer_clear(r, background);
 }
 
-int nt_renderer_clip(NtRenderer *r, float x, float y, float width, float height) {
-    if (r->error[0]) return 0;
+void nt_renderer_clip(NtRenderer *r, float x, float y, float width, float height) {
     Op op = {.kind = OP_CLIP, .clip = {x, y, width, height}};
     Frame *f = &r->frame;
-    if (f->op_count && f->ops[f->op_count - 1].kind == OP_CLIP) {
+    if (f->op_count && f->ops[f->op_count - 1].kind == OP_CLIP)
         f->ops[f->op_count - 1] = op;
-        return 1;
-    }
-    return add_op(r, op);
+    else
+        add_op(r, op);
 }
 
 void nt_renderer_rect(NtRenderer *r, float x, float y, float width, float height,
                       uint32_t color, int wave) {
-    if (r->error[0] || width <= 0 || height <= 0 || !(color & 255)) return;
+    if (width <= 0 || height <= 0 || !(color & 255)) return;
     add_op(r, (Op){.kind = OP_QUAD, .quad = make_quad(x, y, width, height, color, wave ? 3 : 0)});
 }
 
 void nt_renderer_stroke(NtRenderer *r, float x1, float y1, float x2, float y2,
                         float width, uint32_t color) {
-    if (r->error[0] || width <= 0 || !(color & 255)) return;
+    if (width <= 0 || !(color & 255)) return;
     /* Plot coordinates are finite; comparisons avoid two libm calls per segment. */
     float radius = width * 0.5f, padding = radius + 1.0f;
     float dx = x2 - x1, dy = y2 - y1;
@@ -1327,20 +1273,21 @@ void nt_renderer_stroke(NtRenderer *r, float x1, float y1, float x2, float y2,
 
 void nt_renderer_tab(NtRenderer *r, float x, float y, float width, float height,
                      float inset, uint32_t color) {
-    if (r->error[0] || width <= 0 || height <= 0) return;
+    if (width <= 0 || height <= 0) return;
     Op op = {.kind = OP_QUAD, .quad = make_quad(x, y, width, height, color, 5)};
     op.quad.uv[0] = fminf(inset, width * 0.5f);
     add_op(r, op);
 }
 
 void nt_renderer_line(NtRenderer *r, NtLine *line, float x, float y) {
-    if (r->error[0] || (!line->input && !line->count)) return;
-    if (add_op(r, (Op){.kind = OP_LINE, .line = {line, x, y}}))
-        ++line->references;
+    if (!line->input && !line->count) return;
+    add_op(r, (Op){.kind = OP_LINE, .line = {line, x, y}});
+    ++line->references;
 }
 
 static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
-    if (!shape_line(r, line) || !reserve_quads(r, r->quad_count + line->count)) return 0;
+    if (!shape_line(r, line)) return 0;
+    reserve_quads(r, r->quad_count + line->count);
     double inverse_scale = 1. / r->scale;
     float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
     float top = 0;
@@ -1362,7 +1309,7 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
                 static const unsigned quadrants[] = {4, 8, 1, 13, 9, 7, 11, 2, 6, 14};
                 mask = quadrants[code - 0x2596];
                 /* Quadrant masks contain at most three parts. */
-                if (!reserve_quads(r, r->quad_count + 3 + line->count - i - 1)) return 0;
+                reserve_quads(r, r->quad_count + 3 + line->count - i - 1);
             }
             for (unsigned part = 0; part < 4; ++part) {
                 if (!(mask & (1u << part))) continue;
@@ -1413,15 +1360,10 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
     return 1;
 }
 
-int nt_renderer_present(NtRenderer *r) {
-    if (r->error[0]) {
-        clear_frame(&r->frame);
-        return 0;
-    }
+void nt_renderer_present(NtRenderer *r) {
     Swap *s = &r->swap;
     pthread_mutex_lock(&s->lock);
     s->state = SWAP_PENDING;
     pthread_cond_signal(&s->changed);
     pthread_mutex_unlock(&s->lock);
-    return 1;
 }

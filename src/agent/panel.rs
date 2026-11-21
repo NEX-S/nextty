@@ -1,17 +1,19 @@
+use crate::agent::markdown::{self, Markdown};
 use crate::config::Config;
-use crate::context::{self, Snapshot as ContextSnapshot};
-use crate::core::Mode;
-use crate::core::{Flags, WindowSize};
+use crate::context::{self, ContextItem, ContextSnapshot};
+use crate::core::{Flags, Mode, WindowSize};
 use crate::input::keysym;
-use crate::panel::{Grid, mix_color, rgb};
+use crate::panel::{Grid, mix_color, rect, rgb};
 use crate::ui::{Focus, Ui};
-use crate::width::scalar_width;
-use crate::width::text_width;
+use crate::width::{scalar_width, text_width};
 use crate::worker::Worker;
-use crate::workspace::Rect;
-use crate::workspace::{AgentChange, AgentEvent, AgentMessage, AgentModelPatch, Client, PaneId};
+use crate::workspace::{
+    AgentChange, AgentDraft, AgentDrafts, AgentEvent, AgentMessage, AgentModelPatch, AgentRecovery,
+    AgentRequest, AgentSend, Client, PaneId, Rect,
+};
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::io;
 use std::ops::Range;
 use std::os::fd::RawFd;
@@ -30,7 +32,7 @@ pub(crate) struct AgentView {
     pub changes_omitted: u32,
     pub scroll: usize,
     pub revision: u64,
-    pub pending: Vec<serde_json::Value>,
+    pub pending: Vec<AgentRequest>,
 }
 
 impl AgentView {
@@ -40,7 +42,7 @@ impl AgentView {
             || self
                 .pending
                 .iter()
-                .any(|request| request["action"] == "send");
+                .any(|request| matches!(request, AgentRequest::Send(_)));
         let changes_changed = self.changes_omitted != patch.changes_omitted
             || patch
                 .changes
@@ -159,25 +161,21 @@ pub(crate) struct Panel {
     pub backdrop: Option<Grid>,
     pub hits: Vec<(Rect, AgentAction)>,
     pub chat: Rect,
-    pub first: usize,
     pub chat_rows: Vec<(usize, Rect)>,
     #[cfg(feature = "gui")]
     pub editor: Rect,
     pub preview: Option<Rect>,
     pub cursor: Option<(u16, u16)>,
+    bg: u32,
 }
 
 impl Panel {
+    fn text(&mut self, x: u16, y: u16, columns: u16, text: &str, foreground: u32) {
+        self.grid.text(x, y, columns, text, foreground, self.bg);
+    }
+
     fn hit(&mut self, x: u16, y: u16, cols: u16, action: AgentAction) {
-        self.hits.push((
-            Rect {
-                x,
-                y,
-                cols,
-                rows: 1,
-            },
-            action,
-        ));
+        self.hits.push((rect(x, y, cols, 1), action));
     }
 }
 
@@ -188,12 +186,12 @@ pub(crate) fn editor(ui: &Ui, side: Rect) -> (Rect, EditorLines) {
     let layout = session.editor_layout(columns, max_rows);
     let rows = layout.lines.len().max(3).min(max_rows) as u16;
     (
-        Rect {
-            x: side.x + 1,
-            y: (side.y + side.rows).saturating_sub(rows),
-            cols: side.cols.saturating_sub(2),
+        rect(
+            side.x + 1,
+            (side.y + side.rows).saturating_sub(rows),
+            side.cols.saturating_sub(2),
             rows,
-        },
+        ),
         layout,
     )
 }
@@ -215,40 +213,43 @@ pub(crate) fn draw(
     };
     let (editor, editor_layout) = editor(ui, side);
     let rect = if ui.agent.active().context.preview.is_some() {
-        crate::file_panel::preview_rect(Rect {
-            x: 0,
-            y: 1,
-            cols: size.num_cols,
-            rows: size.num_lines.saturating_sub(2),
-        })
+        crate::file_panel::preview_rect(rect(0, 1, size.num_cols, size.num_lines.saturating_sub(2)))
     } else {
         side
     };
-    let frame = Panel {
-        backdrop,
-        grid: match ui.agent.spare_grid.take() {
-            Some(mut grid) => {
-                grid.reset(rect, config.foreground, config.background);
-                grid
-            }
-            None => Grid::new(rect, config.foreground, config.background),
-        },
-        hits: Vec::new(),
-        chat: Rect::default(),
-        first: 0,
-        chat_rows: Vec::new(),
-        #[cfg(feature = "gui")]
-        editor,
-        preview: None,
-        cursor: None,
+    let (foreground, bg) = (config.foreground, config.background);
+    let grid = match ui.agent.spare_grid.take() {
+        Some(mut grid) => {
+            grid.reset(rect, foreground, bg);
+            grid
+        }
+        None => Grid::new(rect, foreground, bg),
     };
     let mut painter = AgentPainter {
         ui,
-        config,
         side,
         pointer,
-        frame,
+        frame: Panel {
+            backdrop,
+            grid,
+            hits: Vec::new(),
+            chat: Rect::default(),
+            chat_rows: Vec::new(),
+            #[cfg(feature = "gui")]
+            editor,
+            preview: None,
+            cursor: None,
+            bg,
+        },
         preedit,
+        palette: Palette {
+            bg,
+            foreground,
+            muted: mix_color(foreground, bg, 180),
+            user_bg: mix_color(foreground, bg, 24),
+            selection_bg: mix_color(foreground, bg, 70),
+            error: mix_color(0xe87575, foreground, 128),
+        },
     };
     painter.draw_agent(editor, editor_layout)?;
     Ok(painter.frame)
@@ -256,11 +257,11 @@ pub(crate) fn draw(
 
 struct AgentPainter<'a> {
     ui: &'a mut Ui,
-    config: &'a Config,
     side: Rect,
     pointer: Option<(u16, u16)>,
     frame: Panel,
     preedit: &'a str,
+    palette: Palette,
 }
 
 #[derive(Clone, Copy)]
@@ -273,87 +274,76 @@ struct Palette {
     error: u32,
 }
 
-fn draw_edit_row(grid: &mut Grid, rect: Rect, path: &str, counts: (u32, u32), palette: Palette) {
-    let (added, removed) = counts;
+fn draw_edit_row(
+    grid: &mut Grid,
+    (x, y, cols): (u16, u16, u16),
+    path: &str,
+    (added, removed): (u32, u32),
+    palette: Palette,
+) {
     let (added_color, removed_color) = crate::panel::diff_colors(palette.foreground);
-    let mut text = String::with_capacity(24);
-    write!(&mut text, " +{added}").unwrap();
-    let plus_end = text.len();
-    write!(&mut text, " -{removed}").unwrap();
-    let (plus, minus) = text.split_at(plus_end);
-    let count_width = (plus.len() + minus.len()).min(usize::from(rect.cols)) as u16;
-    grid.text(
-        rect.x,
-        rect.y,
-        rect.cols.saturating_sub(count_width),
-        &crate::width::fit_middle(path, rect.cols.saturating_sub(count_width)),
-        palette.foreground,
-        palette.bg,
-    );
-    let plus_width = (plus.len() as u16).min(count_width);
-    let x = rect.x + rect.cols.saturating_sub(count_width);
-    grid.text(x, rect.y, plus_width, plus, added_color, palette.bg);
+    let (plus, minus) = (format!(" +{added}"), format!(" -{removed}"));
+    let counts = (plus.len() + minus.len()).min(usize::from(cols)) as u16;
+    let plus_width = (plus.len() as u16).min(counts);
+    let path_width = cols - counts;
+    let bg = palette.bg;
+    let path = crate::width::fit_middle(path, path_width);
+    grid.text(x, y, path_width, &path, palette.foreground, bg);
+    let x = x + path_width;
+    grid.text(x, y, plus_width, &plus, added_color, bg);
     grid.text(
         x + plus_width,
-        rect.y,
-        count_width.saturating_sub(plus_width),
-        minus,
+        y,
+        counts - plus_width,
+        &minus,
         removed_color,
-        palette.bg,
+        bg,
     );
 }
 
 impl AgentPainter<'_> {
+    fn recolor_text(&mut self, rect: Rect, color: u32) {
+        let grid = &mut self.frame.grid;
+        let row = &mut grid.rows[usize::from(rect.y - grid.rect.y)];
+        let start = usize::from(rect.x.saturating_sub(grid.rect.x));
+        let end = (start + usize::from(rect.cols)).min(row.cells.len());
+        for cell in &mut row.cells[start..end] {
+            cell.fg = rgb(color);
+        }
+    }
+
     fn draw_agent(&mut self, editor: Rect, editor_layout: EditorLines) -> io::Result<()> {
-        let side = self.side;
+        let (side, p) = (self.side, self.palette);
         if side.cols < 12 || side.rows < 6 {
-            self.frame.grid.text(
-                side.x,
-                side.y,
-                side.cols,
-                "Alt+a: close",
-                self.config.foreground,
-                self.config.background,
-            );
+            self.frame
+                .text(side.x, side.y, side.cols, "Alt+a: close", p.foreground);
             return Ok(());
         }
-        let palette = Palette {
-            bg: self.config.background,
-            foreground: self.config.foreground,
-            muted: mix_color(self.config.foreground, self.config.background, 180),
-            user_bg: mix_color(self.config.foreground, self.config.background, 24),
-            selection_bg: mix_color(self.config.foreground, self.config.background, 70),
-            error: mix_color(0xe87575, self.config.foreground, 128),
-        };
-        let Palette {
-            bg, user_bg, error, ..
-        } = palette;
-        let chat_top = side.y + 1;
         if self.ui.agent.active().context.preview.is_some() {
-            self.draw_preview(bg);
+            self.draw_preview();
         } else {
-            let divider = mix_color(self.config.foreground, bg, 24);
             for row in &mut self.frame.grid.rows[1..] {
                 row.cells[0].c = '│';
-                row.cells[0].fg = rgb(divider);
+                row.cells[0].fg = rgb(p.user_bg);
                 row.used = 1;
             }
             self.frame.hits.push((side, AgentAction::Output));
-            self.draw_agent_tabs(side, editor, bg);
-            let attachment_count = self.ui.agent.active().context.basket.len();
-            let attachment_rows = (attachment_count as u16)
+            self.draw_agent_tabs(editor);
+            let session = self.ui.agent.active();
+            let attachments = session.context.basket.len();
+            let attachment_rows = (attachments as u16)
                 .min(3)
                 .min(editor.y.saturating_sub(side.y + 6));
             let attachment_first = match self.ui.agent.keyboard {
                 AgentAction::Inspect(index) | AgentAction::Remove(index) => {
                     index.saturating_sub(usize::from(attachment_rows.saturating_sub(1)))
                 }
-                _ => attachment_count.saturating_sub(usize::from(attachment_rows)),
+                _ => attachments.saturating_sub(usize::from(attachment_rows)),
             };
-            let rewind = self.ui.agent.active().rewind_target.is_some();
+            let rewind = session.rewind_target.is_some();
             let hint_rows = if rewind { 3 } else { 0 };
-            let changes = self.ui.agent.active().changed_files();
-            let change_rows = if self.ui.agent.active().changes_expanded {
+            let changes = session.changed_files();
+            let change_rows = if session.changes_expanded {
                 (changes.len() as u16).min(4).min(
                     editor
                         .y
@@ -366,129 +356,75 @@ impl AgentPainter<'_> {
             let chat_end = editor
                 .y
                 .saturating_sub(1 + attachment_rows + hint_rows + change_height);
-            self.draw_transcript(palette, editor, chat_top, chat_end)?;
+            self.draw_transcript(editor, side.y + 1, chat_end)?;
             if rewind {
-                self.draw_rewind(
-                    palette,
-                    Rect {
-                        y: editor.y.saturating_sub(1),
-                        ..editor
-                    },
-                );
+                self.draw_rewind(editor);
             }
-            self.draw_attachments(palette, editor, chat_end, attachment_rows, attachment_first);
+            self.draw_attachments(editor, chat_end, attachment_rows, attachment_first);
             if !changes.is_empty() {
-                self.draw_changes(
-                    palette,
-                    editor,
-                    chat_end + attachment_rows,
-                    change_rows,
-                    &changes,
-                );
+                self.draw_changes(editor, chat_end + attachment_rows, change_rows, &changes);
             }
             let row = &mut self.frame.grid.rows[usize::from(editor.y - side.y - 1)];
-            let edge = crate::core::Cell {
+            row.cells.fill(crate::core::Cell {
                 c: '─',
-                fg: rgb(divider),
-                bg: rgb(bg),
+                fg: rgb(p.user_bg),
+                bg: rgb(p.bg),
                 flags: Flags::empty(),
-            };
-            row.cells.fill(edge);
+            });
             row.cells[0].c = '├';
             row.used = row.cells.len();
-            self.draw_editor(palette, editor, editor_layout);
+            self.draw_editor(editor, editor_layout);
         }
-        let hovered = self.pointer.and_then(|(x, y)| {
-            self.frame
-                .hits
-                .iter()
-                .rfind(|(rect, _)| rect.contains(x, y))
-                .map(|(_, action)| *action)
-        });
-        for index in 0..self.frame.hits.len() {
-            let (rect, action) = self.frame.hits[index];
-            if hovered != Some(action)
-                && !(self.ui.focus == Focus::Controls && self.ui.agent.keyboard == action)
-            {
+        let hovered = self
+            .pointer
+            .and_then(|(x, y)| crate::ui::agent_hit(&self.frame.hits, x, y));
+        let focused = (self.ui.focus == Focus::Controls).then_some(self.ui.agent.keyboard);
+        let hits = std::mem::take(&mut self.frame.hits);
+        for &(rect, action) in &hits {
+            if hovered != Some(action) && focused != Some(action) {
                 continue;
             }
-            if matches!(
-                action,
+            match action {
                 AgentAction::Session(_)
-                    | AgentAction::Editor
-                    | AgentAction::Output
-                    | AgentAction::Copy(_)
-            ) {
-                continue;
-            }
-            if matches!(
-                action,
-                AgentAction::NewSession | AgentAction::CloseSession(_) | AgentAction::ClosePanel
-            ) {
-                let row = &mut self.frame.grid.rows[usize::from(rect.y - self.frame.grid.rect.y)];
-                let start = usize::from(rect.x.saturating_sub(self.frame.grid.rect.x));
-                let end = (start + usize::from(rect.cols)).min(row.cells.len());
-                for cell in &mut row.cells[start..end] {
-                    cell.fg = rgb(if matches!(action, AgentAction::CloseSession(_)) {
-                        0xef5350
-                    } else {
-                        self.config.foreground
-                    });
+                | AgentAction::Editor
+                | AgentAction::Output
+                | AgentAction::Copy(_) => (),
+                AgentAction::NewSession | AgentAction::ClosePanel => {
+                    self.recolor_text(rect, p.foreground)
                 }
-            } else {
-                self.frame.grid.recolor(rect, user_bg);
-                if action == AgentAction::Stop {
-                    let row =
-                        &mut self.frame.grid.rows[usize::from(rect.y - self.frame.grid.rect.y)];
-                    let start = usize::from(rect.x - self.frame.grid.rect.x);
-                    let end = (start + usize::from(rect.cols)).min(row.cells.len());
-                    for cell in &mut row.cells[start..end] {
-                        cell.fg = rgb(error);
+                AgentAction::CloseSession(_) => self.recolor_text(rect, 0xef5350),
+                _ => {
+                    self.frame.grid.recolor(rect, p.user_bg);
+                    if action == AgentAction::Stop {
+                        self.recolor_text(rect, p.error);
                     }
                 }
             }
         }
+        self.frame.hits = hits;
         Ok(())
     }
 
-    fn draw_changes(
-        &mut self,
-        palette: Palette,
-        editor: Rect,
-        top: u16,
-        rows: u16,
-        files: &[(usize, u32, u32)],
-    ) {
+    fn draw_changes(&mut self, editor: Rect, top: u16, rows: u16, files: &[(usize, u32, u32)]) {
+        let p = self.palette;
+        let session = self.ui.agent.active();
         let (added, removed) = files
             .iter()
             .fold((0, 0), |(a, r), entry| (a + entry.1, r + entry.2));
-        let session = self.ui.agent.active();
-        let marker = crate::panel::expand_icon(session.changes_expanded);
-        let omitted = if session.model.changes_omitted == 0 {
-            String::new()
-        } else {
-            format!(" · {} earlier edits omitted", session.model.changes_omitted)
+        let omitted = match session.model.changes_omitted {
+            0 => String::new(),
+            count => format!(" · {count} earlier edits omitted"),
         };
         draw_edit_row(
             &mut self.frame.grid,
-            Rect {
-                x: editor.x + 3,
-                y: top,
-                cols: editor.cols.saturating_sub(3),
-                rows: 1,
-            },
+            (editor.x + 3, top, editor.cols.saturating_sub(3)),
             &format!("{} files{omitted}", files.len()),
             (added, removed),
-            palette,
+            p,
         );
-        self.frame.grid.text(
-            editor.x,
-            top,
-            3,
-            &format!(" {marker} "),
-            palette.muted,
-            palette.bg,
-        );
+        let marker = crate::panel::expand_icon(session.changes_expanded);
+        self.frame
+            .text(editor.x, top, 3, &format!(" {marker} "), p.muted);
         self.frame
             .hit(editor.x, top, editor.cols, AgentAction::ToggleChanges);
         let first = match self.ui.agent.keyboard {
@@ -503,259 +439,163 @@ impl AgentPainter<'_> {
             files.iter().skip(first).take(usize::from(rows)).enumerate()
         {
             let y = top + 1 + row as u16;
-            let path = self.ui.agent.active().model.changes[index]
-                .path
-                .to_string_lossy();
             draw_edit_row(
                 &mut self.frame.grid,
-                Rect {
-                    y,
-                    rows: 1,
-                    ..editor
-                },
-                &path,
+                (editor.x, y, editor.cols),
+                &session.model.changes[index].path.to_string_lossy(),
                 (added, removed),
-                palette,
+                p,
             );
             self.frame
                 .hit(editor.x, y, editor.cols, AgentAction::ChangedFile(index));
         }
     }
 
-    fn draw_transcript(
-        &mut self,
-        palette: Palette,
-        editor: Rect,
-        chat_top: u16,
-        chat_end: u16,
-    ) -> io::Result<()> {
-        let Palette {
-            bg,
-            foreground,
-            muted,
-            user_bg,
-            selection_bg,
-            error,
-        } = palette;
+    fn draw_transcript(&mut self, editor: Rect, chat_top: u16, chat_end: u16) -> io::Result<()> {
+        let p = self.palette;
         let rows = usize::from(chat_end.saturating_sub(chat_top));
-        let columns = usize::from(editor.cols);
-        self.ui.agent.prepare_layout(columns)?;
+        self.ui.agent.prepare_layout(usize::from(editor.cols))?;
         let session = self.ui.agent.active_mut();
-        if let Some(target) = session.rewind_index()
-            && let Some(line) = session.lines.iter().position(|line| {
-                matches!(line, AgentLine::Text { message, .. } if *message as usize == target)
-            })
+        let total = session.lines.len();
+        if let Some(line) = session
+            .rewind_index()
+            .and_then(|message| session.line_of(message))
         {
-            let first = session.lines.len().saturating_sub(rows + session.model.scroll);
+            let first = total.saturating_sub(rows + session.model.scroll);
             if line < first {
-                session.model.scroll = session.lines.len().saturating_sub(rows + line);
+                session.model.scroll = total.saturating_sub(rows + line);
             } else if line >= first + rows {
-                session.model.scroll = session.lines.len().saturating_sub(line + 1);
+                session.model.scroll = total.saturating_sub(line + 1);
             }
         }
-        session.model.scroll = session
-            .model
-            .scroll
-            .min(session.lines.len().saturating_sub(rows));
-        let first = session
-            .lines
-            .len()
-            .saturating_sub(rows + session.model.scroll);
-        self.frame.chat = Rect {
-            x: editor.x,
-            y: chat_top,
-            cols: editor.cols,
-            rows: rows as u16,
-        };
-        self.frame.first = first;
-        for (row, line) in self
-            .ui
-            .agent
-            .active()
-            .lines
-            .iter()
-            .skip(first)
-            .take(rows)
-            .enumerate()
-        {
-            let y = chat_top + row as u16;
-            let indent = line.indent(&self.ui.agent.active().model.messages);
+        session.model.scroll = session.model.scroll.min(total.saturating_sub(rows));
+        let first = total.saturating_sub(rows + session.model.scroll);
+        let session = self.ui.agent.active();
+        self.frame.chat = rect(editor.x, chat_top, editor.cols, rows as u16);
+        for (index, line) in session.lines.iter().enumerate().skip(first).take(rows) {
+            let y = chat_top + (index - first) as u16;
+            let indent = line.indent(&session.model.messages);
             if let Some(indent) = indent {
                 self.frame.chat_rows.push((
-                    first + row,
-                    Rect {
-                        x: editor.x + indent,
-                        y,
-                        cols: editor.cols.saturating_sub(indent),
-                        rows: 1,
-                    },
+                    index,
+                    rect(editor.x + indent, y, editor.cols.saturating_sub(indent), 1),
                 ));
             }
             match line {
                 AgentLine::Blank => (),
-                AgentLine::Edit(index) => {
-                    let change = &self.ui.agent.active().model.changes[*index as usize];
+                AgentLine::Edit(change) => {
+                    let change = *change;
+                    let record = &session.model.changes[change];
                     draw_edit_row(
                         &mut self.frame.grid,
-                        Rect {
-                            x: editor.x + 2,
-                            y,
-                            cols: editor.cols.saturating_sub(2),
-                            rows: 1,
-                        },
-                        &change.path.to_string_lossy(),
-                        (change.added, change.removed),
-                        palette,
+                        (editor.x + 2, y, editor.cols.saturating_sub(2)),
+                        &record.path.to_string_lossy(),
+                        (record.added, record.removed),
+                        p,
                     );
-                    self.frame.hit(
-                        editor.x,
-                        y,
-                        editor.cols,
-                        AgentAction::EditDiff(*index as usize),
-                    );
+                    self.frame
+                        .hit(editor.x, y, editor.cols, AgentAction::EditDiff(change));
                 }
-                AgentLine::Role(index) => {
-                    let message = &self.ui.agent.active().model.messages[*index as usize];
-                    let marker = if message
+                AgentLine::Role(message) => {
+                    let role = &session.model.messages[*message];
+                    let marker = if role
                         .id
                         .as_ref()
-                        .is_some_and(|id| self.ui.agent.active().expanded_tools.contains(id))
+                        .is_some_and(|id| session.expanded_tools.contains(id))
                     {
                         "▾"
                     } else {
                         "›"
                     };
-                    self.frame.grid.text(
+                    self.frame.text(
                         editor.x,
                         y,
                         editor.cols,
-                        &[" ", marker, " ", message.role.as_str(), " "].concat(),
-                        muted,
-                        bg,
+                        &format!(" {marker} {} ", role.role),
+                        p.muted,
                     );
-                    if let Some(selected) = self.ui.agent.active().selection_columns(first + row) {
-                        let from = column_offset(
-                            &message.role,
-                            0..message.role.len(),
-                            selected.start as f32,
-                        );
-                        let to = column_offset(
-                            &message.role,
-                            0..message.role.len(),
-                            selected.end as f32,
-                        );
-                        self.frame.grid.text(
-                            editor.x + 3 + selected.start as u16,
-                            y,
-                            (selected.end - selected.start) as u16,
-                            &message.role[from..to],
-                            self.config.foreground,
-                            selection_bg,
-                        );
-                    }
                     self.frame.hit(
                         editor.x,
                         y,
-                        editor.cols.min(text_width(&message.role) as u16 + 4),
-                        AgentAction::Tool(*index as usize),
+                        editor.cols.min(text_width(&role.role) as u16 + 4),
+                        AgentAction::Tool(*message),
                     );
                 }
-                AgentLine::Text {
-                    message: index,
-                    range,
-                } => {
-                    let message = &self.ui.agent.active().model.messages[*index as usize];
-                    let user = message.role == "You";
-                    let message_bg =
-                        if user && self.ui.agent.active().rewind_target == Some(message.turn) {
-                            selection_bg
-                        } else if user {
-                            user_bg
-                        } else {
-                            bg
-                        };
-                    let indent = message_indent(message);
-                    self.frame.grid.text(
-                        editor.x,
-                        y,
-                        editor.cols,
-                        "",
-                        self.config.foreground,
-                        message_bg,
-                    );
-                    let text = self.ui.agent.active().message_text(*index as usize);
-                    let color =
-                        if user && self.ui.agent.active().rewind_target == Some(message.turn) {
-                            crate::panel::ACCENT
-                        } else if message.role == "Error" {
-                            error
-                        } else if message.id.is_some() {
-                            muted
-                        } else {
-                            foreground
-                        };
-                    let from = range.start as usize;
-                    let to = range.end as usize;
-                    if let Some(document) = self.ui.agent.active().markdown(*index as usize) {
+                AgentLine::Text { message, range } => {
+                    let message = *message;
+                    let record = &session.model.messages[message];
+                    let user = record.role == "You";
+                    let rewinding = user && session.rewind_target == Some(record.turn);
+                    let message_bg = match (rewinding, user) {
+                        (true, _) => p.selection_bg,
+                        (_, true) => p.user_bg,
+                        _ => p.bg,
+                    };
+                    let color = if rewinding {
+                        crate::panel::ACCENT
+                    } else if record.role == "Error" {
+                        p.error
+                    } else if record.id.is_some() {
+                        p.muted
+                    } else {
+                        p.foreground
+                    };
+                    let indent = message_indent(record);
+                    let full = session.message_text(message);
+                    let text = &full[range.clone()];
+                    self.frame
+                        .grid
+                        .text(editor.x, y, editor.cols, "", p.foreground, message_bg);
+                    if let Some(document) = session.markdown(message) {
                         let mut x = editor.x + indent;
-                        for (span, style) in document.spans(from..to) {
-                            if style & crate::agent::markdown::BOLD != 0 {
-                                self.frame.grid.flags.insert(Flags::BOLD);
-                            }
-                            if style & crate::agent::markdown::ITALIC != 0 {
-                                self.frame.grid.flags.insert(Flags::ITALIC);
-                            }
-                            let columns = text_width(&text[span.clone()]) as u16;
-                            let column = x;
-                            x += columns;
+                        for (span, style) in document.spans(range.clone()) {
+                            let fragment = &full[span];
+                            let columns = text_width(fragment) as u16;
+                            self.frame
+                                .grid
+                                .flags
+                                .set(Flags::BOLD, style & markdown::BOLD != 0);
+                            self.frame
+                                .grid
+                                .flags
+                                .set(Flags::ITALIC, style & markdown::ITALIC != 0);
                             self.frame.grid.text(
-                                column,
+                                x,
                                 y,
                                 columns,
-                                &text[span],
-                                crate::agent::markdown::color(style, color),
-                                if style & crate::agent::markdown::CODE != 0 {
-                                    user_bg
+                                fragment,
+                                markdown::color(style, color),
+                                if style & markdown::CODE != 0 {
+                                    p.user_bg
                                 } else {
                                     message_bg
                                 },
                             );
-                            self.frame.grid.flags.remove(Flags::BOLD | Flags::ITALIC);
+                            x += columns;
                         }
+                        self.frame.grid.flags.remove(Flags::BOLD | Flags::ITALIC);
                     } else {
                         self.frame.grid.text(
                             editor.x + indent,
                             y,
                             editor.cols.saturating_sub(indent),
-                            &text[from..to],
+                            text,
                             color,
                             message_bg,
                         );
                     }
-                    if let Some(selected) = self.ui.agent.active().selection_columns(first + row) {
-                        let text = &text[from..to];
-                        let from = column_offset(text, 0..text.len(), selected.start as f32);
-                        let to = column_offset(text, 0..text.len(), selected.end as f32);
-                        self.frame.grid.text(
-                            editor.x + indent + selected.start as u16,
-                            y,
-                            (selected.end - selected.start) as u16,
-                            &text[from..to],
-                            self.config.foreground,
-                            selection_bg,
-                        );
-                    }
                     self.frame
-                        .hit(editor.x, y, editor.cols, AgentAction::Copy(*index as usize));
+                        .hit(editor.x, y, editor.cols, AgentAction::Copy(message));
+                    let label_width = text_width(REWIND_LABEL);
                     if user
-                        && columns >= crate::width::text_width(REWIND_LABEL) + 5
-                        && (row + 1 == rows
+                        && usize::from(editor.cols) >= label_width + 5
+                        && (index + 1 == first + rows
                             || !matches!(
-                                self.ui.agent.active().lines.get(first + row + 1),
-                                Some(AgentLine::Text { message: next, .. }) if next == index
+                                session.lines.get(index + 1),
+                                Some(AgentLine::Text { message: next, .. }) if *next == message
                             ))
                     {
-                        let width = crate::width::text_width(REWIND_LABEL) as u16;
+                        let width = label_width as u16;
                         let x = editor.x + editor.cols.saturating_sub(width);
                         let hovered = self.pointer.is_some_and(|(column, row)| {
                             row == y && column >= x && column < x + width
@@ -765,105 +605,74 @@ impl AgentPainter<'_> {
                             y,
                             width,
                             REWIND_LABEL,
-                            if hovered {
-                                self.config.foreground
-                            } else {
-                                muted
-                            },
+                            if hovered { p.foreground } else { p.muted },
                             message_bg,
                         );
-                        self.frame
-                            .hit(x, y, width, AgentAction::Rewind(*index as usize));
+                        self.frame.hit(x, y, width, AgentAction::Rewind(message));
                     }
                 }
+            }
+            if let Some(indent) = indent
+                && let Some((column, selected)) = session.selection_span(index)
+            {
+                self.frame.grid.text(
+                    editor.x + indent + column as u16,
+                    y,
+                    text_width(selected) as u16,
+                    selected,
+                    p.foreground,
+                    p.selection_bg,
+                );
             }
         }
         Ok(())
     }
 
-    fn draw_rewind(&mut self, palette: Palette, editor: Rect) {
-        let Palette { bg, muted, .. } = palette;
-        self.frame.grid.text(
-            editor.x,
-            editor.y.saturating_sub(3),
-            editor.cols,
-            "j/k select · Enter confirm · Esc exits",
-            muted,
-            bg,
-        );
+    fn draw_rewind(&mut self, editor: Rect) {
+        let p = self.palette;
         let session = self.ui.agent.active();
-        let target =
-            session.model.messages.iter().find(|message| {
-                Some(message.turn) == session.rewind_target && message.role == "You"
-            });
-        let label = target.map_or(String::new(), |message| {
+        let label = session.rewind_index().map_or(String::new(), |index| {
+            let messages = &session.model.messages[index..];
             format!(
                 "Rewind {} turns: {}",
-                session
-                    .model
-                    .messages
-                    .iter()
-                    .filter(|candidate| candidate.role == "You" && candidate.turn >= message.turn)
-                    .count(),
-                message.text.lines().next().unwrap_or("")
+                messages.iter().filter(|m| m.role == "You").count(),
+                messages[0].text.lines().next().unwrap_or("")
             )
         });
-        self.frame.grid.text(
-            editor.x,
-            editor.y.saturating_sub(2),
-            editor.cols,
-            &label,
-            self.config.foreground,
-            bg,
-        );
-        self.frame.grid.text(
-            editor.x,
-            editor.y.saturating_sub(1),
-            editor.cols,
-            "Commands and file changes stay",
-            self.config.foreground,
-            bg,
-        );
+        let top = editor.y.saturating_sub(4);
+        for (row, (text, color)) in [
+            ("j/k select · Enter confirm · Esc exits", p.muted),
+            (label.as_str(), p.foreground),
+            ("Commands and file changes stay", p.foreground),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            self.frame
+                .text(editor.x, top + row as u16, editor.cols, text, color);
+        }
     }
 
-    fn draw_attachments(
-        &mut self,
-        palette: Palette,
-        editor: Rect,
-        chat_end: u16,
-        attachment_rows: u16,
-        attachment_first: usize,
-    ) {
-        let Palette { bg, muted, .. } = palette;
-        for (row, (index, item)) in self
-            .ui
-            .agent
-            .active()
-            .context
-            .basket
+    fn draw_attachments(&mut self, editor: Rect, top: u16, rows: u16, first: usize) {
+        let p = self.palette;
+        let basket = &self.ui.agent.active().context.basket;
+        let remove = editor.x + editor.cols.saturating_sub(3);
+        for (row, (index, item)) in basket
             .iter()
             .enumerate()
-            .skip(attachment_first)
-            .take(usize::from(attachment_rows))
+            .skip(first)
+            .take(usize::from(rows))
             .enumerate()
         {
-            let y = chat_end + row as u16;
-            self.frame.grid.text(
+            let y = top + row as u16;
+            self.frame.text(
                 editor.x,
                 y,
                 editor.cols.saturating_sub(3),
                 &format!(" +{} ", item.label),
-                self.config.foreground,
-                bg,
+                p.foreground,
             );
-            self.frame.grid.text(
-                editor.x + editor.cols.saturating_sub(3),
-                y,
-                3,
-                " × ",
-                muted,
-                bg,
-            );
+            self.frame.text(remove, y, 3, " × ", p.muted);
             self.frame.hit(
                 editor.x,
                 y,
@@ -873,116 +682,87 @@ impl AgentPainter<'_> {
                     .min(text_width(&item.label) as u16 + 3),
                 AgentAction::Inspect(index),
             );
-            self.frame.hit(
-                editor.x + editor.cols.saturating_sub(3),
-                y,
-                3,
-                AgentAction::Remove(index),
-            );
+            self.frame.hit(remove, y, 3, AgentAction::Remove(index));
         }
     }
 
-    fn draw_editor(&mut self, palette: Palette, editor: Rect, layout: EditorLines) {
-        let Palette {
-            foreground,
-            bg,
-            selection_bg,
-            error,
-            ..
-        } = palette;
-        let mut display = std::borrow::Cow::Borrowed(self.ui.agent.active().model.input.as_str());
-        let (mut lines, mut first) = (layout.lines, layout.first);
-        let (mut caret_row, mut caret_column) = (layout.caret_row, layout.caret_column);
-        if self.ui.focus == Focus::Editor && !self.preedit.is_empty() {
-            let input = &self.ui.agent.active().model.input;
-            let cursor = self.ui.agent.active().model.cursor;
-            display = std::borrow::Cow::Owned(
-                [&input[..cursor], self.preedit, &input[cursor..]].concat(),
+    fn draw_editor(&mut self, editor: Rect, layout: EditorLines) {
+        let p = self.palette;
+        let session = self.ui.agent.active();
+        let model = &session.model;
+        let composing = self.ui.focus == Focus::Editor && !self.preedit.is_empty();
+        let display;
+        let (input, layout) = if composing {
+            display = [
+                &model.input[..model.cursor],
+                self.preedit,
+                &model.input[model.cursor..],
+            ]
+            .concat();
+            let layout = editor_lines(
+                &display,
+                model.cursor + self.preedit.len(),
+                session.editor_columns(usize::from(editor.cols)),
+                usize::from(editor.rows),
+                None,
             );
-            let columns = self
-                .ui
-                .agent
-                .active()
-                .editor_columns(usize::from(editor.cols));
-            lines = wrap_context(&display, columns);
-            let cursor = cursor + self.preedit.len();
-            caret_row = lines
-                .iter()
-                .rposition(|range| range.start <= cursor)
-                .unwrap_or(0);
-            caret_column = text_width(&display[lines[caret_row].start..cursor]);
-            if caret_column == columns {
-                caret_row += 1;
-                caret_column = 0;
-                if caret_row == lines.len() {
-                    lines.push(cursor..cursor);
-                }
-            }
-            first = caret_row.saturating_sub(usize::from(editor.rows.saturating_sub(1)));
-        }
-        if self.ui.focus == Focus::Editor
-            && (first..first + usize::from(editor.rows)).contains(&caret_row)
-        {
-            self.frame.cursor = Some((
+            (display.as_str(), layout)
+        } else {
+            (model.input.as_str(), layout)
+        };
+        let EditorLines {
+            lines,
+            first,
+            caret_row,
+            caret_column,
+        } = layout;
+        self.frame.cursor = (self.ui.focus == Focus::Editor
+            && (first..first + usize::from(editor.rows)).contains(&caret_row))
+        .then(|| {
+            (
                 editor.x + caret_column as u16,
                 editor.y + (caret_row - first) as u16,
-            ));
-        } else {
-            self.frame.cursor = None;
-        }
+            )
+        });
+        let selection = model.selection().filter(|_| self.preedit.is_empty());
         for row in 0..editor.rows {
+            let y = editor.y + row;
             let range = lines.get(first + usize::from(row));
-            self.frame.grid.text(
+            self.frame.text(
                 editor.x,
-                editor.y + row,
+                y,
                 editor.cols,
-                range.map_or("", |range| &display[range.clone()]),
-                foreground,
-                bg,
+                range.map_or("", |range| &input[range.clone()]),
+                p.foreground,
             );
-            if self.preedit.is_empty()
-                && let Some(range) = range
-                && let Some(selected) = self.ui.agent.active().model.selection()
+            if let Some(range) = range
+                && let Some(selected) = &selection
             {
-                let start = range.start.max(selected.start);
-                let end = range.end.min(selected.end);
-                if start < end || selected.start <= range.end && selected.end > range.end {
-                    let column = text_width(&display[range.start..start.min(range.end)]) as u16;
-                    let width = if start < end {
-                        text_width(&display[start..end])
-                    } else {
-                        0
-                    };
+                let from = selected.start.clamp(range.start, range.end);
+                let to = selected.end.clamp(range.start, range.end);
+                // A selected line break shows as one extra selected cell.
+                let newline = selected.start <= range.end && selected.end > range.end;
+                if from < to || newline {
+                    let cols = text_width(&input[from..to]) + usize::from(newline);
                     self.frame.grid.recolor(
-                        Rect {
-                            x: editor.x + column,
-                            y: editor.y + row,
-                            cols: (width + usize::from(selected.end > range.end)) as u16,
-                            rows: 1,
-                        },
-                        selection_bg,
+                        rect(
+                            editor.x + text_width(&input[range.start..from]) as u16,
+                            y,
+                            cols as u16,
+                            1,
+                        ),
+                        p.selection_bg,
                     );
                 }
             }
         }
         self.frame.hits.push((editor, AgentAction::Editor));
-        if self.ui.agent.active().model.busy {
-            self.frame.grid.text(
-                editor.x + editor.cols.saturating_sub(3),
-                editor.y,
-                3,
-                " ■ ",
-                error,
-                bg,
-            );
-            self.frame.hit(
-                editor.x + editor.cols.saturating_sub(3),
-                editor.y,
-                3,
-                AgentAction::Stop,
-            );
+        let stop = editor.x + editor.cols.saturating_sub(3);
+        if model.busy {
+            self.frame.text(stop, editor.y, 3, " ■ ", p.error);
+            self.frame.hit(stop, editor.y, 3, AgentAction::Stop);
         }
-        if self.ui.agent.active().context.menu {
+        if session.context.menu {
             for (row, (label, action)) in [
                 ("Selection", AgentAction::Selection),
                 ("Visible screen", AgentAction::Screen),
@@ -991,13 +771,12 @@ impl AgentPainter<'_> {
             .enumerate()
             {
                 let y = editor.y.saturating_sub(3) + row as u16;
-                self.frame.grid.text(
+                self.frame.text(
                     editor.x,
                     y,
                     editor.cols,
                     &format!(" {label} "),
-                    self.config.foreground,
-                    bg,
+                    p.foreground,
                 );
                 self.frame.hit(
                     editor.x,
@@ -1009,15 +788,15 @@ impl AgentPainter<'_> {
         }
     }
 
-    fn draw_preview(&mut self, bg: u32) {
+    fn draw_preview(&mut self) {
+        let p = self.palette;
         let rect = self.frame.grid.rect;
         let Some(preview) = &mut self.ui.agent.active_mut().context.preview else {
             return;
         };
         let body = crate::panel::popup_body(rect);
-        let columns = body.cols;
         let rows = usize::from(body.rows);
-        preview.prepare(usize::from(columns.max(1)));
+        preview.prepare(usize::from(body.cols.max(1)));
         let ContextPreview {
             item,
             scroll,
@@ -1025,43 +804,42 @@ impl AgentPainter<'_> {
             ..
         } = preview;
         *scroll = (*scroll).min(lines.len().saturating_sub(rows));
-        self.frame.grid = Grid::popup(rect, self.config.foreground, bg, &item.label);
-        let bg = mix_color(self.config.foreground, bg, 9);
-        let muted = mix_color(self.config.foreground, bg, 176);
-        let close = crate::panel::popup_close(rect);
-        let x = body.x;
-        let (added_color, removed_color) = crate::panel::diff_colors(self.config.foreground);
+        self.frame.grid = Grid::popup(rect, p.foreground, p.bg, &item.label);
+        let bg = mix_color(p.foreground, p.bg, 9);
+        let muted = mix_color(p.foreground, bg, 176);
+        let (added_color, removed_color) = crate::panel::diff_colors(p.foreground);
+        let text = &item.snapshot.text;
         for (row, range) in lines.iter().skip(*scroll).take(rows).enumerate() {
+            let color = if item.kind == "diff" {
+                match text.as_bytes()[text[..range.start].rfind('\n').map_or(0, |at| at + 1)..]
+                    .first()
+                {
+                    Some(b'+') => added_color,
+                    Some(b'-') => removed_color,
+                    Some(b'@') => mix_color(0x83b9d6, p.foreground, 128),
+                    _ => p.foreground,
+                }
+            } else {
+                p.foreground
+            };
             self.frame.grid.text(
-                x,
+                body.x,
                 body.y + row as u16,
-                columns,
-                &item.snapshot.text[range.clone()],
-                if item.kind == "diff" {
-                    match item.snapshot.text.as_bytes().get(
-                        item.snapshot.text[..range.start]
-                            .rfind('\n')
-                            .map_or(0, |offset| offset + 1),
-                    ) {
-                        Some(b'+') => added_color,
-                        Some(b'-') => removed_color,
-                        Some(b'@') => mix_color(0x83b9d6, self.config.foreground, 128),
-                        _ => self.config.foreground,
-                    }
-                } else {
-                    self.config.foreground
-                },
+                body.cols,
+                &text[range.clone()],
+                color,
                 bg,
             );
         }
         let footer = rect.y + rect.rows.saturating_sub(2);
         self.frame
             .grid
-            .text(x, footer, columns, " ⧉   Esc close", muted, bg);
+            .text(body.x, footer, body.cols, " ⧉   Esc close", muted, bg);
+        let close = crate::panel::popup_close(rect);
         self.frame
             .hit(close.x, close.y, close.cols, AgentAction::ClosePreview);
         self.frame.hit(
-            x,
+            body.x,
             footer,
             text_width(" ⧉ ") as u16,
             AgentAction::CopyPreview,
@@ -1069,37 +847,21 @@ impl AgentPainter<'_> {
         self.frame.preview = Some(body);
     }
 
-    fn tab_icon(
-        &mut self,
-        rect: Rect,
-        label: &str,
-        colors: (u32, u32),
-        background: u32,
-        hovered: bool,
-    ) {
+    fn tab_icon(&mut self, rect: Rect, label: &str, colors: (u32, u32), background: u32) {
+        let hovered = self.pointer.is_some_and(|(x, y)| rect.contains(x, y));
         let foreground = if hovered { colors.1 } else { colors.0 };
-        self.frame
-            .grid
-            .text(rect.x, rect.y, rect.cols, "", foreground, background);
-        self.frame
-            .grid
-            .text(rect.x + 1, rect.y, 1, label, foreground, background);
+        let grid = &mut self.frame.grid;
+        grid.text(rect.x, rect.y, rect.cols, "", foreground, background);
+        grid.text(rect.x + 1, rect.y, 1, label, foreground, background);
     }
 
-    fn draw_agent_tabs(&mut self, side: Rect, editor: Rect, bg: u32) {
-        let muted = 0x606060;
-        let line_bg = 0x111111;
+    fn draw_agent_tabs(&mut self, editor: Rect) {
+        let (side, p) = (self.side, self.palette);
+        let (muted, line_bg) = (0x606060, 0x111111);
         self.frame
             .grid
             .text(side.x, side.y, side.cols, "", 0xcccccc, line_bg);
-        self.frame.grid.text(
-            side.x,
-            side.y,
-            1,
-            "│",
-            mix_color(self.config.foreground, bg, 24),
-            bg,
-        );
+        self.frame.text(side.x, side.y, 1, "│", p.user_bg);
         let mut x = editor.x;
         for (index, column, columns) in self.ui.agent.tabs(usize::from(side.cols.saturating_sub(1)))
         {
@@ -1109,30 +871,24 @@ impl AgentPainter<'_> {
             let hovered = self
                 .pointer
                 .is_some_and(|(column, row)| row == side.y && (x..x + width).contains(&column));
-            let model = &self.ui.agent.sessions[index].model;
-            let status = if model.busy {
+            let session = &self.ui.agent.sessions[index];
+            let status = if session.model.busy {
                 0xfe9b30
-            } else if model.messages.last().is_some_and(|last| {
-                model
-                    .messages
-                    .iter()
-                    .rev()
-                    .take_while(|message| message.turn == last.turn)
-                    .any(|message| matches!(message.role.as_str(), "Error" | "Blocked"))
-            }) {
+            } else if session.failed() {
                 0xef5350
             } else {
                 0xb5d2a2
             };
             let tab_bg = if active { 0x363636 } else { 0x1b1b1b };
-            self.frame.grid.flags.set(Flags::UNDERLINE, active);
-            self.frame.grid.text(x, side.y, width, "", muted, tab_bg);
-            self.frame.grid.text(x + 1, side.y, 1, "•", status, tab_bg);
-            self.frame.grid.text(
+            let grid = &mut self.frame.grid;
+            grid.flags.set(Flags::UNDERLINE, active);
+            grid.text(x, side.y, width, "", muted, tab_bg);
+            grid.text(x + 1, side.y, 1, "•", status, tab_bg);
+            grid.text(
                 x + 3,
                 side.y,
                 width.saturating_sub(6),
-                self.ui.agent.sessions[index].title(),
+                session.title(),
                 if active {
                     0xdddddd
                 } else if hovered {
@@ -1144,27 +900,21 @@ impl AgentPainter<'_> {
             );
             self.frame
                 .hit(x, side.y, width, AgentAction::Session(index));
-            let close = Rect {
-                x: x + width.saturating_sub(3),
-                y: side.y,
-                cols: 3,
-                rows: 1,
-            };
-            let close_hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
+            let close = rect(x + width.saturating_sub(3), side.y, 3, 1);
             self.tab_icon(
                 close,
                 "×",
                 (if active { 0xdddddd } else { muted }, 0xef5350),
                 tab_bg,
-                close_hovered,
             );
             self.frame
                 .hits
                 .push((close, AgentAction::CloseSession(index)));
             if active {
-                let row = &mut self.frame.grid.rows[usize::from(side.y - self.frame.grid.rect.y)];
+                let grid = &mut self.frame.grid;
+                let row = &mut grid.rows[usize::from(side.y - grid.rect.y)];
                 for column in x..x + width {
-                    row.extra_mut(usize::from(column - self.frame.grid.rect.x))
+                    row.extra_mut(usize::from(column - grid.rect.x))
                         .underline_color = Some(rgb(0xcccccc));
                 }
             }
@@ -1174,46 +924,9 @@ impl AgentPainter<'_> {
         x += 1;
         self.frame.grid.text(x, side.y, 2, "+", 0xcccccc, line_bg);
         self.frame.hit(x, side.y, 2, AgentAction::NewSession);
-        let close = Rect {
-            x: side.x + side.cols.saturating_sub(3),
-            y: side.y,
-            cols: 3,
-            rows: 1,
-        };
-        let hovered = self.pointer.is_some_and(|(x, y)| close.contains(x, y));
-        self.tab_icon(close, "›", (muted, 0xcccccc), line_bg, hovered);
+        let close = rect(side.x + side.cols.saturating_sub(3), side.y, 3, 1);
+        self.tab_icon(close, "›", (muted, 0xcccccc), line_bg);
         self.frame.hits.push((close, AgentAction::ClosePanel));
-    }
-}
-
-#[derive(Clone)]
-pub(crate) struct ContextItem {
-    pub label: String,
-    pub source: String,
-    pub kind: String,
-    pub snapshot: ContextSnapshot,
-}
-
-type ContextView = (String, String, String, String, bool);
-
-impl ContextItem {
-    fn view(&self) -> (&str, &str, &str, &str, bool) {
-        (
-            &self.label,
-            &self.source,
-            &self.kind,
-            &self.snapshot.text,
-            self.snapshot.incomplete,
-        )
-    }
-
-    fn from_view((label, source, kind, text, incomplete): ContextView) -> Self {
-        Self {
-            label,
-            source,
-            kind,
-            snapshot: ContextSnapshot { text, incomplete },
-        }
     }
 }
 
@@ -1225,10 +938,10 @@ pub(crate) struct ContextPreview {
 }
 
 impl ContextPreview {
-    pub fn new(item: ContextItem, scroll: usize) -> Self {
+    pub fn new(item: ContextItem) -> Self {
         Self {
             item,
-            scroll,
+            scroll: 0,
             columns: 0,
             lines: Vec::new(),
         }
@@ -1237,10 +950,7 @@ impl ContextPreview {
     fn prepare(&mut self, columns: usize) {
         let columns = columns.max(1);
         if self.columns != columns {
-            let mut lines = std::mem::take(&mut self.lines);
-            lines.clear();
-            wrap_context_into(&self.item.snapshot.text, columns, |line| lines.push(line));
-            self.lines = lines;
+            self.lines = wrap_context(&self.item.snapshot.text, columns);
             self.columns = columns;
         }
     }
@@ -1280,21 +990,18 @@ pub(crate) enum AgentAction {
     ToggleChanges,
 }
 
-// Agent bounds retained text at 256 KiB, so cached offsets fit in u32.
 pub(crate) enum AgentLine {
-    Role(u32),
-    Edit(u32),
-    Text { message: u32, range: Range<u32> },
+    Role(usize),
+    Edit(usize),
+    Text { message: usize, range: Range<usize> },
     Blank,
 }
 
-pub(crate) fn message_indent(message: &AgentMessage) -> u16 {
-    if message.role == "You" {
-        1
-    } else if message.id.is_some() {
-        2
-    } else {
-        0
+fn message_indent(message: &AgentMessage) -> u16 {
+    match (message.role == "You", message.id.is_some()) {
+        (true, _) => 1,
+        (_, true) => 2,
+        _ => 0,
     }
 }
 
@@ -1302,7 +1009,7 @@ impl AgentLine {
     pub(crate) fn indent(&self, messages: &[AgentMessage]) -> Option<u16> {
         match self {
             Self::Role(_) => Some(3),
-            Self::Text { message, .. } => Some(message_indent(&messages[*message as usize])),
+            Self::Text { message, .. } => Some(message_indent(&messages[*message])),
             Self::Blank | Self::Edit(_) => None,
         }
     }
@@ -1325,11 +1032,11 @@ struct ChatSelection {
 struct RenderedMarkdown {
     turn: u64,
     source: Arc<str>,
-    document: Arc<crate::agent::markdown::Markdown>,
+    document: Arc<Markdown>,
 }
 
 impl RenderedMarkdown {
-    fn matches(&self, message: &crate::workspace::AgentMessage) -> bool {
+    fn matches(&self, message: &AgentMessage) -> bool {
         message.role == "Agent"
             && message.id.is_none()
             && message.turn == self.turn
@@ -1350,7 +1057,7 @@ struct MarkdownResult {
 }
 
 fn markdown_worker() -> io::Result<Worker<MarkdownJob, MarkdownResult>> {
-    let notification = Arc::new(crate::eventfd::new()?);
+    let notification = Arc::new(crate::sys::new()?);
     Worker::new(
         "nextty-markdown",
         notification,
@@ -1362,7 +1069,7 @@ fn markdown_worker() -> io::Result<Worker<MarkdownJob, MarkdownResult>> {
                     let old = cached
                         .as_ref()
                         .map(|rendered| (rendered.source.as_ref(), rendered.document.as_ref()));
-                    let document = Arc::new(crate::agent::markdown::Markdown::render(&source, old));
+                    let document = Arc::new(Markdown::render(&source, old));
                     (
                         index,
                         RenderedMarkdown {
@@ -1398,9 +1105,11 @@ pub(crate) struct AgentPanel {
     pub keyboard: AgentAction,
     next_id: u64,
     remote: RemoteState,
-    pub view_dirty: bool,
+    view_dirty: bool,
     markdown_worker: Option<Worker<MarkdownJob, MarkdownResult>>,
     next_render: u64,
+    // The conversation and request id of the markdown job in flight.
+    rendering: Option<(u64, u64)>,
     // The previous frame's grid, handed back by the frontend for reuse.
     pub spare_grid: Option<Grid>,
 }
@@ -1419,14 +1128,14 @@ impl Default for AgentPanel {
             view_dirty: true,
             markdown_worker: None,
             next_render: 0,
+            rendering: None,
             spare_grid: None,
         }
     }
 }
 
 impl AgentPanel {
-    fn apply_model(&mut self, patch: &AgentModelPatch) -> io::Result<bool> {
-        let mut value: serde_json::Value = serde_json::from_slice(&patch.recovery)?;
+    fn apply_model(&mut self, patch: AgentModelPatch) -> io::Result<bool> {
         let Some(session) = self
             .sessions
             .iter_mut()
@@ -1434,72 +1143,28 @@ impl AgentPanel {
         else {
             return Ok(false);
         };
-        let selection = session.selection_checkpoint();
-        let rewind: Option<(u64, String, Vec<ContextView>)> = serde_json::from_value(
-            value
-                .get_mut("rewind_restore")
-                .map_or(serde_json::Value::Null, serde_json::Value::take),
-        )
-        .map_err(io::Error::other)?;
-        let failed: Option<(u64, String, Vec<ContextView>)> = serde_json::from_value(
-            value
-                .get_mut("failed_send")
-                .map_or(serde_json::Value::Null, serde_json::Value::take),
-        )
-        .map_err(io::Error::other)?;
-        let mut redraw = session.model.restore_patch(patch)?;
+        let stamp = session.selection_stamp();
+        let redraw = session.model.restore_patch(&patch)?;
         if redraw {
             session.columns = 0;
             session.sync_rendered();
         }
-        if let Some((turn, input, items)) = rewind
-            && session.rewind_applied != Some(turn)
-        {
-            session.model.input = input;
-            session.model.set_cursor(session.model.input.len(), false);
-            session.model.scroll = 0;
-            session.context.basket = items.into_iter().map(ContextItem::from_view).collect();
-            session.context.preview = None;
-            session.context.menu = false;
-            session.editor_scroll = None;
-            session.rewind_target = None;
-            session.rewind_applied = Some(turn);
-            self.view_dirty = true;
-            redraw = true;
-        }
-        if let Some((revision, input, items)) = failed
-            && session.failed_send_applied != Some(revision)
-        {
-            session.restore_draft(
-                input,
-                items.into_iter().map(ContextItem::from_view).collect(),
-            );
-            session.failed_send_applied = Some(revision);
-            session.editor_scroll = None;
-            self.view_dirty = true;
-            redraw = true;
-        }
-        if selection.is_some() && !session.selection_matches(selection.as_ref()) {
-            session.clear_selection();
-            redraw = true;
-        }
-        Ok(redraw)
+        Ok(redraw | session.keep_selection(stamp))
     }
 
     fn poll_remote(&mut self, client: &mut Client, config: &Config) -> io::Result<(bool, bool)> {
         if client.snapshot().is_none() {
             return Ok((false, false));
         }
-        if self.remote == RemoteState::Unopened
-            && !self.open
-            && self
-                .sessions
-                .iter()
-                .all(|session| session.model.pending.is_empty())
-        {
-            return Ok((false, false));
-        }
         if self.remote == RemoteState::Unopened {
+            if !self.open
+                && self
+                    .sessions
+                    .iter()
+                    .all(|session| session.model.pending.is_empty())
+            {
+                return Ok((false, false));
+            }
             client.send(crate::workspace::Action::AgentOpen)?;
             self.remote = RemoteState::Loading;
         }
@@ -1508,16 +1173,24 @@ impl AgentPanel {
         let mut models_changed = false;
         while let Some(event) = client.next_agent_event() {
             match event {
-                AgentEvent::Draft(payload) => {
+                AgentEvent::Draft(drafts) => {
                     self.view_dirty = false;
-                    self.restore_view_state(serde_json::from_slice(&payload)?)?;
+                    self.restore_view_state(drafts);
                     changed = true;
                 }
                 AgentEvent::Model(patch) => {
-                    let redraw = self.apply_model(&patch)?;
+                    let redraw = self.apply_model(patch)?;
                     changed |= redraw;
                     messages |= redraw;
                     models_changed = true;
+                }
+                AgentEvent::Recovery(recovery) => {
+                    if let Some(session) =
+                        self.sessions.iter_mut().find(|s| s.id == recovery.session)
+                    {
+                        let busy = session.model.busy;
+                        changed |= session.recover(recovery) || busy != session.model.busy;
+                    }
                 }
                 AgentEvent::Start(payload) => crate::agent::owner::spawn(client, &payload, config)?,
                 AgentEvent::Ready => self.remote = RemoteState::Ready,
@@ -1532,112 +1205,90 @@ impl AgentPanel {
         if models_changed {
             self.request_markdown()?;
         }
-        if self.remote == RemoteState::Ready && client.can_agent_input() {
-            if self.view_dirty {
-                client.send(crate::workspace::Action::AgentView(serde_json::to_vec(
-                    &self.view_state(),
-                )?))?;
-                self.view_dirty = false;
+        if self.remote != RemoteState::Ready {
+            return Ok((changed, messages));
+        }
+        let writable = client.can_agent_input();
+        if writable {
+            let complete = std::mem::take(&mut self.view_dirty);
+            let sessions: Vec<_> = (self.sessions.iter_mut())
+                .filter(|session| complete || session.edited)
+                .map(|session| {
+                    session.edited = false;
+                    session.draft()
+                })
+                .collect();
+            if complete || !sessions.is_empty() {
+                client.send(crate::workspace::Action::AgentView(AgentDrafts {
+                    next_id: self.next_id,
+                    complete,
+                    sessions,
+                }))?;
             }
-            for session in &mut self.sessions {
-                for mut request in session.model.pending.drain(..) {
-                    request["session"] = serde_json::json!(session.id);
-                    client.send(crate::workspace::Action::AgentRequest(
-                        serde_json::to_vec(&request).map_err(io::Error::other)?,
-                    ))?;
+        }
+        for session in &mut self.sessions {
+            if session.model.pending.is_empty() {
+                continue;
+            }
+            for request in std::mem::take(&mut session.model.pending) {
+                if writable {
+                    client.send(crate::workspace::Action::AgentRequest(request))?;
+                } else if let AgentRequest::Send(send) = request {
+                    session.restore_draft(send.input, send.basket);
+                    session.model.busy = false;
+                    session.edited = true;
                 }
             }
-        } else if self.remote == RemoteState::Ready {
-            for session in &mut self.sessions {
-                if !session.model.pending.is_empty() {
-                    for mut request in std::mem::take(&mut session.model.pending) {
-                        if request["action"] == "send" {
-                            let input = serde_json::from_value(request["input"].take())?;
-                            let items: Vec<ContextView> =
-                                serde_json::from_value(request["basket"].take())?;
-                            session.restore_draft(
-                                input,
-                                items.into_iter().map(ContextItem::from_view).collect(),
-                            );
-                            session.model.busy = false;
-                            self.view_dirty = true;
-                        }
-                    }
-                    changed = true;
-                }
-            }
+            changed |= !writable;
         }
         Ok((changed, messages))
     }
 
-    fn view_state(&self) -> serde_json::Value {
-        let sessions = self.sessions.iter().map(|session| serde_json::json!({
-            "id": session.id,
-            "input": session.model.input,
-            "rewind_applied": session.rewind_applied,
-            "failed_send_applied": session.failed_send_applied,
-            "basket": session.context.basket.iter().map(ContextItem::view).collect::<Vec<_>>(),
-        })).collect();
-        let mut view = serde_json::json!({"next_id": self.next_id});
-        view["sessions"] = serde_json::Value::Array(sessions);
-        view
-    }
-
-    fn restore_view_state(&mut self, mut value: serde_json::Value) -> io::Result<()> {
-        let next_id = serde_json::from_value(value["next_id"].take())?;
-        let values: Vec<serde_json::Value> = serde_json::from_value(value["sessions"].take())?;
+    fn restore_view_state(&mut self, drafts: AgentDrafts) {
         let current = self.active().id;
-        let mut previous = std::mem::take(&mut self.sessions);
-        self.sessions.reserve_exact(values.len());
-        for mut value in values {
-            let id = serde_json::from_value(value["id"].take())?;
-            let mut session = previous
+        let loading = self.remote == RemoteState::Loading;
+        let order: Vec<u64> = drafts.sessions.iter().map(|draft| draft.id).collect();
+        for draft in drafts.sessions {
+            let index = self
+                .sessions
                 .iter()
-                .position(|session| session.id == id)
-                .map(|index| previous.swap_remove(index))
-                .unwrap_or_else(|| AgentSession {
-                    id,
-                    ..AgentSession::default()
+                .position(|session| session.id == draft.id)
+                .unwrap_or_else(|| {
+                    self.sessions.push(AgentSession {
+                        id: draft.id,
+                        ..AgentSession::default()
+                    });
+                    self.sessions.len() - 1
                 });
-            let input = serde_json::from_value(value["input"].take())?;
-            let basket: Vec<ContextView> = serde_json::from_value(value["basket"].take())?;
-            let basket = basket.into_iter().map(ContextItem::from_view).collect();
-            if self.remote == RemoteState::Loading
-                && (!session.model.input.is_empty() || !session.context.basket.is_empty())
-            {
-                session.restore_draft(input, basket);
-                self.view_dirty = true;
-            } else {
-                if session.model.input != input {
-                    session.model.input = input;
-                    session.model.set_cursor(session.model.input.len(), false);
-                    session.editor_scroll = None;
-                }
-                session.context.basket = basket;
-            }
-            session.rewind_applied = serde_json::from_value(value["rewind_applied"].take())?;
-            session.failed_send_applied =
-                serde_json::from_value(value["failed_send_applied"].take())?;
-            self.sessions.push(session);
+            self.view_dirty |= self.sessions[index].restore_snapshot(draft, loading);
         }
-        if self.remote == RemoteState::Loading {
-            for session in previous {
-                if !session.model.input.is_empty()
-                    || !session.context.basket.is_empty()
-                    || !session.model.pending.is_empty()
-                {
-                    self.sessions.push(session);
-                    self.view_dirty = true;
-                }
-            }
+        if drafts.complete {
+            // Sessions used before the first snapshot arrived are kept and published.
+            let mut dirty = false;
+            self.sessions.retain(|session| {
+                let listed = order.contains(&session.id);
+                let keep = listed
+                    || loading
+                        && (!session.model.input.is_empty()
+                            || !session.context.basket.is_empty()
+                            || !session.model.pending.is_empty());
+                dirty |= keep && !listed;
+                keep
+            });
+            self.view_dirty |= dirty;
+            self.sessions.sort_by_key(|session| {
+                order
+                    .iter()
+                    .position(|id| *id == session.id)
+                    .unwrap_or(usize::MAX)
+            });
         }
         self.current = self
             .sessions
             .iter()
             .position(|session| session.id == current)
             .unwrap_or(0);
-        self.next_id = self.next_id.max(next_id);
-        Ok(())
+        self.next_id = self.next_id.max(drafts.next_id);
     }
 
     pub fn active(&self) -> &AgentSession {
@@ -1653,23 +1304,16 @@ impl AgentPanel {
         }
         // Commit with wrapping during draw so input keeps the displayed frame's geometry.
         self.apply_markdown();
-        if self.active().render_request.is_none() {
-            let session = self.active_mut();
-            let selection = session.selection_prefixes().is_some();
-            session.sync_rendered();
-            // Cache invalidation only removes rendered text, so valid endpoints keep their prefixes.
-            if selection && session.selection_prefixes().is_none() {
-                session.clear_selection();
-            }
+        if !self.rendering_active() {
+            self.active_mut().sync_rendered();
         }
         self.request_markdown()?;
         self.active_mut().layout(columns);
-
         Ok(())
     }
 
     fn request_markdown(&mut self) -> io::Result<()> {
-        if !self.open || self.active().render_request.is_some() {
+        if !self.open || self.rendering_active() {
             return Ok(());
         }
         let session = &mut self.sessions[self.current];
@@ -1699,19 +1343,22 @@ impl AgentPanel {
             if self.markdown_worker.is_none() {
                 self.markdown_worker = Some(markdown_worker()?);
             }
-            for session in &mut self.sessions {
-                session.render_request = None;
-            }
             self.next_render += 1;
-            let job = MarkdownJob {
-                session: self.active().id,
-                request: self.next_render,
+            let session = self.active().id;
+            self.rendering = Some((session, self.next_render));
+            let request = self.next_render;
+            self.markdown_worker.as_ref().unwrap().submit(MarkdownJob {
+                session,
+                request,
                 messages,
-            };
-            self.active_mut().render_request = Some(job.request);
-            self.markdown_worker.as_ref().unwrap().submit(|_| job);
+            });
         }
         Ok(())
+    }
+
+    fn rendering_active(&self) -> bool {
+        self.rendering
+            .is_some_and(|(session, _)| session == self.active().id)
     }
 
     pub fn layout_fd(&self) -> RawFd {
@@ -1722,21 +1369,20 @@ impl AgentPanel {
         let Some(worker) = &self.markdown_worker else {
             return Ok(false);
         };
-        Ok(crate::eventfd::consume_notification(worker.fd())?
-            && self.open
-            && worker.ready(|_| true))
+        Ok(crate::sys::consume_notification(worker.fd())? && self.open && worker.ready(|_| true))
     }
 
     fn apply_markdown(&mut self) {
         let Some(result) = self.markdown_worker.as_mut().and_then(Worker::take) else {
             return;
         };
-        let Some(session) = self.sessions.iter_mut().find(|session| {
-            session.id == result.session && session.render_request == Some(result.request)
-        }) else {
+        if self.rendering != Some((result.session, result.request)) {
+            return;
+        }
+        self.rendering = None;
+        let Some(session) = self.sessions.iter_mut().find(|s| s.id == result.session) else {
             return;
         };
-        session.render_request = None;
         // New deltas can arrive between parsing and drawing the next frame.
         if !result.messages.iter().all(|(index, rendered)| {
             session
@@ -1747,7 +1393,7 @@ impl AgentPanel {
         }) {
             return;
         }
-        let selection = session.selection_checkpoint();
+        let stamp = session.selection_stamp();
         // An unchanged rendered prefix only needs its last line wrapped again.
         session.append_from = None;
         if let [(index, rendered)] = result.messages.as_slice()
@@ -1763,8 +1409,8 @@ impl AgentPanel {
                     .enumerate()
                     .rev()
                     .find_map(|(line, value)| match value {
-                        AgentLine::Text { message, range } if *message as usize == *index => {
-                            Some((line, range.start as usize))
+                        AgentLine::Text { message, range } if message == index => {
+                            Some((line, range.start))
                         }
                         _ => None,
                     });
@@ -1772,50 +1418,38 @@ impl AgentPanel {
         for (index, rendered) in result.messages {
             session.rendered[index] = Some(rendered);
         }
-        if session.selection.is_some() && !session.selection_matches(selection.as_ref()) {
-            session.clear_selection();
-        }
+        session.keep_selection(stamp);
         if session.append_from.is_none() {
             session.columns = 0;
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn wait_layout(&mut self, columns: usize) {
-        self.prepare_layout(columns).unwrap();
-        while self.active().render_request.is_some() {
-            let mut fd = libc::pollfd {
-                fd: self.layout_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-            self.poll_layout().unwrap();
-            self.prepare_layout(columns).unwrap();
-        }
-    }
-
-    fn new_session(&mut self) {
+    fn leave(&mut self) {
         let session = self.active_mut();
         session.end_selection();
         session.rewind_target = None;
+        self.keyboard = AgentAction::Editor;
+    }
+
+    fn push_session(&mut self) {
         self.sessions.push(AgentSession {
             id: self.next_id,
             ..AgentSession::default()
         });
         self.next_id += 1;
+    }
+
+    fn new_session(&mut self) {
+        self.leave();
+        self.push_session();
         self.view_dirty = true;
         self.current = self.sessions.len() - 1;
-        self.keyboard = AgentAction::Editor;
     }
 
     fn switch(&mut self, index: usize) {
         if index < self.sessions.len() {
-            let session = self.active_mut();
-            session.end_selection();
-            session.rewind_target = None;
+            self.leave();
             self.current = index;
-            self.keyboard = AgentAction::Editor;
         }
     }
 
@@ -1823,24 +1457,17 @@ impl AgentPanel {
         if index >= self.sessions.len() {
             return;
         }
-        let session = self.active_mut();
-        session.end_selection();
-        session.rewind_target = None;
+        self.leave();
         self.sessions.remove(index);
         self.view_dirty = true;
         if self.sessions.is_empty() {
-            self.sessions.push(AgentSession {
-                id: self.next_id,
-                ..AgentSession::default()
-            });
-            self.next_id += 1;
+            self.push_session();
         }
         self.current = if index < self.current {
             self.current - 1
         } else {
             self.current.min(self.sessions.len() - 1)
         };
-        self.keyboard = AgentAction::Editor;
     }
 
     pub fn insert(&mut self, id: u64, text: &str) -> Result<(), String> {
@@ -1848,22 +1475,20 @@ impl AgentPanel {
             .sessions
             .iter_mut()
             .find(|session| session.id == id)
-            .ok_or_else(|| "Conversation was closed; paste discarded".to_string())?;
-        let range = session
-            .model
-            .selection()
-            .unwrap_or(session.model.cursor..session.model.cursor);
-        let changed = &session.model.input[range] != text;
-        session.model.insert(text)?;
+            .ok_or("Conversation was closed; paste discarded")?;
+        let model = &mut session.model;
+        let replaced = model.selection().unwrap_or(model.cursor..model.cursor);
+        session.edited |= model.input[replaced] != *text;
+        model.insert(text)?;
         session.editor_scroll = None;
-        self.view_dirty |= changed;
         Ok(())
     }
 
     pub fn clear_input(&mut self) {
-        self.view_dirty |= !self.active().model.input.is_empty();
-        self.active_mut().model.clear_input();
-        self.active_mut().prompt_index = None;
+        let session = self.active_mut();
+        session.edited |= !session.model.input.is_empty();
+        session.model.clear_input();
+        session.prompt_index = None;
     }
 
     pub fn controls(&self) -> Vec<AgentAction> {
@@ -1878,14 +1503,7 @@ impl AgentPanel {
                 AgentAction::ContextMenu,
             ];
         }
-        let capacity = (6
-            + self.sessions.len()
-            + usize::from(session.model.busy)
-            + session.context.basket.len() * 2
-            + session.model.messages.len())
-        .next_power_of_two();
-        let mut actions = Vec::with_capacity(capacity);
-        actions.extend([AgentAction::Editor, AgentAction::Output]);
+        let mut actions = vec![AgentAction::Editor, AgentAction::Output];
         if session.model.busy {
             actions.push(AgentAction::Stop);
         }
@@ -1894,27 +1512,12 @@ impl AgentPanel {
             actions.push(AgentAction::ToggleChanges);
             if session.changes_expanded {
                 actions.extend(
-                    session
-                        .changed_files()
-                        .iter()
-                        .map(|entry| AgentAction::ChangedFile(entry.0)),
+                    (session.changed_files().iter()).map(|entry| AgentAction::ChangedFile(entry.0)),
                 );
             }
         }
         for index in 0..session.context.basket.len() {
             actions.extend([AgentAction::Inspect(index), AgentAction::Remove(index)]);
-        }
-        let mut edits: HashMap<&str, smallvec::SmallVec<[usize; 1]>> = HashMap::new();
-        if !session.model.changes.is_empty()
-            && session
-                .model
-                .messages
-                .iter()
-                .any(|message| message.id.is_some())
-        {
-            for (index, change) in session.model.changes.iter().enumerate() {
-                edits.entry(&change.tool_id).or_default().push(index);
-            }
         }
         for (index, message) in session.model.messages.iter().enumerate().rev() {
             if message.role == "You" {
@@ -1925,8 +1528,12 @@ impl AgentPanel {
             } else {
                 AgentAction::Copy(index)
             });
-            if let Some(indices) = message.id.as_deref().and_then(|id| edits.get(id)) {
-                actions.extend(indices.iter().copied().map(AgentAction::EditDiff));
+            if let Some(id) = &message.id {
+                actions.extend(
+                    (session.model.changes.iter().enumerate())
+                        .filter(|(_, change)| &change.tool_id == id)
+                        .map(|(index, _)| AgentAction::EditDiff(index)),
+                );
             }
         }
         actions.push(AgentAction::NewSession);
@@ -1948,56 +1555,40 @@ impl AgentPanel {
             .current
             .saturating_sub(count - 1)
             .min(self.sessions.len() - count);
-        // Reuse the column slot for desired widths while fitting the tabs.
-        let mut tabs: Vec<_> = (start..start + count)
+        let desired: Vec<usize> = (start..start + count)
             .map(|index| {
                 let title = self.sessions[index].title();
-                let desired = if title.len() <= available {
-                    text_width(title) + 6
-                } else {
-                    let mut width = 6;
-                    for ch in title.chars() {
-                        width += usize::from(scalar_width(ch).min(2));
-                        if width >= available {
-                            break;
-                        }
+                let mut width = 6;
+                for ch in title.chars() {
+                    width += usize::from(scalar_width(ch));
+                    if width >= available {
+                        break;
                     }
-                    width
-                };
-                (index, desired.max(7), 0)
+                }
+                width.max(7)
             })
             .collect();
+        // Short titles keep their width; longer ones share what is left.
+        let mut order: Vec<usize> = (0..count).collect();
+        order.sort_by_key(|&tab| desired[tab]);
+        let mut widths = vec![0; count];
         let mut remaining = available;
-        let mut pending = tabs.len();
-        while pending != 0 {
-            let share = remaining / pending;
-            let mut fitted = false;
-            for (_, desired, width) in &mut tabs {
-                if *width == 0 && *desired <= share {
-                    *width = *desired;
-                    remaining -= *desired;
-                    pending -= 1;
-                    fitted = true;
-                }
-            }
-            if !fitted {
-                let mut extra = remaining % pending;
-                for (_, _, width) in &mut tabs {
-                    if *width == 0 {
-                        *width = share + usize::from(extra > 0);
-                        extra = extra.saturating_sub(1);
-                    }
-                }
-                break;
-            }
+        for (rank, tab) in order.into_iter().enumerate() {
+            widths[tab] = desired[tab].min(remaining / (count - rank));
+            remaining -= widths[tab];
         }
-        let mut x = 0;
-        for (_, column, width) in &mut tabs {
-            *column = x;
-            x += *width;
-        }
-        tabs
+        (widths.into_iter().enumerate())
+            .scan(0, |column, (offset, width)| {
+                *column += width;
+                Some((start + offset, *column - width, width))
+            })
+            .collect()
     }
+}
+
+// Control characters display as one blank cell.
+fn cell_width(c: char) -> usize {
+    usize::from(scalar_width(if c.is_control() { ' ' } else { c }))
 }
 
 fn wrap_context(text: &str, columns: usize) -> Vec<Range<usize>> {
@@ -2035,8 +1626,7 @@ fn wrap_context_into(text: &str, columns: usize, mut push: impl FnMut(Range<usiz
             let mut width = 0;
             for (index, c) in line[begin - offset..].char_indices() {
                 let index = begin + index;
-                let c = if c.is_control() { ' ' } else { c };
-                let next = usize::from(scalar_width(c).min(2));
+                let next = cell_width(c);
                 if width + next > columns && index > start {
                     push(start..index);
                     start = index;
@@ -2062,13 +1652,56 @@ fn column_offset(text: &str, range: Range<usize>, column: f32) -> usize {
     }
     let mut used = 0.;
     for (index, c) in line.char_indices() {
-        let width = f32::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2));
+        let width = cell_width(c) as f32;
         if column < used + width * 0.5 {
             return range.start + index;
         }
         used += width;
     }
     range.end
+}
+
+fn editor_lines(
+    input: &str,
+    cursor: usize,
+    columns: usize,
+    rows: usize,
+    scroll: Option<usize>,
+) -> EditorLines {
+    let columns = columns.max(1);
+    let rows = rows.max(1);
+    let prefix = &input[..cursor];
+    let mut lines = wrap_context(input, columns);
+    let (caret_lines, caret_range) = if cursor == input.len() {
+        (lines.len(), lines.last().cloned().unwrap_or(0..0))
+    } else {
+        let row = lines.partition_point(|range| range.end < cursor);
+        // A caret inside CRLF falls between adjacent displayed ranges.
+        let row = row.saturating_sub(usize::from(lines[row].start > cursor));
+        let offset = lines[row].start;
+        let mut caret = (0usize, 0..0);
+        wrap_context_into(&prefix[offset..], columns, |range| {
+            caret.0 += 1;
+            caret.1 = range;
+        });
+        (
+            row + caret.0.max(1),
+            offset + caret.1.start..offset + caret.1.end,
+        )
+    };
+    let width = prefix[caret_range].chars().map(cell_width).sum::<usize>();
+    let caret_row = caret_lines.saturating_sub(1) + usize::from(width >= columns);
+    if caret_row >= lines.len() {
+        lines.push(input.len()..input.len());
+    }
+    EditorLines {
+        first: scroll
+            .unwrap_or_else(|| caret_row.saturating_sub(rows - 1))
+            .min(lines.len().saturating_sub(rows)),
+        lines,
+        caret_row,
+        caret_column: width % columns,
+    }
 }
 
 pub(crate) struct EditorLines {
@@ -2089,15 +1722,13 @@ pub(crate) struct AgentSession {
     pub columns: usize,
     append_from: Option<(usize, usize)>,
     rendered: Vec<Option<RenderedMarkdown>>,
-    render_request: Option<u64>,
     pub editor_scroll: Option<usize>,
     pub rewind_target: Option<u64>,
+    edited: bool,
     escape_pending: bool,
     prompt_index: Option<usize>,
     prompt_draft: String,
     selection: Option<ChatSelection>,
-    rewind_applied: Option<u64>,
-    failed_send_applied: Option<u64>,
 }
 
 impl AgentSession {
@@ -2116,6 +1747,66 @@ impl AgentSession {
             files[position].2 += change.removed;
         }
         files
+    }
+
+    fn draft(&self) -> AgentDraft {
+        AgentDraft {
+            id: self.id,
+            input: self.model.input.clone(),
+            basket: self.context.basket.clone(),
+        }
+    }
+
+    // Restores the daemon's draft; `merge` keeps what was typed before it arrived.
+    fn restore_snapshot(&mut self, draft: AgentDraft, merge: bool) -> bool {
+        let merge = merge && (!self.model.input.is_empty() || !self.context.basket.is_empty());
+        if merge {
+            self.restore_draft(draft.input, draft.basket);
+        } else {
+            if self.model.input != draft.input {
+                self.model.input = draft.input;
+                self.model.set_cursor(self.model.input.len(), false);
+                self.editor_scroll = None;
+            }
+            self.context.basket = draft.basket;
+        }
+        merge
+    }
+
+    fn recover(&mut self, recovery: AgentRecovery) -> bool {
+        self.model.busy = false;
+        let AgentRecovery {
+            rewind,
+            input,
+            basket,
+            ..
+        } = recovery;
+        if rewind {
+            self.model.input = input;
+            self.model.set_cursor(self.model.input.len(), false);
+            self.model.scroll = 0;
+            self.context = ChatContext {
+                basket,
+                ..ChatContext::default()
+            };
+            self.rewind_target = None;
+        } else if input.is_empty() && basket.is_empty() {
+            return false;
+        } else {
+            self.restore_draft(input, basket);
+        }
+        self.editor_scroll = None;
+        self.edited = true;
+        true
+    }
+
+    fn failed(&self) -> bool {
+        let messages = &self.model.messages;
+        messages.last().is_some_and(|last| {
+            (messages.iter().rev())
+                .take_while(|message| message.turn == last.turn)
+                .any(|message| matches!(message.role.as_str(), "Error" | "Blocked"))
+        })
     }
 
     fn restore_draft(&mut self, mut input: String, mut items: Vec<ContextItem>) {
@@ -2144,6 +1835,17 @@ impl AgentSession {
             .position(|message| message.turn == turn && message.role == "You")
     }
 
+    fn line_of(&self, message: usize) -> Option<usize> {
+        self.lines
+            .iter()
+            .position(|line| matches!(line, AgentLine::Text { message: at, .. } if *at == message))
+    }
+
+    // Scrolls so `line` is the newest visible row.
+    fn reveal(&mut self, line: usize) {
+        self.model.scroll = self.lines.len().saturating_sub(line + 1);
+    }
+
     pub fn title(&self) -> &str {
         self.model
             .messages
@@ -2162,7 +1864,7 @@ impl AgentSession {
         }
     }
 
-    pub fn markdown(&self, index: usize) -> Option<&crate::agent::markdown::Markdown> {
+    pub fn markdown(&self, index: usize) -> Option<&Markdown> {
         self.rendered
             .get(index)
             .and_then(Option::as_ref)
@@ -2180,36 +1882,28 @@ impl AgentSession {
     }
 
     fn line_text(&self, index: usize) -> Option<(TranscriptPoint, Range<usize>, &str)> {
-        match self.lines.get(index)? {
+        let (message, part, text, range) = match self.lines.get(index)? {
             AgentLine::Role(message) => {
-                let text = &self.model.messages.get(*message as usize)?.role;
-                Some((
-                    TranscriptPoint {
-                        message: *message as usize,
-                        part: 0,
-                        offset: 0,
-                    },
-                    0..text.len(),
-                    text,
-                ))
+                let role = self.model.messages.get(*message)?.role.as_str();
+                (*message, 0, role, 0..role.len())
             }
             AgentLine::Text { message, range } => {
-                self.model.messages.get(*message as usize)?;
-                let text = self.message_text(*message as usize);
-                let range = range.start as usize..range.end as usize;
-                text.get(range.clone())?;
-                Some((
-                    TranscriptPoint {
-                        message: *message as usize,
-                        part: 1,
-                        offset: range.start,
-                    },
-                    range,
-                    text,
-                ))
+                self.model.messages.get(*message)?;
+                (*message, 1, self.message_text(*message), range.clone())
             }
-            AgentLine::Blank | AgentLine::Edit(_) => None,
-        }
+            AgentLine::Blank | AgentLine::Edit(_) => return None,
+        };
+        text.get(range.clone())?;
+        let offset = range.start;
+        Some((
+            TranscriptPoint {
+                message,
+                part,
+                offset,
+            },
+            range,
+            text,
+        ))
     }
 
     pub fn point(&self, line: usize, column: usize) -> Option<TranscriptPoint> {
@@ -2255,39 +1949,29 @@ impl AgentSession {
         self.selection = None;
     }
 
-    fn selection_checkpoint(&self) -> Option<[(u64, Option<String>, String); 2]> {
-        self.selection_prefixes().map(|prefixes| {
-            prefixes.map(|(turn, id, text)| (turn, id.map(str::to_owned), text.to_owned()))
-        })
-    }
-
-    fn selection_matches(&self, previous: Option<&[(u64, Option<String>, String); 2]>) -> bool {
-        self.selection_prefixes().is_some_and(|current| {
-            previous.is_none_or(|previous| {
-                current
-                    == previous
-                        .each_ref()
-                        .map(|(turn, id, text)| (*turn, id.as_deref(), text.as_str()))
-            })
-        })
-    }
-
-    fn selection_prefixes(&self) -> Option<[(u64, Option<&str>, &str); 2]> {
+    // Identifies the text before both selection endpoints, so a stream update that
+    // rewrites it can drop the selection.
+    fn selection_stamp(&self) -> Option<u64> {
         let selection = self.selection.as_ref()?;
-        let checkpoint = |point: TranscriptPoint| {
+        let mut hasher = DefaultHasher::new();
+        for point in [selection.anchor, selection.head] {
             let message = self.model.messages.get(point.message)?;
             let text = if point.part == 0 {
                 &message.role
             } else {
                 self.message_text(point.message)
             };
-            Some((
-                message.turn,
-                message.id.as_deref(),
-                text.get(..point.offset)?,
-            ))
-        };
-        Some([checkpoint(selection.anchor)?, checkpoint(selection.head)?])
+            (message.turn, &message.id, text.get(..point.offset)?).hash(&mut hasher);
+        }
+        Some(hasher.finish())
+    }
+
+    fn keep_selection(&mut self, before: Option<u64>) -> bool {
+        let stale = before.is_some() && self.selection_stamp() != before;
+        if stale {
+            self.selection = None;
+        }
+        stale
     }
 
     fn selected_range(
@@ -2317,33 +2001,18 @@ impl AgentSession {
         (from < to).then_some(from..to)
     }
 
-    fn selection_columns(&self, line: usize) -> Option<Range<usize>> {
+    fn selection_span(&self, line: usize) -> Option<(usize, &str)> {
         let selection = self.selection.as_ref()?;
         let (point, range, text) = self.line_text(line)?;
         let selected = Self::selected_range(selection, point, range.clone())?;
-        let start = crate::width::text_width(&text[range.start..selected.start]);
-        Some(start..start + crate::width::text_width(&text[selected]))
+        Some((
+            text_width(&text[range.start..selected.start]),
+            &text[selected],
+        ))
     }
 
     pub fn selected_text(&self) -> Option<String> {
         let selection = self.selection.as_ref()?;
-        let (anchor, head) = (selection.anchor, selection.head);
-        if (anchor.message, anchor.part) == (head.message, head.part)
-            && let Some(message) = self.model.messages.get(anchor.message)
-        {
-            let text = if anchor.part == 0 {
-                &message.role
-            } else {
-                self.message_text(anchor.message)
-            };
-            // Hard-line gaps are only copied between nonempty selected rows.
-            if let Some(text) =
-                text.get(anchor.offset.min(head.offset)..anchor.offset.max(head.offset))
-                && memchr::memchr2(b'\r', b'\n', text.as_bytes()).is_none()
-            {
-                return (!text.is_empty()).then(|| text.to_owned());
-            }
-        }
         let mut output = String::new();
         let mut previous: Option<TranscriptPoint> = None;
         for index in 0..self.lines.len() {
@@ -2378,50 +2047,15 @@ impl AgentSession {
     }
 
     pub fn editor_layout(&self, columns: usize, rows: usize) -> EditorLines {
-        let columns = columns.max(1);
-        let rows = rows.max(1);
-        let prefix = &self.model.input[..self.model.cursor];
-        let mut lines = wrap_context(&self.model.input, columns);
-        let (caret_lines, caret_range) = if self.model.cursor == self.model.input.len() {
-            (lines.len(), lines.last().cloned().unwrap_or(0..0))
-        } else {
-            let row = lines.partition_point(|range| range.end < self.model.cursor);
-            // A caret inside CRLF falls between adjacent displayed ranges.
-            let row = row.saturating_sub(usize::from(lines[row].start > self.model.cursor));
-            let offset = lines[row].start;
-            let mut caret = (0usize, 0..0);
-            wrap_context_into(&prefix[offset..], columns, |range| {
-                caret.0 += 1;
-                caret.1 = range;
-            });
-            (
-                row + caret.0.max(1),
-                offset + caret.1.start..offset + caret.1.end,
-            )
-        };
-        let text = &prefix[caret_range];
-        let width = if text.is_ascii() {
-            text.len()
-        } else {
-            text.chars()
-                .map(|c| usize::from(scalar_width(if c.is_control() { ' ' } else { c }).min(2)))
-                .sum::<usize>()
-        };
-        let caret_row = caret_lines.saturating_sub(1) + usize::from(width >= columns);
-        if caret_row >= lines.len() {
-            lines.push(self.model.input.len()..self.model.input.len());
-        }
-        let first = self
-            .editor_scroll
-            .unwrap_or_else(|| caret_row.saturating_sub(rows - 1))
-            .min(lines.len().saturating_sub(rows));
-        EditorLines {
-            lines,
-            first,
-            caret_row,
-            caret_column: width % columns,
-        }
+        editor_lines(
+            &self.model.input,
+            self.model.cursor,
+            columns,
+            rows,
+            self.editor_scroll,
+        )
     }
+
     fn move_vertical(&mut self, layout: EditorLines, up: bool, extend: bool) {
         let row = if up {
             layout.caret_row.saturating_sub(1)
@@ -2461,9 +2095,7 @@ impl AgentSession {
         self.model.set_cursor(cursor, extend);
     }
     fn add_context(&mut self, item: ContextItem) -> Result<(), &'static str> {
-        if self.context.basket.iter().any(|old| {
-            old.source == item.source && old.label == item.label && old.snapshot == item.snapshot
-        }) {
+        if self.context.basket.contains(&item) {
             return Err("Already attached");
         }
         if self.context.basket.len() >= 3
@@ -2495,9 +2127,9 @@ impl AgentSession {
             self.columns = 0;
         }
     }
-    pub fn send(&mut self, client: &Client) -> io::Result<bool> {
+    pub fn send(&mut self, client: &Client) -> io::Result<()> {
         if self.model.busy || self.model.input.trim().is_empty() {
-            return Ok(false);
+            return Ok(());
         }
         let pane = client
             .snapshot()
@@ -2506,27 +2138,12 @@ impl AgentSession {
         if !client.can_agent_input() {
             return Err(io::Error::other("Workspace is read-only"));
         }
-        let mut request = serde_json::json!({
-            "action": "send",
-            "pane": pane,
-        });
-        request["basket"] = serde_json::Value::Array(
-            self.context
-                .basket
-                .drain(..)
-                .map(|item| {
-                    serde_json::Value::Array(vec![
-                        item.label.into(),
-                        item.source.into(),
-                        item.kind.into(),
-                        item.snapshot.text.into(),
-                        item.snapshot.incomplete.into(),
-                    ])
-                })
-                .collect(),
-        );
-        request["input"] = serde_json::Value::String(std::mem::take(&mut self.model.input));
-        self.model.pending.push(request);
+        self.model.pending.push(AgentRequest::Send(AgentSend {
+            session: self.id,
+            pane,
+            input: std::mem::take(&mut self.model.input),
+            basket: std::mem::take(&mut self.context.basket),
+        }));
         self.model.clear_input();
         self.model.busy = true;
         self.model.scroll = 0;
@@ -2535,7 +2152,29 @@ impl AgentSession {
         self.context.menu = false;
         self.columns = 0;
         self.editor_scroll = None;
-        Ok(true)
+        self.edited = true;
+        Ok(())
+    }
+
+    fn recall_prompt(&mut self, up: bool) {
+        let prompts: Vec<_> = (self.model.messages.iter())
+            .filter(|message| message.role == "You")
+            .collect();
+        let current = self.prompt_index.unwrap_or(prompts.len());
+        if self.prompt_index.is_none() {
+            self.prompt_draft = self.model.input.clone();
+        }
+        let index = if up {
+            current.saturating_sub(1)
+        } else {
+            (current + 1).min(prompts.len())
+        };
+        self.model.input = (prompts.get(index))
+            .map_or_else(|| self.prompt_draft.clone(), |message| message.text.clone());
+        self.prompt_index = (index < prompts.len()).then_some(index);
+        self.model
+            .set_cursor(if up { 0 } else { self.model.input.len() }, false);
+        self.edited = true;
     }
 
     fn attach_screen(
@@ -2545,23 +2184,17 @@ impl AgentSession {
         selection: bool,
     ) -> Result<(), &'static str> {
         let screen = client.screens().get(&pane).ok_or("No active pane")?;
-        let range = if selection {
-            Some(
-                screen
-                    .selection_range()
-                    .ok_or("Select text in the terminal first")?,
-            )
+        let (label, kind, range) = if selection {
+            let range = screen
+                .selection_range()
+                .ok_or("Select text in the terminal first")?;
+            ("Visible selection", "Selection", Some(range))
         } else {
-            None
+            ("Visible screen", "Screen", None)
         };
         self.add_context(ContextItem {
-            label: if selection {
-                "Visible selection"
-            } else {
-                "Visible screen"
-            }
-            .into(),
-            kind: if selection { "Selection" } else { "Screen" }.into(),
+            label: label.into(),
+            kind: kind.into(),
             source: context_source(client, pane),
             snapshot: context::snapshot(screen, range),
         })
@@ -2596,21 +2229,15 @@ impl AgentSession {
         let first = append.map_or(0, |_| self.model.messages.len() - 1);
         let offset = append.map_or(0, |(_, offset)| offset);
         for (index, message) in self.model.messages.iter().enumerate().skip(first) {
-            let tool = message.id.is_some();
-            if tool {
-                lines.push(AgentLine::Role(index as u32));
+            let tool = message.id.as_ref();
+            if tool.is_some() {
+                lines.push(AgentLine::Role(index));
             }
-            if !tool
-                || message
-                    .id
-                    .as_ref()
-                    .is_some_and(|id| self.expanded_tools.contains(id))
-            {
-                let reserved = if message.role == "You"
-                    && columns >= crate::width::text_width(REWIND_LABEL) + 5
-                {
-                    1 + crate::width::text_width(REWIND_LABEL)
-                } else if tool || message.role == "You" {
+            if tool.is_none_or(|id| self.expanded_tools.contains(id)) {
+                let label = text_width(REWIND_LABEL);
+                let reserved = if message.role == "You" && columns >= label + 5 {
+                    1 + label
+                } else if tool.is_some() || message.role == "You" {
                     2
                 } else {
                     0
@@ -2620,20 +2247,17 @@ impl AgentSession {
                     columns.saturating_sub(reserved),
                     |range| {
                         lines.push(AgentLine::Text {
-                            message: index as u32,
-                            range: (offset + range.start) as u32..(offset + range.end) as u32,
+                            message: index,
+                            range: offset + range.start..offset + range.end,
                         });
                     },
                 );
             }
-            if let Some(id) = &message.id {
+            if let Some(id) = tool {
                 lines.extend(
-                    self.model
-                        .changes
-                        .iter()
-                        .enumerate()
+                    (self.model.changes.iter().enumerate())
                         .filter(|(_, change)| &change.tool_id == id)
-                        .map(|(index, _)| AgentLine::Edit(index as u32)),
+                        .map(|(change, _)| AgentLine::Edit(change)),
                 );
             }
             lines.push(AgentLine::Blank);
@@ -2641,12 +2265,12 @@ impl AgentSession {
         self.lines = lines;
         if let Some((anchor, gap)) = anchor {
             if let Some(index) = self.lines.iter().position(|line| match line {
-                AgentLine::Role(message) => *message as usize == anchor.message && anchor.part == 0,
+                AgentLine::Role(message) => *message == anchor.message && anchor.part == 0,
                 AgentLine::Text { message, range } => {
-                    *message as usize == anchor.message
+                    *message == anchor.message
                         && anchor.part == 1
-                        && (range.contains(&(anchor.offset as u32))
-                            || range.is_empty() && range.start as usize == anchor.offset)
+                        && (range.contains(&anchor.offset)
+                            || range.is_empty() && range.start == anchor.offset)
                 }
                 AgentLine::Blank | AgentLine::Edit(_) => false,
             }) {
@@ -2698,32 +2322,23 @@ impl Ui {
             AgentAction::Output => Focus::Output,
             _ => Focus::Controls,
         };
-        if let AgentAction::Tool(index) | AgentAction::Copy(index) | AgentAction::Rewind(index) =
-            self.agent.keyboard
-            && let Some(line) = self.agent.sessions[self.agent.current]
-                .lines
-                .iter()
-                .rposition(|line| match line {
-                    AgentLine::Role(i) | AgentLine::Text { message: i, .. } => *i as usize == index,
+        let keyboard = self.agent.keyboard;
+        let session = self.agent.active_mut();
+        let line = match keyboard {
+            AgentAction::Tool(index) | AgentAction::Copy(index) | AgentAction::Rewind(index) => {
+                session.lines.iter().rposition(|line| match line {
+                    AgentLine::Role(at) | AgentLine::Text { message: at, .. } => *at == index,
                     AgentLine::Blank | AgentLine::Edit(_) => false,
                 })
-        {
-            self.agent.sessions[self.agent.current].model.scroll = self.agent.sessions
-                [self.agent.current]
-                .lines
-                .len()
-                .saturating_sub(line + 1);
-        }
-        if let AgentAction::EditDiff(index) = self.agent.keyboard
-            && let Some(line) = self
-                .agent
-                .active()
+            }
+            AgentAction::EditDiff(index) => session
                 .lines
                 .iter()
-                .position(|line| matches!(line, AgentLine::Edit(at) if *at as usize == index))
-        {
-            self.agent.active_mut().model.scroll =
-                self.agent.active().lines.len().saturating_sub(line + 1);
+                .position(|line| matches!(line, AgentLine::Edit(at) if *at == index)),
+            _ => None,
+        };
+        if let Some(line) = line {
+            session.reveal(line);
         }
         let hint = match self.agent.keyboard {
             AgentAction::Editor => "Agent input · Enter sends · Shift+Enter newline",
@@ -2762,8 +2377,8 @@ impl Ui {
         }
         match symbol {
             keysym::ESCAPE => {
-                if self.agent.sessions[self.agent.current].context.menu {
-                    self.agent.sessions[self.agent.current].context.menu = false;
+                if self.agent.active().context.menu {
+                    self.agent.active_mut().context.menu = false;
                     self.agent.keyboard = AgentAction::ContextMenu;
                 } else {
                     self.focus = Focus::Editor;
@@ -2828,17 +2443,17 @@ impl Ui {
                 self.agent.active_mut().clear_selection();
                 self.focus = Focus::Output;
             }
-            AgentAction::Stop => self
-                .agent
-                .active_mut()
-                .model
-                .pending
-                .push(serde_json::json!({"action":"abort"})),
+            AgentAction::Stop => {
+                let session = self.agent.active_mut();
+                session.model.pending.push(AgentRequest::Abort {
+                    session: session.id,
+                });
+            }
             AgentAction::ContextMenu => {
-                self.agent.sessions[self.agent.current].context.menu =
-                    !self.agent.sessions[self.agent.current].context.menu;
+                let menu = !self.agent.active().context.menu;
+                self.agent.active_mut().context.menu = menu;
                 self.focus = Focus::Controls;
-                self.agent.keyboard = if self.agent.sessions[self.agent.current].context.menu {
+                self.agent.keyboard = if menu {
                     AgentAction::Selection
                 } else {
                     AgentAction::ContextMenu
@@ -2846,12 +2461,12 @@ impl Ui {
             }
             AgentAction::Selection | AgentAction::Screen => {
                 if let Some(pane) = client.snapshot().map(|s| s.focused) {
-                    let count = self.agent.active().context.basket.len();
-                    self.agent
-                        .active_mut()
+                    let session = self.agent.active_mut();
+                    let count = session.context.basket.len();
+                    session
                         .attach_screen(client, pane, action == AgentAction::Selection)
                         .map_err(io::Error::other)?;
-                    self.agent.view_dirty |= count != self.agent.active().context.basket.len();
+                    session.edited |= count != session.context.basket.len();
                 }
                 if !self.agent.open {
                     self.toggle_agent();
@@ -2859,71 +2474,54 @@ impl Ui {
                 self.focus = Focus::Editor;
             }
             AgentAction::ToggleChanges => {
-                self.agent.active_mut().changes_expanded = !self.agent.active().changes_expanded;
+                let session = self.agent.active_mut();
+                session.changes_expanded = !session.changes_expanded;
                 self.agent.keyboard = AgentAction::ToggleChanges;
                 self.focus = Focus::Controls;
             }
             AgentAction::EditDiff(index) | AgentAction::ChangedFile(index) => {
                 let single = matches!(action, AgentAction::EditDiff(_));
-                let session = self.agent.active_mut();
-                if let Some(change) = session.model.changes.get(index) {
-                    let path = change.path.clone();
-                    let mut text = String::with_capacity(64);
+                let changes = &self.agent.active().model.changes;
+                if let Some(path) = changes.get(index).map(|change| change.path.clone()) {
+                    let mut text = String::new();
                     let mut incomplete = false;
-                    let changes = if single {
-                        std::slice::from_ref(change)
-                    } else {
-                        &session.model.changes
-                    };
-                    for change in changes
-                        .iter()
-                        .filter(|change| single || change.path == path)
-                    {
+                    for (_, change) in changes.iter().enumerate().filter(|(at, change)| {
+                        if single {
+                            *at == index
+                        } else {
+                            change.path == path
+                        }
+                    }) {
                         writeln!(
                             text,
-                            "Turn {} · +{} -{}",
-                            change.turn, change.added, change.removed
+                            "Turn {} · +{} -{}\n{}",
+                            change.turn, change.added, change.removed, change.diff
                         )
                         .unwrap();
-                        text.push_str(&change.diff);
                         if change.truncated {
                             text.push_str("\n[Diff truncated]\n");
                             incomplete = true;
                         }
                         text.push('\n');
                     }
-                    session.context.preview = Some(ContextPreview::new(
-                        ContextItem {
-                            label: format!("{} · recorded Agent edits", path.display()),
-                            source: "Agent edit_file".into(),
-                            kind: "diff".into(),
-                            snapshot: ContextSnapshot { text, incomplete },
-                        },
-                        0,
-                    ));
-                    self.agent.keyboard = AgentAction::CopyPreview;
-                    self.focus = Focus::Controls;
+                    self.open_preview(ContextItem {
+                        label: format!("{} · recorded Agent edits", path.display()),
+                        source: "Agent edit_file".into(),
+                        kind: "diff".into(),
+                        snapshot: ContextSnapshot { text, incomplete },
+                    });
                 }
             }
             AgentAction::Inspect(index) => {
-                if let Some(item) = self.agent.sessions[self.agent.current]
-                    .context
-                    .basket
-                    .get(index)
-                {
-                    self.agent.sessions[self.agent.current].context.preview =
-                        Some(ContextPreview::new(item.clone(), 0));
-                    self.agent.keyboard = AgentAction::CopyPreview;
-                    self.focus = Focus::Controls;
+                if let Some(item) = self.agent.active().context.basket.get(index).cloned() {
+                    self.open_preview(item);
                 }
             }
             AgentAction::Remove(index) => {
-                if index < self.agent.sessions[self.agent.current].context.basket.len() {
-                    self.agent.sessions[self.agent.current]
-                        .context
-                        .basket
-                        .remove(index);
-                    self.agent.view_dirty = true;
+                let session = self.agent.active_mut();
+                if index < session.context.basket.len() {
+                    session.context.basket.remove(index);
+                    session.edited = true;
                 }
                 self.agent.keyboard = AgentAction::ContextMenu;
             }
@@ -2933,56 +2531,60 @@ impl Ui {
             }
             AgentAction::Copy(index) => {
                 self.focus = Focus::Output;
-                return Ok(self.agent.sessions[self.agent.current]
-                    .model
-                    .messages
-                    .get(index)
-                    .map(|message| message.text.clone()));
+                let messages = &self.agent.active().model.messages;
+                return Ok(messages.get(index).map(|message| message.text.clone()));
             }
             AgentAction::CopyPreview => {
-                return Ok(self.agent.sessions[self.agent.current]
-                    .context
-                    .preview
-                    .as_ref()
-                    .map(|preview| preview.item.snapshot.text.clone()));
+                let preview = self.agent.active().context.preview.as_ref();
+                return Ok(preview.map(|preview| preview.item.snapshot.text.clone()));
             }
             AgentAction::ClosePreview => {
-                self.agent.sessions[self.agent.current].context.preview = None;
+                self.agent.active_mut().context.preview = None;
                 self.focus = Focus::Editor;
             }
         }
         Ok(None)
     }
+
+    fn open_preview(&mut self, item: ContextItem) {
+        self.agent.active_mut().context.preview = Some(ContextPreview::new(item));
+        self.agent.keyboard = AgentAction::CopyPreview;
+        self.focus = Focus::Controls;
+    }
+
     fn select_agent_rewind(&mut self, index: usize) {
         let session = self.agent.active_mut();
-        let Some(message) = session
-            .model
-            .messages
-            .get(index)
+        let Some(turn) = (session.model.messages.get(index))
             .filter(|message| message.role == "You")
+            .map(|message| message.turn)
         else {
             return;
         };
-        session.rewind_target = Some(message.turn);
+        session.rewind_target = Some(turn);
         session.clear_selection();
-        if let Some(line) = session.lines.iter().position(
-            |line| matches!(line, AgentLine::Text { message, .. } if *message as usize == index),
-        ) {
-            session.model.scroll = session.lines.len().saturating_sub(line + 1);
+        if let Some(line) = session.line_of(index) {
+            session.reveal(line);
         }
         self.agent.keyboard = AgentAction::Rewind(index);
         self.focus = Focus::Controls;
     }
 
-    fn previous_agent_rewind(&mut self) {
+    fn move_agent_rewind(&mut self, up: bool) {
         let session = self.agent.active();
-        let before = session
-            .rewind_index()
-            .unwrap_or(session.model.messages.len());
-        if let Some(index) = session.model.messages[..before]
-            .iter()
-            .rposition(|message| message.role == "You")
-        {
+        let messages = &session.model.messages;
+        let current = session.rewind_index();
+        let index = if up {
+            messages[..current.unwrap_or(messages.len())]
+                .iter()
+                .rposition(|message| message.role == "You")
+        } else {
+            current.and_then(|current| {
+                (messages[current + 1..].iter())
+                    .position(|message| message.role == "You")
+                    .map(|offset| current + 1 + offset)
+            })
+        };
+        if let Some(index) = index {
             self.select_agent_rewind(index);
         }
     }
@@ -3016,11 +2618,11 @@ impl Ui {
         self.cancel_rewind();
         self.focus = Focus::Editor;
         if let Some(turn) = turn {
-            self.agent
-                .active_mut()
-                .model
-                .pending
-                .push(serde_json::json!({"action":"rewind", "turn":turn}));
+            let session = self.agent.active_mut();
+            session.model.pending.push(AgentRequest::Rewind {
+                session: session.id,
+                turn,
+            });
         }
     }
 
@@ -3029,43 +2631,26 @@ impl Ui {
             self.cancel_rewind();
             return false;
         }
-        if !self.agent.open
-            || self.agent.active().context.menu
-            || self.agent.active().context.preview.is_some()
-        {
+        let session = self.agent.active();
+        if !self.agent.open || session.context.menu || session.context.preview.is_some() {
             return false;
         }
-        if self.agent.active().rewind_target.is_some() {
+        if session.rewind_target.is_some() {
             match symbol {
                 keysym::ESCAPE => self.cancel_rewind(),
                 keysym::RETURN | keysym::KP_ENTER => self.confirm_agent_rewind(),
-                0x6b => self.previous_agent_rewind(),
-                0x6a => {
-                    let session = self.agent.active();
-                    if let Some(index) = session.rewind_index().and_then(|index| {
-                        session.model.messages[index + 1..]
-                            .iter()
-                            .position(|message| message.role == "You")
-                            .map(|offset| index + 1 + offset)
-                    }) {
-                        self.select_agent_rewind(index);
-                    }
-                }
+                0x6b => self.move_agent_rewind(true),
+                0x6a => self.move_agent_rewind(false),
                 _ => (),
             }
             return true;
         }
-        if symbol == keysym::ESCAPE {
-            if self.agent.active().escape_pending {
-                self.agent.active_mut().escape_pending = false;
-                self.previous_agent_rewind();
-            } else {
-                self.agent.active_mut().escape_pending = true;
-            }
-            return true;
+        let double = symbol == keysym::ESCAPE && session.escape_pending;
+        self.agent.active_mut().escape_pending = symbol == keysym::ESCAPE && !double;
+        if double {
+            self.move_agent_rewind(true);
         }
-        self.agent.active_mut().escape_pending = false;
-        false
+        symbol == keysym::ESCAPE
     }
 
     /// Handles a key aimed at the Agent panel; `None` passes it to the next region.
@@ -3076,8 +2661,14 @@ impl Ui {
         viewport: (usize, usize),
     ) -> io::Result<Option<crate::input::KeyResult>> {
         use crate::input::KeyResult;
-        let (control, shift, letter, paste) =
-            (key.control(), key.shift(), key.letter(), key.paste());
+        let (control, shift, letter) = (key.control(), key.shift(), key.letter());
+        let step = if matches!(key.symbol, keysym::PAGE_UP | keysym::PAGE_DOWN) {
+            10
+        } else {
+            1
+        };
+        let up = matches!(key.symbol, keysym::UP | keysym::PAGE_UP);
+        let down = matches!(key.symbol, keysym::DOWN | keysym::PAGE_DOWN);
         if control && letter == Some('c') && self.agent.open && self.focus.is_agent() {
             self.agent.active_mut().escape_pending = false;
             if self.agent.active().model.input.is_empty() {
@@ -3089,35 +2680,26 @@ impl Ui {
             }
             return Ok(Some(KeyResult::Handled));
         }
+        let activate = |ui: &mut Self, client: &mut Client| {
+            let Some(action) = ui.agent_key(key.symbol, shift, control) else {
+                return Ok(Some(KeyResult::Handled));
+            };
+            let copy = ui.activate_agent(action, client)?;
+            Ok(Some(copy.map_or(KeyResult::Handled, KeyResult::Copy)))
+        };
         if self.agent.active().context.preview.is_some() {
             if matches!(key.symbol, keysym::TAB | keysym::LEFT_TAB)
                 || self.focus == Focus::Controls
                     && matches!(key.symbol, keysym::RETURN | keysym::KP_ENTER | 32)
             {
-                if let Some(action) = self.agent_key(key.symbol, shift, control) {
-                    return self.activate_agent(action, client).map(|copy| {
-                        Some(copy.map_or(KeyResult::Handled, |text| KeyResult::Copy(text, false)))
-                    });
-                }
+                return activate(self, client);
             } else if let Some(preview) = &mut self.agent.active_mut().context.preview {
-                match key.symbol {
-                    keysym::ESCAPE => self.agent.active_mut().context.preview = None,
-                    keysym::UP | keysym::PAGE_UP => {
-                        preview.scroll = preview
-                            .scroll
-                            .saturating_sub(if key.symbol == keysym::PAGE_UP { 10 } else { 1 })
-                    }
-                    keysym::DOWN | keysym::PAGE_DOWN => {
-                        preview.scroll =
-                            preview
-                                .scroll
-                                .saturating_add(if key.symbol == keysym::PAGE_DOWN {
-                                    10
-                                } else {
-                                    1
-                                })
-                    }
-                    _ => (),
+                if key.symbol == keysym::ESCAPE {
+                    self.agent.active_mut().context.preview = None;
+                } else if up {
+                    preview.scroll = preview.scroll.saturating_sub(step);
+                } else if down {
+                    preview.scroll = preview.scroll.saturating_add(step);
                 }
             }
             return Ok(Some(KeyResult::Handled));
@@ -3128,155 +2710,103 @@ impl Ui {
         if self.agent_rewind_key(key.symbol) {
             return Ok(Some(KeyResult::Handled));
         }
-        if self.agent.open && self.focus.is_agent() {
-            if matches!(key.symbol, keysym::TAB | keysym::LEFT_TAB)
-                || control && key.symbol == 32
-                || self.focus == Focus::Controls
-            {
-                if let Some(action) = self.agent_key(key.symbol, shift, control) {
-                    return self
-                        .activate_agent(action, client)
-                        .map(|copy| {
-                            copy.map_or(KeyResult::Handled, |text| KeyResult::Copy(text, false))
-                        })
-                        .map(Some);
-                }
-                return Ok(Some(KeyResult::Handled));
+        if !(self.agent.open && self.focus.is_agent()) {
+            return Ok(None);
+        }
+        if matches!(key.symbol, keysym::TAB | keysym::LEFT_TAB)
+            || control && key.symbol == 32
+            || self.focus == Focus::Controls
+        {
+            return activate(self, client);
+        }
+        if self.focus == Focus::Output {
+            let session = self.agent.active_mut();
+            if key.symbol == keysym::ESCAPE {
+                session.clear_selection();
+                self.focus = Focus::Terminal;
+            } else if key.symbol == keysym::END {
+                session.model.scroll = 0;
+            } else if up {
+                session.model.scroll = session.model.scroll.saturating_add(step);
+            } else if down {
+                session.model.scroll = session.model.scroll.saturating_sub(step);
             }
-            if self.focus == Focus::Output {
-                let model = &mut self.agent.active_mut().model;
-                match key.symbol {
-                    keysym::ESCAPE => {
-                        self.agent.active_mut().clear_selection();
-                        self.focus = Focus::Terminal;
-                    }
-                    keysym::END => model.scroll = 0,
-                    keysym::UP | keysym::PAGE_UP => {
-                        model.scroll = model
-                            .scroll
-                            .saturating_add(if key.symbol == keysym::PAGE_UP { 10 } else { 1 })
-                    }
-                    keysym::DOWN | keysym::PAGE_DOWN => {
-                        model.scroll =
-                            model
-                                .scroll
-                                .saturating_sub(if key.symbol == keysym::PAGE_DOWN {
-                                    10
-                                } else {
-                                    1
-                                })
-                    }
-                    _ => (),
-                }
-                return Ok(Some(KeyResult::Handled));
-            }
-            if !(control && matches!(letter, Some('h' | 'j' | 'k' | 'l'))) {
-                self.agent.active_mut().prompt_index = None;
-            }
-            if paste {
-                return Ok(Some(KeyResult::Paste));
-            }
-            if control {
-                match letter {
-                    Some('a') => self.agent.active_mut().model.select_all(),
-                    Some('x') => {
-                        if let Some(range) = self.agent.active().model.selection() {
-                            return Ok(Some(KeyResult::Copy(
-                                self.agent.active().model.input[range].to_owned(),
-                                true,
-                            )));
-                        }
-                    }
-                    Some('u') => self.agent.clear_input(),
-                    Some('h' | 'l') => self.agent.active_mut().model.key(
-                        if letter == Some('h') {
-                            keysym::LEFT
-                        } else {
-                            keysym::RIGHT
-                        },
-                        false,
-                    ),
-                    Some('j' | 'k') => {
-                        let up = letter == Some('k');
-                        let layout = self.agent.active().editor_layout(viewport.0, viewport.1);
-                        if (up && layout.caret_row == 0)
-                            || (!up && layout.caret_row + 1 == layout.lines.len())
-                        {
-                            let session = self.agent.active_mut();
-                            let prompts: Vec<_> = session
-                                .model
-                                .messages
-                                .iter()
-                                .filter(|message| message.role == "You")
-                                .collect();
-                            let current = session.prompt_index.unwrap_or(prompts.len());
-                            if session.prompt_index.is_none() {
-                                session.prompt_draft = session.model.input.clone();
-                            }
-                            let index = if up {
-                                current.saturating_sub(1)
-                            } else {
-                                (current + 1).min(prompts.len())
-                            };
-                            session.model.input = prompts
-                                .get(index)
-                                .map(|message| message.text.clone())
-                                .unwrap_or_else(|| session.prompt_draft.clone());
-                            session.prompt_index = (index < prompts.len()).then_some(index);
-                            session
-                                .model
-                                .set_cursor(if up { 0 } else { session.model.input.len() }, false);
-                            self.agent.view_dirty = true;
-                        } else {
-                            self.agent.active_mut().move_vertical(layout, up, false);
-                        }
-                    }
-                    _ => (),
-                }
-            } else {
-                match key.symbol {
-                    keysym::ESCAPE => {
-                        if self.agent.active().context.menu {
-                            self.agent.active_mut().context.menu = false;
-                        } else {
-                            self.focus = Focus::Terminal;
-                        }
-                    }
-                    keysym::RETURN | keysym::KP_ENTER if shift => {
-                        if let Err(error) = self.agent.insert(self.agent.active().id, "\n") {
-                            self.message(error);
-                        }
-                    }
-                    keysym::RETURN | keysym::KP_ENTER => {
-                        match self.agent.active_mut().send(client) {
-                            Ok(changed) => self.agent.view_dirty |= changed,
-                            Err(error) => self.message(format!("Agent: {error}")),
-                        }
-                    }
-                    keysym::UP | keysym::DOWN => {
-                        let layout = self.agent.active().editor_layout(viewport.0, viewport.1);
-                        self.agent.active_mut().move_vertical(
-                            layout,
-                            key.symbol == keysym::UP,
-                            shift,
-                        );
-                    }
-                    _ => {
-                        let length = self.agent.active().model.input.len();
-                        self.agent.active_mut().model.key(key.symbol, shift);
-                        self.agent.view_dirty |= self.agent.active().model.input.len() != length;
-                        if !key.text.is_empty()
-                            && let Err(error) = self.agent.insert(self.agent.active().id, key.text)
-                        {
-                            self.message(error);
-                        }
-                    }
-                }
-            }
-            self.agent.active_mut().editor_scroll = None;
             return Ok(Some(KeyResult::Handled));
         }
-        Ok(None)
+        if !(control && matches!(letter, Some('h' | 'j' | 'k' | 'l'))) {
+            self.agent.active_mut().prompt_index = None;
+        }
+        if key.paste() {
+            return Ok(Some(KeyResult::Paste));
+        }
+        if control {
+            match letter {
+                Some('a') => self.agent.active_mut().model.select_all(),
+                Some('x') => {
+                    if let Some(range) = self.agent.active().model.selection() {
+                        let text = self.agent.active().model.input[range].to_owned();
+                        self.insert_active("");
+                        return Ok(Some(KeyResult::Copy(text)));
+                    }
+                }
+                Some('u') => self.agent.clear_input(),
+                Some('h') => self.agent.active_mut().model.key(keysym::LEFT, false),
+                Some('l') => self.agent.active_mut().model.key(keysym::RIGHT, false),
+                Some('j' | 'k') => {
+                    let up = letter == Some('k');
+                    let session = self.agent.active_mut();
+                    let layout = session.editor_layout(viewport.0, viewport.1);
+                    if if up {
+                        layout.caret_row == 0
+                    } else {
+                        layout.caret_row + 1 == layout.lines.len()
+                    } {
+                        session.recall_prompt(up);
+                    } else {
+                        session.move_vertical(layout, up, false);
+                    }
+                }
+                _ => (),
+            }
+        } else {
+            match key.symbol {
+                keysym::ESCAPE => {
+                    if self.agent.active().context.menu {
+                        self.agent.active_mut().context.menu = false;
+                    } else {
+                        self.focus = Focus::Terminal;
+                    }
+                }
+                keysym::RETURN | keysym::KP_ENTER if shift => self.insert_active("\n"),
+                keysym::RETURN | keysym::KP_ENTER => {
+                    if let Err(error) = self.agent.active_mut().send(client) {
+                        self.message(format!("Agent: {error}"));
+                    }
+                }
+                keysym::UP | keysym::DOWN => {
+                    let session = self.agent.active_mut();
+                    let layout = session.editor_layout(viewport.0, viewport.1);
+                    session.move_vertical(layout, key.symbol == keysym::UP, shift);
+                }
+                _ => {
+                    let session = self.agent.active_mut();
+                    let length = session.model.input.len();
+                    session.model.key(key.symbol, shift);
+                    session.edited |= session.model.input.len() != length;
+                    if !key.text.is_empty() {
+                        self.insert_active(key.text);
+                    }
+                }
+            }
+        }
+        self.agent.active_mut().editor_scroll = None;
+        Ok(Some(KeyResult::Handled))
+    }
+
+    fn insert_active(&mut self, text: &str) {
+        if let Err(error) = self.agent.insert(self.agent.active().id, text) {
+            self.message(error);
+        }
     }
 
     pub fn toggle_agent(&mut self) {
@@ -3298,33 +2828,42 @@ impl Ui {
 mod tests {
     use super::*;
 
-    #[test]
-    fn mirror_restores_canonical_messages_without_overwriting_next_draft() {
-        let patch = AgentModelPatch {
-            busy: true,
-            revision: 9,
-            turn: 3,
-            messages: vec![AgentMessage {
-                role: "You".into(),
-                text: "first request".into(),
-                turn: 3,
-                id: None,
-            }],
-            ..AgentModelPatch::default()
-        };
-        let mut mirror = AgentView::default();
-        mirror.insert("下一条🙂").unwrap();
-        mirror.anchor = Some(3);
-        mirror.scroll = 7;
-        let cursor = mirror.cursor;
-        assert!(mirror.restore_patch(&patch).unwrap());
-        assert_eq!(mirror.input, "下一条🙂");
-        assert_eq!(mirror.cursor, cursor);
-        assert_eq!(mirror.anchor, Some(3));
-        assert_eq!(mirror.scroll, 7);
-        assert_eq!(mirror.messages[0].turn, 3);
-        assert_eq!(mirror.revision, 9);
-        assert!(mirror.busy);
+    impl AgentPanel {
+        fn wait_layout(&mut self, columns: usize) {
+            self.prepare_layout(columns).unwrap();
+            while self.rendering_active() {
+                let mut fd = libc::pollfd {
+                    fd: self.layout_fd(),
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
+                self.poll_layout().unwrap();
+                self.prepare_layout(columns).unwrap();
+            }
+        }
+
+        fn model_snapshot(&self) -> Vec<AgentModelPatch> {
+            self.sessions
+                .iter()
+                .map(|session| AgentModelPatch {
+                    session: session.id,
+                    busy: session.model.busy,
+                    revision: session.model.revision,
+                    messages: session.model.messages.clone(),
+                    ..AgentModelPatch::default()
+                })
+                .collect()
+        }
+
+        fn restore_models(&mut self, patches: Vec<AgentModelPatch>) -> io::Result<bool> {
+            let mut redraw = false;
+            for patch in patches {
+                redraw |= self.apply_model(patch)?;
+            }
+            self.request_markdown()?;
+            Ok(redraw)
+        }
     }
 
     #[test]
@@ -3369,639 +2908,6 @@ mod tests {
     }
 
     #[test]
-    fn replacing_selected_text_can_reuse_the_input_budget() {
-        let mut agent = AgentView::default();
-        agent.insert(&"x".repeat(INPUT_LIMIT)).unwrap();
-        agent.select_all();
-        agent.insert("short draft").unwrap();
-        assert_eq!(agent.input, "short draft");
-    }
-
-    #[test]
-    fn wrapped_diff_keeps_its_line_color_in_dark_and_light_themes() {
-        for (foreground, background) in [(0xcccccc, 0x202020), (0x202020, 0xf5f5f5)] {
-            let mut ui = Ui::new().unwrap();
-            ui.agent.open = true;
-            ui.agent.active_mut().context.preview = Some(ContextPreview::new(
-                ContextItem {
-                    label: "long.rs".into(),
-                    source: "Agent edit_file".into(),
-                    kind: "diff".into(),
-                    snapshot: ContextSnapshot {
-                        text: format!("+{}\n-{}\n", "a".repeat(150), "b".repeat(150)),
-                        incomplete: false,
-                    },
-                },
-                0,
-            ));
-            let config = Config {
-                foreground,
-                background,
-                ..Config::default()
-            };
-            let size = WindowSize {
-                num_cols: 80,
-                num_lines: 40,
-                cell_width: 0,
-                cell_height: 0,
-            };
-            let panel = draw(
-                &mut ui,
-                &config,
-                Rect {
-                    x: 40,
-                    y: 1,
-                    cols: 40,
-                    rows: 38,
-                },
-                size,
-                None,
-                "",
-            )
-            .unwrap();
-            let body = panel.preview.unwrap();
-            let (added, removed) = crate::panel::diff_colors(foreground);
-            let mut continuations = 0;
-            for row in &panel.grid.rows {
-                let cell = &row.cells[usize::from(body.x - panel.grid.rect.x)];
-                match cell.c {
-                    '+' | 'a' => {
-                        assert_eq!(cell.fg, rgb(added));
-                        continuations += usize::from(cell.c == 'a');
-                    }
-                    '-' | 'b' => {
-                        assert_eq!(cell.fg, rgb(removed));
-                        continuations += usize::from(cell.c == 'b');
-                    }
-                    _ => (),
-                }
-            }
-            assert!(continuations >= 4);
-            assert_eq!(panel.grid.rows[0].cells[0].c, '╭');
-            assert_eq!(panel.grid.rows.last().unwrap().cells[0].c, '╰');
-        }
-    }
-
-    #[test]
-    fn recorded_file_edits_group_counts_and_open_colored_diff() {
-        let mut ui = Ui::new().unwrap();
-        ui.agent.open = true;
-        ui.agent.active_mut().model.changes = vec![
-            crate::workspace::AgentChange {
-                turn: 1,
-                tool_id: "edit-one".into(),
-                path: "/project/a.rs".into(),
-                added: 1,
-                removed: 1,
-                diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
-                truncated: false,
-            },
-            crate::workspace::AgentChange {
-                turn: 2,
-                tool_id: "edit-two".into(),
-                path: "/project/a.rs".into(),
-                added: 2,
-                removed: 0,
-                diff: "@@ -1 +1,3 @@\n new\n+second\n+third\n".into(),
-                truncated: false,
-            },
-        ]
-        .into();
-        assert_eq!(ui.agent.active().changed_files(), vec![(0, 3, 1)]);
-        assert!(ui.agent.controls().contains(&AgentAction::ToggleChanges));
-        ui.agent.active_mut().model.messages = vec![
-            crate::workspace::AgentMessage {
-                turn: 1,
-                role: "edit_file · done".into(),
-                text: "written".into(),
-                id: Some("edit-one".into()),
-            },
-            crate::workspace::AgentMessage {
-                turn: 2,
-                role: "edit_file · done".into(),
-                text: "written".into(),
-                id: Some("edit-two".into()),
-            },
-        ];
-        let size = WindowSize {
-            num_cols: 100,
-            num_lines: 30,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let side = Rect {
-            x: 50,
-            y: 1,
-            cols: 50,
-            rows: 28,
-        };
-        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
-        assert!(
-            panel
-                .hits
-                .iter()
-                .any(|(_, action)| *action == AgentAction::ToggleChanges)
-        );
-        assert!(
-            !panel
-                .hits
-                .iter()
-                .any(|(_, action)| *action == AgentAction::ChangedFile(0))
-        );
-        assert!(
-            panel
-                .hits
-                .iter()
-                .any(|(_, action)| *action == AgentAction::EditDiff(0))
-        );
-        assert!(
-            panel
-                .hits
-                .iter()
-                .any(|(_, action)| *action == AgentAction::EditDiff(1))
-        );
-        assert!(matches!(
-            ui.agent.active().lines.as_slice(),
-            [
-                AgentLine::Role(0),
-                AgentLine::Edit(0),
-                AgentLine::Blank,
-                AgentLine::Role(1),
-                AgentLine::Edit(1),
-                AgentLine::Blank
-            ]
-        ));
-        let header = panel
-            .hits
-            .iter()
-            .find(|(_, action)| *action == AgentAction::ToggleChanges)
-            .unwrap()
-            .0;
-        let row = &panel.grid.rows[usize::from(header.y - panel.grid.rect.y)];
-        assert!(row.cells.iter().any(|cell| cell.c == ''));
-        assert!(
-            row.cells
-                .iter()
-                .any(|cell| cell.c == '+' && cell.fg == rgb(0xb5d2a2))
-        );
-        assert!(
-            row.cells
-                .iter()
-                .any(|cell| cell.c == '-' && cell.fg == rgb(0xe87575))
-        );
-        let path =
-            std::env::temp_dir().join(format!("nextty-file-diff-ui-{}.sock", std::process::id()));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let client = Client::connect(&path).unwrap();
-        let (_stream, _) = listener.accept().unwrap();
-        std::fs::remove_file(path).unwrap();
-        ui.activate_agent(AgentAction::EditDiff(0), &client)
-            .unwrap();
-        assert!(
-            !ui.agent
-                .active()
-                .context
-                .preview
-                .as_ref()
-                .unwrap()
-                .item
-                .snapshot
-                .text
-                .contains("+second")
-        );
-        ui.activate_agent(AgentAction::ClosePreview, &client)
-            .unwrap();
-        ui.activate_agent(AgentAction::ToggleChanges, &client)
-            .unwrap();
-        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
-        assert!(
-            panel
-                .hits
-                .iter()
-                .any(|(_, action)| *action == AgentAction::ChangedFile(0))
-        );
-        ui.activate_agent(AgentAction::ChangedFile(0), &client)
-            .unwrap();
-        let preview = ui.agent.active().context.preview.as_ref().unwrap();
-        assert_eq!(preview.item.kind, "diff");
-        assert!(preview.item.snapshot.text.contains("+second"));
-        assert!(preview.item.snapshot.text.contains("-old"));
-        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
-        let backdrop = panel.backdrop.as_ref().unwrap();
-        assert_eq!(backdrop.rect, side);
-        assert!(
-            backdrop
-                .rows
-                .iter()
-                .any(|row| row.cells.iter().any(|cell| cell.c == '' || cell.c == ''))
-        );
-        assert!(panel.hits.iter().all(|(_, action)| matches!(
-            action,
-            AgentAction::ClosePreview | AgentAction::CopyPreview
-        )));
-        assert!(panel.grid.rect.x > 0 && panel.grid.rect.y > 1);
-        assert!(panel.grid.rect.cols < size.num_cols && panel.grid.rect.rows < size.num_lines);
-        let added = panel
-            .grid
-            .rows
-            .iter()
-            .find_map(|row| row.cells.get(2).filter(|cell| cell.c == '+'))
-            .unwrap();
-        assert_eq!(added.fg, rgb(0xb5d2a2));
-        ui.activate_agent(AgentAction::ClosePreview, &client)
-            .unwrap();
-        assert!(ui.agent.active().context.preview.is_none());
-        assert_eq!(ui.agent.active().model.changes.len(), 2);
-    }
-
-    #[test]
-    fn tab_dot_tracks_agent_outcome_without_treating_tool_errors_as_failure() {
-        let mut ui = Ui::new().unwrap();
-        ui.agent.open = true;
-        let config = Config::default();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let side = Rect {
-            x: 40,
-            y: 1,
-            cols: 40,
-            rows: 22,
-        };
-        for (role, busy, expected) in [
-            ("Agent", false, 0xb5d2a2),
-            ("Error", true, 0xfe9b30),
-            ("Error", false, 0xef5350),
-            ("Blocked", false, 0xef5350),
-            ("shell error", false, 0xb5d2a2),
-        ] {
-            let model = &mut ui.agent.active_mut().model;
-            model.busy = busy;
-            model.messages = vec![crate::workspace::AgentMessage {
-                turn: 1,
-                role: role.into(),
-                text: "result".into(),
-                id: None,
-            }];
-            let panel = draw(&mut ui, &config, side, size, None, "").unwrap();
-            let row = &panel.grid.rows[0];
-            assert_eq!(row.cells[0].bg, panel.grid.rows[1].cells[0].bg);
-            assert_eq!(row.cells[2].c, '•');
-            assert_eq!(row.cells[2].fg, rgb(expected));
-            assert!(row.cells[4].flags.contains(Flags::UNDERLINE));
-            assert_eq!(row.cells[4].fg, rgb(0xdddddd));
-            let width = ui.agent.tabs(39)[0].2;
-            assert_eq!(
-                row.cells[1..1 + width]
-                    .iter()
-                    .map(|cell| cell.c)
-                    .collect::<String>(),
-                " • New chat × "
-            );
-            assert!(
-                row.cells[1..1 + width].iter().all(|cell| {
-                    cell.bg == rgb(0x363636) && cell.flags.contains(Flags::UNDERLINE)
-                })
-            );
-            assert_eq!(row.extra(2).unwrap().underline_color, Some(rgb(0xcccccc)));
-            assert_eq!(row.cells[1 + width].bg, rgb(0x111111));
-            assert!(!row.cells.iter().any(|cell| cell.c == '╱'));
-        }
-    }
-
-    #[test]
-    fn shared_editor_preserves_composition_and_only_emits_changed_rows() {
-        let mut ui = Ui::new().unwrap();
-        ui.agent.open = true;
-        ui.focus = Focus::Editor;
-        ui.agent.active_mut().model.insert("e\u{301}中").unwrap();
-        let config = Config::default();
-        let size = WindowSize {
-            num_cols: 80,
-            num_lines: 24,
-            cell_width: 0,
-            cell_height: 0,
-        };
-        let side = Rect {
-            x: 40,
-            y: 1,
-            cols: 40,
-            rows: 22,
-        };
-        let first = draw(&mut ui, &config, side, size, None, "").unwrap();
-        first
-            .grid
-            .for_each_run::<io::Error>(Some(&first.grid), &[], |_| {
-                panic!("unchanged grid emitted a run")
-            })
-            .unwrap();
-        let composing = draw(&mut ui, &config, side, size, None, "文").unwrap();
-        assert_eq!(ui.agent.active().model.input, "e\u{301}中");
-        let editor = editor(&ui, side).0;
-        assert_eq!(composing.cursor, Some((editor.x + 5, editor.y)));
-        composing
-            .grid
-            .for_each_run::<io::Error>(Some(&first.grid), &[], |run| {
-                assert!(run.y >= editor.y);
-                Ok(())
-            })
-            .unwrap();
-        let mut output = Vec::new();
-        composing.grid.ansi(&mut output, None, &[]).unwrap();
-        let mut terminal = crate::core::Core::new(size, config.foreground, config.background);
-        crate::vt::Parser::new().advance(&mut terminal, &output);
-        for (row, cells) in composing.grid.rows.iter().enumerate() {
-            let observed = terminal.row(usize::from(composing.grid.rect.y) + row);
-            for (column, cell) in cells.cells.iter().enumerate() {
-                assert_eq!(
-                    observed.cells[usize::from(composing.grid.rect.x) + column],
-                    *cell
-                );
-                assert_eq!(
-                    observed
-                        .extra(usize::from(composing.grid.rect.x) + column)
-                        .map_or(&[][..], |extra| extra.zerowidth.as_slice()),
-                    cells
-                        .extra(column)
-                        .map_or(&[][..], |extra| extra.zerowidth.as_slice()),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn first_agent_restore_preserves_typing_while_loading() {
-        for saved in ["", "saved"] {
-            let mut remote = AgentPanel::default();
-            remote.active_mut().model.input = saved.into();
-            let mut local = AgentPanel {
-                remote: RemoteState::Loading,
-                ..AgentPanel::default()
-            };
-            local.active_mut().model.input = "typed".into();
-            local.active_mut().model.cursor = 5;
-            local.restore_view_state(remote.view_state()).unwrap();
-            assert_eq!(
-                local.active().model.input,
-                if saved.is_empty() {
-                    "typed"
-                } else {
-                    "saved\ntyped"
-                }
-            );
-            assert_eq!(
-                local.active().model.cursor,
-                local.active().model.input.len()
-            );
-            assert!(local.view_dirty);
-        }
-    }
-
-    #[test]
-    fn initial_idle_model_keeps_a_send_queued_while_loading_busy() {
-        use crate::wire::{Peer, Response};
-        use crate::workspace::{Action, Snapshot};
-
-        let path = std::env::temp_dir().join(format!(
-            "nextty-ui-loading-send-{}.sock",
-            std::process::id()
-        ));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let mut client = Client::connect(&path).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        std::fs::remove_file(path).unwrap();
-        let mut peer = Peer::new(stream).unwrap();
-        peer.send_response(Response::State(
-            Snapshot {
-                name: "loading".into(),
-                controller: true,
-                focused: 1,
-                active_tab: 1,
-                tabs: Vec::new(),
-                panes: Vec::new(),
-            },
-            Vec::new(),
-            0,
-        ))
-        .unwrap();
-        peer.flush().unwrap();
-        client.poll().unwrap();
-
-        let saved = AgentPanel::default();
-        let mut local = AgentPanel {
-            open: true,
-            remote: RemoteState::Loading,
-            ..AgentPanel::default()
-        };
-        let item = ContextItem {
-            label: "attachment".into(),
-            source: "pane 1".into(),
-            kind: "Screen".into(),
-            snapshot: ContextSnapshot {
-                text: "registers".into(),
-                incomplete: false,
-            },
-        };
-        local.active_mut().context.basket.push(item.clone());
-        local.active_mut().model.insert("first draft").unwrap();
-        assert!(local.active_mut().send(&client).unwrap());
-        peer.send_response(Response::Agent(AgentEvent::Draft(
-            serde_json::to_vec(&saved.view_state()).unwrap(),
-        )))
-        .unwrap();
-        peer.send_response(Response::Agent(AgentEvent::Model(
-            saved.model_snapshot().remove(0),
-        )))
-        .unwrap();
-        peer.send_response(Response::Agent(AgentEvent::Ready))
-            .unwrap();
-        peer.flush().unwrap();
-        client.poll().unwrap();
-        local.poll_remote(&mut client, &Config::default()).unwrap();
-        assert!(local.active().model.pending.is_empty());
-        local.active_mut().model.insert("next draft").unwrap();
-        assert!(!local.active_mut().send(&client).unwrap());
-        assert!(local.active().model.busy);
-        assert_eq!(local.active().model.input, "next draft");
-        client.flush().unwrap();
-        let mut requests = Vec::new();
-        while let Some(action) = peer.next_action().unwrap() {
-            if let Action::AgentRequest(payload) = action {
-                requests.push(serde_json::from_slice::<serde_json::Value>(&payload).unwrap());
-            }
-        }
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0]["input"], "first draft");
-        assert_eq!(requests[0]["basket"], serde_json::json!([item.view()]));
-
-        peer.send_response(Response::Agent(AgentEvent::Model(
-            saved.model_snapshot().remove(0),
-        )))
-        .unwrap();
-        peer.flush().unwrap();
-        client.poll().unwrap();
-        local.poll_remote(&mut client, &Config::default()).unwrap();
-        assert!(!local.active().model.busy);
-        assert_eq!(local.active().model.input, "next draft");
-    }
-
-    impl AgentPanel {
-        fn model_snapshot(&self) -> Vec<AgentModelPatch> {
-            self.sessions
-                .iter()
-                .map(|session| AgentModelPatch {
-                    session: session.id,
-                    busy: session.model.busy,
-                    revision: session.model.revision,
-                    messages: session.model.messages.clone(),
-                    recovery: b"{}".to_vec(),
-                    ..AgentModelPatch::default()
-                })
-                .collect()
-        }
-
-        fn restore_models(&mut self, patches: Vec<AgentModelPatch>) -> io::Result<bool> {
-            let mut redraw = false;
-            for patch in patches {
-                redraw |= self.apply_model(&patch)?;
-            }
-            self.request_markdown()?;
-            Ok(redraw)
-        }
-    }
-
-    #[test]
-    fn failed_send_restores_once_and_preserves_newer_edits() {
-        let mut panel = AgentPanel::default();
-        let item = ContextItem {
-            label: "old attachment".into(),
-            source: "pane 1".into(),
-            kind: "Screen".into(),
-            snapshot: ContextSnapshot {
-                text: "registers".into(),
-                incomplete: false,
-            },
-        };
-        panel.active_mut().model.insert("next draft").unwrap();
-        panel.active_mut().model.anchor = Some(0);
-        panel.active_mut().context.basket.push(item.clone());
-        let mut models = panel.model_snapshot();
-        models[0].recovery = serde_json::to_vec(
-            &serde_json::json!({"failed_send":[3, "failed draft", [item.view()]]}),
-        )
-        .unwrap();
-        panel.restore_models(models.clone()).unwrap();
-        assert_eq!(panel.active().model.input, "failed draft\nnext draft");
-        assert_eq!(
-            panel.active().model.cursor,
-            "failed draft\nnext draft".len()
-        );
-        assert_eq!(panel.active().model.anchor, Some("failed draft\n".len()));
-        assert_eq!(panel.active().context.basket.len(), 2);
-        panel.restore_models(models.clone()).unwrap();
-        assert_eq!(panel.active().model.input, "failed draft\nnext draft");
-        let view = panel.view_state();
-        let mut empty = AgentPanel::default();
-        empty.restore_models(models.clone()).unwrap();
-        assert_eq!(empty.active().model.input, "failed draft");
-        assert_eq!(empty.active().model.cursor, "failed draft".len());
-        assert_eq!(empty.active().context.basket.len(), 1);
-        let mut attached = AgentPanel::default();
-        attached.restore_view_state(view).unwrap();
-        attached.restore_models(models).unwrap();
-        assert_eq!(attached.active().model.input, "failed draft\nnext draft");
-        assert_eq!(attached.active().context.basket.len(), 2);
-    }
-
-    #[test]
-    fn read_only_stop_and_rewind_report_rejection_without_sticking_busy() {
-        let path =
-            std::env::temp_dir().join(format!("nextty-ui-readonly-{}.sock", std::process::id()));
-        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
-        let mut client = Client::connect(&path).unwrap();
-        let (stream, _) = listener.accept().unwrap();
-        std::fs::remove_file(path).unwrap();
-        let mut peer = crate::wire::Peer::new(stream).unwrap();
-        peer.send_response(crate::wire::Response::State(
-            crate::workspace::Snapshot {
-                name: "readonly".into(),
-                controller: false,
-                focused: 1,
-                active_tab: 1,
-                tabs: Vec::new(),
-                panes: Vec::new(),
-            },
-            Vec::new(),
-            0,
-        ))
-        .unwrap();
-        peer.flush().unwrap();
-        client.poll().unwrap();
-        let mut ui = Ui::new().unwrap();
-        ui.agent.remote = RemoteState::Ready;
-        ui.agent
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 7,
-                role: "You".into(),
-                text: "earlier".into(),
-                id: None,
-            });
-        ui.agent.active_mut().rewind_target = Some(7);
-        ui.confirm_agent_rewind();
-        ui.activate_agent(AgentAction::Stop, &client).unwrap();
-        assert_eq!(ui.agent.active().model.pending[0]["turn"], 7);
-        assert!(!ui.agent.active().model.busy);
-        ui.agent.active_mut().model.pending.push(serde_json::json!({
-            "action":"send", "input":"rejected draft", "basket":[],
-        }));
-        ui.agent.active_mut().model.busy = true;
-        ui.agent.active_mut().model.insert("newer draft").unwrap();
-        assert_eq!(
-            ui.poll_agent(&mut client, &Config::default()).unwrap(),
-            (true, false)
-        );
-        assert!(ui.agent.active().model.pending.is_empty());
-        assert!(!ui.agent.active().model.busy);
-        assert_eq!(ui.status.as_ref().unwrap().0, "Workspace is read-only");
-        assert_eq!(ui.agent.active().model.input, "rejected draft\nnewer draft");
-    }
-
-    #[test]
-    fn trimming_an_expanded_tool_marks_the_view_without_user_input() {
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        panel
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "shell · done".into(),
-                text: "output".into(),
-                id: Some("old-tool".into()),
-            });
-        panel.active_mut().expanded_tools.insert("old-tool".into());
-        panel.prepare_layout(40).unwrap();
-        panel.view_dirty = false;
-        let mut models = panel.model_snapshot();
-        models[0].messages.clear();
-        panel.restore_models(models).unwrap();
-        assert!(!panel.view_dirty);
-        panel.prepare_layout(40).unwrap();
-        assert!(panel.active().expanded_tools.is_empty());
-        assert!(!panel.view_dirty);
-        assert_eq!(panel.active().model.scroll, 0);
-    }
-
-    #[test]
     fn editor_control_navigation_recalls_prompts_and_clear_precedes_stop() {
         let path = std::env::temp_dir().join(format!("nextty-editor-{}.sock", std::process::id()));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
@@ -4015,12 +2921,7 @@ mod tests {
             .active_mut()
             .model
             .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "You".into(),
-                text: "previous".into(),
-                id: None,
-            });
+            .push(message(1, "You", "previous", None));
         ui.agent.active_mut().model.insert("draft").unwrap();
         let mut press = |ui: &mut Ui, symbol, modifiers| {
             ui.agent_key_input(
@@ -4050,10 +2951,10 @@ mod tests {
         assert!(ui.agent.active().model.busy);
         assert!(ui.agent.active().model.pending.is_empty());
         press(&mut ui, 'c' as u32, crate::input::CONTROL);
-        assert_eq!(
-            ui.agent.active().model.pending.last().unwrap()["action"],
-            "abort"
-        );
+        assert!(matches!(
+            ui.agent.active().model.pending.last().unwrap(),
+            AgentRequest::Abort { .. }
+        ));
     }
 
     #[test]
@@ -4095,130 +2996,6 @@ mod tests {
     }
 
     #[test]
-    fn markdown_completion_wakes_the_final_frame_and_uses_the_current_width() {
-        let mut panel = AgentPanel::default();
-        panel
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: "**done** 中文".into(),
-                id: None,
-            });
-        panel.prepare_layout(40).unwrap();
-        assert_eq!(panel.layout_fd(), -1);
-        assert!(panel.active().lines.is_empty());
-        panel.open = true;
-        panel.prepare_layout(40).unwrap();
-        assert_eq!(panel.active().message_text(0), "");
-        let mut fd = libc::pollfd {
-            fd: panel.layout_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-        assert!(panel.poll_layout().unwrap());
-        assert_eq!(panel.active().message_text(0), "");
-        panel.prepare_layout(6).unwrap();
-        assert_eq!(panel.active().message_text(0), "done 中文");
-        assert_eq!(panel.active().lines.len(), 3);
-        panel.prepare_layout(40).unwrap();
-        assert_eq!(panel.active().lines.len(), 2);
-        assert!(panel.active().render_request.is_none());
-    }
-
-    #[test]
-    fn markdown_appends_request_work_without_redrawing_until_completion() {
-        let mut owner = AgentPanel::default();
-        owner
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: "**first**".into(),
-                id: None,
-            });
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        panel.wait_layout(40);
-        assert!(!panel.poll_layout().unwrap());
-        owner.active_mut().model.messages[0].text.push_str(" next");
-        assert!(!panel.restore_models(owner.model_snapshot()).unwrap());
-        assert!(panel.active().render_request.is_some());
-        assert_eq!(panel.active().message_text(0), "first");
-        let mut fd = libc::pollfd {
-            fd: panel.layout_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-        assert!(panel.poll_layout().unwrap());
-        assert_eq!(panel.active().message_text(0), "first");
-        panel.prepare_layout(40).unwrap();
-        assert_eq!(panel.active().message_text(0), "first next");
-
-        owner.active_mut().model.messages[0].text = "**other** next".into();
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        panel.wait_layout(40);
-        assert_eq!(panel.active().message_text(0), "other next");
-
-        owner.active_mut().model.busy = true;
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        owner.active_mut().model.busy = false;
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        let message = &mut owner.active_mut().model.messages[0];
-        message.role = "run · running".into();
-        message.id = Some("tool".into());
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        owner.active_mut().model.messages[0].text = "tool output".into();
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-        owner.active_mut().model.messages[0].role = "run · done".into();
-        assert!(panel.restore_models(owner.model_snapshot()).unwrap());
-    }
-
-    #[test]
-    fn streaming_markdown_progress_survives_new_text_before_the_next_frame() {
-        let mut owner = AgentPanel::default();
-        owner
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: "**first**".into(),
-                id: None,
-            });
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        panel.restore_models(owner.model_snapshot()).unwrap();
-        let mut fd = libc::pollfd {
-            fd: panel.layout_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-        owner.active_mut().model.messages[0]
-            .text
-            .push_str("\n\nnext");
-        panel.restore_models(owner.model_snapshot()).unwrap();
-        assert!(panel.poll_layout().unwrap());
-        panel.prepare_layout(40).unwrap();
-        assert_eq!(panel.active().message_text(0), "first");
-        panel.wait_layout(40);
-        assert_eq!(panel.active().message_text(0), "first\n\nnext");
-    }
-
-    #[test]
     fn streamed_unicode_geometry_matches_full_layout() {
         let mut panel = AgentPanel {
             open: true,
@@ -4232,12 +3009,7 @@ mod tests {
                 .active_mut()
                 .model
                 .messages
-                .push(crate::workspace::AgentMessage {
-                    turn: 1,
-                    role: "Agent".into(),
-                    text: text.into(),
-                    id: None,
-                });
+                .push(message(1, "Agent", text, None));
         }
         panel.wait_layout(12);
         let session = panel.active_mut();
@@ -4286,91 +3058,12 @@ mod tests {
     }
 
     #[test]
-    fn markdown_results_ignore_outdated_requests_and_sources() {
-        for restore in [false, true] {
-            let mut owner = AgentPanel::default();
-            owner
-                .active_mut()
-                .model
-                .messages
-                .push(crate::workspace::AgentMessage {
-                    turn: 1,
-                    role: "Agent".into(),
-                    text: "**old".into(),
-                    id: None,
-                });
-            let mut panel = AgentPanel {
-                open: true,
-                ..AgentPanel::default()
-            };
-            panel.restore_models(owner.model_snapshot()).unwrap();
-            let mut fd = libc::pollfd {
-                fd: panel.layout_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            };
-            assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-            if restore {
-                owner.active_mut().model.messages[0].text = "**new**".into();
-                panel.restore_models(owner.model_snapshot()).unwrap();
-            } else {
-                panel.active_mut().model.messages[0].text = "**new**".into();
-            }
-            assert!(panel.poll_layout().unwrap());
-            panel.prepare_layout(40).unwrap();
-            assert_eq!(panel.active().message_text(0), "");
-            panel.wait_layout(40);
-            assert_eq!(panel.active().message_text(0), "new");
-        }
-    }
-
-    #[test]
-    fn rewinding_discards_a_completed_markdown_result() {
-        let mut owner = AgentPanel::default();
-        owner
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: "**discarded reply**".into(),
-                id: None,
-            });
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        panel.restore_models(owner.model_snapshot()).unwrap();
-        let mut fd = libc::pollfd {
-            fd: panel.layout_fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        assert_eq!(unsafe { libc::poll(&mut fd, 1, 5000) }, 1);
-        owner.active_mut().model.messages.clear();
-        let mut models = owner.model_snapshot();
-        models[0].recovery =
-            serde_json::to_vec(&serde_json::json!({"rewind_restore":[1, "restored draft", []]}))
-                .unwrap();
-        panel.restore_models(models).unwrap();
-        assert!(panel.poll_layout().unwrap());
-        panel.prepare_layout(40).unwrap();
-        assert!(panel.active().model.messages.is_empty());
-        assert!(panel.active().rendered.is_empty());
-        assert!(panel.active().lines.is_empty());
-        assert_eq!(panel.active().model.input, "restored draft");
-    }
-
-    #[test]
     fn transcript_copy_preserves_unselected_hard_line_gaps() {
         let mut session = AgentSession::default();
-        session.model.messages.push(crate::workspace::AgentMessage {
-            turn: 1,
-            role: "You".into(),
-            text: "ab\r\ncd\n\nef".into(),
-            id: None,
-        });
+        session
+            .model
+            .messages
+            .push(message(1, "You", "ab\r\ncd\n\nef", None));
         session.layout(80);
         for (from, to, expected) in [
             ((0, 0), (0, 0), None),
@@ -4398,24 +3091,9 @@ mod tests {
             ..AgentPanel::default()
         };
         panel.active_mut().model.messages = vec![
-            crate::workspace::AgentMessage {
-                role: "You".into(),
-                text: "a中🙂e\u{301}\nnext".into(),
-                id: None,
-                turn: 1,
-            },
-            crate::workspace::AgentMessage {
-                role: "run · done".into(),
-                text: "hidden tool output".into(),
-                id: Some("tool".into()),
-                turn: 1,
-            },
-            crate::workspace::AgentMessage {
-                role: "Agent".into(),
-                text: "answer".into(),
-                id: None,
-                turn: 1,
-            },
+            message(1, "You", "a中🙂e\u{301}\nnext", None),
+            message(1, "run · done", "hidden tool output", Some("tool")),
+            message(1, "Agent", "answer", None),
         ];
         panel.wait_layout(6);
         let session = panel.active_mut();
@@ -4428,7 +3106,7 @@ mod tests {
         let end = session.point(last, 99).unwrap();
         session.begin_selection(start, false);
         session.extend_selection(end);
-        assert_eq!(session.selection_columns(0), Some(1..3));
+        assert_eq!(session.selection_span(0), Some((1, "中")));
         let expected = "中🙂e\u{301}\nnext\n\nrun · done\n\nanswer";
         assert_eq!(session.selected_text().as_deref(), Some(expected));
         session.end_selection();
@@ -4443,18 +3121,8 @@ mod tests {
     fn streamed_models_keep_selection_when_selected_text_is_unchanged() {
         let mut owner = AgentPanel::default();
         owner.active_mut().model.messages = vec![
-            crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                text: "keep this\n\n**draft".into(),
-                id: None,
-            },
-            crate::workspace::AgentMessage {
-                turn: 1,
-                role: "run · running".into(),
-                text: "running".into(),
-                id: Some("cmd".into()),
-            },
+            message(1, "Agent", "keep this\n\n**draft", None),
+            message(1, "run · running", "running", Some("cmd")),
         ];
         let mut mirror = AgentPanel {
             open: true,
@@ -4502,12 +3170,7 @@ mod tests {
             .active_mut()
             .model
             .messages
-            .push(crate::workspace::AgentMessage {
-                role: "Agent".into(),
-                text: "**中文".into(),
-                id: None,
-                turn: 1,
-            });
+            .push(message(1, "Agent", "**中文", None));
         panel.wait_layout(20);
         let session = panel.active_mut();
         session.begin_selection(session.point(0, 2).unwrap(), false);
@@ -4518,305 +3181,164 @@ mod tests {
         assert_eq!(panel.active().selected_text(), None);
     }
 
-    #[test]
-    fn full_layout_invalidation_overrides_pending_stream_update() {
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        for text in ["**previous**", "reply"] {
-            panel
-                .active_mut()
-                .model
-                .messages
-                .push(crate::workspace::AgentMessage {
-                    role: "Agent".into(),
-                    text: text.into(),
-                    id: None,
-                    turn: 1,
-                });
+    fn message(turn: u64, role: &str, text: impl Into<String>, id: Option<&str>) -> AgentMessage {
+        AgentMessage {
+            turn,
+            role: role.into(),
+            text: text.into(),
+            id: id.map(Into::into),
         }
-        panel.wait_layout(20);
-        panel.active_mut().model.messages[1].text.push_str(" next");
-        panel.wait_layout(20);
-        assert_eq!(panel.active().message_text(0), "previous");
-        assert_eq!(panel.active().message_text(1), "reply next");
-        panel.active_mut().model.messages.remove(0);
-        panel.active_mut().columns = 0;
-        panel.wait_layout(20);
-        assert_eq!(panel.active().message_text(0), "reply next");
-        assert_eq!(panel.active().rendered.len(), 1);
+    }
+
+    fn change(
+        turn: u64,
+        tool_id: &str,
+        added: u32,
+        removed: u32,
+        diff: &str,
+    ) -> crate::workspace::AgentChange {
+        crate::workspace::AgentChange {
+            turn,
+            tool_id: tool_id.into(),
+            path: "/project/a.rs".into(),
+            added,
+            removed,
+            diff: diff.into(),
+            truncated: false,
+        }
     }
 
     #[test]
-    fn view_updates_preserve_models_and_apply_rewind_once() {
-        let mut owner = AgentPanel::default();
-        owner
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                role: "You".into(),
-                text: "earlier".into(),
-                id: None,
-                turn: 4,
-            });
-        owner.active_mut().model.revision = 3;
-        let item = ContextItem {
-            label: "registers".into(),
-            source: "pane 1".into(),
-            kind: "Screen".into(),
-            snapshot: ContextSnapshot {
-                text: "rax 0x1234".into(),
-                incomplete: false,
-            },
-        };
-        let mut view = owner.view_state();
-        let canonical = owner.model_snapshot();
-        view["sessions"][0]["input"] = serde_json::json!("typing");
-        owner.restore_view_state(view.clone()).unwrap();
-        assert_eq!(owner.model_snapshot(), canonical);
-        assert_eq!(owner.active().model.input, "typing");
-        let mut frontend = AgentPanel::default();
-        frontend.active_mut().model.insert("next draft").unwrap();
-        frontend.restore_models(owner.model_snapshot()).unwrap();
-        assert_eq!(frontend.active().model.input, "next draft");
-        let canonical = frontend.model_snapshot();
-        frontend.restore_view_state(view.clone()).unwrap();
-        assert_eq!(frontend.model_snapshot(), canonical);
-        let mut models = owner.model_snapshot();
-        models[0].recovery = serde_json::to_vec(
-            &serde_json::json!({"rewind_restore":[4, "earlier", [item.view()]]}),
-        )
-        .unwrap();
-        frontend.restore_models(models.clone()).unwrap();
-        assert_eq!(frontend.active().model.input, "earlier");
-        assert_eq!(frontend.active().context.basket.len(), 1);
-        frontend.active_mut().model.insert(" edited").unwrap();
-        frontend.restore_models(models.clone()).unwrap();
-        assert_eq!(frontend.active().model.input, "earlier edited");
-        let view = frontend.view_state();
-        let mut attached = AgentPanel::default();
-        attached.restore_view_state(view).unwrap();
-        attached.restore_models(models).unwrap();
-        assert_eq!(attached.active().model.input, "earlier edited");
-        assert_eq!(attached.active().context.basket.len(), 1);
-        attached.restore_models(owner.model_snapshot()).unwrap();
-        assert_eq!(attached.active().model.input, "earlier edited");
-        assert_eq!(attached.active().context.basket.len(), 1);
-    }
-
-    #[test]
-    fn agent_view_roundtrip_preserves_drafts_and_canonical_models() {
-        let mut panel = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        panel.new_session();
-        panel.keyboard = AgentAction::Inspect(0);
-        let item = ContextItem {
-            label: "寄存器".into(),
-            source: "pane 1".into(),
-            kind: "Screen".into(),
-            snapshot: ContextSnapshot {
-                text: "rax 0x1234\n终端内容".into(),
-                incomplete: true,
-            },
-        };
-        for session in &mut panel.sessions {
-            session.model.insert("中文🙂 draft").unwrap();
-            session.model.cursor = "中文".len();
-            session.model.anchor = Some("中".len());
-            session.model.scroll = 7;
-            session.context.basket.push(item.clone());
-            session.context.menu = true;
-            session.context.preview = Some(ContextPreview::new(item.clone(), 3));
-            session.expanded_tools.insert("tool-11".into());
-            session.editor_scroll = Some(2);
-            session.rewind_target = Some(11);
-            session.selection = Some(ChatSelection {
-                anchor: TranscriptPoint {
-                    message: 0,
-                    part: 0,
-                    offset: 0,
-                },
-                head: TranscriptPoint {
-                    message: 0,
-                    part: 0,
-                    offset: 6,
-                },
-                dragging: true,
-            });
-        }
-        let view = panel.view_state();
-        assert_eq!(panel.view_state(), view);
-        panel.active_mut().model.cursor = 0;
-        panel.active_mut().context.menu = false;
-        panel.active_mut().context.preview = None;
-        assert_eq!(panel.view_state(), view);
-        assert!(view["sessions"][0].get("cursor").is_none());
-        assert!(view["sessions"][0].get("messages").is_none());
-        let mut restored = AgentPanel::default();
-        restored.new_session();
-        for session in &mut restored.sessions {
-            session.model.messages.push(crate::workspace::AgentMessage {
-                role: "Agent".into(),
-                text: format!("canonical model {}", session.id),
-                id: None,
-                turn: 11,
-            });
-            session.model.busy = true;
-            session.model.revision = 99;
-            session.layout(40);
-        }
-        restored.sessions.swap(0, 1);
-        restored.restore_view_state(view.clone()).unwrap();
-        assert_eq!(restored.view_state(), view);
-        for session in &restored.sessions {
-            assert_eq!(
-                session.model.messages[0].text,
-                format!("canonical model {}", session.id)
-            );
-            assert!(session.model.busy);
-            assert_eq!(session.model.revision, 99);
-            assert!(session.selection.is_none());
-            assert!(!session.context.menu);
-            assert!(session.context.preview.is_none());
-            assert_eq!(session.model.scroll, 0);
-            assert_eq!(session.model.cursor, session.model.input.len());
-        }
-        restored.new_session();
-        assert_eq!(restored.active().id, 2);
-    }
-
-    #[test]
-    fn restored_stream_updates_markdown_selection_and_trimmed_messages() {
-        let mut owner = AgentPanel::default();
-        for text in ["**earlier**", "**中文"] {
-            owner
-                .active_mut()
-                .model
-                .messages
-                .push(crate::workspace::AgentMessage {
-                    role: "Agent".into(),
-                    text: text.into(),
-                    id: None,
-                    turn: 1,
-                });
-        }
-        let mut frontend = AgentPanel {
-            open: true,
-            ..AgentPanel::default()
-        };
-        frontend.restore_models(owner.model_snapshot()).unwrap();
-        frontend.wait_layout(40);
-        let session = frontend.active_mut();
-        let line = session
-            .lines
-            .iter()
-            .position(|line| matches!(line, AgentLine::Text { message: 1, .. }))
+    fn recorded_edits_group_by_file_and_open_single_or_grouped_diffs() {
+        let path = std::env::temp_dir().join(format!("nextty-diff-{}.sock", std::process::id()));
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let client = Client::connect(&path).unwrap();
+        let (_stream, _) = listener.accept().unwrap();
+        std::fs::remove_file(path).unwrap();
+        let mut ui = Ui::new().unwrap();
+        let model = &mut ui.agent.active_mut().model;
+        model.changes = vec![
+            change(1, "one", 1, 1, "-old\n+new\n"),
+            change(2, "two", 2, 0, "+second\n"),
+        ]
+        .into();
+        model.messages = vec![
+            message(1, "edit_file · done", "text", Some("one")),
+            message(2, "edit_file · done", "text", Some("two")),
+        ];
+        assert_eq!(ui.agent.active().changed_files(), vec![(0, 3, 1)]);
+        let controls = ui.agent.controls();
+        assert!(controls.contains(&AgentAction::ToggleChanges));
+        assert!(!controls.contains(&AgentAction::ChangedFile(0)));
+        assert!(controls.contains(&AgentAction::EditDiff(0)));
+        assert!(controls.contains(&AgentAction::EditDiff(1)));
+        ui.activate_agent(AgentAction::EditDiff(0), &client)
             .unwrap();
-        session.begin_selection(session.point(line, 2).unwrap(), false);
-        session.extend_selection(session.point(line, 4).unwrap());
-        assert!(session.selected_text().is_some());
-        owner.active_mut().model.messages[1].text.push_str("**");
-        frontend.restore_models(owner.model_snapshot()).unwrap();
-        frontend.wait_layout(40);
-        assert_eq!(frontend.active().message_text(0), "earlier");
-        assert_eq!(frontend.active().message_text(1), "中文");
-        assert_eq!(frontend.active().selected_text(), None);
-        owner.active_mut().model.messages.remove(0);
-        owner.active_mut().model.revision += 1;
-        frontend.restore_models(owner.model_snapshot()).unwrap();
-        frontend.wait_layout(40);
-        assert_eq!(frontend.active().message_text(0), "中文");
-        assert_eq!(frontend.active().rendered.len(), 1);
+        let diff = |ui: &Ui| {
+            ui.agent
+                .active()
+                .context
+                .preview
+                .as_ref()
+                .unwrap()
+                .item
+                .snapshot
+                .text
+                .clone()
+        };
+        assert!(diff(&ui).contains("-old") && !diff(&ui).contains("+second"));
+        ui.activate_agent(AgentAction::ChangedFile(0), &client)
+            .unwrap();
+        assert!(diff(&ui).contains("-old") && diff(&ui).contains("+second"));
     }
 
     #[test]
-    fn conversation_tabs_keep_drafts_context_and_scroll_independent() {
-        let mut panel = AgentPanel::default();
-        panel.active_mut().model.insert("first draft").unwrap();
-        panel.active_mut().model.scroll = 7;
-        panel.active_mut().context.basket.push(ContextItem {
-            label: "Screen".into(),
-            source: "pane 1".into(),
-            kind: "Screen".into(),
-            snapshot: ContextSnapshot {
-                text: "original snapshot".into(),
-                incomplete: false,
-            },
-        });
-        panel.new_session();
-        panel.active_mut().model.insert("second draft").unwrap();
-        assert!(panel.active().context.basket.is_empty());
-        panel.switch(0);
-        assert_eq!(panel.active().model.input, "first draft");
-        assert_eq!(panel.active().model.scroll, 7);
-        assert_eq!(
-            panel.active().context.basket[0].snapshot.text,
-            "original snapshot"
-        );
-        panel.close(1);
-        assert_eq!(panel.active().model.input, "first draft");
-        for _ in 0..12 {
-            panel.new_session();
+    fn drawing_the_transcript_exposes_message_tool_and_edit_hits() {
+        let mut ui = Ui::new().unwrap();
+        ui.agent.open = true;
+        let model = &mut ui.agent.active_mut().model;
+        model.messages = vec![
+            message(1, "You", "text", None),
+            message(1, "edit_file · done", "text", Some("one")),
+            message(1, "Error", "text", None),
+        ];
+        model.changes = vec![change(1, "one", 2, 1, "+x\n")].into();
+        let size = WindowSize {
+            num_cols: 100,
+            num_lines: 30,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let side = rect(50, 1, 50, 28);
+        let panel = draw(&mut ui, &Config::default(), side, size, None, "").unwrap();
+        let hits: Vec<_> = panel.hits.iter().map(|(_, action)| *action).collect();
+        for expected in [
+            AgentAction::Copy(0),
+            AgentAction::Rewind(0),
+            AgentAction::Tool(1),
+            AgentAction::EditDiff(0),
+            AgentAction::Copy(2),
+            AgentAction::ToggleChanges,
+            AgentAction::Editor,
+            AgentAction::NewSession,
+            AgentAction::ClosePanel,
+        ] {
+            assert!(hits.contains(&expected));
         }
-        let tabs = panel.tabs(30);
-        assert!(tabs.iter().any(|(index, _, _)| *index == panel.current));
-        assert!(tabs.iter().all(|(_, x, width)| x + width <= 24));
+        let text: String = panel
+            .grid
+            .rows
+            .iter()
+            .flat_map(|row| row.cells.iter().map(|cell| cell.c))
+            .collect();
+        assert!(text.contains("› edit_file · done") && text.contains("+2 -1"));
     }
 
     #[test]
-    fn conversation_titles_use_panel_space_and_redistribute_short_tab_width() {
-        let mut panel = AgentPanel::default();
-        let title = "使用 pwndbg 分析 sudo 的启动与权限检查";
-        panel
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 1,
-                role: "You".into(),
-                text: title.into(),
-                id: None,
-            });
-        let wide = panel.tabs(100);
-        assert_eq!(wide[0].2, crate::width::text_width(title) + 6);
-        assert!(wide[0].2 > 18);
-        let narrow = panel.tabs(24);
-        assert_eq!(narrow[0].2, 17);
-        assert!(wide[0].2 > narrow[0].2);
-        panel.new_session();
-        panel
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 2,
-                role: "You".into(),
-                text: "第二个长会话标题".repeat(8),
-                id: None,
-            });
-        panel.new_session();
-        panel
-            .active_mut()
-            .model
-            .messages
-            .push(crate::workspace::AgentMessage {
-                turn: 3,
-                role: "You".into(),
-                text: "a".into(),
-                id: None,
-            });
-        let tabs = panel.tabs(80);
-        assert_eq!(tabs.len(), 3);
-        assert_eq!(tabs[2].2, 7);
-        assert!(tabs[0].2 > 18 && tabs[1].2 > 18);
-        assert_eq!(tabs.iter().map(|tab| tab.2).sum::<usize>(), 73);
-        let tiny = panel.tabs(12);
-        assert!(tiny.iter().any(|tab| tab.0 == panel.current));
-        assert!(tiny.iter().all(|tab| tab.1 + tab.2 <= 6));
+    fn composition_shows_in_the_editor_without_changing_the_draft() {
+        let mut ui = Ui::new().unwrap();
+        ui.agent.open = true;
+        ui.focus = Focus::Editor;
+        ui.agent.active_mut().model.insert("e\u{301}中").unwrap();
+        let size = WindowSize {
+            num_cols: 80,
+            num_lines: 24,
+            cell_width: 0,
+            cell_height: 0,
+        };
+        let side = rect(40, 1, 40, 22);
+        let composing = draw(&mut ui, &Config::default(), side, size, None, "文").unwrap();
+        assert_eq!(ui.agent.active().model.input, "e\u{301}中");
+        let editor = editor(&ui, side).0;
+        assert_eq!(composing.cursor, Some((editor.x + 5, editor.y)));
+    }
+
+    #[test]
+    fn restoring_a_draft_keeps_text_typed_while_loading_and_recovery_prepends_failed_sends() {
+        let mut panel = AgentPanel {
+            remote: RemoteState::Loading,
+            ..AgentPanel::default()
+        };
+        panel.active_mut().model.insert("typed").unwrap();
+        panel.restore_view_state(AgentDrafts {
+            next_id: 1,
+            complete: true,
+            sessions: vec![AgentDraft {
+                id: 0,
+                input: "saved".into(),
+                basket: Vec::new(),
+            }],
+        });
+        assert_eq!(panel.active().model.input, "saved\ntyped");
+        assert_eq!(panel.active().model.cursor, "saved\ntyped".len());
+        assert!(panel.view_dirty);
+        panel.active_mut().model.busy = true;
+        assert!(panel.active_mut().recover(AgentRecovery {
+            input: "failed".into(),
+            ..AgentRecovery::default()
+        }));
+        assert_eq!(panel.active().model.input, "failed\nsaved\ntyped");
+        assert!(!panel.active().model.busy && panel.active().edited);
     }
 
     #[test]
@@ -4910,12 +3432,10 @@ mod tests {
     #[test]
     fn history_anchor_survives_reflow_and_collapsed_tool_append() {
         let mut session = AgentSession::default();
-        session.model.messages.push(crate::workspace::AgentMessage {
-            turn: 1,
-            role: "You".into(),
-            text: "0123456789".repeat(50),
-            id: None,
-        });
+        session
+            .model
+            .messages
+            .push(message(1, "You", "0123456789".repeat(50), None));
         session.layout(20);
         session.model.scroll = 10;
         let last = session.lines.len() - session.model.scroll - 1;
@@ -4927,12 +3447,12 @@ mod tests {
         let last = session.lines.len() - session.model.scroll - 1;
         let range = session.line_text(last).unwrap().1;
         assert!(range.contains(&anchor));
-        session.model.messages.push(crate::workspace::AgentMessage {
-            turn: 2,
-            role: "shell · done".into(),
-            text: "hidden output".repeat(500),
-            id: Some("tool".into()),
-        });
+        session.model.messages.push(message(
+            2,
+            "shell · done",
+            "hidden output".repeat(500),
+            Some("tool"),
+        ));
         session.columns = 0;
         session.layout(40);
         let last = session.lines.len() - session.model.scroll - 1;

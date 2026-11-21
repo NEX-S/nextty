@@ -1,4 +1,4 @@
-use crate::eventfd::consume_notification;
+use crate::sys::consume_notification;
 use curl::easy::{Easy2, Handler, List, WriteError};
 use curl::multi::{Multi, WaitFd};
 use serde_json::Value;
@@ -6,8 +6,6 @@ use std::io;
 use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
-
-const BUFFER_LIMIT: usize = 256 * 1024;
 
 pub(crate) fn retryable(error: &io::Error) -> bool {
     if error
@@ -40,15 +38,10 @@ pub(crate) fn retryable(error: &io::Error) -> bool {
 #[derive(Default)]
 struct Response {
     bytes: Vec<u8>,
-    overflow: bool,
 }
 
 impl Handler for Response {
     fn write(&mut self, bytes: &[u8]) -> Result<usize, WriteError> {
-        if self.bytes.len() + bytes.len() > BUFFER_LIMIT {
-            self.overflow = true;
-            return Ok(0);
-        }
         self.bytes.extend_from_slice(bytes);
         Ok(bytes.len())
     }
@@ -58,7 +51,6 @@ impl Handler for Response {
 struct Sse {
     pending: Vec<u8>,
     data: Vec<u8>,
-    bytes: usize,
 }
 
 impl Sse {
@@ -75,10 +67,6 @@ impl Sse {
             let line = &self.pending[start..end];
             let line = line.strip_suffix(b"\r").unwrap_or(line);
             if line.is_empty() && !self.data.is_empty() {
-                self.bytes += self.data.len();
-                if self.bytes > 1024 * 1024 {
-                    return Err(io::Error::other("Model response exceeds 1 MiB"));
-                }
                 let complete = emit(serde_json::from_slice(&self.data)?)?;
                 self.data.clear();
                 if complete {
@@ -87,9 +75,6 @@ impl Sse {
                 }
             } else if let Some(data) = line.strip_prefix(b"data:") {
                 let data = data.strip_prefix(b" ").unwrap_or(data);
-                if self.data.len() + data.len() + 1 > BUFFER_LIMIT {
-                    return Err(io::Error::other("Agent SSE event exceeds 256 KiB"));
-                }
                 if !self.data.is_empty() {
                     self.data.push(b'\n');
                 }
@@ -98,9 +83,6 @@ impl Sse {
             start = end + 1;
         }
         self.pending.drain(..start);
-        if self.pending.len() + self.data.len() > BUFFER_LIMIT {
-            return Err(io::Error::other("Agent SSE event exceeds 256 KiB"));
-        }
         Ok(false)
     }
 
@@ -161,9 +143,6 @@ impl Http {
                 let status = handle.response_code()?;
                 let response = handle.get_mut();
                 let complete = if (200..300).contains(&status) {
-                    if response.overflow {
-                        return Err(io::Error::other("Agent unread response exceeds 256 KiB"));
-                    }
                     let complete = sse.feed(&response.bytes, &mut emit)?;
                     response.bytes.clear();
                     complete
@@ -212,6 +191,32 @@ impl Http {
 }
 
 #[cfg(test)]
+pub(crate) fn read_request(stream: &mut std::net::TcpStream) -> Vec<u8> {
+    use std::io::Read;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    let mut header = Vec::new();
+    while !header.ends_with(b"\r\n\r\n") {
+        let mut byte = [0];
+        stream.read_exact(&mut byte).unwrap();
+        header.push(byte[0]);
+    }
+    let length: usize = String::from_utf8(header)
+        .unwrap()
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse().unwrap())
+        })
+        .unwrap();
+    let mut body = vec![0; length];
+    stream.read_exact(&mut body).unwrap();
+    body
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
@@ -226,27 +231,7 @@ mod tests {
         let url = format!("http://{}/messages", listener.local_addr().unwrap());
         let thread = thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
-            stream
-                .set_read_timeout(Some(Duration::from_secs(3)))
-                .unwrap();
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                header.push(byte[0]);
-            }
-            let header = String::from_utf8(header).unwrap();
-            let length: usize = header
-                .lines()
-                .find_map(|line| {
-                    let (name, value) = line.split_once(':')?;
-                    name.eq_ignore_ascii_case("content-length")
-                        .then_some(value.trim())
-                })
-                .unwrap()
-                .parse()
-                .unwrap();
-            stream.read_exact(&mut vec![0; length]).unwrap();
+            read_request(&mut stream);
             reply(stream);
         });
         (url, thread)
@@ -270,7 +255,7 @@ mod tests {
                 &url,
                 &[],
                 b"{}",
-                crate::eventfd::new().unwrap().as_raw_fd(),
+                crate::sys::new().unwrap().as_raw_fd(),
                 &AtomicBool::new(false),
                 |event| {
                     if events.is_empty() {
@@ -303,19 +288,11 @@ mod tests {
             reply.extend_from_slice(body);
             reply.extend_from_slice(b"\r\n0\r\n\r\n");
             stream.write_all(&reply).unwrap();
-            let mut header = Vec::new();
-            while !header.ends_with(b"\r\n\r\n") {
-                let mut byte = [0];
-                stream.read_exact(&mut byte).unwrap();
-                header.push(byte[0]);
-            }
-            let mut request_body = [0; 2];
-            stream.read_exact(&mut request_body).unwrap();
-            assert_eq!(&request_body, b"{}");
+            assert_eq!(read_request(&mut stream), b"{}");
             stream.write_all(&reply).unwrap();
         });
         let mut http = Http::new();
-        let wake = crate::eventfd::new().unwrap();
+        let wake = crate::sys::new().unwrap();
         let canceled = AtomicBool::new(false);
         let mut events = Vec::new();
         for _ in 0..2 {
@@ -332,82 +309,38 @@ mod tests {
     #[test]
     fn errors_detach_the_transfer_and_preserve_http_error_bodies() {
         let mut http = Http::new();
-        let wake = crate::eventfd::new().unwrap();
-        let canceled = AtomicBool::new(false);
-        let (url, thread) = server(|mut stream| {
-            stream.write_all(b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 19\r\n\r\ngateway unavailable").unwrap();
-        });
-        let error = http
-            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| {
-                panic!("HTTP error emitted as SSE")
-            })
-            .unwrap_err();
-        assert_eq!(error.to_string(), "Agent HTTP 429: gateway unavailable");
-        thread.join().unwrap();
-        let (url, thread) = server(|mut stream| {
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {}\n\n")
-                .unwrap();
-        });
-        let error = http
-            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| {
-                Err(io::Error::other("receiver full"))
-            })
-            .unwrap_err();
-        assert_eq!(error.to_string(), "receiver full");
-        thread.join().unwrap();
-        let (url, thread) = server(|mut stream| {
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"unfinished\":")
-                .unwrap();
-        });
-        let error = http
-            .stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| Ok(false))
-            .unwrap_err();
-        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
-        thread.join().unwrap();
-        let (url, thread) = server(|mut stream| {
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {}\n\n")
-                .unwrap();
-        });
-        http.stream(&url, &[], b"{}", wake.as_raw_fd(), &canceled, |_| Ok(false))
-            .unwrap();
-        thread.join().unwrap();
-    }
-
-    #[test]
-    #[ignore = "waits 125 seconds to cover the former 120-second low-speed timeout"]
-    fn accepts_a_model_response_after_more_than_two_minutes_of_silence() {
-        let (url, server) = server(|mut stream| {
-            thread::sleep(Duration::from_secs(125));
-            stream
-                .write_all(
-                    b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"type\":\"end\"}\n\n",
-                )
-                .unwrap();
-        });
-        let mut events = Vec::new();
-        Http::new()
-            .stream(
+        let mut fetch = |reply: &'static [u8], emit: fn(Value) -> io::Result<bool>| {
+            let (url, thread) = server(move |mut stream| stream.write_all(reply).unwrap());
+            let wake = crate::sys::new().unwrap();
+            let result = http.stream(
                 &url,
                 &[],
                 b"{}",
-                crate::eventfd::new().unwrap().as_raw_fd(),
+                wake.as_raw_fd(),
                 &AtomicBool::new(false),
-                |event| {
-                    events.push(event);
-                    Ok(false)
-                },
-            )
-            .unwrap();
-        assert_eq!(events, [serde_json::json!({"type":"end"})]);
-        server.join().unwrap();
+                emit,
+            );
+            thread.join().unwrap();
+            result
+        };
+        let error = fetch(
+            b"HTTP/1.1 429 Too Many Requests\r\nContent-Length: 19\r\n\r\ngateway unavailable",
+            |_| panic!("HTTP error emitted as SSE"),
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "Agent HTTP 429: gateway unavailable");
+        let ok = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {}\n\n";
+        let error = fetch(ok, |_| Err(io::Error::other("receiver full"))).unwrap_err();
+        assert_eq!(error.to_string(), "receiver full");
+        let unfinished = b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\ndata: {\"unfinished\":";
+        let error = fetch(unfinished, |_| Ok(false)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
+        fetch(ok, |_| Ok(false)).unwrap();
     }
 
     #[test]
     fn cancellation_wakes_and_closes_an_idle_transfer() {
-        let wake = Arc::new(crate::eventfd::new().unwrap());
+        let wake = Arc::new(crate::sys::new().unwrap());
         let canceled = Arc::new(AtomicBool::new(false));
         let (ready, received) = mpsc::channel();
         let (url, server) = server(move |mut stream| {

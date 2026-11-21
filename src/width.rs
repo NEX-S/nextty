@@ -2,12 +2,11 @@
 
 #[path = "width_tables.rs"]
 mod tables;
-#[cfg(any(feature = "gui", feature = "tui", test))]
 use std::borrow::Cow;
 use tables::*;
 
-/// Width of one scalar, with C0/C1 controls mapped to zero. U+17D8 has width 3.
-/// The terminal grid applies its own two-column clamp at the call site.
+/// Terminal columns of one scalar, with C0/C1 controls mapped to zero. The table gives U+17D8
+/// width 3; a cell holds at most two columns.
 pub fn scalar_width(ch: char) -> u8 {
     if ch.is_ascii() {
         return u8::from(!ch.is_ascii_control());
@@ -15,20 +14,18 @@ pub fn scalar_width(ch: char) -> u8 {
     let cp = ch as usize;
     let page = usize::from(WIDTH_PAGES[cp >> 8]);
     let packed = WIDTH_DATA[page][(cp >> 2) & 63];
-    (packed >> ((cp & 3) * 2)) & 3
+    ((packed >> ((cp & 3) * 2)) & 3).min(2)
 }
 
-#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn text_width(text: &str) -> usize {
     let prefix = printable_ascii_prefix(text.as_bytes());
     prefix
         + text[prefix..]
             .chars()
-            .map(|c| usize::from(scalar_width(c).min(2)))
+            .map(|c| usize::from(scalar_width(c)))
             .sum::<usize>()
 }
 
-#[cfg(any(feature = "gui", feature = "tui", test))]
 pub(crate) fn printable_ascii_prefix(bytes: &[u8]) -> usize {
     // Whole blocks can vectorize; keep early exit for the remaining bytes.
     let prefix = bytes
@@ -48,58 +45,34 @@ pub(crate) fn printable_ascii_prefix(bytes: &[u8]) -> usize {
 }
 
 /// One clipping policy keeps the GUI and TUI header labels on the same columns.
-#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn fit_label(text: &str, columns: u16) -> Cow<'_, str> {
-    let columns = usize::from(columns);
-    // With widths capped at two columns, UTF-8 byte length is an upper bound.
-    if text.len() <= columns
-        && !text[printable_ascii_prefix(text.as_bytes())..]
-            .chars()
-            .any(char::is_control)
-    {
-        return Cow::Borrowed(text.trim_end());
-    }
-    let end = text.len().min(columns);
-    // A non-ASCII scalar at the boundary may extend the label without using a column.
-    if end < text.len()
-        && text.as_bytes()[end].is_ascii()
-        && printable_ascii_prefix(&text.as_bytes()[..end]) == end
-    {
-        return Cow::Borrowed(text[..end].trim_end());
-    }
-    let mut used = 0usize;
+    let mut used = 0;
     let mut end = 0;
-    let mut controls = false;
     for ch in text.chars() {
-        let control = ch.is_control();
-        used += if control {
+        used += if ch.is_control() {
             1
         } else {
-            usize::from(scalar_width(ch).min(2))
+            usize::from(scalar_width(ch))
         };
-        if used > columns {
+        if used > usize::from(columns) {
             break;
         }
-        controls |= control;
         end += ch.len_utf8();
     }
     let text = &text[..end];
-    if !controls {
+    if !text.chars().any(char::is_control) {
         return Cow::Borrowed(text.trim_end());
     }
-    let mut label = String::with_capacity(text.len());
-    label.extend(
-        text.chars()
-            .map(|ch| if ch.is_control() { ' ' } else { ch }),
-    );
+    let mut label: String = text
+        .chars()
+        .map(|ch| if ch.is_control() { ' ' } else { ch })
+        .collect();
     label.truncate(label.trim_end().len());
     Cow::Owned(label)
 }
 
-#[cfg(any(feature = "gui", feature = "tui", test))]
 pub fn fit_middle(text: &str, columns: u16) -> Cow<'_, str> {
-    let prefix = printable_ascii_prefix(text.as_bytes());
-    let clean = if text[prefix..].chars().any(char::is_control) {
+    let clean = if text.chars().any(char::is_control) {
         Cow::Owned(
             text.chars()
                 .map(|ch| if ch.is_control() { ' ' } else { ch })
@@ -108,9 +81,7 @@ pub fn fit_middle(text: &str, columns: u16) -> Cow<'_, str> {
     } else {
         Cow::Borrowed(text)
     };
-    if clean.len() <= usize::from(columns)
-        || prefix <= usize::from(columns) && text_width(&clean) <= usize::from(columns)
-    {
+    if text_width(&clean) <= usize::from(columns) {
         return clean;
     }
     if columns == 0 {
@@ -122,7 +93,7 @@ pub fn fit_middle(text: &str, columns: u16) -> Cow<'_, str> {
     let mut used = 0;
     let mut start = clean.len();
     for (index, ch) in clean.char_indices().rev() {
-        let width = usize::from(scalar_width(ch).min(2));
+        let width = usize::from(scalar_width(ch));
         if used + width > right {
             break;
         }
@@ -163,7 +134,7 @@ mod tests {
     }
 
     #[test]
-    fn scalar_policy_includes_unicode_17_and_width_three() {
+    fn scalar_policy_includes_unicode_17_and_clamps_width_three() {
         for (ch, expected) in [
             ('a', 1),
             ('中', 2),
@@ -171,21 +142,17 @@ mod tests {
             ('\u{115f}', 2),
             ('\u{1160}', 0),
             ('\u{17a4}', 2),
-            ('\u{17d8}', 3),
+            ('\u{17d8}', 2),
             ('\u{2d7f}', 1),
             ('\u{1faea}', 2),
             ('\u{1f1e6}', 1),
             ('\0', 0),
             ('\u{85}', 0),
+            ('\u{5c8}', 0),
+            ('\u{18e00}', 2),
+            ('\u{1facc}', 2),
         ] {
             assert_eq!(scalar_width(ch), expected, "{ch:?}");
         }
-    }
-
-    #[test]
-    fn unicode_18_additions_use_the_current_scalar_properties() {
-        assert_eq!(scalar_width('\u{5c8}'), 0);
-        assert_eq!(scalar_width('\u{18e00}'), 2);
-        assert_eq!(scalar_width('\u{1facc}'), 2);
     }
 }

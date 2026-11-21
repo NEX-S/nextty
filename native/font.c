@@ -1,3 +1,4 @@
+#define _GNU_SOURCE
 #include "font.h"
 #include "font_data.h"
 #include <cairo-ft.h>
@@ -67,11 +68,6 @@ static int installed_family(NtFonts *f, const char *family) {
     if (!strcmp(family, "monospace")) return 1;
     FcPattern *query = FcPatternCreate();
     FcObjectSet *objects = FcObjectSetBuild(FC_FAMILY, NULL);
-    if (!query || !objects) {
-        if (query) FcPatternDestroy(query);
-        if (objects) FcObjectSetDestroy(objects);
-        return fail(f, "Cannot allocate Fontconfig font query");
-    }
     FcPatternAddString(query, FC_FAMILY, (const FcChar8 *)family);
     FcFontSet *set = FcFontList(f->config, query, objects);
     int found = 0;
@@ -121,7 +117,6 @@ static Style *style(NtFonts *f, unsigned flags) {
     Style *s = &f->styles[flags];
     if (s->set) return s;
     s->query = FcPatternCreate();
-    if (!s->query) { fail(f, "Cannot allocate font pattern"); return NULL; }
     FcPatternAddString(s->query, FC_FAMILY, (const FcChar8 *)(flags & 4 ? "emoji" : f->family));
     FcPatternAddDouble(s->query, FC_PIXEL_SIZE, f->size * f->scale);
     FcPatternAddInteger(s->query, FC_WEIGHT, flags & 1 ? FC_WEIGHT_BOLD : FC_WEIGHT_REGULAR);
@@ -132,12 +127,8 @@ static Style *style(NtFonts *f, unsigned flags) {
     FcDefaultSubstitute(s->query);
     FcResult result;
     s->set = FcFontSort(f->config, s->query, FcFalse, NULL, &result);
-    if (!s->set || !s->set->nfont) {
-        fail(f, "Fontconfig could not load font_family \"%s\"", f->family);
-        return NULL;
-    }
+    if (!s->set || !s->set->nfont) return s; /* nt_fonts_new rejects a family without fonts. */
     s->fonts = calloc((size_t)s->set->nfont, sizeof *s->fonts);
-    if (!s->fonts) { fail(f, "Cannot allocate fallback fonts"); return NULL; }
     for (int i = 0; i < s->set->nfont; ++i) {
         if (FcPatternGetCharSet(s->set->fonts[i], FC_CHARSET, 0, &s->fonts[i].charset) != FcResultMatch)
             s->fonts[i].charset = NULL;
@@ -202,14 +193,11 @@ failed:
     return NULL;
 }
 
-int nt_fonts_scale(NtFonts *f, double scale) {
-    if (!isfinite(scale) || scale <= 0 || f->size * scale > INT_MAX / 1024.0)
-        return fail(f, "Invalid window/font scale %.6g", scale);
+void nt_fonts_scale(NtFonts *f, double scale) {
     if (scale != f->scale) {
         clear_styles(f);
         f->scale = scale;
     }
-    return 1;
 }
 
 void nt_fonts_metrics(const NtFonts *f, float *width, float *height) {
@@ -219,25 +207,23 @@ void nt_fonts_metrics(const NtFonts *f, float *width, float *height) {
 
 NtFonts *nt_fonts_new(const char *family, float size, char *error, size_t error_size) {
     NtFonts *f = calloc(1, sizeof *f);
-    if (!f) { snprintf(error, error_size, "Cannot allocate font owner"); return NULL; }
     f->error = error;
     f->error_size = error_size;
     f->size = size;
     f->scale = 1;
-    if (!nt_fonts_scale(f, 1)) goto failed;
     f->buffer = hb_buffer_create();
     hb_buffer_set_flags(f->buffer, HB_BUFFER_FLAG_REMOVE_DEFAULT_IGNORABLES);
-    f->family = malloc(strlen(family) + 1);
-    if (!f->family) { fail(f, "Cannot allocate font family"); goto failed; }
-    strcpy(f->family, family);
+    f->family = strdup(family);
     f->config = FcConfigReference(FcConfigGetCurrent());
-    if (!f->config) { fail(f, "Cannot initialize Fontconfig"); goto failed; }
     if (!installed_family(f, family)) goto failed;
     f->options = cairo_font_options_create();
     cairo_font_options_set_antialias(f->options, CAIRO_ANTIALIAS_GRAY);
     cairo_font_options_set_hint_style(f->options, CAIRO_HINT_STYLE_SLIGHT);
     Style *s = style(f, 0);
-    if (!s) goto failed;
+    if (!s->set || !s->set->nfont) {
+        fail(f, "Fontconfig could not load font_family \"%s\"", family);
+        goto failed;
+    }
     Font *font = NULL;
     for (int i = 0; i < s->set->nfont; ++i) {
         FcCharSet *charset = s->fonts[i].charset;
@@ -289,7 +275,6 @@ static Font *find_cluster_font(NtFonts *f, const FriBidiChar *codes, Character *
     }
     for (int pass = 0; pass <= emoji; ++pass) {
         Style *s = style(f, flags | (emoji && !pass ? 4 : 0));
-        if (!s) return NULL;
         for (int i = 0; i < s->set->nfont; ++i) {
             FcCharSet *charset = s->fonts[i].charset;
             if (!charset) continue;
@@ -301,7 +286,6 @@ static Font *find_cluster_font(NtFonts *f, const FriBidiChar *codes, Character *
     }
     /* Keep the base visible when no font covers all combining characters. */
     Style *s = style(f, flags);
-    if (!s) return NULL;
     for (int i = 0; i < s->set->nfont; ++i) {
         FcCharSet *charset = s->fonts[i].charset;
         if (charset && FcCharSetHasChar(charset, codes[start])) return load_font(f, s, i);
@@ -354,7 +338,6 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     *glyphs = NULL;
     *count = 0;
     if (!length) return 1;
-    if (length > INT_MAX) return fail(f, "Terminal line is too long to shape");
     size_t ascii_end = 0;
     while (ascii_end < length && (unsigned char)text[ascii_end] >= 0x20 &&
            (unsigned char)text[ascii_end] <= 0x7e) ++ascii_end;
@@ -366,13 +349,10 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
     }
     size_t item_size = sizeof(Character) + sizeof(FriBidiChar) + sizeof(FriBidiLevel) +
         (printable_ascii ? 0 : sizeof(FriBidiCharType) + sizeof(FriBidiBracketType));
-    if (characters > SIZE_MAX / item_size) return fail(f, "Line itemization is too large");
     /* Keep the character, code and bidi arrays in one scratch allocation. */
     if (characters * item_size > f->scratch_size) {
-        void *grown = realloc(f->scratch, characters * item_size);
-        if (!grown) return fail(f, "Cannot allocate line itemization");
-        f->scratch = grown;
         f->scratch_size = characters * item_size;
+        f->scratch = realloc(f->scratch, f->scratch_size);
     }
     Character *chars = f->scratch;
     FriBidiChar *codes = (FriBidiChar *)(chars + characters);
@@ -392,7 +372,6 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         if (!printable_ascii) {
             if (decoded >= 0x80) {
                 bytes = utf8proc_iterate((const uint8_t *)text + byte, (ptrdiff_t)(length - byte), &decoded);
-                if (bytes < 0) { fail(f, "Cannot decode terminal text: %s", utf8proc_errmsg(bytes)); goto failed; }
             }
             script = hb_unicode_script(unicode, (uint32_t)decoded);
             if (script != HB_SCRIPT_COMMON && script != HB_SCRIPT_INHERITED && script != HB_SCRIPT_UNKNOWN) previous = script;
@@ -422,9 +401,8 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         fribidi_get_bidi_types(codes, (FriBidiStrIndex)n, types);
         fribidi_get_bracket_types(codes, (FriBidiStrIndex)n, types, brackets);
         FriBidiParType base = FRIBIDI_PAR_ON;
-        if (!fribidi_get_par_embedding_levels_ex(types, brackets, (FriBidiStrIndex)n, &base, levels)) {
-            fail(f, "FriBidi could not itemize terminal line"); goto failed;
-        }
+        if (!fribidi_get_par_embedding_levels_ex(types, brackets, (FriBidiStrIndex)n, &base, levels))
+            return fail(f, "FriBidi could not itemize terminal line");
         hb_script_t next = HB_SCRIPT_LATIN;
         for (size_t i = n; i--;) {
             if (chars[i].script == HB_SCRIPT_UNKNOWN) chars[i].script = next;
@@ -435,12 +413,12 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         size_t end = i + 1;
         while (end < n && chars[end].cluster == i) ++end;
         Font *font = cluster_font(f, codes, chars, i, end, chars[i].flags);
-        if (!font) goto failed;
+        if (!font) return 0;
         for (size_t j = i; j < end; ++j) {
             if (chars[j].flags == chars[i].flags) chars[j].font = font;
             else {
                 chars[j].font = cluster_font(f, codes, chars, i, end, chars[j].flags);
-                if (!chars[j].font) goto failed;
+                if (!chars[j].font) return 0;
             }
         }
         i = end;
@@ -465,7 +443,6 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         unsigned shaped;
         hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &shaped);
         hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(buffer, NULL);
-        if (!hb_buffer_allocation_successful(buffer)) { fail(f, "HarfBuzz could not allocate shaped line"); goto failed; }
         /* The terminal column map uses UTF-8 byte offsets. */
         if (!printable_ascii)
             for (unsigned j = 0; j < shaped; ++j) info[j].cluster = chars[info[j].cluster].byte;
@@ -498,9 +475,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
                 if (used == capacity) {
                     size_t needed = used + shaped - j;
                     capacity = capacity * 2 > needed ? capacity * 2 : needed;
-                    NtFontGlyph *grown = realloc(out, capacity * sizeof *out);
-                    if (!grown) { fail(f, "Cannot allocate line glyphs"); goto failed; }
-                    out = grown;
+                    out = realloc(out, capacity * sizeof *out);
                 }
                 if (!used || out[used - 1].font != font->cairo) cairo_scaled_font_reference(font->cairo);
                 out[used++] = (NtFontGlyph){ .font = font->cairo, .glyph = info[j].codepoint,
@@ -514,15 +489,8 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         font->blank_glyph = blank_glyph;
         start = end;
     }
-    if (used < capacity / 2) {
-        NtFontGlyph *trimmed = realloc(out, used * sizeof *out);
-        if (!trimmed) { fail(f, "Cannot allocate line glyphs"); goto failed; }
-        out = trimmed;
-    }
+    if (used < capacity / 2) out = realloc(out, used * sizeof *out);
     *glyphs = out;
     *count = used;
     return 1;
-failed:
-    nt_font_glyphs_free(out, used);
-    return 0;
 }

@@ -31,21 +31,13 @@ pub(crate) struct Markdown {
 
 impl Markdown {
     fn push(&mut self, text: &str, style: u8) {
-        let mut chars = text[crate::width::printable_ascii_prefix(text.as_bytes())..].chars();
-        if let Some(control) = chars.find(|ch| ch.is_control() && *ch != '\n') {
-            let prefix = text.len() - chars.as_str().len() - control.len_utf8();
-            self.text.push_str(&text[..prefix]);
-            self.text.push(' ');
-            self.text.extend(chars.map(|ch| {
-                if ch.is_control() && ch != '\n' {
-                    ' '
-                } else {
-                    ch
-                }
-            }));
-        } else {
-            self.text.push_str(text);
-        }
+        self.text.extend(text.chars().map(|ch| {
+            if ch.is_control() && ch != '\n' {
+                ' '
+            } else {
+                ch
+            }
+        }));
         if let Some((end, previous)) = self.spans.last_mut()
             && *previous == style
         {
@@ -252,7 +244,7 @@ impl Markdown {
         let mut events =
             Parser::new_ext(&source[offset..], Options::ENABLE_TABLES).into_offset_iter();
         while let Some((event, range)) = events.next() {
-            if reusable && styles.len() == 1 && !matches!(&event, Event::End(_)) {
+            if styles.len() == 1 && !matches!(&event, Event::End(_)) {
                 let start = offset + range.start;
                 let start = source[..start]
                     .rfind(['\r', '\n'])
@@ -414,6 +406,12 @@ mod tests {
                 previous = Some((text, incremental));
             }
         }
+        let linked = "[x](https://example.com)\n\n";
+        let linked = Markdown::render(linked, None);
+        let source = "[x](https://example.com)\n\nplain\n\nnext";
+        let appended = Markdown::render(source, Some(("[x](https://example.com)\n\n", &linked)));
+        assert_eq!(appended.text, Markdown::render(source, None).text);
+        assert!(appended.prefix.is_some());
         let old_source = "old paragraph\n\nlast";
         let old = Markdown::render(old_source, None);
         let changed = "new paragraph\n\nlast";

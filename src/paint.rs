@@ -1,7 +1,6 @@
 use crate::native::{Line, Renderer, Run};
 use crate::{
     core::{Flags, Point},
-    error::Result,
     screen::Screen,
     vt::{Color, CursorShape, NamedColor},
     width::scalar_width,
@@ -14,23 +13,16 @@ pub fn text_columns(text: &str) -> Vec<u16> {
     if prefix == text.len() {
         return Vec::new();
     }
-    let mut result = Vec::with_capacity(text.len());
-    result.extend((0..prefix).map(|column| column as u16));
+    let mut result: Vec<u16> = (0..prefix as u16).collect();
     let (mut column, mut previous) = (prefix, prefix.saturating_sub(1));
     for ch in text[prefix..].chars() {
-        let width = usize::from(scalar_width(ch).min(2));
-        result.resize(
-            result.len() + ch.len_utf8(),
-            if width == 0 {
-                previous as u16
-            } else {
-                column as u16
-            },
-        );
+        let width = usize::from(scalar_width(ch));
+        let owner = if width == 0 { previous } else { column };
+        result.extend(std::iter::repeat_n(owner as u16, ch.len_utf8()));
         if width != 0 {
             previous = column;
+            column += width;
         }
-        column += width;
     }
     result
 }
@@ -60,22 +52,15 @@ struct Row {
 }
 
 struct CachedRow {
-    text: Box<str>,
-    columns: Box<[u16]>,
+    row: Row,
     line: Option<Line>,
-    runs: Vec<StyleRun>,
 }
 
 impl CachedRow {
     fn matches(&self, row: &Row) -> bool {
-        self.text.as_ref() == row.text
-            && self.columns.as_ref() == row.columns.as_slice()
-            && (self
-                .runs
-                .iter()
-                .map(|run| run.text)
-                .eq(row.runs.iter().map(|run| run.text))
-                || text_runs(&self.runs).eq(text_runs(&row.runs)))
+        self.row.text == row.text
+            && self.row.columns == row.columns
+            && text_runs(&self.row.runs).eq(text_runs(&row.runs))
     }
 }
 
@@ -132,6 +117,12 @@ impl Frame {
                 }
             }
         }
+        let text_style = Flags::BOLD
+            | Flags::ITALIC
+            | Flags::DIM
+            | Flags::INVERSE
+            | Flags::ALL_UNDERLINES
+            | Flags::STRIKEOUT;
         let mut rows = Vec::with_capacity(term.dirty_rows().count());
         for index in term.dirty_rows() {
             let line = index as i32 - term.display_offset() as i32;
@@ -154,11 +145,8 @@ impl Frame {
                 end = end.max(column + 1);
             }
             let end = end.min(columns);
-            let previous = cache.rows.get(index);
-            let mut text =
-                String::with_capacity(previous.map_or(end, |row| end.max(row.text.len())));
-            let previous_runs = previous.map_or(0, |row| row.runs.len());
-            let mut runs: Vec<StyleRun> = Vec::with_capacity(previous_runs.min(end));
+            let mut text = String::with_capacity(end);
+            let mut runs: Vec<StyleRun> = Vec::new();
             let mut column_map = Vec::new();
             let mut previous_style = None;
             for (column, cell, extra) in data.cells_with_extras(0..end) {
@@ -186,7 +174,7 @@ impl Frame {
                     }
                     column_map.extend(std::iter::repeat_n(column as u16, text.len() - start));
                 }
-                let flags = cell.flags & Flags::TEXT_STYLE;
+                let flags = cell.flags & text_style;
                 let underline_color = extra.and_then(|extra| extra.underline_color);
                 let style = (
                     cell.fg,
@@ -275,45 +263,6 @@ impl Frame {
         }
     }
 
-    fn align_cache(&self, cache: &mut LineCache) {
-        if cache.rows.len() != self.row_count || cache.columns != self.columns {
-            return;
-        }
-        for rows in self.rows.chunk_by(|a, b| a.index + 1 == b.index) {
-            if rows.len() == 1 {
-                continue;
-            }
-            let cached = &mut cache.rows[rows[0].index..rows[0].index + rows.len()];
-            let mut changed = rows
-                .iter()
-                .enumerate()
-                .filter(|(new, row)| !cached[*new].matches(row))
-                .peekable();
-            let found = changed.next().and_then(|(new, row)| {
-                if let Some(old) = cached.iter().position(|cached| cached.matches(row)) {
-                    return Some((new, old));
-                }
-                changed.peek()?;
-                let mut indexed: Vec<_> = cached.iter().enumerate().collect();
-                // Preserve the first matching cache entry when text repeats.
-                indexed.sort_unstable_by_key(|(index, row)| (&row.text, *index));
-                changed.find_map(|(new, row)| {
-                    let start = indexed
-                        .partition_point(|(_, cached)| cached.text.as_ref() < row.text.as_str());
-                    indexed[start..]
-                        .iter()
-                        .take_while(|(_, cached)| cached.text.as_ref() == row.text)
-                        .find(|(_, cached)| cached.matches(row))
-                        .map(|(old, _)| (new, *old))
-                })
-            });
-            if let Some((new, old)) = found {
-                let count = cached.len();
-                cached.rotate_left((old + count - new) % count);
-            }
-        }
-    }
-
     pub fn paint(
         self,
         cell: (f32, f32),
@@ -322,29 +271,23 @@ impl Frame {
         renderer: &Renderer,
         origin: (f32, f32),
         size: (f32, f32),
-    ) -> Result<()> {
-        self.align_cache(cache);
+    ) {
         cache.rows.truncate(self.row_count);
         let mut native_runs = smallvec::SmallVec::<[Run; 4]>::new();
         for row in self.rows {
             if let Some(cached) = cache.rows.get_mut(row.index)
                 && cached.matches(&row)
             {
-                cached.runs = row.runs;
+                cached.row.runs = row.runs;
                 continue;
             }
             native_runs.clear();
             native_runs.extend(text_runs(&row.runs));
             let line = (!row.text.is_empty())
-                .then(|| renderer.shape(&row.text, &native_runs, &row.columns))
-                .transpose()?;
-            let cached = CachedRow {
-                text: row.text.into_boxed_str(),
-                columns: row.columns.into_boxed_slice(),
-                line,
-                runs: row.runs,
-            };
-            if let Some(slot) = cache.rows.get_mut(row.index) {
+                .then(|| renderer.shape(&row.text, &native_runs, &row.columns));
+            let index = row.index;
+            let cached = CachedRow { row, line };
+            if let Some(slot) = cache.rows.get_mut(index) {
                 *slot = cached;
             } else {
                 cache.rows.push(cached);
@@ -355,6 +298,7 @@ impl Frame {
         for (row, data) in cache.rows.iter().enumerate() {
             let y = origin.1 + cell.1 * row as f32;
             for runs in data
+                .row
                 .runs
                 .chunk_by(|a, b| a.background == b.background && a.end == b.start)
             {
@@ -370,7 +314,7 @@ impl Frame {
                     if row + 1 == self.row_count {
                         height += (size.1 - cell.1 * self.row_count as f32).max(0.);
                     }
-                    renderer.rect(x, y, width, height, color.get(), false);
+                    renderer.rect(x, y, width, height, color.get());
                 }
             }
             // Cell backgrounds fill the pane's remainder; the cursor stays on the grid.
@@ -384,28 +328,23 @@ impl Frame {
                     cell.0 * width as f32,
                     cell.1,
                     self.cursor_color,
-                    false,
                 );
             }
             if let Some(line) = &data.line {
                 renderer.line(line, origin.0, y);
             }
-            for run in &data.runs {
+            for run in &data.row.runs {
                 let x = origin.0 + cell.0 * run.start as f32;
                 let width = cell.0 * (run.end - run.start) as f32;
                 if let Some(color) = run.underline {
-                    let wave = run.decorations.contains(Flags::UNDERCURL);
-                    renderer.rect(
-                        x,
-                        y + cell.1 - if wave { 4. } else { 2. },
-                        width,
-                        if wave { 3. } else { 1. },
-                        color.get(),
-                        wave,
-                    );
+                    if run.decorations.contains(Flags::UNDERCURL) {
+                        renderer.undercurl(x, y + cell.1 - 4., width, 3., color.get());
+                    } else {
+                        renderer.rect(x, y + cell.1 - 2., width, 1., color.get());
+                    }
                 }
                 if run.decorations.contains(Flags::STRIKEOUT) {
-                    renderer.rect(x, y + cell.1 * 0.55, width, 1., run.text.color, false);
+                    renderer.rect(x, y + cell.1 * 0.55, width, 1., run.text.color);
                 }
             }
         }
@@ -414,21 +353,20 @@ impl Frame {
             let y = origin.1 + cell.1 * row as f32;
             let width = cell.0 * width as f32;
             if !focused {
-                renderer.rect(x, y, width, 1., self.cursor_color, false);
-                renderer.rect(x, y + cell.1 - 1., width, 1., self.cursor_color, false);
-                renderer.rect(x, y, 1., cell.1, self.cursor_color, false);
-                renderer.rect(x + width - 1., y, 1., cell.1, self.cursor_color, false);
+                renderer.rect(x, y, width, 1., self.cursor_color);
+                renderer.rect(x, y + cell.1 - 1., width, 1., self.cursor_color);
+                renderer.rect(x, y, 1., cell.1, self.cursor_color);
+                renderer.rect(x + width - 1., y, 1., cell.1, self.cursor_color);
             } else {
                 match shape {
-                    CursorShape::Beam => renderer.rect(x, y, 2., cell.1, self.cursor_color, false),
+                    CursorShape::Beam => renderer.rect(x, y, 2., cell.1, self.cursor_color),
                     CursorShape::Underline => {
-                        renderer.rect(x, y + cell.1 - 2., width, 2., self.cursor_color, false)
+                        renderer.rect(x, y + cell.1 - 2., width, 2., self.cursor_color)
                     }
                     _ => (),
                 }
             }
         }
-        Ok(())
     }
 }
 
@@ -443,24 +381,25 @@ mod tests {
         vt::Parser,
     };
 
+    fn core(num_cols: u16, num_lines: u16, foreground: u32, background: u32) -> Core {
+        let size = WindowSize {
+            num_cols,
+            num_lines,
+            cell_width: 8,
+            cell_height: 16,
+        };
+        Core::new(size, foreground, background)
+    }
+
     fn frame(core: &Core) -> Frame {
         let mut screen = Screen::default();
-        screen.apply(Update::capture(core, true)).unwrap();
+        screen.apply(Update::capture(core, true));
         Frame::new(&mut screen, &LineCache::default(), true, false)
     }
 
     #[test]
     fn bottom_right_block_cursor_is_separate_from_the_cell_background() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 4,
-                num_lines: 2,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            0xcccccc,
-            0x202020,
-        );
+        let mut core = core(4, 2, 0xcccccc, 0x202020);
         Parser::new().advance(&mut core, b"\x1b[2;4HX\x1b[2;4H\x1b[2 q");
         let focused = frame(&core);
         assert_eq!(focused.cursor, Some((3, 1, CursorShape::Block, 1)));
@@ -469,7 +408,7 @@ mod tests {
         assert!(run.background.is_none());
 
         let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
+        screen.apply(Update::capture(&core, true));
         let unfocused = Frame::new(&mut screen, &LineCache::default(), false, false);
         let run = unfocused.rows[1].runs.last().unwrap();
         assert_eq!(run.text.color, 0xccccccff);
@@ -478,16 +417,7 @@ mod tests {
 
     #[test]
     fn dimmed_foreground_becomes_the_background_after_inverse() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 4,
-                num_lines: 1,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            0xffffff,
-            0,
-        );
+        let mut core = core(4, 1, 0xffffff, 0);
         Parser::new().advance(&mut core, b"\x1b[2;7;38;2;255;0;0;48;2;32;48;64mX");
         let frame = frame(&core);
         let style = &frame.rows[0].runs[0];
@@ -509,58 +439,6 @@ mod tests {
     }
 
     #[test]
-    fn partial_scroll_reuses_shaping_without_moving_undamaged_rows() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 20,
-                num_lines: 8,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        let mut parser = Parser::new();
-        parser.advance(
-            &mut core,
-            b"\x1b[?25lheader\r\nguard\r\nA\r\nB\r\nC\r\nD\r\nE\r\nfooter\x1b[3;7r\x1b[7;1H",
-        );
-        let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true)).unwrap();
-        core.reset_damage();
-        let initial = Frame::new(&mut screen, &LineCache::default(), true, false);
-        let mut cache = LineCache {
-            rows: initial
-                .rows
-                .into_iter()
-                .map(|row| CachedRow {
-                    text: row.text.into_boxed_str(),
-                    columns: row.columns.into_boxed_slice(),
-                    line: None,
-                    runs: row.runs,
-                })
-                .collect(),
-            columns: initial.columns,
-            block_cursor: initial.block_cursor,
-        };
-        parser.advance(&mut core, b"\x1b7\x1b[H#\x1b8\r\nF");
-        screen.apply(Update::capture(&core, false)).unwrap();
-        let scrolled = Frame::new(&mut screen, &cache, true, false);
-        scrolled.align_cache(&mut cache);
-        assert_eq!(
-            scrolled
-                .rows
-                .iter()
-                .filter(|row| !cache.rows[row.index].matches(row))
-                .map(|row| row.text.as_str())
-                .collect::<Vec<_>>(),
-            ["#eader", "F"]
-        );
-        assert_eq!(cache.rows[1].text.as_ref(), "guard");
-        assert_eq!(cache.rows[7].text.as_ref(), "footer");
-    }
-
-    #[test]
     fn blank_tail_preserves_visible_decorations_and_wide_text() {
         for (input, expected) in [
             ("abc\x1b[31m  ", "abc"),
@@ -572,16 +450,7 @@ mod tests {
             ("abc\u{3000}  ", "abc\u{3000}"),
         ] {
             let config = Config::default();
-            let mut core = Core::new(
-                WindowSize {
-                    num_cols: 12,
-                    num_lines: 2,
-                    cell_width: 10,
-                    cell_height: 22,
-                },
-                config.foreground,
-                config.background,
-            );
+            let mut core = core(12, 2, config.foreground, config.background);
             Parser::new().advance(&mut core, format!("\x1b[?25l{input}").as_bytes());
             let frame = frame(&core);
             assert_eq!(frame.rows[0].text, expected);
@@ -598,16 +467,7 @@ mod tests {
     #[test]
     fn blank_tail_keeps_multiline_selection_and_the_cursor_at_the_edge() {
         use crate::core::{Point, SelectionType, Side};
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 21,
-                num_lines: 3,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            0xcccccc,
-            0x202020,
-        );
+        let mut core = core(21, 3, 0xcccccc, 0x202020);
         let mut parser = Parser::new();
         parser.advance(&mut core, b"\x1b[?25l");
         core.selection_start(
@@ -640,20 +500,10 @@ mod tests {
     }
 
     #[test]
-
     fn prompt_cells_do_not_gain_selection_background() {
         use crate::core::{Point, SelectionType, Side};
         let config = Config::default();
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 16,
-                num_lines: 2,
-                cell_width: 10,
-                cell_height: 22,
-            },
-            config.foreground,
-            config.background,
-        );
+        let mut core = core(16, 2, config.foreground, config.background);
         Parser::new().advance(
             &mut core,
             "\x1b[?25l\x1b]133;A\x07 • \x1b]133;B\x07echo".as_bytes(),
@@ -679,18 +529,8 @@ mod tests {
     }
 
     #[test]
-
     fn right_prompt_shaping_and_decorations_keep_terminal_columns() {
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 21,
-                num_lines: 2,
-                cell_width: 10,
-                cell_height: 22,
-            },
-            0xcccccc,
-            0x202020,
-        );
+        let mut core = core(21, 2, 0xcccccc, 0x202020);
         Parser::new().advance(&mut core, "\x1b]133;A\x07 • \x1b]133;B\x07cmd\x1b[1;19H\x1b[44;4m\x1b]133;P;2\x07中a\u{301}\x1b]133;P;0\x07\x1b[0m\x1b[1;4H".as_bytes());
         let frame = frame(&core);
         let row = &frame.rows[0];

@@ -29,31 +29,12 @@ pub(crate) mod keysym {
     mod gui {
         pub const KP_TAB: u32 = 0xff89;
         pub const KP_F1: u32 = 0xff91;
-        pub const KP_F2: u32 = 0xff92;
-        pub const KP_F3: u32 = 0xff93;
         pub const KP_F4: u32 = 0xff94;
         pub const KP_HOME: u32 = 0xff95;
-        pub const KP_LEFT: u32 = 0xff96;
-        pub const KP_UP: u32 = 0xff97;
-        pub const KP_RIGHT: u32 = 0xff98;
-        pub const KP_DOWN: u32 = 0xff99;
-        pub const KP_PAGE_UP: u32 = 0xff9a;
-        pub const KP_PAGE_DOWN: u32 = 0xff9b;
         pub const KP_END: u32 = 0xff9c;
         pub const KP_INSERT: u32 = 0xff9e;
         pub const KP_DELETE: u32 = 0xff9f;
         pub const F1: u32 = 0xffbe;
-        pub const F2: u32 = 0xffbf;
-        pub const F3: u32 = 0xffc0;
-        pub const F4: u32 = 0xffc1;
-        pub const F5: u32 = 0xffc2;
-        pub const F6: u32 = 0xffc3;
-        pub const F7: u32 = 0xffc4;
-        pub const F8: u32 = 0xffc5;
-        pub const F9: u32 = 0xffc6;
-        pub const F10: u32 = 0xffc7;
-        pub const F11: u32 = 0xffc8;
-        pub const F12: u32 = 0xffc9;
     }
 }
 
@@ -83,7 +64,6 @@ impl Key<'_> {
 pub(crate) enum PasteTarget {
     Search,
     Monitor,
-
     Agent(u64),
     Pane {
         pane: crate::workspace::PaneId,
@@ -95,19 +75,17 @@ pub(crate) enum PasteTarget {
 pub(crate) enum KeyResult {
     Unhandled,
     Handled,
-    Copy(String, bool),
+    Copy(String),
     Paste,
+    Quit,
 }
 
-#[cfg(any(feature = "tui", test))]
 #[derive(Default)]
 pub(crate) struct TextDecoder {
     pending: Vec<u8>,
 }
 
-#[cfg(any(feature = "tui", test))]
 impl TextDecoder {
-    #[cfg(feature = "tui")]
     pub fn clear(&mut self) {
         self.pending.clear();
     }
@@ -142,23 +120,6 @@ impl TextDecoder {
     }
 }
 
-pub(crate) fn without_controls(text: &str) -> Cow<'_, str> {
-    let mut chars = text[crate::width::printable_ascii_prefix(text.as_bytes())..].chars();
-    let Some(control) = chars.find(|ch| ch.is_control()) else {
-        return Cow::Borrowed(text);
-    };
-    let start = text.len() - chars.as_str().len() - control.len_utf8();
-    let Some(kept) = chars.find(|ch| !ch.is_control()) else {
-        return Cow::Borrowed(&text[..start]);
-    };
-    let mut filtered = String::with_capacity(text.len());
-    filtered.push_str(&text[..start]);
-    filtered.push(kept);
-    filtered.extend(chars.filter(|ch| !ch.is_control()));
-    Cow::Owned(filtered)
-}
-
-#[cfg(any(feature = "tui", test))]
 pub(crate) fn character_key(ch: char) -> (u32, u32) {
     match ch {
         '\0' => (32, CONTROL),
@@ -171,7 +132,6 @@ pub(crate) fn character_key(ch: char) -> (u32, u32) {
     }
 }
 
-#[cfg(any(feature = "tui", test))]
 pub(crate) fn sequence_key(bytes: &[u8]) -> Option<(u32, u32)> {
     Some(match bytes {
         b"\x1b" => (keysym::ESCAPE, 0),
@@ -225,17 +185,24 @@ pub fn key_bytes(
     let control = modifiers & CONTROL != 0;
     let modifier = 1 + u8::from(shift) + 2 * u8::from(alt) + 4 * u8::from(control);
 
+    // Keypad keys act as their main-block twins.
+    let symbol = match symbol {
+        keysym::KP_HOME..=keysym::KP_END => symbol - keysym::KP_HOME + keysym::HOME,
+        keysym::KP_F1..=keysym::KP_F4 => symbol - keysym::KP_F1 + keysym::F1,
+        keysym::KP_INSERT => keysym::INSERT,
+        keysym::KP_DELETE => keysym::DELETE,
+        keysym::KP_TAB => keysym::TAB,
+        _ => symbol,
+    };
+    let function = symbol.wrapping_sub(keysym::F1); // F1..F12 are consecutive
     let special = match symbol {
-        keysym::UP | keysym::KP_UP => Some((b'A', true)),
-        keysym::DOWN | keysym::KP_DOWN => Some((b'B', true)),
-        keysym::RIGHT | keysym::KP_RIGHT => Some((b'C', true)),
-        keysym::LEFT | keysym::KP_LEFT => Some((b'D', true)),
-        keysym::HOME | keysym::KP_HOME => Some((b'H', true)),
-        keysym::END | keysym::KP_END => Some((b'F', true)),
-        keysym::F1 | keysym::KP_F1 => Some((b'P', false)),
-        keysym::F2 | keysym::KP_F2 => Some((b'Q', false)),
-        keysym::F3 | keysym::KP_F3 => Some((b'R', false)),
-        keysym::F4 | keysym::KP_F4 => Some((b'S', false)),
+        keysym::UP => Some((b'A', true)),
+        keysym::DOWN => Some((b'B', true)),
+        keysym::RIGHT => Some((b'C', true)),
+        keysym::LEFT => Some((b'D', true)),
+        keysym::HOME => Some((b'H', true)),
+        keysym::END => Some((b'F', true)),
+        _ if function < 4 => Some((b'P' + function as u8, false)),
         _ => None,
     };
     if let Some((final_byte, cursor)) = special {
@@ -249,32 +216,22 @@ pub fn key_bytes(
     }
 
     let number = match symbol {
-        keysym::INSERT | keysym::KP_INSERT => Some(2),
-        keysym::DELETE | keysym::KP_DELETE => Some(3),
-        keysym::PAGE_UP | keysym::KP_PAGE_UP => Some(5),
-        keysym::PAGE_DOWN | keysym::KP_PAGE_DOWN => Some(6),
-        keysym::F5 => Some(15),
-        keysym::F6 => Some(17),
-        keysym::F7 => Some(18),
-        keysym::F8 => Some(19),
-        keysym::F9 => Some(20),
-        keysym::F10 => Some(21),
-        keysym::F11 => Some(23),
-        keysym::F12 => Some(24),
+        keysym::INSERT => Some(2),
+        keysym::DELETE => Some(3),
+        keysym::PAGE_UP => Some(5),
+        keysym::PAGE_DOWN => Some(6),
+        _ if (4..12).contains(&function) => {
+            Some([15, 17, 18, 19, 20, 21, 23, 24][function as usize - 4])
+        }
         _ => None,
     };
     if let Some(number) = number {
-        let mut bytes = Vec::with_capacity(7);
-        bytes.extend_from_slice(b"\x1b[");
-        if number >= 10 {
-            bytes.push(b'0' + number / 10);
-        }
-        bytes.push(b'0' + number % 10);
-        if modifier != 1 {
-            bytes.extend_from_slice(&[b';', b'0' + modifier]);
-        }
-        bytes.push(b'~');
-        return Some(bytes);
+        let modifier = if modifier == 1 {
+            String::new()
+        } else {
+            format!(";{modifier}")
+        };
+        return Some(format!("\x1b[{number}{modifier}~").into_bytes());
     }
 
     let mut utf8 = [0; 4];
@@ -289,8 +246,8 @@ pub fn key_bytes(
         }
         keysym::ESCAPE => b"\x1b",
         keysym::LEFT_TAB => b"\x1b[Z",
-        keysym::TAB | keysym::KP_TAB if shift => b"\x1b[Z",
-        keysym::TAB | keysym::KP_TAB => b"\t",
+        keysym::TAB if shift => b"\x1b[Z",
+        keysym::TAB => b"\t",
         _ if control => {
             let ch = symbol_char(symbol)?.to_ascii_lowercase();
             utf8[0] = match ch {
@@ -334,105 +291,31 @@ pub fn symbol_char(symbol: u32) -> Option<char> {
 
 #[cfg(feature = "gui")]
 pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
-    if !bracketed {
-        if !text.as_bytes().contains(&b'\n') {
-            return text.into_bytes();
-        }
-        let mut data = text.into_bytes();
-        let mut previous_cr = false;
-        data.retain_mut(|byte| {
-            let remove = previous_cr && *byte == b'\n';
-            previous_cr = *byte == b'\r';
-            if *byte == b'\n' {
-                *byte = b'\r';
-            }
-            !remove
-        });
-        return data;
+    if bracketed {
+        let text = text.replace('\x1b', "").replace("\r\n", "\n");
+        format!("\x1b[200~{text}\x1b[201~").into_bytes()
+    } else {
+        text.replace("\r\n", "\r").replace('\n', "\r").into_bytes()
     }
-
-    let split = memchr::memchr2(b'\r', 0x1b, text.as_bytes()).unwrap_or(text.len());
-    if split == text.len() {
-        return bracketed_plain(text.into_bytes());
-    }
-    let mut data = Vec::with_capacity(text.len() + 12);
-    data.extend_from_slice(b"\x1b[200~");
-    let text = text.as_bytes();
-    let (plain, text) = text.split_at(split);
-    data.extend_from_slice(plain);
-    let mut start = 0;
-    for index in memchr::memchr2_iter(b'\r', 0x1b, text) {
-        let byte = text[index];
-        if (byte == b'\r' && text.get(index + 1) == Some(&b'\n')) || byte == 0x1b {
-            data.extend_from_slice(&text[start..index]);
-            start = index + 1;
-        }
-    }
-    data.extend_from_slice(&text[start..]);
-    data.extend_from_slice(b"\x1b[201~");
-    data
-}
-
-#[cfg(feature = "gui")]
-// Keep buffer shifting out of the newline-normalization path.
-#[inline(never)]
-fn bracketed_plain(mut data: Vec<u8>) -> Vec<u8> {
-    let length = data.len();
-    data.reserve_exact(12);
-    data.resize(length + 6, 0);
-    data.copy_within(..length, 6);
-    data[..6].copy_from_slice(b"\x1b[200~");
-    data.extend_from_slice(b"\x1b[201~");
-    data
 }
 
 pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> Option<Vec<u8>> {
     if mode.contains(Mode::SGR_MOUSE) {
-        // A u16 code and two 64-bit coordinates need at most 51 bytes.
-        let mut bytes = [0; 51];
-        let mut start = bytes.len();
-        for (mut value, suffix) in [
-            (y + 1, if release { b'm' } else { b'M' }),
-            (x + 1, b';'),
-            (usize::from(code), b';'),
-        ] {
-            start -= 1;
-            bytes[start] = suffix;
-            loop {
-                start -= 1;
-                bytes[start] = b'0' + (value % 10) as u8;
-                value /= 10;
-                if value == 0 {
-                    break;
-                }
-            }
-        }
-        start -= 3;
-        bytes[start..start + 3].copy_from_slice(b"\x1b[<");
-        return Some(bytes[start..].to_vec());
+        let end = if release { 'm' } else { 'M' };
+        return Some(format!("\x1b[<{code};{};{}{end}", x + 1, y + 1).into_bytes());
     }
-    let utf8 = mode.contains(Mode::UTF8_MOUSE);
-    let limit = if utf8 { 2015 } else { 223 };
-    if x >= limit || y >= limit || code > 223 {
+    if x >= 223 || y >= 223 || code > 223 {
         return None;
     }
     let code = if release { 3 + (code & 28) } else { code };
-    let mut data = Vec::with_capacity(8);
-    data.extend_from_slice(&[0x1b, b'[', b'M', 32 + code as u8]);
-    for coordinate in [x, y] {
-        let encoded = 33 + coordinate;
-        if utf8 {
-            data.extend_from_slice(
-                char::from_u32(encoded as u32)
-                    .unwrap()
-                    .encode_utf8(&mut [0; 4])
-                    .as_bytes(),
-            );
-        } else {
-            data.push(encoded as u8);
-        }
-    }
-    Some(data)
+    Some(vec![
+        0x1b,
+        b'[',
+        b'M',
+        32 + code as u8,
+        33 + x as u8,
+        33 + y as u8,
+    ])
 }
 
 #[cfg(all(test, feature = "gui"))]
@@ -479,11 +362,6 @@ mod tests {
             b"\x1b[M !!"
         );
         assert!(mouse_bytes(0, 223, 0, false, Mode::NONE).is_none());
-        assert!(mouse_bytes(0, 2015, 0, false, Mode::UTF8_MOUSE).is_none());
-        assert_eq!(
-            mouse_bytes(0, 2014, 0, false, Mode::UTF8_MOUSE).unwrap(),
-            "\x1b[M ߿!".as_bytes()
-        );
     }
 
     fn key(value: &str) -> (u32, u32) {
@@ -532,21 +410,11 @@ mod tests {
     }
 
     #[test]
-    fn text_and_mode_independent_keys_do_not_read_terminal_state() {
-        for value in ["a", "ctrl-c", "ctrl-left", "enter", "f1", "shift-f4"] {
-            let (symbol, modifiers) = key(value);
-            assert_eq!(
-                key_bytes(symbol, modifiers, "", || panic!("unexpected mode read")),
-                encode(value, Mode::NONE)
-            );
-        }
-    }
-    #[test]
     fn cursor_keys_follow_application_mode_and_xterm_modifiers() {
         assert_eq!(encode("up", Mode::NONE), Some(b"\x1b[A".to_vec()));
         assert_eq!(encode("home", Mode::APP_CURSOR), Some(b"\x1bOH".to_vec()));
         assert_eq!(
-            key_bytes(keysym::KP_UP, 0, "", || Mode::APP_CURSOR),
+            key_bytes(keysym::KP_HOME + 2, 0, "", || Mode::APP_CURSOR),
             Some(b"\x1bOA".to_vec())
         );
         assert_eq!(

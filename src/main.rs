@@ -1,14 +1,14 @@
 mod ssh;
 
 use nextty::config::Config;
-use nextty::error::{Error, Result};
 use nextty::terminal::Shell;
 use nextty::workspace::{self, Action, Client, CreateOptions};
+use std::io::{self, Result};
 use std::path::PathBuf;
 
 fn main() {
     if let Err(error) = run() {
-        eprintln!("{error:#}");
+        eprintln!("{error}");
         std::process::exit(1);
     }
 }
@@ -16,15 +16,14 @@ fn main() {
 fn run() -> Result<()> {
     let mut args = std::env::args().skip(1);
     let (mut directory, mut program, mut config_path) = (None, None, None);
-    let mut command = None;
-    let mut gui = !cfg!(feature = "tui") && cfg!(feature = "gui");
-    let mut positions = [None, None];
+    let (mut command, mut gui, mut positional) = (None, false, Vec::new());
     while let Some(arg) = args.next() {
+        let mut value = || {
+            args.next()
+                .ok_or_else(|| io::Error::other(format!("{arg} requires an argument")))
+        };
         match arg.as_str() {
-            "--agent-owner" => {
-                nextty::agent::owner::run()?;
-                return Ok(());
-            }
+            "--agent-owner" => return nextty::agent::owner::run(),
             "--help" | "-h" => {
                 help();
                 return Ok(());
@@ -33,97 +32,58 @@ fn run() -> Result<()> {
                 println!("nextty {}", env!("CARGO_PKG_VERSION"));
                 return Ok(());
             }
-            "--working-directory" => {
-                directory =
-                    Some(PathBuf::from(args.next().ok_or_else(|| {
-                        Error::msg("--working-directory requires a path")
-                    })?))
-            }
-            "--config" => {
-                config_path = Some(PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| Error::msg("--config requires a path"))?,
-                ))
-            }
+            "--working-directory" => directory = Some(PathBuf::from(value()?)),
+            "--config" => config_path = Some(PathBuf::from(value()?)),
             "--gui" => gui = true,
             "--tui" => gui = false,
-            "--bridge" => {
-                let version = args
-                    .next()
-                    .ok_or_else(|| Error::msg("--bridge requires a protocol version"))?
-                    .parse::<u8>()
-                    .map_err(|_| Error::msg("invalid bridge protocol version"))?;
-                if args.next().is_some() {
-                    return Err(Error::msg("unexpected bridge argument"));
-                }
-                nextty::workspace::run_bridge(version)?;
-                return Ok(());
-            }
-            "--server" => {
-                let path = PathBuf::from(
-                    args.next()
-                        .ok_or_else(|| Error::msg("--server requires a socket path"))?,
-                );
-                if args.next().is_some() {
-                    return Err(Error::msg("unexpected server argument"));
-                }
-                nextty::workspace::run_server(&path)?;
-                return Ok(());
-            }
+            "--bridge" => return nextty::bridge::run_bridge(&value()?),
+            "--server" => return nextty::workspace::run_server(&PathBuf::from(value()?)),
             "-e" => {
-                program = Some(Shell::new(
-                    args.next()
-                        .ok_or_else(|| Error::msg("-e requires a command"))?,
-                    args.collect::<Vec<_>>(),
-                ));
+                program = Some(Shell::new(value()?, args.collect()));
                 break;
             }
             "new" | "attach" | "list" | "terminate" if command.is_none() => command = Some(arg),
-            _ if command.is_some() && positions[1].is_none() && !arg.starts_with('-') => {
-                let index = usize::from(positions[0].is_some());
-                positions[index] = Some(arg)
+            _ if command.is_some() && positional.len() < 2 && !arg.starts_with('-') => {
+                positional.push(arg)
             }
-            _ => return Err(Error::msg(format!("unknown argument {arg:?}; use --help"))),
+            _ => {
+                return Err(io::Error::other(format!(
+                    "unknown argument {arg:?}; use --help"
+                )));
+            }
         }
     }
 
-    let [first, second] = positions;
-    let (remote, name) = match (command.as_deref(), first, second) {
-        (_, None, None) => (None, None),
-        (Some("list"), Some(host), None) => (Some(ssh::RemoteTarget::parse(&host)?), None),
-        (Some("list"), _, _) => return Err(Error::msg("list takes at most one remote target")),
-        (_, Some(host), Some(name)) => (Some(ssh::RemoteTarget::parse(&host)?), Some(name)),
-        (_, Some(host), None) if ssh::RemoteTarget::recognizes(&host) => {
-            (Some(ssh::RemoteTarget::parse(&host)?), None)
-        }
-        (_, Some(name), None) => (None, Some(name)),
+    let command = command.as_deref().unwrap_or("new");
+    let (remote, name) = match (command, positional.as_slice()) {
+        (_, []) => (None, None),
+        ("list", [host]) => (Some(host), None),
+        ("list", _) => return Err(io::Error::other("list takes at most one remote target")),
+        (_, [host, name]) => (Some(host), Some(name.clone())),
+        (_, [host]) if ssh::RemoteTarget::recognizes(host) => (Some(host), None),
+        (_, [name]) => (None, Some(name.clone())),
         _ => unreachable!(),
     };
-    let command = command.as_deref().unwrap_or("new");
-    if command != "new" && (directory.is_some() || program.is_some()) {
-        return Err(Error::msg(
-            "--working-directory and -e apply to new workspaces",
-        ));
-    }
+    let remote = remote
+        .map(|host| ssh::RemoteTarget::parse(host))
+        .transpose()?;
     if matches!(command, "attach" | "terminate") && name.is_none() {
-        return Err(Error::msg(format!(
+        return Err(io::Error::other(format!(
             "{command} requires a workspace name; use nextty list"
         )));
     }
     if matches!(command, "new" | "attach") && gui && !cfg!(feature = "gui") {
-        return Err(Error::msg(
+        return Err(io::Error::other(
             "this build has no gui frontend; enable its Cargo feature",
         ));
     }
-    if matches!(command, "new" | "attach") && !gui && !cfg!(feature = "tui") {
-        return Err(Error::msg(
-            "this build has no tui frontend; enable its Cargo feature",
-        ));
-    }
     let socket = remote.is_none().then(workspace::socket_path).transpose()?;
-    let connect = || match &remote {
-        Some(target) => Client::connect_remote(target.command(), target.label()),
-        None => Client::connect(socket.as_ref().unwrap()),
+    let connect = || {
+        match (&remote, &socket) {
+            (Some(target), _) => Client::connect_remote(target.command(command), target.label()),
+            (None, socket) => Client::connect(socket.as_ref().unwrap()),
+        }
+        .map_err(|error| io::Error::new(error.kind(), format!("connect workspace server: {error}")))
     };
     if matches!(command, "list" | "terminate") {
         let list = command == "list";
@@ -131,80 +91,86 @@ fn run() -> Result<()> {
         if config_path.is_some() {
             Config::load(config_path)?;
         }
-        let action = if list {
-            Action::List
-        } else {
-            Action::TerminateName(name.unwrap())
-        };
         let mut client = match connect() {
-            Ok(client) => client,
             Err(error)
                 if list
                     && remote.is_none()
                     && matches!(
                         error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                        io::ErrorKind::NotFound | io::ErrorKind::ConnectionRefused
                     ) =>
             {
                 println!("No workspaces.");
                 return Ok(());
             }
-            Err(error) => return Err(Error::context("connect workspace server", error)),
+            client => client?,
         };
-        client.send(action)?;
+        client.send(match name {
+            Some(name) => Action::TerminateName(name),
+            None => Action::List,
+        })?;
         return control_reply(&mut client, list);
     }
     let config = Config::load(config_path)?;
-    let size = CreateOptions::default().size;
-    let action = if command == "attach" {
-        Action::Attach {
-            name: name.unwrap(),
-            size,
-        }
-    } else {
-        Action::Create {
+    let action = match name {
+        Some(name) if command == "attach" => Action::Attach { name },
+        name => Action::Create {
             name: name.unwrap_or_default(),
             options: CreateOptions {
-                size,
                 foreground: config.foreground,
                 background: config.background,
+                // A remote server resolves relative or missing directories against its own HOME.
                 directory: if remote.is_some() {
                     directory
                 } else {
-                    Some(match directory {
-                        Some(path) if path.is_absolute() => path,
-                        Some(path) => std::env::current_dir()?.join(path),
-                        None => std::env::current_dir()?,
-                    })
+                    Some(std::path::absolute(
+                        directory.unwrap_or_else(|| ".".into()),
+                    )?)
                 },
                 program,
                 history_capacity: config.history_limit_bytes,
+                ..CreateOptions::default()
             },
-        }
+        },
     };
-    if command == "new" && remote.is_none() {
-        workspace::ensure_server(&std::env::current_exe()?, socket.as_ref().unwrap())
-            .map_err(|error| Error::context("start workspace server", error))?;
+    if command == "new"
+        && let Some(socket) = &socket
+    {
+        workspace::ensure_server(&std::env::current_exe()?, socket).map_err(|error| {
+            io::Error::new(error.kind(), format!("start workspace server: {error}"))
+        })?;
     }
-    let mut client =
-        connect().map_err(|error| Error::context("connect workspace server", error))?;
+    let mut client = connect()?;
     client.send(action)?;
     #[cfg(feature = "gui")]
     if gui {
         return nextty::WorkspaceView::new(client, config)?.run();
     }
-    #[cfg(feature = "tui")]
-    nextty::tui::run(client, config)?;
-    Ok(())
+    nextty::tui::run(client, config)
 }
 
-fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<()> {
-    use nextty::workspace::ClientEvent;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+fn control_reply(client: &mut Client, list: bool) -> Result<()> {
+    use nextty::workspace::Response;
     loop {
-        for event in client.poll()? {
+        let events = match client.poll() {
+            // A bridge that finds no server ends quietly, as the local connect does.
+            Err(error)
+                if list
+                    && matches!(
+                        error.kind(),
+                        io::ErrorKind::UnexpectedEof
+                            | io::ErrorKind::BrokenPipe
+                            | io::ErrorKind::ConnectionReset
+                    ) =>
+            {
+                println!("No workspaces.");
+                return Ok(());
+            }
+            events => events?,
+        };
+        for event in events {
             match event {
-                ClientEvent::List(workspaces) => {
+                Response::List(workspaces) => {
                     if workspaces.is_empty() {
                         println!("No workspaces.");
                     }
@@ -216,20 +182,13 @@ fn control_reply(client: &mut nextty::workspace::Client, list: bool) -> Result<(
                     }
                     return Ok(());
                 }
-                ClientEvent::Detached if !list => return Ok(()),
-                ClientEvent::Error(error) => return Err(Error::msg(error)),
+                Response::Detached if !list => return Ok(()),
+                Response::Error(error) => return Err(io::Error::other(error)),
                 _ => (),
             }
         }
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Err(Error::msg("workspace server did not reply"));
-        }
         let mut fd = client.pollfd();
-        nextty::poll::poll(
-            std::slice::from_mut(&mut fd),
-            nextty::poll::timeout_millis(remaining),
-        )?;
+        nextty::sys::poll(std::slice::from_mut(&mut fd), -1)?;
         if fd.revents & libc::POLLOUT != 0 {
             client.flush()?;
         }
@@ -239,7 +198,7 @@ fn help() {
     println!("nextty — terminal\n\nUsage: nextty [OPTIONS] [-e COMMAND [ARG...]]");
 
     println!(
-        "       nextty new [HOST] [NAME] [OPTIONS]\n       nextty attach [HOST] NAME [OPTIONS]\n       nextty list [HOST]\n       nextty terminate [HOST] NAME\n\nDefaults: use the current terminal when tui is compiled in, otherwise GUI. --tui selects the current terminal explicitly.\nHOST: [user@]host[:port] or ssh://[user@]host[:port]\nUse [IPv6]:port; SSH aliases work as HOST with NAME or ssh://alias."
+        "       nextty new [HOST] [NAME] [OPTIONS]\n       nextty attach [HOST] NAME [OPTIONS]\n       nextty list [HOST]\n       nextty terminate [HOST] NAME\n\nDefaults to the current terminal.\nHOST: [user@]host[:port] or ssh://[user@]host[:port]\nUse [IPv6]:port; SSH aliases work as HOST with NAME or ssh://alias."
     );
     #[cfg(feature = "gui")]
     println!("--gui opens a desktop window (Vulkan 1.3).");
@@ -266,9 +225,5 @@ fn help() {
     println!(
         "Alt+f            Files: left tree, l expands/previews, Enter inserts path (local sessions)"
     );
-    println!(
-        "\nCompiled features: gui={}, tui={}",
-        cfg!(feature = "gui"),
-        cfg!(feature = "tui")
-    );
+    println!("\nCompiled features: gui={}", cfg!(feature = "gui"));
 }

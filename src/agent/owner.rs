@@ -1,52 +1,60 @@
 use crate::agent::Agent;
 use crate::config::Config;
-use crate::workspace::{Action, AgentEvent, AgentModelPatch, Client, ClientEvent};
-use serde_json::Value;
+use crate::context::ContextItem;
+use crate::workspace::{
+    Action, AgentEvent, AgentModelPatch, AgentRecovery, AgentRequest, AgentSend, Client,
+    ClientEndpoint, Response,
+};
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
-use std::path::PathBuf;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-fn os(value: Value) -> io::Result<OsString> {
-    Ok(OsString::from_vec(serde_json::from_value(value)?))
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct OwnerInit {
+    endpoint: ClientEndpoint,
+    target: Option<String>,
+    name: String,
+    #[serde(with = "crate::wire::bytes")]
+    token: Vec<u8>,
+    base_url: String,
+    model: String,
 }
 
-#[cfg(any(feature = "gui", feature = "tui"))]
 pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Result<()> {
-    use crate::workspace::ClientEndpoint;
-    use serde_json::json;
-    use std::os::unix::{ffi::OsStrExt, process::CommandExt};
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::process::CommandExt;
     use std::process::Stdio;
 
-    let endpoint = match client.endpoint() {
-        ClientEndpoint::Local(path) => json!({"local": path.as_os_str().as_bytes()}),
-        ClientEndpoint::Remote {
-            program,
-            args,
-            env,
-            directory,
-        } => json!({
-            "program":program.as_bytes(), "args":args.iter().map(|v| v.as_bytes()).collect::<Vec<_>>(),
-            "env":env.iter().map(|(k,v)| (k.as_bytes(),v.as_ref().map(|v| v.as_bytes()))).collect::<Vec<_>>(),
-            "directory":directory.as_ref().map(|p| p.as_os_str().as_bytes()), "target":client.remote_target().unwrap(),
-        }),
-    };
-    let name = &client
+    let name = client
         .snapshot()
         .ok_or_else(|| io::Error::other("No workspace"))?
-        .name;
-    let mut init = json!({"name":name,"token":token,
-        "base_url":config.base_url,"model":config.model});
-    init["endpoint"] = endpoint;
+        .name
+        .clone();
+    let init = OwnerInit {
+        endpoint: client.endpoint().clone(),
+        target: client.remote_target().map(str::to_owned),
+        name,
+        token: token.to_vec(),
+        base_url: config.base_url.clone(),
+        model: config.model.clone(),
+    };
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(crate::workspace::socket_path()?.with_extension("agent.log"))?;
     // Keep using the running binary even if an upgrade has unlinked it.
     let mut command = Command::new("/proc/self/exe");
     command
         .arg("--agent-owner")
         .stdin(Stdio::piped())
-        .stdout(Stdio::null());
+        .stdout(Stdio::null())
+        .stderr(log);
     unsafe {
         command.pre_exec(|| {
             if libc::setsid() < 0 {
@@ -56,9 +64,10 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
         });
     }
     let mut child = command.spawn()?;
-    let stdin = child.stdin.take().unwrap();
+    let mut stdin = child.stdin.take().unwrap();
     std::thread::spawn(move || child.wait());
-    serde_json::to_writer(stdin, &init)?;
+    use std::io::Write;
+    stdin.write_all(&postcard::to_allocvec(&init).map_err(io::Error::other)?)?;
     Ok(())
 }
 
@@ -66,13 +75,11 @@ pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Resul
 struct Session {
     id: u64,
     model: Agent,
-    published: Vec<(String, usize)>,
+    published: Vec<usize>,
     published_revision: Option<u64>,
     dirty: bool,
-    pending_send: Option<Value>,
-    sent_context: BTreeMap<u64, Vec<Value>>,
-    rewind_restore: Option<(u64, String, Vec<Value>)>,
-    failed_send: Option<(u64, String, Vec<Value>)>,
+    pending_send: Option<AgentSend>,
+    sent_context: BTreeMap<u64, Vec<ContextItem>>,
 }
 
 impl Session {
@@ -86,25 +93,40 @@ impl Session {
         self.model.revision += 1;
     }
 
+    /// Hands text the frontends no longer show back to them: a rewound turn or an unsent message.
+    fn recover(
+        &self,
+        client: &mut Client,
+        rewind: bool,
+        input: String,
+        basket: Vec<ContextItem>,
+    ) -> io::Result<()> {
+        client.send(Action::AgentRecover(AgentRecovery {
+            session: self.id,
+            rewind,
+            input,
+            basket,
+        }))
+    }
+
     fn request(
         &mut self,
-        mut request: Value,
+        request: AgentRequest,
         config: &Config,
         client: &mut Client,
     ) -> io::Result<()> {
         self.dirty = true;
-        if let Some(mut pending) = self.pending_send.take() {
+        if let Some(pending) = self.pending_send.take() {
             self.model.revision += 1;
-            self.failed_send = Some((
-                self.model.revision,
-                serde_json::from_value(pending["input"].take())?,
-                serde_json::from_value(pending["basket"].take())?,
-            ));
+            self.recover(client, false, pending.input, pending.basket)?;
         }
-        match request["action"].as_str() {
-            Some("send") => {
-                let mut input: String = serde_json::from_value(request["input"].take())?;
-                let basket: Vec<Value> = serde_json::from_value(request["basket"].take())?;
+        match request {
+            AgentRequest::Send(AgentSend {
+                pane,
+                mut input,
+                basket,
+                ..
+            }) => {
                 let prompt = if basket.is_empty() {
                     input.clone()
                 } else {
@@ -114,7 +136,6 @@ impl Session {
                     )
                 };
                 let result = (|| {
-                    let pane = serde_json::from_value(request["pane"].take())?;
                     let target = crate::agent::terminal_context(client, pane)?;
                     self.model.send(
                         &mut input,
@@ -128,49 +149,42 @@ impl Session {
                 let turn = match result {
                     Ok(turn) => turn,
                     Err(error) => {
-                        self.failed_send = Some((self.model.revision + 1, input, basket));
+                        self.recover(client, false, input, basket)?;
                         return Err(error);
                     }
                 };
                 if !basket.is_empty() {
                     self.sent_context.insert(turn, basket);
                 }
-                self.rewind_restore = None;
-                self.failed_send = None;
                 Ok(())
             }
-            Some("abort") => self.model.close(client),
-            Some("rewind") => self
-                .model
-                .rewind(serde_json::from_value(request["turn"].take())?),
-            _ => Err(io::Error::other("Unknown Agent action")),
+            AgentRequest::Abort { .. } => self.model.close(client),
+            AgentRequest::Rewind { turn, .. } => self.model.rewind(turn),
         }
     }
 
     fn poll(&mut self, client: &mut Client) -> io::Result<()> {
-        if !self.model.poll(client)? {
+        if !self.model.poll(client) {
             return Ok(());
         }
         self.dirty = true;
         if let Some((turn, input)) = self.model.rewound.take() {
-            let items = self.sent_context.remove(&turn).unwrap_or_default();
-            self.rewind_restore = Some((turn, input, items));
+            let basket = self.sent_context.remove(&turn).unwrap_or_default();
+            self.recover(client, true, input, basket)?;
         }
         Ok(())
     }
 
-    fn patch(&mut self) -> io::Result<AgentModelPatch> {
+    fn patch(&mut self) -> AgentModelPatch {
         let reset = self.published_revision != Some(self.model.revision);
         let (start, prefix_bytes) = if !reset {
             let start = self
                 .published
                 .iter()
                 .zip(&self.model.messages)
-                .position(|((role, length), message)| {
-                    role != &message.role || *length != message.text.len()
-                })
+                .position(|(length, message)| *length != message.text.len())
                 .unwrap_or(self.published.len().min(self.model.messages.len()));
-            let prefix_bytes = self.published.get(start).map_or(0, |(_, length)| *length);
+            let prefix_bytes = self.published.get(start).copied().unwrap_or(0);
             (start, prefix_bytes)
         } else {
             self.sent_context.retain(|turn, _| {
@@ -185,7 +199,6 @@ impl Session {
             session: self.id,
             busy: self.model.busy,
             revision: self.model.revision,
-            turn: self.model.turn,
             start: start as u32,
             prefix_bytes: prefix_bytes as u32,
             messages: self.model.messages[start..]
@@ -200,81 +213,54 @@ impl Session {
                 .collect(),
             changes: reset.then(|| self.model.changes.clone()),
             changes_omitted: self.model.changes_omitted,
-            recovery: if self.rewind_restore.is_none() && self.failed_send.is_none() {
-                b"{}".to_vec()
-            } else {
-                serde_json::to_vec(
-                    &[
-                        ("rewind_restore", &self.rewind_restore),
-                        ("failed_send", &self.failed_send),
-                    ]
-                    .into_iter()
-                    .filter(|(_, value)| value.is_some())
-                    .collect::<BTreeMap<_, _>>(),
-                )?
-            },
         };
         self.published
             .resize_with(self.model.messages.len(), Default::default);
-        for ((role, length), message) in self.published[start..]
+        for (length, message) in self.published[start..]
             .iter_mut()
             .zip(&self.model.messages[start..])
         {
-            role.clone_from(&message.role);
             *length = message.text.len();
         }
         self.published_revision = Some(self.model.revision);
         self.dirty = false;
-        Ok(patch)
+        patch
     }
 }
 
 pub fn run() -> io::Result<()> {
-    let mut init: Value = serde_json::from_reader(io::stdin().lock())?;
-    let endpoint = &mut init["endpoint"];
-    let mut client = if !endpoint["local"].is_null() {
-        Client::connect(&PathBuf::from(os(endpoint["local"].take())?))?
-    } else {
-        let mut command = Command::new(os(endpoint["program"].take())?);
-        let args: Vec<Vec<u8>> = serde_json::from_value(endpoint["args"].take())?;
-        command.args(args.into_iter().map(OsString::from_vec));
-        let env: Vec<(Vec<u8>, Option<Vec<u8>>)> = serde_json::from_value(endpoint["env"].take())?;
-        for (key, value) in env {
-            let key = OsString::from_vec(key);
-            if let Some(value) = value {
-                command.env(key, OsString::from_vec(value));
-            } else {
-                command.env_remove(key);
-            }
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    io::stdin().lock().read_to_end(&mut bytes)?;
+    let OwnerInit {
+        endpoint,
+        target,
+        name,
+        token,
+        base_url,
+        model,
+    } = postcard::from_bytes(&bytes).map_err(io::Error::other)?;
+    let mut client = match endpoint {
+        ClientEndpoint::Local(path) => Client::connect(&path)?,
+        ClientEndpoint::Remote { program, args } => {
+            let mut command = Command::new(OsString::from_vec(program));
+            command.args(args.into_iter().map(OsString::from_vec));
+            Client::connect_remote(command, target.unwrap())?
         }
-        if !endpoint["directory"].is_null() {
-            command.current_dir(os(endpoint["directory"].take())?);
-        }
-        Client::connect_remote(command, serde_json::from_value(endpoint["target"].take())?)?
     };
     let config = Config {
-        base_url: serde_json::from_value(init["base_url"].take())?,
-        model: serde_json::from_value(init["model"].take())?,
+        base_url,
+        model,
         ..Config::default()
     };
-    client.send(Action::AgentAttach {
-        name: serde_json::from_value(init["name"].take())?,
-        token: serde_json::from_value(init["token"].take())?,
-    })?;
+    client.send(Action::AgentAttach { name, token })?;
     client.flush()?;
     let mut sessions = Vec::<Session>::new();
     let mut publish_at = Instant::now();
     let mut fds = Vec::new();
     loop {
         fds.clear();
-        fds.extend([
-            client.pollfd(),
-            libc::pollfd {
-                fd: client.receiver_fd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ]);
+        fds.push(client.pollfd());
         fds.extend(sessions.iter().map(|session| libc::pollfd {
             fd: session.model.fd(),
             events: libc::POLLIN,
@@ -292,27 +278,24 @@ pub fn run() -> io::Result<()> {
                 )
                 .min()
                 .map_or(-1, |deadline| {
-                    crate::poll::timeout_millis(
+                    crate::sys::timeout_millis(
                         deadline.saturating_duration_since(std::time::Instant::now()),
                     )
                 })
         };
-        crate::poll::poll(&mut fds, timeout)?;
-        if fds[1].revents != 0 {
-            crate::eventfd::consume_notification(fds[1].fd)?;
-        }
-        for fd in fds[2..].iter().filter(|fd| fd.revents != 0) {
-            crate::eventfd::consume_notification(fd.fd)?;
+        crate::sys::poll(&mut fds, timeout)?;
+        for fd in fds[1..].iter().filter(|fd| fd.revents != 0) {
+            crate::sys::consume_notification(fd.fd)?;
         }
         client.flush()?;
-        if fds[0].revents != 0 || fds[1].revents != 0 || client.needs_poll() {
+        if fds[0].revents != 0 || client.needs_poll() {
             for mut event in client.poll()? {
                 for session in &mut sessions {
-                    session.model.handle_event(&mut event, &mut client)?;
+                    session.model.handle_event(&mut event, &mut client);
                 }
                 match event {
-                    ClientEvent::Detached => return Ok(()),
-                    ClientEvent::Error(error) => return Err(io::Error::other(error)),
+                    Response::Detached => return Ok(()),
+                    Response::Error(error) => return Err(io::Error::other(error)),
                     _ => (),
                 }
             }
@@ -322,18 +305,15 @@ pub fn run() -> io::Result<()> {
         }
         while let Some(event) = client.next_agent_event() {
             match event {
-                AgentEvent::Draft(payload) => {
-                    let view: Value = serde_json::from_slice(&payload)?;
-                    let ids: Vec<u64> = view["sessions"]
-                        .as_array()
-                        .unwrap()
-                        .iter()
-                        .map(|session| serde_json::from_value(session["id"].clone()))
-                        .collect::<Result<_, _>>()?;
-                    for mut session in sessions.extract_if(.., |session| !ids.contains(&session.id))
-                    {
-                        session.model.close(&mut client)?;
-                        client.send(Action::AgentRemove(session.id))?;
+                AgentEvent::Draft(drafts) => {
+                    let ids: Vec<u64> = drafts.sessions.iter().map(|session| session.id).collect();
+                    if drafts.complete {
+                        for mut session in
+                            sessions.extract_if(.., |session| !ids.contains(&session.id))
+                        {
+                            session.model.close(&mut client)?;
+                            client.send(Action::AgentRemove(session.id))?;
+                        }
                     }
                     for id in ids {
                         if !sessions.iter().any(|session| session.id == id) {
@@ -344,12 +324,16 @@ pub fn run() -> io::Result<()> {
                         }
                     }
                 }
-                AgentEvent::Request(payload) => {
-                    let mut request: Value = serde_json::from_slice(&payload)?;
-                    let id: u64 = serde_json::from_value(request["session"].take())?;
+                AgentEvent::Request(request) => {
+                    let id = match &request {
+                        AgentRequest::Send(send) => send.session,
+                        AgentRequest::Abort { session } | AgentRequest::Rewind { session, .. } => {
+                            *session
+                        }
+                    };
                     if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
-                        if request["action"] == "send" {
-                            session.pending_send = Some(request);
+                        if let AgentRequest::Send(send) = request {
+                            session.pending_send = Some(send);
                             client.refresh_screen()?;
                             continue;
                         }
@@ -364,7 +348,8 @@ pub fn run() -> io::Result<()> {
         for session in &mut sessions {
             if !client.screen_stale()
                 && let Some(request) = session.pending_send.take()
-                && let Err(error) = session.request(request, &config, &mut client)
+                && let Err(error) =
+                    session.request(AgentRequest::Send(request), &config, &mut client)
             {
                 session.error(error);
             }
@@ -378,7 +363,7 @@ pub fn run() -> io::Result<()> {
             && (Instant::now() >= publish_at || sessions.iter().all(|session| !session.model.busy))
         {
             for session in sessions.iter_mut().filter(|session| session.dirty) {
-                client.send(Action::AgentUpdate(session.patch()?))?;
+                client.send(Action::AgentUpdate(session.patch()))?;
             }
             publish_at = Instant::now() + Duration::from_millis(16);
         }
@@ -389,10 +374,9 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use std::path::PathBuf;
 
     #[test]
-    #[cfg(any(feature = "gui", feature = "tui"))]
     fn streaming_patches_only_append_new_bytes_and_reset_after_trim() {
         let mut session = Session::default();
         session.model.messages = vec![
@@ -410,13 +394,12 @@ mod tests {
             },
         ];
         let mut mirror = crate::agent::panel::AgentView::default();
-        let initial = session.patch().unwrap();
+        let initial = session.patch();
         assert!(initial.changes.is_some());
         mirror.restore_patch(&initial).unwrap();
         let before = session.model.messages[1].text.len();
         session.model.messages[1].text.push_str("中文🙂");
-        let patch = session.patch().unwrap();
-        assert_eq!(patch.recovery, b"{}");
+        let patch = session.patch();
         assert!(patch.changes.is_none());
         assert_eq!(patch.start, 1);
         assert_eq!(patch.prefix_bytes as usize, before);
@@ -425,11 +408,12 @@ mod tests {
         assert!(!mirror.restore_patch(&patch).unwrap());
         assert_eq!(mirror.messages, session.model.messages);
         session.model.messages[1].role = "shell · done".into();
-        assert!(mirror.restore_patch(&session.patch().unwrap()).unwrap());
+        session.model.revision += 1;
+        assert!(mirror.restore_patch(&session.patch()).unwrap());
         assert_eq!(mirror.messages, session.model.messages);
         session.model.messages.remove(0);
         session.model.revision += 1;
-        let patch = session.patch().unwrap();
+        let patch = session.patch();
         assert_eq!(patch.start, 0);
         assert_eq!(patch.prefix_bytes, 0);
         assert!(patch.changes.is_some());
@@ -438,11 +422,10 @@ mod tests {
     }
 
     #[test]
-    #[cfg(any(feature = "gui", feature = "tui"))]
     fn file_evidence_survives_changes_only_patches_and_transcript_rewind() {
         let mut session = Session::default();
         let mut mirror = crate::agent::panel::AgentView::default();
-        mirror.restore_patch(&session.patch().unwrap()).unwrap();
+        mirror.restore_patch(&session.patch()).unwrap();
         std::sync::Arc::make_mut(&mut session.model.changes).push(crate::workspace::AgentChange {
             turn: 1,
             tool_id: "1:0:0:edit-tool".into(),
@@ -453,19 +436,19 @@ mod tests {
             truncated: false,
         });
         session.model.revision += 1;
-        let patch = session.patch().unwrap();
+        let patch = session.patch();
         assert!(patch.messages.is_empty());
         assert!(mirror.restore_patch(&patch).unwrap());
         assert_eq!(mirror.changes, session.model.changes);
         session.model.messages.clear();
         session.model.revision += 1;
-        mirror.restore_patch(&session.patch().unwrap()).unwrap();
+        mirror.restore_patch(&session.patch()).unwrap();
         assert_eq!(mirror.changes, session.model.changes);
         session.model.changes_omitted = 1;
-        assert!(mirror.restore_patch(&session.patch().unwrap()).unwrap());
+        assert!(mirror.restore_patch(&session.patch()).unwrap());
         assert_eq!(mirror.changes_omitted, 1);
         session.model = Agent::default();
-        let reset = session.patch().unwrap();
+        let reset = session.patch();
         assert!(reset.changes.as_ref().unwrap().is_empty());
         assert!(mirror.restore_patch(&reset).unwrap());
         assert!(mirror.changes.is_empty());
@@ -477,33 +460,73 @@ mod tests {
             std::env::temp_dir().join(format!("nextty-owner-send-{}.sock", std::process::id()));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let mut client = Client::connect(&path).unwrap();
-        let (_peer, _) = listener.accept().unwrap();
+        let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
         std::fs::remove_file(path).unwrap();
+        let mut recovered = |client: &mut Client| {
+            client.flush().unwrap();
+            match peer.next_action().unwrap() {
+                Some(Action::AgentRecover(recovery)) => recovery,
+                other => panic!("expected a recovery, got {other:?}"),
+            }
+        };
+        let basket = vec![ContextItem {
+            label: "screen".into(),
+            source: "pane 1".into(),
+            kind: "Screen".into(),
+            snapshot: crate::context::ContextSnapshot {
+                text: "registers".into(),
+                incomplete: false,
+            },
+        }];
+        let send = |input: &str| AgentSend {
+            session: 0,
+            pane: 1,
+            input: input.into(),
+            basket: basket.clone(),
+        };
         let mut session = Session::default();
         session.model.revision = 8;
-        let basket = vec![json!({"label":"screen", "text":"registers"})];
-        let request = json!({"action":"send", "input":"inspect this", "pane":1, "basket":basket});
         assert!(
             session
-                .request(request, &Config::default(), &mut client)
+                .request(
+                    AgentRequest::Send(send("inspect this")),
+                    &Config::default(),
+                    &mut client,
+                )
                 .is_err()
         );
-        let snapshot: Value = serde_json::from_slice(&session.patch().unwrap().recovery).unwrap();
-        assert_eq!(snapshot["failed_send"], json!([9, "inspect this", basket]));
+        assert_eq!(
+            recovered(&mut client),
+            AgentRecovery {
+                session: 0,
+                rewind: false,
+                input: "inspect this".into(),
+                basket: basket.clone(),
+            }
+        );
         assert!(!session.model.busy);
         assert!(session.sent_context.is_empty());
         let mut queued = Session {
-            pending_send: Some(
-                json!({"action":"send", "input":"queued draft", "pane":1, "basket":basket}),
-            ),
+            pending_send: Some(send("queued draft")),
             ..Session::default()
         };
         queued
-            .request(json!({"action":"abort"}), &Config::default(), &mut client)
+            .request(
+                AgentRequest::Abort { session: 0 },
+                &Config::default(),
+                &mut client,
+            )
             .unwrap();
         assert!(queued.pending_send.is_none());
-        let snapshot: Value = serde_json::from_slice(&queued.patch().unwrap().recovery).unwrap();
-        assert_eq!(snapshot["failed_send"], json!([1, "queued draft", basket]));
+        assert_eq!(
+            recovered(&mut client),
+            AgentRecovery {
+                session: 0,
+                rewind: false,
+                input: "queued draft".into(),
+                basket,
+            }
+        );
         assert!(!queued.model.busy);
     }
 }

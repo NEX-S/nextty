@@ -2,7 +2,6 @@ use crate::core::{Cell, Flags, Row};
 use crate::vt::{Color, Rgb};
 use crate::width::{fit_label, scalar_width};
 use crate::workspace::Rect;
-#[cfg(any(feature = "tui", test))]
 use std::io::{self, Write};
 
 pub(crate) const BACKGROUND: u32 = 0x202020;
@@ -35,28 +34,29 @@ pub(crate) fn diff_colors(foreground: u32) -> (u32, u32) {
     }
 }
 
-pub(crate) fn popup_close(rect: Rect) -> Rect {
-    Rect {
-        x: rect.x + rect.cols.saturating_sub(5),
-        y: rect.y + 1,
-        cols: 3,
-        rows: 1,
-    }
+pub(crate) fn rect(x: u16, y: u16, cols: u16, rows: u16) -> Rect {
+    Rect { x, y, cols, rows }
 }
 
-pub(crate) fn popup_body(rect: Rect) -> Rect {
-    Rect {
-        x: rect.x + 2,
-        y: rect.y + 3,
-        cols: rect.cols.saturating_sub(4),
-        rows: rect.rows.saturating_sub(5),
-    }
+pub(crate) fn popup_close(area: Rect) -> Rect {
+    rect(area.x + area.cols.saturating_sub(5), area.y + 1, 3, 1)
+}
+
+pub(crate) fn popup_body(area: Rect) -> Rect {
+    rect(
+        area.x + 2,
+        area.y + 3,
+        area.cols.saturating_sub(4),
+        area.rows.saturating_sub(5),
+    )
 }
 
 pub(crate) struct Grid {
     pub rect: Rect,
     pub rows: Vec<Row>,
     pub flags: Flags,
+    /// When set, only these rows are compared and emitted by `ansi_trim`.
+    pub damage: Option<Vec<usize>>,
 }
 
 pub(crate) struct TextRun<'a> {
@@ -81,47 +81,13 @@ fn packed(color: Color) -> u32 {
     color.packed()
 }
 
-#[cfg(any(feature = "tui", test))]
-pub(crate) fn sgr_rgb(output: &mut Vec<u8>, color: Rgb) {
-    let mut bytes = [0; 12];
-    let mut end = 0;
-    for value in [color.r, color.g, color.b] {
-        bytes[end] = b';';
-        end += 1;
-        if value >= 100 {
-            bytes[end] = b'0' + value / 100;
-            end += 1;
-        }
-        if value >= 10 {
-            bytes[end] = b'0' + value / 10 % 10;
-            end += 1;
-        }
-        bytes[end] = b'0' + value % 10;
-        end += 1;
-    }
-    output.extend_from_slice(&bytes[..end]);
-}
-
-#[cfg(any(feature = "tui", test))]
-pub(crate) fn cursor_position(output: &mut impl Write, row: u16, column: u16) -> io::Result<()> {
-    let mut bytes = [0; 14];
-    bytes[..2].copy_from_slice(b"\x1b[");
-    let mut end = 2;
-    for (mut value, suffix) in [(row, b';'), (column, b'H')] {
-        let start = end;
-        loop {
-            bytes[end] = b'0' + (value % 10) as u8;
-            end += 1;
-            value /= 10;
-            if value == 0 {
-                break;
-            }
-        }
-        bytes[start..end].reverse();
-        bytes[end] = suffix;
-        end += 1;
-    }
-    output.write_all(&bytes[..end])
+fn sgr_colors(output: &mut Vec<u8>, foreground: Rgb, background: Rgb) -> io::Result<()> {
+    let (f, b) = (foreground, background);
+    write!(
+        output,
+        "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
+        f.r, f.g, f.b, b.r, b.g, b.b
+    )
 }
 
 impl Grid {
@@ -137,6 +103,7 @@ impl Grid {
                 .map(|_| Row::new(usize::from(rect.cols), blank))
                 .collect(),
             flags: Flags::empty(),
+            damage: None,
         }
     }
 
@@ -208,6 +175,42 @@ impl Grid {
         }
     }
 
+    pub fn put_row(&mut self, x: u16, y: u16, source: &Row, columns: usize) {
+        if y < self.rect.y
+            || y >= self.rect.y + self.rect.rows
+            || x < self.rect.x
+            || x >= self.rect.x + self.rect.cols
+        {
+            return;
+        }
+        let row = &mut self.rows[usize::from(y - self.rect.y)];
+        let start = usize::from(x - self.rect.x);
+        let end = (start + columns.min(source.cells.len())).min(row.cells.len());
+        if start >= end {
+            return;
+        }
+        row.cells[start..end].clone_from_slice(&source.cells[..end - start]);
+        row.clear_extras(start, end);
+        for (column, extra) in source.extras() {
+            if *column < end - start {
+                *row.extra_mut(start + *column) = extra.clone();
+            }
+        }
+        row.wrapped = false;
+        row.used = row.used.max(end);
+    }
+
+    pub fn blit(&mut self, source: &Self) {
+        for (index, row) in source.rows.iter().enumerate() {
+            self.put_row(
+                source.rect.x,
+                source.rect.y + index as u16,
+                row,
+                row.cells.len(),
+            );
+        }
+    }
+
     pub fn text(
         &mut self,
         x: u16,
@@ -245,7 +248,7 @@ impl Grid {
         let text = fit_label(text, (end - start) as u16);
         let mut column = start;
         for c in text.chars() {
-            let width = usize::from(scalar_width(c).min(2));
+            let width = usize::from(scalar_width(c));
             if width == 0 {
                 if column > start {
                     let previous = row.leading_column(column - 1);
@@ -280,27 +283,44 @@ impl Grid {
         }
     }
 
+    fn row_changed(&self, previous: Option<&Self>, index: usize) -> bool {
+        let row = &self.rows[index];
+        if self
+            .damage
+            .as_ref()
+            .is_some_and(|rows| !rows.contains(&index))
+        {
+            return false;
+        }
+        previous.is_none_or(|previous| {
+            previous.rect != self.rect
+                || previous
+                    .rows
+                    .get(index)
+                    .is_none_or(|old| old.cells != row.cells || old.extras() != row.extras())
+        })
+    }
+
     pub fn for_each_run<E>(
         &self,
         previous: Option<&Self>,
-        damage: &[bool],
+        trim: bool,
         mut emit: impl FnMut(TextRun<'_>) -> Result<(), E>,
     ) -> Result<(), E> {
         let mut text = String::new();
-        for (index, row) in self.rows.iter().enumerate().filter(|(index, row)| {
-            damage
-                .get(usize::from(self.rect.y) + index)
-                .copied()
-                .unwrap_or(false)
-                || previous.is_none_or(|previous| {
-                    previous.rect != self.rect
-                        || previous.rows.get(*index).is_none_or(|old| {
-                            old.cells != row.cells || old.extras() != row.extras()
-                        })
-                })
-        }) {
+        for (index, row) in self
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.row_changed(previous, *index))
+        {
             text.reserve(row.cells.len().saturating_sub(text.len()));
-            let mut cells = row.cells_with_extras(0..row.cells.len()).peekable();
+            let columns = if trim {
+                row.used.min(row.cells.len())
+            } else {
+                row.cells.len()
+            };
+            let mut cells = row.cells_with_extras(0..columns).peekable();
             while let Some(&(start, cell, extra)) = cells.peek() {
                 let style = cell.flags - (Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER);
                 let underline_color = if style.contains(Flags::UNDERLINE) {
@@ -323,9 +343,7 @@ impl Grid {
                         }
                     }
                 }
-                let end = cells
-                    .peek()
-                    .map_or(row.cells.len(), |(column, _, _)| *column);
+                let end = cells.peek().map_or(columns, |(column, _, _)| *column);
                 emit(TextRun {
                     x: self.rect.x + start as u16,
                     y: self.rect.y + index as u16,
@@ -341,18 +359,13 @@ impl Grid {
         Ok(())
     }
 
-    #[cfg(any(feature = "tui", test))]
-    pub fn ansi(
-        &self,
-        output: &mut Vec<u8>,
-        previous: Option<&Self>,
-        damage: &[bool],
-    ) -> io::Result<()> {
+    /// Writes the rows that differ from `previous`, ending each at its last used cell.
+    pub fn ansi(&self, output: &mut Vec<u8>, previous: Option<&Self>) -> io::Result<()> {
         let mut cursor = None;
         let mut style = None;
-        self.for_each_run::<io::Error>(previous, damage, |run| {
+        self.for_each_run::<io::Error>(previous, true, |run| {
             if cursor != Some((run.x, run.y)) {
-                cursor_position(output, run.y + 1, run.x + 1)?;
+                write!(output, "\x1b[{};{}H", run.y + 1, run.x + 1)?;
             }
             cursor = Some((run.x + run.columns, run.y));
             let next_style = (
@@ -363,27 +376,48 @@ impl Grid {
             );
             if style != Some(next_style) {
                 style = Some(next_style);
-                output.extend_from_slice(b"\x1b[0;38;2");
-                sgr_rgb(output, Rgb::from_packed(run.foreground));
-                output.extend_from_slice(b";48;2");
-                sgr_rgb(output, Rgb::from_packed(run.background));
-                output.push(b'm');
+                sgr_colors(
+                    output,
+                    Rgb::from_packed(run.foreground),
+                    Rgb::from_packed(run.background),
+                )?;
                 if run.flags.contains(Flags::BOLD) {
                     output.extend_from_slice(b"\x1b[1m");
+                }
+                if run.flags.contains(Flags::DIM) {
+                    output.extend_from_slice(b"\x1b[2m");
                 }
                 if run.flags.contains(Flags::ITALIC) {
                     output.extend_from_slice(b"\x1b[3m");
                 }
+                if run.flags.contains(Flags::STRIKEOUT) {
+                    output.extend_from_slice(b"\x1b[9m");
+                }
                 if run.flags.contains(Flags::UNDERLINE) {
-                    let color = run.underline_color.unwrap_or(run.foreground);
-                    output.extend_from_slice(b"\x1b[4;58;2");
-                    sgr_rgb(output, Rgb::from_packed(color));
-                    output.push(b'm');
+                    let color = Rgb::from_packed(run.underline_color.unwrap_or(run.foreground));
+                    write!(output, "\x1b[4;58;2;{};{};{}m", color.r, color.g, color.b)?;
                 }
             }
             output.extend_from_slice(run.text.as_bytes());
             Ok(())
         })?;
+        for (index, row) in self.rows.iter().enumerate() {
+            if self.row_changed(previous, index) && row.used < row.cells.len() {
+                let (Color::Spec(foreground), Color::Spec(background)) =
+                    (row.cells[row.used].fg, row.cells[row.used].bg)
+                else {
+                    unreachable!()
+                };
+                write!(
+                    output,
+                    "\x1b[{};{}H",
+                    self.rect.y + index as u16 + 1,
+                    self.rect.x + row.used as u16 + 1
+                )?;
+                sgr_colors(output, foreground, background)?;
+                output.extend_from_slice(b"\x1b[K");
+            }
+        }
         output.extend_from_slice(b"\x1b[0m");
         Ok(())
     }
@@ -396,13 +430,7 @@ mod tests {
 
     #[test]
     fn ansi_preserves_styles_and_wide_cells_across_the_right_margin() {
-        let rect = Rect {
-            x: 0,
-            y: 0,
-            cols: 8,
-            rows: 3,
-        };
-        let mut grid = Grid::new(rect, 0xcccccc, 0x202020);
+        let mut grid = Grid::new(rect(0, 0, 8, 3), 0xcccccc, 0x202020);
         grid.text(0, 0, 8, "ab中cdef", 0xcccccc, 0x202020);
         grid.text(0, 1, 8, "12345678", 0xcccccc, 0x202020);
         grid.flags = Flags::BOLD;
@@ -415,7 +443,7 @@ mod tests {
                 Some(rgb(if column < 4 { 0x123456 } else { 0x654321 }));
         }
         let mut bytes = Vec::new();
-        grid.ansi(&mut bytes, None, &[]).unwrap();
+        grid.ansi(&mut bytes, None).unwrap();
         let mut core = Core::new(
             WindowSize {
                 num_cols: 8,
@@ -428,7 +456,7 @@ mod tests {
         );
         crate::vt::Parser::new().advance(&mut core, &bytes);
         for (y, row) in grid.rows.iter().enumerate() {
-            for (x, cell) in row.cells.iter().enumerate() {
+            for (x, cell) in row.cells.iter().enumerate().take(row.used) {
                 if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
                     assert_eq!(core.row(y).cells[x], *cell, "cell ({x}, {y})");
                     if let Some(color) = row.extra(x).and_then(|extra| extra.underline_color) {

@@ -13,8 +13,8 @@ impl Worker {
     fn new(url: String) -> Self {
         let shared = Arc::new(Shared {
             state: Mutex::new(State::default()),
-            wake: Arc::new(crate::eventfd::new().unwrap()),
-            notification: crate::eventfd::new().unwrap(),
+            wake: Arc::new(crate::sys::new().unwrap()),
+            notification: crate::sys::new().unwrap(),
         });
         let control = Arc::clone(&shared);
         let (done, receiver) = mpsc::sync_channel(1);
@@ -86,29 +86,8 @@ impl Server {
                         Err(error) => panic!("accept model request: {error}"),
                     }
                 };
-                stream
-                    .set_read_timeout(Some(Duration::from_secs(3)))
-                    .unwrap();
-                let mut header = Vec::new();
-                while !header.ends_with(b"\r\n\r\n") {
-                    let mut byte = [0];
-                    stream.read_exact(&mut byte).unwrap();
-                    header.push(byte[0]);
-                }
-                let header = String::from_utf8(header).unwrap();
-                let length: usize = header
-                    .lines()
-                    .find_map(|line| {
-                        let (name, value) = line.split_once(':')?;
-                        name.eq_ignore_ascii_case("content-length")
-                            .then_some(value.trim())
-                    })
-                    .unwrap()
-                    .parse()
-                    .unwrap();
-                let mut body = vec![0; length];
-                stream.read_exact(&mut body).unwrap();
-                let body: Value = serde_json::from_slice(&body).unwrap();
+                let body: Value =
+                    serde_json::from_slice(&crate::agent::http::read_request(&mut stream)).unwrap();
                 if body["tool_choice"]["type"] == "none" {
                     assert!(body.get("cache_control").is_none());
                 } else {
@@ -222,6 +201,12 @@ fn settled(agent: &Harness, mut terminal: impl FnMut(ToolRequest)) -> Vec<Event>
     }
 }
 
+fn errored(events: &[Event]) -> bool {
+    events
+        .iter()
+        .any(|event| matches!(event, Event::Message("Error", _)))
+}
+
 fn paired(messages: &[Value]) {
     let mut pending = Vec::new();
     for message in messages {
@@ -253,7 +238,7 @@ fn paired(messages: &[Value]) {
 #[test]
 fn completed_terminal_result_precedes_cancellation() {
     let (tx, rx) = mpsc::sync_channel(1);
-    let wake = crate::eventfd::new().unwrap();
+    let wake = crate::sys::new().unwrap();
     let canceled = AtomicBool::new(false);
     tx.send(Ok("unique executed result".into())).unwrap();
     canceled.store(true, Ordering::Release);
@@ -265,99 +250,6 @@ fn completed_terminal_result_precedes_cancellation() {
     let error = receive_tool(rx, wake.as_raw_fd(), &canceled).unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::Interrupted);
     assert_eq!(error.to_string(), "Stopped by user");
-}
-
-#[test]
-fn completed_tool_result_survives_a_full_event_queue() {
-    let server = Server::new(3, |index, body, stream| {
-        paired(body["messages"].as_array().unwrap());
-        if index == 2 {
-            sse(stream, goal_response("complete", "Recovered."));
-            return;
-        }
-        if index == 0 {
-            sse(
-                stream,
-                response(
-                    "",
-                    &[
-                        ("completed", "shell", json!({"command":"one side effect"})),
-                        ("unstarted", "input", json!({"text":"must not run\n"})),
-                    ],
-                ),
-            );
-        } else {
-            let messages = body["messages"].as_array().unwrap();
-            let results = messages
-                .iter()
-                .find_map(|message| {
-                    message["content"].as_array().filter(|blocks| {
-                        blocks
-                            .first()
-                            .is_some_and(|block| block["type"] == "tool_result")
-                    })
-                })
-                .unwrap();
-            assert_eq!(results[0]["content"], "unique executed result");
-            assert_eq!(results[0]["is_error"], false);
-            assert_eq!(results[1]["tool_use_id"], "unstarted");
-            assert_eq!(results[1]["is_error"], true);
-            sse(stream, response("Recovered after backpressure.", &[]));
-        }
-    });
-    let worker = Worker::new(server.url.clone());
-    let agent = worker.agent();
-    agent.send("execute once".into(), 17, json!({})).unwrap();
-    let deadline = Instant::now() + Duration::from_secs(3);
-    let request = loop {
-        assert!(Instant::now() < deadline);
-        wait(agent.fd(), 50).unwrap();
-        if let Some(request) = agent.poll().into_iter().find_map(|event| {
-            if let Event::Request(request) = event {
-                Some(request)
-            } else {
-                None
-            }
-        }) {
-            break request;
-        }
-    };
-    assert_eq!(request.tool, Tool::Shell);
-    for _ in 0..1024 {
-        emit(&agent.shared, Event::Notice(String::new())).unwrap();
-    }
-    request
-        .respond(Ok("unique executed result".into()))
-        .unwrap();
-    while agent.shared.state.lock().unwrap().active.is_some()
-        && !agent.worker.as_ref().unwrap().is_finished()
-    {
-        assert!(
-            Instant::now() < deadline,
-            "turn did not settle under backpressure"
-        );
-        thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        !agent.worker.as_ref().unwrap().is_finished(),
-        "backpressure killed the session"
-    );
-    let events = agent.poll();
-    assert!(events.iter().any(|event| matches!(event, Event::Settled)));
-    assert!(
-        events
-            .iter()
-            .all(|event| !matches!(event, Event::Request(_)))
-    );
-    agent.send("continue".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| panic!("unstarted tool was replayed"));
-    assert!(events.iter().any(
-        |event| matches!(event, Event::Text(text) if text == "Recovered after backpressure.")
-    ));
-    for turn in worker.finish().0 {
-        paired(&turn.messages);
-    }
-    server.finish();
 }
 
 #[test]
@@ -465,10 +357,10 @@ fn shell_input_and_history_reads_share_the_target_and_preserve_later_turns() {
             Tool::Input => json!({"screen":"#0 main"}).to_string(),
             _ => panic!("unexpected workspace tool"),
         };
-        request.respond(Ok(text)).unwrap();
+        request.respond(Ok(text));
     });
     assert_eq!(calls, [Tool::Shell, Tool::Read, Tool::Input]);
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     agent.send("next request".into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("no further terminal operation"));
     assert!(
@@ -532,10 +424,10 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
         if action == "drop" {
             worker.finish();
             assert!(pending.canceled.load(Ordering::Acquire));
-            pending.respond(Ok("late completion".into())).unwrap();
+            pending.respond(Ok("late completion".into()));
         } else {
             if action == "abort" {
-                agent.abort().unwrap();
+                agent.abort();
                 settled(agent, |_| panic!("cancel issued another terminal action"));
             } else {
                 agent.rewind(turn).unwrap();
@@ -557,7 +449,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
                 }
             }
             assert!(pending.canceled.load(Ordering::Acquire));
-            pending.respond(Ok("late completion".into())).unwrap();
+            pending.respond(Ok("late completion".into()));
             agent.send("resume".into(), 17, json!({})).unwrap();
             let events = settled(agent, |_| panic!("old wait revived"));
             assert!(
@@ -631,11 +523,11 @@ fn truncated_model_response_retries_without_replaying_completed_or_partial_tools
     let mut commands = Vec::new();
     let events = settled(agent, |request| {
         let command = request.input["command"].as_str().unwrap().to_owned();
-        request.respond(Ok(format!("{command}-completed"))).unwrap();
+        request.respond(Ok(format!("{command}-completed")));
         commands.push(command);
     });
     assert_eq!(commands, ["first", "second"]);
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     assert_eq!(
         events
             .iter()
@@ -683,13 +575,13 @@ fn completed_model_message_does_not_wait_for_a_missing_http_chunk_trailer() {
         let events = settled(agent, |request| {
             assert_eq!(request.input["command"], "once");
             calls += 1;
-            request.respond(Ok("once-completed".into())).unwrap();
+            request.respond(Ok("once-completed".into()));
         });
         assert_eq!(calls, 1);
         assert!(
             events
                 .iter()
-                .all(|event| !matches!(event, Event::Error(_) | Event::ResetText))
+                .all(|event| !matches!(event, Event::Message("Error", _) | Event::ResetText))
         );
         worker.finish();
         server.finish();
@@ -718,18 +610,17 @@ fn stopping_during_network_backoff_prevents_another_request_or_tool() {
                 .iter()
                 .all(|event| !matches!(event, Event::Request(_)))
         );
-        if events
-            .iter()
-            .any(|event| matches!(event, Event::Notice(text) if text.contains("Retrying")))
-        {
+        if events.iter().any(
+            |event| matches!(event, Event::Message("Context", text) if text.contains("Retrying")),
+        ) {
             break;
         }
     }
     let start = Instant::now();
-    agent.abort().unwrap();
+    agent.abort();
     let events = settled(agent, |_| panic!("tool executed after cancellation"));
     assert!(start.elapsed() < Duration::from_millis(500));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     worker.finish();
     server.finish();
 }
@@ -756,8 +647,8 @@ fn summary_network_recovery_is_bounded_and_keeps_the_request() {
     });
     let shared = Shared {
         state: Mutex::new(State::default()),
-        wake: Arc::new(crate::eventfd::new().unwrap()),
-        notification: crate::eventfd::new().unwrap(),
+        wake: Arc::new(crate::sys::new().unwrap()),
+        notification: crate::sys::new().unwrap(),
     };
     let mut session = Session {
         http: Http::new(),
@@ -768,12 +659,13 @@ fn summary_network_recovery_is_bounded_and_keeps_the_request() {
         summary: String::new(),
     };
     let messages = [json!({"role":"user","content":"Keep completed command 123."})];
-    let body = session.summary_request(&messages).unwrap();
     let canceled = AtomicBool::new(false);
-    let error = session.summarize(&shared, &body, &canceled).unwrap_err();
+    let error = session
+        .summarize(&shared, &messages, &canceled)
+        .unwrap_err();
     assert!(error.to_string().contains("503"));
     assert_eq!(
-        session.summarize(&shared, &body, &canceled).unwrap(),
+        session.summarize(&shared, &messages, &canceled).unwrap(),
         "Recovered summary."
     );
     server.finish();
@@ -823,14 +715,12 @@ fn malformed_streams_and_terminal_errors_do_not_poison_the_next_turn() {
     let agent = worker.agent();
     agent.send("first request".into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("incomplete tool call executed"));
-    assert!(events.iter().any(|event| matches!(event, Event::Error(_))));
+    assert!(errored(&events));
     agent.send("next request".into(), 17, json!({})).unwrap();
     let events = settled(agent, |request| {
-        request
-            .respond(Err(io::Error::other("Shell is busy")))
-            .unwrap();
+        request.respond(Err(io::Error::other("Shell is busy")));
     });
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     for turn in worker.finish().0 {
         paired(&turn.messages);
     }
@@ -866,10 +756,10 @@ fn output_limit_never_executes_even_a_parseable_tool_call() {
     let agent = worker.agent();
     agent.send("first request".into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("output-limited tool call executed"));
-    assert!(events.iter().any(|event| matches!(event, Event::Error(_))));
+    assert!(errored(&events));
     agent.send("continue".into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("unexpected tool call"));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     worker.finish();
     server.finish();
 }
@@ -933,10 +823,14 @@ fn long_work_summarizes_complete_exchanges_privately_and_rolls_old_turns_forward
         )
         .unwrap();
     let events = settled(agent, |request| {
-        request.respond(Ok("x".repeat(60_000))).unwrap();
+        request.respond(Ok("x".repeat(60_000)));
     });
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
-    assert!(events.iter().any(|event| matches!(event, Event::Notice(_))));
+    assert!(!errored(&events));
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Message("Context", _)))
+    );
     assert!(
         !events
             .iter()
@@ -950,7 +844,7 @@ fn long_work_summarizes_complete_exchanges_privately_and_rolls_old_turns_forward
         )
         .unwrap();
     let events = settled(agent, |_| panic!("summary cannot execute a tool"));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     let (history, summary) = worker.finish();
     assert_eq!(history.len(), 1);
     assert!(summary.contains("PRIVATE SUMMARY 2"));
@@ -1024,14 +918,14 @@ fn repeated_compaction_keeps_the_request_when_summaries_omit_it() {
     let events = settled(agent, |request| {
         let text = format!("Observation {observations}: {}", "x".repeat(60_000));
         observations += 1;
-        request.respond(Ok(text)).unwrap();
+        request.respond(Ok(text));
     });
     assert_eq!(observations, 18);
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     assert_eq!(
         events
             .iter()
-            .filter(|event| matches!(event, Event::Notice(_)))
+            .filter(|event| matches!(event, Event::Message("Context", _)))
             .count(),
         4
     );
@@ -1104,12 +998,10 @@ fn goal_review_compaction_keeps_the_latest_tool_result_as_original_evidence() {
             "historical-output:"
         };
         calls += 1;
-        request
-            .respond(Ok(format!("{label}{}", "x".repeat(60_000))))
-            .unwrap();
+        request.respond(Ok(format!("{label}{}", "x".repeat(60_000))));
     });
     assert_eq!(calls, 4);
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     let (history, _) = worker.finish();
     paired(&history[0].messages);
     server.finish();
@@ -1162,22 +1054,20 @@ fn failed_compaction_preserves_executed_results_for_the_next_turn() {
         .unwrap();
     let mut actions = 0;
     let events = settled(agent, |request| {
-        request
-            .respond(Ok(format!("executed-{actions}: {}", "x".repeat(60_000))))
-            .unwrap();
+        request.respond(Ok(format!("executed-{actions}: {}", "x".repeat(60_000))));
         actions += 1;
     });
     assert_eq!(actions, 5);
     assert!(
         events
             .iter()
-            .any(|event| matches!(event, Event::Error(text) if text.contains("400")))
+            .any(|event| matches!(event, Event::Message("Error", text) if text.contains("400")))
     );
     agent
         .send("continue without repeating actions".into(), 17, json!({}))
         .unwrap();
     let events = settled(agent, |_| panic!("completed action was replayed"));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     let (history, summary) = worker.finish();
     assert!(summary.contains("All five actions already executed."));
     assert_eq!(history.len(), 1);
@@ -1219,10 +1109,11 @@ fn default_goal_continues_after_a_premature_final_and_verifies_the_result() {
                 4 => {
                     assert_eq!(body["system"], GOAL_REVIEW);
                     assert!(json!(messages).to_string().contains("verified-result"));
-                    goal_response(
-                        "complete",
-                        "Command 7 exited successfully with the requested result.",
-                    )
+                    let review = json!({
+                        "status":"complete",
+                        "reason":"Command 7 exited successfully with the requested result."
+                    });
+                    response(&format!("```json\n{review}\n```"), &[])
                 }
                 _ => unreachable!(),
             },
@@ -1237,19 +1128,15 @@ fn default_goal_continues_after_a_premature_final_and_verifies_the_result() {
     let events = settled(agent, |request| {
         calls += 1;
         assert_eq!(request.tool, Tool::Read);
-        request
-            .respond(Ok(
-                json!({"exit_code":0,"text":"verified-result"}).to_string()
-            ))
-            .unwrap();
+        request.respond(Ok(
+            json!({"exit_code":0,"text":"verified-result"}).to_string()
+        ));
     });
     assert_eq!(calls, 1);
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::Notice(text) if text.contains("Read command 7")))
-    );
+    assert!(!errored(&events));
+    assert!(events.iter().any(
+        |event| matches!(event, Event::Message("Context", text) if text.contains("Read command 7"))
+    ));
     assert!(
         !events
             .iter()
@@ -1296,12 +1183,12 @@ fn blocked_goal_reports_the_missing_input_and_accepts_the_next_submission() {
     let events = settled(agent, |_| {
         panic!("missing input must not cause terminal actions")
     });
-    assert!(events.iter().any(|event| matches!(event, Event::Blocked(text) if text.contains("provide the target directory"))));
+    assert!(events.iter().any(|event| matches!(event, Event::Message("Blocked", text) if text.contains("provide the target directory"))));
     agent.send("Use /project".into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| {
         panic!("an answer does not require a terminal action")
     });
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     assert_eq!(worker.finish().0.len(), 2);
     server.finish();
 }
@@ -1330,10 +1217,10 @@ fn stopping_an_idle_goal_review_closes_the_request_without_more_actions() {
         .unwrap();
     review_started.recv_timeout(Duration::from_secs(3)).unwrap();
     let started = Instant::now();
-    agent.abort().unwrap();
+    agent.abort();
     let events = settled(agent, |_| panic!("a canceled review executed a tool"));
     assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     let (history, _) = worker.finish();
     assert!(
         json!(history[0].messages)
@@ -1373,15 +1260,15 @@ fn malformed_goal_review_preserves_completed_actions_without_retrying_them() {
     let mut calls = 0;
     let events = settled(agent, |request| {
         calls += 1;
-        request.respond(Ok("executed-once".into())).unwrap();
+        request.respond(Ok("executed-once".into()));
     });
     assert_eq!(calls, 1);
-    assert!(events.iter().any(|event| matches!(event, Event::Error(_))));
+    assert!(errored(&events));
     agent
         .send("continue using the existing result".into(), 17, json!({}))
         .unwrap();
     let events = settled(agent, |_| panic!("completed action was replayed"));
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     for turn in worker.finish().0 {
         paired(&turn.messages);
     }
@@ -1454,7 +1341,7 @@ fn workspace_tools_route_explicit_panes_and_keep_committed_results() {
             Tool::OpenTerminal => json!({"created":true,"pane":32}),
             _ => json!({"text":"original evidence"}),
         };
-        request.respond(Ok(result.to_string())).unwrap();
+        request.respond(Ok(result.to_string()));
     });
     assert_eq!(
         calls,
@@ -1467,10 +1354,10 @@ fn workspace_tools_route_explicit_panes_and_keep_committed_results() {
             (Tool::OpenTerminal, 31)
         ]
     );
-    assert!(events.iter().all(|event| !matches!(event, Event::Error(_))));
+    assert!(!errored(&events));
     assert!(!edit_id.is_empty());
     assert!(events.iter().any(|event| matches!(event,
-        Event::Tool { id, name, done: true, .. } if name == "edit_file" && id == &edit_id)));
+        Event::Tool { id, role, .. } if role == "edit_file · done" && id == &edit_id)));
     worker.finish();
     server.finish();
 }
@@ -1502,7 +1389,7 @@ fn tool_request(
             input,
             canceled: Arc::new(AtomicBool::new(false)),
             reply,
-            wake: Arc::new(crate::eventfd::new().unwrap()),
+            wake: Arc::new(crate::sys::new().unwrap()),
         },
         receiver,
     )
@@ -1513,7 +1400,7 @@ fn terminal_frame(
     peer: &mut crate::wire::Peer,
     prompt: Option<u64>,
 ) {
-    use crate::workspace::{Action, PaneView, Rect, Snapshot};
+    use crate::workspace::{Action, PaneView, Snapshot};
     client.request_screen().unwrap();
     client.flush().unwrap();
     let mut request = None;
@@ -1533,7 +1420,7 @@ fn terminal_frame(
         0,
     );
     peer.send_response(crate::wire::Response::State(
-        Snapshot {
+        Some(Snapshot {
             name: "test".into(),
             controller: true,
             focused: 1,
@@ -1542,12 +1429,7 @@ fn terminal_frame(
             panes: vec![PaneView {
                 id: 7,
                 tab: 7,
-                rect: Rect {
-                    x: 0,
-                    y: 0,
-                    cols: 20,
-                    rows: 4,
-                },
+                rect: crate::panel::rect(0, 0, 20, 4),
                 title: "shell".into(),
                 cwd: None,
                 process: Arc::default(),
@@ -1556,7 +1438,7 @@ fn terminal_frame(
                 input_generation: 4,
                 shell_prompt: prompt,
             }],
-        },
+        }),
         vec![(7, crate::screen::Update::capture_live(&core))],
         request.unwrap(),
     ))
@@ -1566,32 +1448,37 @@ fn terminal_frame(
     assert!(!client.screen_stale());
 }
 
-#[test]
-fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
+// Starts open_terminal from pane 1, acknowledges new pane 7 and delivers its first frame.
+fn open_terminal(
+    client: &mut crate::workspace::Client,
+    peer: &mut crate::wire::Peer,
+) -> (crate::agent::Agent, mpsc::Receiver<io::Result<String>>) {
     use crate::agent::{Agent, Stage};
-    use crate::workspace::{Action, ClientEvent};
-    let (mut client, mut peer) = terminal_client();
     let mut agent = Agent::default();
     let (request, result) = tool_request(Tool::OpenTerminal, 1, json!({"pane":1}));
-    agent.begin(request, &mut client).unwrap();
+    agent.begin(request, client);
     let Stage::NewTerminal { id } = agent.operation.as_ref().unwrap().stage else {
         panic!()
     };
-    agent
-        .handle_event(
-            &mut ClientEvent::AgentNewTab {
-                request: id,
-                result: Ok(7),
-            },
-            &mut client,
-        )
-        .unwrap();
-    terminal_frame(&mut client, &mut peer, None);
-    agent.advance(&mut client).unwrap();
+    let ack = &mut crate::workspace::Response::AgentNewTab {
+        request: id,
+        result: Ok(7),
+    };
+    agent.handle_event(ack, client);
+    terminal_frame(client, peer, None);
+    (agent, result)
+}
+
+#[test]
+fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
+    use crate::workspace::Action;
+    let (mut client, mut peer) = terminal_client();
+    let (mut agent, result) = open_terminal(&mut client, &mut peer);
+    agent.advance(&mut client);
     assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
     assert!(agent.deadline().is_some());
     terminal_frame(&mut client, &mut peer, Some(9));
-    agent.advance(&mut client).unwrap();
+    agent.advance(&mut client);
     let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
     assert_eq!(value["created"], true);
     assert_eq!(value["pane"], 7);
@@ -1601,7 +1488,7 @@ fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
     assert!(!agent.observed_input.contains_key(&1));
 
     let (request, _result) = tool_request(Tool::Shell, 7, json!({"command":"printf verified"}));
-    agent.begin_ready(request, &mut client).unwrap();
+    agent.begin_ready(request, &mut client);
     client.flush().unwrap();
     let Some(Action::AgentInput {
         pane,
@@ -1617,8 +1504,7 @@ fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
 
 #[test]
 fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
-    use crate::agent::{Agent, Stage};
-    use crate::workspace::ClientEvent;
+    use crate::agent::Stage;
     for finish in [
         "timeout",
         "cancel",
@@ -1627,22 +1513,7 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
         "stalled-frame",
     ] {
         let (mut client, mut peer) = terminal_client();
-        let mut agent = Agent::default();
-        let (request, result) = tool_request(Tool::OpenTerminal, 1, json!({"pane":1}));
-        agent.begin(request, &mut client).unwrap();
-        let Stage::NewTerminal { id } = agent.operation.as_ref().unwrap().stage else {
-            panic!()
-        };
-        agent
-            .handle_event(
-                &mut ClientEvent::AgentNewTab {
-                    request: id,
-                    result: Ok(7),
-                },
-                &mut client,
-            )
-            .unwrap();
-        terminal_frame(&mut client, &mut peer, None);
+        let (mut agent, result) = open_terminal(&mut client, &mut peer);
         match finish {
             "timeout" => {
                 agent.operation.as_mut().unwrap().stage = Stage::NewTerminalOutput {
@@ -1672,7 +1543,7 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
             }
             _ => unreachable!(),
         }
-        agent.advance(&mut client).unwrap();
+        agent.advance(&mut client);
         assert!(agent.operation.is_none());
         assert!(agent.deadline().is_none());
         let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
@@ -1683,7 +1554,7 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
             assert_eq!(value["outcome"], "timeout");
             let (request, result) =
                 tool_request(Tool::Shell, 7, json!({"command":"printf too-early"}));
-            agent.begin_ready(request, &mut client).unwrap();
+            agent.begin_ready(request, &mut client);
             assert!(result.recv().unwrap().is_err());
         } else {
             assert!(value["observation_error"].is_string());
@@ -1694,7 +1565,7 @@ fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
 #[test]
 fn accepted_input_observation_ends_without_a_fresh_frame() {
     use crate::agent::{Agent, Operation, Stage};
-    use crate::workspace::ClientEvent;
+    use crate::workspace::Response;
     for cancel in [false, true] {
         let (mut client, _peer) = terminal_client();
         let mut agent = Agent::default();
@@ -1707,15 +1578,13 @@ fn accepted_input_observation_ends_without_a_fresh_frame() {
                 before: 0,
             },
         });
-        agent
-            .handle_event(
-                &mut ClientEvent::AgentInput {
-                    request: 42,
-                    result: Ok(None),
-                },
-                &mut client,
-            )
-            .unwrap();
+        agent.handle_event(
+            &mut Response::AgentInput {
+                request: 42,
+                result: Ok(None),
+            },
+            &mut client,
+        );
         assert!(client.screen_stale());
         assert!(agent.deadline().is_some());
         if cancel {
@@ -1733,7 +1602,7 @@ fn accepted_input_observation_ends_without_a_fresh_frame() {
             };
             *until = Instant::now();
         }
-        agent.advance(&mut client).unwrap();
+        agent.advance(&mut client);
         let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
         assert_eq!(value["input_queued"], true);
         assert!(value["observation_error"].is_string());
@@ -1768,7 +1637,7 @@ fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
         });
         client.refresh_screen().unwrap();
         assert_eq!(agent.deadline(), Some(until));
-        agent.advance(&mut client).unwrap();
+        agent.advance(&mut client);
         assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
         let (Stage::Command { until, .. } | Stage::Change { until }) =
             &mut agent.operation.as_mut().unwrap().stage
@@ -1776,7 +1645,7 @@ fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
             panic!()
         };
         *until = Instant::now();
-        agent.advance(&mut client).unwrap();
+        agent.advance(&mut client);
         let result = result.recv().unwrap();
         if tool == Tool::Shell {
             let value: Value = serde_json::from_str(&result.unwrap()).unwrap();
@@ -1794,9 +1663,41 @@ fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
 }
 
 #[test]
+fn stopping_a_shell_observation_keeps_the_accepted_command() {
+    use crate::agent::{Agent, Operation, Stage};
+    let (mut client, _peer) = terminal_client();
+    let mut agent = Agent::default();
+    let (request, result) = tool_request(Tool::Shell, 7, json!({"command":"make"}));
+    agent.operation = Some(Operation {
+        request,
+        stage: Stage::Command {
+            command: 37,
+            until: Instant::now() + Duration::from_secs(60),
+        },
+    });
+    agent.close(&mut client).unwrap();
+    let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
+    assert_eq!(value["input_queued"], true);
+    assert_eq!(value["command"], 37);
+    assert!(value["observation_error"].is_string());
+}
+
+#[test]
+fn waiting_without_an_activity_baseline_does_not_report_a_change() {
+    use crate::agent::Agent;
+    let (mut client, mut peer) = terminal_client();
+    terminal_frame(&mut client, &mut peer, Some(9));
+    let mut agent = Agent::default();
+    let (request, result) = tool_request(Tool::Read, 7, json!({"source":"screen","wait":30}));
+    agent.begin_ready(request, &mut client);
+    agent.advance(&mut client);
+    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+}
+
+#[test]
 fn committed_file_diff_keeps_its_tool_identity_without_expanding_model_result() {
     use crate::agent::{Agent, Operation, Stage};
-    use crate::workspace::{AgentChange, ClientEvent, FileResult};
+    use crate::workspace::{AgentChange, FileResult, Response};
     let (mut client, _peer) = terminal_client();
     let mut agent = Agent {
         turn: 5,
@@ -1811,23 +1712,21 @@ fn committed_file_diff_keeps_its_tool_identity_without_expanding_model_result() 
         request,
         stage: Stage::File { id: 42 },
     });
-    agent
-        .handle_event(
-            &mut ClientEvent::AgentFile {
-                request: 42,
-                result: Ok(FileResult::Edited {
-                    change: AgentChange {
-                        path: "a.rs".into(),
-                        added: 1,
-                        removed: 1,
-                        diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
-                        ..AgentChange::default()
-                    },
-                }),
-            },
-            &mut client,
-        )
-        .unwrap();
+    agent.handle_event(
+        &mut Response::AgentFile {
+            request: 42,
+            result: Ok(FileResult::Edited {
+                change: AgentChange {
+                    path: "a.rs".into(),
+                    added: 1,
+                    removed: 1,
+                    diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+                    ..AgentChange::default()
+                },
+            }),
+        },
+        &mut client,
+    );
     assert_eq!(agent.changes[0].tool_id, "test-edit");
     assert_eq!(agent.changes[0].turn, 5);
     let returned: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();

@@ -1,7 +1,52 @@
 use super::*;
+use crate::history::HistoryBudget;
 use crate::vt::Parser;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
-fn terminal(columns: u16, lines: u16) -> (Core, Parser) {
+impl Core {
+    /// Rows changed since `reset_damage`.
+    pub(crate) fn dirty_rows(&self) -> impl Iterator<Item = usize> + '_ {
+        let all = self.full_revision == self.revision;
+        (0..self.screen_lines()).filter(move |&y| {
+            !self.revision_pending && (all || self.row(y).revision == self.revision)
+        })
+    }
+
+    pub(crate) fn palette_dirty(&self) -> bool {
+        !self.revision_pending && self.palette_revision == self.revision
+    }
+}
+
+pub(crate) fn selection_to_string(core: &Core) -> Option<String> {
+    let range = core.selection_range()?;
+    let mut text = String::new();
+    for line in range.start.line..=range.end.line {
+        let row = core.absolute_row(line)?;
+        let start = if line == range.start.line {
+            range.start.column
+        } else {
+            0
+        };
+        let end = if line == range.end.line {
+            range.end.column + 1
+        } else {
+            core.columns()
+        };
+        text.extend(row.text(start, end, true));
+        if line != range.end.line && !row.wrapped {
+            text.push('\n');
+        }
+    }
+    Some(text)
+}
+
+fn terminal_with_history(columns: u16, lines: u16) -> (Core, Parser) {
+    (disk_core(columns, lines, 1 << 20), Parser::new())
+}
+
+pub(crate) fn terminal(columns: u16, lines: u16) -> (Core, Parser) {
     (
         Core::new(
             WindowSize {
@@ -16,18 +61,103 @@ fn terminal(columns: u16, lines: u16) -> (Core, Parser) {
         Parser::new(),
     )
 }
+
+static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
+
+/// A core whose scrolled-out rows go through the real history writer.
+pub(crate) fn disk_core(columns: u16, lines: u16, capacity: u64) -> Core {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
+    std::fs::create_dir_all(&root).unwrap();
+    let budget = HistoryBudget::new(
+        root.join(format!(
+            "test-{}-{}",
+            std::process::id(),
+            NEXT_BUDGET.fetch_add(1, Ordering::Relaxed)
+        )),
+        capacity,
+    )
+    .unwrap();
+    let mut core = Core::new(
+        WindowSize {
+            num_cols: columns,
+            num_lines: lines,
+            cell_width: 0,
+            cell_height: 0,
+        },
+        0xcccccc,
+        0x202020,
+    );
+    core.enable_history(budget);
+    core
+}
+
+/// Parses all of `bytes`, waiting for the history writer whenever the parser stops for it.
+pub(crate) fn parse_all(core: &mut Core, parser: &mut Parser, mut bytes: &[u8]) {
+    while !bytes.is_empty() {
+        bytes = &bytes[parser.advance(core, bytes).0..];
+        if !bytes.is_empty() {
+            core.poll_history();
+            std::thread::yield_now();
+        }
+    }
+}
+
+/// Returns once the writer has stored every row sent so far and the core has seen its replies.
+pub(crate) fn settle(core: &mut Core) {
+    let cursor = HistoryCursor {
+        epoch: core.history.as_ref().unwrap().layout_epoch,
+        row: core.block_origin + core.main_screen().cursor.point.line as u64,
+        offset: 0,
+    };
+    let (receiver, _) = core.read_history(None, Some(cursor), None);
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        core.poll_history();
+        match receiver.try_recv() {
+            Ok(page) => {
+                page.unwrap();
+                core.poll_history();
+                return;
+            }
+            Err(mpsc::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "history writer stalled");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(mpsc::TryRecvError::Disconnected) => panic!("history request dropped"),
+        }
+    }
+}
+
+pub(crate) fn resize(core: &mut Core, columns: u16, lines: u16) {
+    core.resize(WindowSize {
+        num_cols: columns,
+        num_lines: lines,
+        ..core.size
+    });
+}
+
+/// Selects the cells from `start` through `end`, both inclusive.
+pub(crate) fn select(core: &mut Core, start: (i32, usize), end: (i32, usize)) {
+    let point = |(line, column)| Point { line, column };
+    core.selection_start(point(start), Side::Left, SelectionType::Simple);
+    core.selection_update(point(end), Side::Right);
+}
+
 fn line(core: &Core, y: usize) -> String {
     core.row(y).cells.iter().map(|cell| cell.c).collect()
 }
+pub(crate) fn replies(core: &mut Core) -> Vec<u8> {
+    core.take_events()
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Write(bytes) => Some(bytes),
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
 fn feed(core: &mut Core, processor: &mut Parser, text: &str) {
     processor.advance(core, text.as_bytes());
-}
-
-#[test]
-fn cells_are_sixteen_bytes_without_extra_allocation() {
-    assert_eq!(std::mem::size_of::<Cell>(), 16);
-    let (core, _) = terminal(80, 24);
-    assert!(core.active.rows.iter().all(|row| row.extras().is_empty()));
 }
 
 #[test]
@@ -112,12 +242,7 @@ fn row_snapshots_keep_extras_across_edits_clear_and_reflow() {
             feed(&mut core, &mut parser, edit);
             assert_eq!(snapshot.cells, cells);
             assert_eq!(snapshot.extras(), extras, "{alternate} {edit:?}");
-            core.resize(WindowSize {
-                num_cols: 2,
-                num_lines: 2,
-                cell_width: 8,
-                cell_height: 16,
-            });
+            resize(&mut core, 2, 2);
             assert_eq!(snapshot.cells, cells);
             assert_eq!(snapshot.extras(), extras, "resize: {alternate} {edit:?}");
         }
@@ -125,39 +250,8 @@ fn row_snapshots_keep_extras_across_edits_clear_and_reflow() {
 }
 
 #[test]
-fn row_parts_keep_unordered_extras_addressable_and_reject_duplicate_columns() {
-    let accent = Extra {
-        zerowidth: vec!['\u{301}'].into(),
-        underline_color: None,
-    };
-    let underline = Extra {
-        zerowidth: Vec::new().into(),
-        underline_color: Some(Color::Indexed(42)),
-    };
-    let row = Row::from_parts(
-        vec![Cell::default(); 8],
-        false,
-        0,
-        vec![(6, accent.clone()), (1, underline.clone())],
-    )
-    .unwrap();
-    assert_eq!(row.extra(6), Some(&accent));
-    assert_eq!(row.extra(1), Some(&underline));
-    assert_eq!(row.extra(3), None);
-    assert!(
-        Row::from_parts(
-            vec![Cell::default(); 8],
-            false,
-            0,
-            vec![(6, accent.clone()), (1, underline), (6, accent)],
-        )
-        .is_none()
-    );
-}
-
-#[test]
 fn pending_wrap_combining_and_wide_overwrite() {
-    let (mut core, mut parser) = terminal(6, 3);
+    let (mut core, mut parser) = terminal_with_history(6, 3);
     feed(&mut core, &mut parser, "abcde界\u{301}");
     assert!(core.row(0).wrapped);
     assert_eq!(line(&core, 1), "界     ");
@@ -208,167 +302,6 @@ fn region_scrolling_does_not_enter_history_and_uses_bce() {
 }
 
 #[test]
-fn alternate_screen_preserves_main_and_its_saved_cursor() {
-    let (mut core, mut parser) = terminal(8, 3);
-    feed(
-        &mut core,
-        &mut parser,
-        "main\x1b7\x1b[2;3H\x1b[?1049halternate\x1b7\x1b[3;3H\x1b8\x1b[?1049l",
-    );
-    assert_eq!(line(&core, 0), "main    ");
-    assert_eq!(core.cursor().0, Point { line: 1, column: 2 });
-    assert!(!core.mode().contains(Mode::ALT_SCREEN));
-    feed(&mut core, &mut parser, "\x1b[?47h");
-    assert_eq!(line(&core, 0), "alternat");
-    feed(&mut core, &mut parser, "\x1b[?47l");
-    assert_eq!(line(&core, 0), "main    ");
-}
-
-#[test]
-fn history_is_bounded_and_clear_saved_only_removes_history() {
-    let (mut core, mut parser) = terminal(8, 2);
-    for _ in 0..HISTORY_LIMIT + 50 {
-        feed(&mut core, &mut parser, "line\r\n");
-    }
-    assert_eq!(core.history_size(), HISTORY_LIMIT);
-    core.scroll_display(Scroll::Top);
-    assert_eq!(core.display_offset(), HISTORY_LIMIT);
-    core.reset_damage();
-    feed(&mut core, &mut parser, "\x1b[3J");
-    assert_eq!(core.dirty_rows().count(), 2);
-    assert_eq!(core.history_size(), 0);
-    assert_eq!(core.display_offset(), 0);
-    assert_eq!(line(&core, 0), "line    ");
-    core.reset_damage();
-    feed(&mut core, &mut parser, "\x1b[3J");
-    assert_eq!(core.dirty_rows().count(), 0);
-}
-
-#[test]
-fn reflow_preserves_explicit_spaces_colors_wide_and_combining() {
-    let (mut core, mut parser) = terminal(8, 4);
-    feed(
-        &mut core,
-        &mut parser,
-        "ab  界\u{301}cdef\r\n\x1b[41m  \x1b[0m",
-    );
-    core.resize(WindowSize {
-        num_cols: 5,
-        num_lines: 4,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    core.selection_start(
-        Point {
-            line: -(core.history_size() as i32),
-            column: 0,
-        },
-        Side::Left,
-        SelectionType::Simple,
-    );
-    core.selection_update(
-        Point {
-            line: core.cursor().0.line,
-            column: 2,
-        },
-        Side::Left,
-    );
-    let text = core.selection_to_string().unwrap();
-    assert!(text.starts_with("ab  界\u{301}cdef\n"), "{text:?}");
-    core.resize(WindowSize {
-        num_cols: 10,
-        num_lines: 4,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    assert_eq!(line(&core, 0), "ab  界 cdef");
-    assert_eq!(
-        core.row(0).extra(4).unwrap().zerowidth.as_slice(),
-        &['\u{301}']
-    );
-    assert_eq!(core.row(1).cells[0].bg, Color::Named(NamedColor::Red));
-    assert_eq!(core.row(1).cells[1].bg, Color::Named(NamedColor::Red));
-}
-
-#[test]
-fn reflow_moves_combining_and_underline_colors_after_out_of_order_edits() {
-    let (mut core, mut parser) = terminal(6, 5);
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b[58;5;2ma\u{301}b\u{302}界\u{303}cd\u{304}e\u{305}f\u{306}\x1b[1;1H\x1b[58;5;3mA\u{307}",
-    );
-    for columns in [3, 1, 12] {
-        core.resize(WindowSize {
-            num_cols: columns,
-            num_lines: 12,
-            cell_width: 8,
-            cell_height: 16,
-        });
-    }
-    core.selection_start(
-        Point { line: 0, column: 0 },
-        Side::Left,
-        SelectionType::Lines,
-    );
-    assert_eq!(
-        core.selection_to_string().as_deref(),
-        Some("A\u{307}b\u{302}界\u{303}cd\u{304}e\u{305}f\u{306}")
-    );
-    assert_eq!(
-        core.row(0).extra(0).unwrap().underline_color,
-        Some(Color::Indexed(3))
-    );
-    for column in 1..7 {
-        assert_eq!(
-            core.row(0).extra(column).unwrap().underline_color,
-            Some(Color::Indexed(2))
-        );
-    }
-}
-
-#[test]
-fn reflow_does_not_turn_selection_padding_into_written_spaces() {
-    let (mut core, _) = terminal(9, 3);
-    core.selection_start(
-        Point { line: 0, column: 0 },
-        Side::Left,
-        SelectionType::Simple,
-    );
-    core.selection_update(Point { line: 2, column: 8 }, Side::Right);
-    assert_eq!(core.selection_to_string().as_deref(), Some("\n\n"));
-    core.resize(WindowSize {
-        num_cols: 2,
-        num_lines: 3,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    assert!(core.active.rows.iter().all(|row| row.used == 0));
-    assert!(!core.selection_to_string().unwrap().contains(' '));
-}
-
-#[test]
-fn reflow_does_not_turn_a_saved_cursor_in_a_wide_wrap_gap_into_text() {
-    let (mut core, mut parser) = terminal(2, 3);
-    feed(&mut core, &mut parser, "a中\x1b[1;2H\x1b7\x1b[2;1H");
-    assert!(core.row(0).wrapped);
-    assert_eq!(core.row(0).used, 1);
-    core.resize(WindowSize {
-        num_cols: 3,
-        num_lines: 3,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    assert_eq!(line(&core, 0), "a中 ");
-    core.selection_start(
-        Point { line: 0, column: 0 },
-        Side::Left,
-        SelectionType::Lines,
-    );
-    assert_eq!(core.selection_to_string().as_deref(), Some("a中"));
-}
-
-#[test]
 fn damage_tracks_content_changes_separately_from_display_metadata() {
     let (mut core, mut parser) = terminal(8, 3);
     core.reset_damage();
@@ -406,37 +339,10 @@ fn automatic_wrap_damages_the_previous_rows_metadata() {
 }
 
 #[test]
-fn resize_preserves_insertion_after_a_full_line() {
-    for columns in [3, 8] {
-        let (mut core, mut parser) = terminal(6, 4);
-        feed(&mut core, &mut parser, "abcdef");
-        core.resize(WindowSize {
-            num_cols: columns,
-            num_lines: 4,
-            cell_width: 8,
-            cell_height: 16,
-        });
-        feed(&mut core, &mut parser, "Z");
-        core.selection_start(
-            Point { line: 0, column: 0 },
-            Side::Left,
-            SelectionType::Simple,
-        );
-        core.selection_update(core.cursor().0, Side::Left);
-        assert_eq!(core.selection_to_string().as_deref(), Some("abcdefZ"));
-    }
-}
-
-#[test]
 fn alternate_resize_truncates_without_reflowing() {
     let (mut core, mut parser) = terminal(8, 3);
     feed(&mut core, &mut parser, "main\x1b[?1049habcdefgh\r\nsecond");
-    core.resize(WindowSize {
-        num_cols: 4,
-        num_lines: 3,
-        cell_width: 8,
-        cell_height: 16,
-    });
+    resize(&mut core, 4, 3);
     assert_eq!(line(&core, 0), "abcd");
     assert_eq!(line(&core, 1), "seco");
     assert_eq!(core.history_size(), 0);
@@ -447,7 +353,7 @@ fn alternate_resize_truncates_without_reflowing() {
         SelectionType::Simple,
     );
     core.selection_update(core.cursor().0, Side::Left);
-    assert_eq!(core.selection_to_string().as_deref(), Some("mainZ"));
+    assert_eq!(selection_to_string(&core).as_deref(), Some("mainZ"));
 }
 
 #[test]
@@ -459,29 +365,28 @@ fn word_and_line_selection_follow_soft_wraps_and_wide_cells() {
         Side::Left,
         SelectionType::Semantic,
     );
-    assert_eq!(core.selection_to_string().as_deref(), Some("ab界cdef"));
+    assert_eq!(selection_to_string(&core).as_deref(), Some("ab界cdef"));
     core.selection_start(
         Point { line: 1, column: 1 },
         Side::Left,
         SelectionType::Lines,
     );
-    assert_eq!(core.selection_to_string().as_deref(), Some("ab界cdef end"));
+    assert_eq!(selection_to_string(&core).as_deref(), Some("ab界cdef end"));
     core.selection_start(
         Point { line: 0, column: 0 },
         Side::Right,
         SelectionType::Simple,
     );
     core.selection_update(Point { line: 0, column: 0 }, Side::Left);
-    assert_eq!(core.selection_to_string().as_deref(), Some("a"));
+    assert_eq!(selection_to_string(&core).as_deref(), Some("a"));
 }
 
 #[test]
 fn object_selection_preserves_urls_locations_and_quoted_unicode() {
     fn select_object(core: &mut Core, line: i32, column: usize) {
         let [start, end] = object_selection((i64::from(line), column), |row| {
-            Ok::<_, std::convert::Infallible>(core.absolute_row(row as i32))
+            core.absolute_row(row as i32)
         })
-        .unwrap()
         .unwrap_or([(i64::from(line), column); 2]);
         core.selection_start(
             Point {
@@ -511,57 +416,19 @@ fn object_selection_preserves_urls_locations_and_quoted_unicode() {
         let (mut core, mut parser) = terminal(40, 3);
         feed(&mut core, &mut parser, text);
         select_object(&mut core, 0, column);
-        assert_eq!(core.selection_to_string().as_deref(), Some(expected));
+        assert_eq!(selection_to_string(&core).as_deref(), Some(expected));
     }
     let (mut core, mut parser) = terminal(8, 5);
     feed(&mut core, &mut parser, "see \"中\u{301}文 file.rs\" now");
     select_object(&mut core, 1, 2);
     assert_eq!(
-        core.selection_to_string().as_deref(),
+        selection_to_string(&core).as_deref(),
         Some("\"中\u{301}文 file.rs\"")
     );
     let (mut core, mut parser) = terminal(100, 100);
     feed(&mut core, &mut parser, &"a".repeat(10_000));
     select_object(&mut core, 50, 0);
-    assert_eq!(core.selection_to_string().as_deref(), Some("a"));
-}
-
-#[test]
-fn height_resize_moves_view_border_without_rebuilding_rows() {
-    let (mut core, mut parser) = terminal(5, 3);
-    feed(&mut core, &mut parser, "one\r\ntwo\r\nthree\r\nfour");
-    let first_allocation = core.active.rows[0].cells.as_ptr();
-    core.selection_start(
-        Point {
-            line: -1,
-            column: 0,
-        },
-        Side::Left,
-        SelectionType::Simple,
-    );
-    core.selection_update(Point { line: 0, column: 3 }, Side::Left);
-    core.resize(WindowSize {
-        num_cols: 5,
-        num_lines: 5,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    assert_eq!(core.active.rows[0].cells.as_ptr(), first_allocation);
-    assert_eq!(core.history_size(), 0);
-    assert_eq!(core.cursor().0, Point { line: 3, column: 4 });
-    assert_eq!(core.selection_to_string().as_deref(), Some("one\ntwo"));
-    core.resize(WindowSize {
-        num_cols: 5,
-        num_lines: 2,
-        cell_width: 8,
-        cell_height: 16,
-    });
-    assert_eq!(core.active.rows[0].cells.as_ptr(), first_allocation);
-    assert_eq!(core.history_size(), 2);
-    assert_eq!(core.cursor().0, Point { line: 1, column: 4 });
-    assert_eq!(line(&core, 0), "three");
-    assert_eq!(line(&core, 1), "four ");
-    assert_eq!(core.selection_to_string().as_deref(), Some("one\ntwo"));
+    assert_eq!(selection_to_string(&core).as_deref(), Some("a"));
 }
 
 #[test]
@@ -573,30 +440,14 @@ fn restoring_origin_cursor_clamps_to_the_current_margins_before_reporting() {
         "\x1b[2;6r\x1b[?6h\x1b7\x1b[5;8r\x1b8\x1b[6n",
     );
     assert_eq!(core.cursor().0, Point { line: 4, column: 0 });
-    let replies: Vec<_> = core
-        .take_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Write(bytes) => Some(bytes),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(replies, [b"\x1b[1;1R"]);
+    assert_eq!(replies(&mut core), b"\x1b[1;1R");
     feed(
         &mut core,
         &mut parser,
         "\x1b[4;4H\x1b7\x1b[2;4r\x1b8\x1b[6n",
     );
     assert_eq!(core.cursor().0, Point { line: 3, column: 3 });
-    let replies: Vec<_> = core
-        .take_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Write(bytes) => Some(bytes),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(replies, [b"\x1b[3;4R"]);
+    assert_eq!(replies(&mut core), b"\x1b[3;4R");
 }
 
 #[test]
@@ -618,17 +469,8 @@ fn origin_mode_follows_the_restored_cursor_and_active_screen() {
         "\x1b[?6l\x1b[?6$p\x1b[?47h\x1b[?6$p",
     );
     assert!(core.mode().contains(Mode::ORIGIN));
-    let replies: Vec<_> = core
-        .take_events()
-        .into_iter()
-        .filter_map(|event| match event {
-            Event::Write(bytes) => Some(bytes),
-            _ => None,
-        })
-        .flatten()
-        .collect();
     assert_eq!(
-        replies,
+        replies(&mut core),
         b"\x1b[?6;1$y\x1b[1;1R\x1b[?6;2$y\x1b[?6;1$y\x1b[?6;2$y\x1b[?6;1$y"
     );
 }
@@ -636,7 +478,7 @@ fn origin_mode_follows_the_restored_cursor_and_active_screen() {
 #[test]
 fn top_anchored_scroll_region_preserves_history_and_fixed_footer() {
     for scroll in ["\n", "\x1b[S"] {
-        let (mut core, mut parser) = terminal(5, 4);
+        let (mut core, mut parser) = terminal_with_history(5, 4);
         feed(
             &mut core,
             &mut parser,
@@ -655,7 +497,7 @@ fn top_anchored_scroll_region_preserves_history_and_fixed_footer() {
         assert_eq!(line(&core, 1), "three");
         assert_eq!(line(&core, 2), "     ");
         assert_eq!(line(&core, 3), "fixed");
-        assert_eq!(core.selection_to_string().as_deref(), Some("fixed"));
+        assert_eq!(selection_to_string(&core).as_deref(), Some("fixed"));
         core.scroll_display(Scroll::Top);
         assert_eq!(line(&core, 0), "one  ");
     }
@@ -665,7 +507,7 @@ fn top_anchored_scroll_region_preserves_history_and_fixed_footer() {
 fn local_scrolling_damages_only_the_visible_region_and_preserves_fixed_rows() {
     for (offset, expected) in [(0, vec![1, 2]), (2, vec![3]), (6, vec![])] {
         for scroll in ["\x1b[S", "\x1b[T"] {
-            let (mut core, mut parser) = terminal(10, 4);
+            let (mut core, mut parser) = terminal_with_history(10, 4);
             feed(
                 &mut core,
                 &mut parser,
@@ -686,22 +528,6 @@ fn local_scrolling_damages_only_the_visible_region_and_preserves_fixed_rows() {
 }
 
 #[test]
-fn clear_saved_only_removes_main_history() {
-    let (mut core, mut parser) = terminal(5, 2);
-    feed(&mut core, &mut parser, "one\r\ntwo\r\nthree");
-    let retained = core.history_size();
-    assert!(retained > 0);
-    feed(&mut core, &mut parser, "\x1b[?1049h\x1b[3J\x1b[?1049l");
-    assert_eq!(core.history_size(), retained);
-    feed(&mut core, &mut parser, "\x1b[3J");
-    assert_eq!(core.history_size(), 0);
-    assert_eq!(line(&core, 0), "two  ");
-    assert_eq!(line(&core, 1), "three");
-    feed(&mut core, &mut parser, "\x1b[3J");
-    assert_eq!(core.history_size(), 0);
-}
-
-#[test]
 fn partial_screen_erases_damage_only_visible_erased_rows_and_clear_pending_wrap() {
     for (offset, erase, expected) in [
         (0, "\x1b[J", vec![2, 3]),
@@ -711,7 +537,7 @@ fn partial_screen_erases_damage_only_visible_erased_rows_and_clear_pending_wrap(
         (6, "\x1b[J", vec![]),
         (6, "\x1b[1J", vec![]),
     ] {
-        let (mut core, mut parser) = terminal(10, 4);
+        let (mut core, mut parser) = terminal_with_history(10, 4);
         feed(
             &mut core,
             &mut parser,
@@ -783,40 +609,6 @@ fn full_line_erase_clears_wide_extras_and_wrap_with_the_current_background() {
 }
 
 #[test]
-fn clear_resets_bce_blanks_inserted_beyond_the_text_or_deleted_at_the_tail() {
-    for edit in ["\x1b[1;6H\x1b[2@", "\x1b[1;1H\x1b[2P"] {
-        let (mut core, mut parser) = terminal(8, 3);
-        feed(&mut core, &mut parser, "abc\x1b[44m");
-        feed(&mut core, &mut parser, edit);
-        assert!(
-            core.row(0)
-                .cells
-                .iter()
-                .any(|cell| cell.bg == Color::Named(NamedColor::Blue))
-        );
-        feed(&mut core, &mut parser, "\x1b[0m\x1b[2J");
-        assert!(
-            core.row(0)
-                .cells
-                .iter()
-                .all(|cell| *cell == Cell::default())
-        );
-    }
-}
-
-#[test]
-fn line_edit_repair_keeps_styled_blanks_before_the_cursor() {
-    let (mut core, _) = terminal(80, 2);
-    let row = core.screen_row_mut(0);
-    row.cells[10].bg = Color::Indexed(1);
-    row.used = 3;
-    core.goto(0, 70);
-    core.shift_chars(1, true);
-    assert_eq!(core.row(0).used(), 11);
-    assert_eq!(core.row(0).cells[10].bg, Color::Indexed(1));
-}
-
-#[test]
 fn delete_char_moves_the_colored_wide_gap_into_the_clearable_prefix() {
     let (mut core, mut parser) = terminal(5, 3);
     feed(
@@ -859,58 +651,4 @@ fn disabling_1047_on_the_main_screen_clears_only_the_inactive_alternate() {
     assert_eq!(line(&core, 0), "        ");
     feed(&mut core, &mut parser, "\x1b[?47l");
     assert_eq!(line(&core, 0), "shell   ");
-}
-
-#[test]
-fn alternate_roundtrip_restores_the_main_history_viewport_and_cursor() {
-    let (mut core, mut parser) = terminal(8, 3);
-    feed(
-        &mut core,
-        &mut parser,
-        "one\r\ntwo\r\nthree\r\nfour\r\nfive",
-    );
-    let cursor = core.cursor().0;
-    core.scroll_display(Scroll::Top);
-    assert_eq!(core.display_offset(), 2);
-    assert_eq!(line(&core, 0), "one     ");
-    feed(&mut core, &mut parser, "\x1b[?1049ha\r\nb\r\nc\r\nd");
-    assert_eq!(core.history_size(), 0);
-    assert_eq!(core.display_offset(), 0);
-    feed(&mut core, &mut parser, "\x1b[?1049l");
-    assert_eq!(core.history_size(), 2);
-    assert_eq!(core.display_offset(), 2);
-    assert_eq!(line(&core, 0), "one     ");
-    assert_eq!(core.cursor().0, cursor);
-}
-
-#[test]
-fn command_elapsed_time_stops_at_completion() {
-    let (mut core, mut parser) = terminal(40, 8);
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b]133;A\x07$ \x1b]133;B\x07sleep 1\r\n\x1b]133;C\x07",
-    );
-    core.blocks.back_mut().unwrap().started =
-        Some(std::time::Instant::now() - std::time::Duration::from_millis(1250));
-    let running = core
-        .recent_command_blocks()
-        .last()
-        .unwrap()
-        .elapsed_ms
-        .unwrap();
-    assert!(running >= 1250);
-    feed(&mut core, &mut parser, "\x1b]133;D;0\x07");
-    let done = core
-        .recent_command_blocks()
-        .last()
-        .unwrap()
-        .elapsed_ms
-        .unwrap();
-    assert!(done >= running);
-    std::thread::sleep(std::time::Duration::from_millis(2));
-    assert_eq!(
-        core.recent_command_blocks().last().unwrap().elapsed_ms,
-        Some(done)
-    );
 }

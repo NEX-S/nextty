@@ -33,11 +33,7 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
         let wakeup = Arc::clone(&notification);
         let handle = thread::Builder::new().name(name.into()).spawn(move || {
             let (lock, changed) = &*worker;
-            let notify = || {
-                if let Err(error) = crate::eventfd::notify(wakeup.as_raw_fd()) {
-                    eprintln!("notify {name}: {error}");
-                }
-            };
+            let notify = || crate::sys::notify(wakeup.as_raw_fd());
             let _exit = WakeOnDrop(|| {
                 if !std::mem::replace(&mut lock.lock().unwrap().closed, true) {
                     notify();
@@ -81,16 +77,14 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
         self.notification.as_raw_fd()
     }
 
-    #[cfg(any(feature = "gui", feature = "tui", test))]
     pub fn ready(&self, matches: impl FnOnce(&Output) -> bool) -> bool {
         let state = self.shared.0.lock().unwrap();
         state.closed || state.result.as_ref().is_some_and(matches)
     }
 
-    pub fn submit(&self, request: impl FnOnce(Option<&mut Request>) -> Request) {
+    pub fn submit(&self, request: Request) {
         let (lock, changed) = &*self.shared;
         let mut state = lock.lock().unwrap();
-        let request = request(state.pending.as_mut());
         let previous = state.pending.replace(request);
         drop(state);
         if previous.is_none() {
@@ -150,25 +144,25 @@ mod tests {
                 }
             }
         }
-        let notification = Arc::new(crate::eventfd::new().unwrap());
+        let notification = Arc::new(crate::sys::new().unwrap());
         let mut worker = Worker::new("publish-test", notification, |result, publish| {
             publish(result);
         })
         .unwrap();
         let (entered, dropping) = mpsc::channel();
         let (release, blocked) = mpsc::channel();
-        worker.submit(|_| Output::Stale(entered, blocked));
+        worker.submit(Output::Stale(entered, blocked));
         let mut fds = [libc::pollfd {
             fd: worker.fd(),
             events: libc::POLLIN,
             revents: 0,
         }];
-        crate::poll::poll(&mut fds, 5000).unwrap();
+        crate::sys::poll(&mut fds, 5000).unwrap();
         assert_ne!(fds[0].revents & libc::POLLIN, 0);
-        crate::eventfd::consume_notification(worker.fd()).unwrap();
-        worker.submit(|_| Output::Current);
+        crate::sys::consume_notification(worker.fd()).unwrap();
+        worker.submit(Output::Current);
         dropping.recv_timeout(Duration::from_secs(5)).unwrap();
-        crate::poll::poll(&mut fds, 1000).unwrap();
+        crate::sys::poll(&mut fds, 1000).unwrap();
         let notified = fds[0].revents & libc::POLLIN != 0;
         let result = worker.take();
         release.send(()).unwrap();

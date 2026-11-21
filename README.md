@@ -4,8 +4,6 @@
 
 继续在熟悉的终端中使用 Shell、调试器和 CLI 工具。需要检查输出、修改文件，或执行并验证任务时，再打开 Agent 面板。nextty 提供终端事实和工具，由 Agent 决定如何使用。
 
-项目采用精简的 Rust 终端核心、原生桌面后端，以及有明确边界的后台任务。即使正在解析输出、将历史写入磁盘或等待 GPU，输入也应保持响应。
-
 ![桌面分屏视图](docs/assets/workspace.png)
 
 <sub>开发过程中截取的桌面分屏视图。</sub>
@@ -18,22 +16,6 @@
 - **感知命令边界的输出：** Bash/Zsh 集成记录提示符、命令输出和退出状态。可在提示符之间跳转、复制某条命令的输出，或搜索保留的历史，而不会把搜索文字发送给 Shell。
 - **Agent 面板：** 提供终端上下文、直接读取/搜索/编辑文件、执行 Shell 命令、与前台程序交互，以及在单独的可见终端中验证结果。独立对话流式显示 Markdown，支持嵌套的无序/有序列表和对齐表格，并在前端分离后继续运行。
 - **本地工具：** 支持模糊搜索和文本预览的异步文件浏览器，以及 CPU、内存、网络、进程和存储监控。
-
-## 设计理念
-
-**缩短终端路径。** PTY 输入不经过控件树或通用异步运行时。每个 PTY 都有一个 I/O 线程，负责写入、读取、解析和进程通知。持续输出的流每次只处理有限工作量，然后再次处理输入。
-
-**让慢任务有明确归属。** 历史存储、文件遍历、HTTP 请求、Shell 工具、Markdown 解析和 GPU 提交都不在前端输入循环中执行。批量输出、历史和文件传输缓冲区有明确上限；消费端较慢时，这些路径通过背压限制上游。
-
-**共享状态，把平台代码留在边缘。** 桌面和 ANSI 前端使用相同的工作区协议与 UI 状态。Wayland、字体塑形和 Vulkan 留在原生后端，终端解析与工作区行为留在 Rust 中。
-
-**为 Agent 提供事实和有边界的访问能力。** nextty 负责终端身份、精确读取、输入冲突和执行状态。Agent 负责选择命令、解释证据并验证任务。保留一个精简的模型/工具循环，应用特定工作使用普通 Shell 工具。现有终端程序无需 Agent 钩子或适配器。
-
-**在适合的地方使用库。** nextty 自行实现解析器、屏幕、PTY 后端和工作区传输；字体、塑形、栅格化、HTTP 和 TLS 使用系统库。项目不嵌入浏览器、JavaScript 运行时或外部 Agent 可执行程序。
-
-**明确面向一个平台。** 桌面端面向现代 Linux 和 GNOME/Wayland，不提供 X11 后端或平台兼容层。Cargo feature 在构建时选择前端。只有出现具体的共享需求时，才将局部数据类型和函数提取出来。
-
-**用测量判断性能改动。** 额外缓存、线程和批处理规则带来的收益需要足以抵偿复杂度。解析吞吐量、PTY 往返和合成器呈现是不同的测量，任何一项都不能单独代表按键到屏幕的延迟。
 
 ## 构建
 
@@ -60,26 +42,17 @@ font_family = "monospace"
 
 构建时由 `glslangValidator` 将着色器编译为 SPIR-V。Wayland 协议桩代码已提交到仓库，正常构建无需 `wayland-scanner`。GUI 构建链接系统 Fontconfig、HarfBuzz、FriBidi、Cairo/FreeType、utf8proc、Wayland、xkbcommon 和 Vulkan；所有构建都链接系统 libcurl。
 
-### 只构建需要的前端
+### 前端构建
 
-默认 feature 为 `gui,tui`。Agent 支持、工作区服务、系统统计和文件导航始终包含在内；仅在启用前端时编译对应的渲染和键鼠处理代码。
-
-- `gui`：Wayland 窗口、输入处理、字体后端和 Vulkan 渲染器。
-- `tui`：在现有终端中运行的 ANSI 前端。
+ANSI 前端始终编译；默认 feature 为 `gui`，启用 Wayland 窗口、字体后端和 Vulkan 渲染器。Agent 支持、工作区服务、系统统计和文件导航始终包含在内。
 
 ```sh
-# 两种前端
+# 桌面和 ANSI 前端
 cargo build --release --locked
-# 仅桌面端（默认打开 GUI）
-cargo build --release --locked --no-default-features --features gui
 # ANSI 前端和远程工作区服务端，不依赖图形库
-cargo build --release --locked --no-default-features --features tui --target-dir target/headless
+cargo build --release --locked --no-default-features --target-dir target/headless
 ./target/headless/release/nextty
-# 仅工作区服务端
-cargo build --release --locked --no-default-features
 ```
-
-所有构建均包含 Agent 并链接系统 libcurl。所有桌面窗口都通过工作区守护进程运行。
 
 ### 安装到系统
 
@@ -112,7 +85,7 @@ nextty --working-directory /path/to/project
 nextty --gui -e /bin/bash --noprofile --norc
 ```
 
-若编译时包含 ANSI 前端，`nextty` 默认使用它，否则使用 GUI 前端。`--gui` 打开桌面窗口，`--tui` 显式选择当前终端。nextty 的选项应放在 `-e` 之前，之后的所有内容都属于子命令。显式指定的 `-e` 命令按原样运行；只有默认启动的交互式 Bash/Zsh 会自动安装 Shell 集成。
+`nextty` 默认使用当前终端，`--gui` 打开桌面窗口，`--tui` 显式选择当前终端。nextty 的选项应放在 `-e` 之前，之后的所有内容都属于子命令。显式指定的 `-e` 命令按原样运行；只有默认启动的交互式 Bash/Zsh 会自动安装 Shell 集成。
 
 配置中可设置 `tab_style = "angled"`（默认）或 `tab_style = "flat"`。标签页圆点以橙色表示程序运行中，绿色表示成功结束，红色表示失败，灰色表示空闲或状态未知。关闭仍有程序运行或状态未知的标签页时，会要求确认。
 
@@ -125,13 +98,13 @@ nextty --gui -e /bin/bash --noprofile --norc
 ### 通过 SSH 使用
 
 ```sh
-nextty new devbox dev --tui
+nextty new devbox dev
 nextty attach devbox dev --gui
 nextty list devbox
 nextty terminate devbox dev
 
 nextty attach user@host:2222 0
-nextty new ssh://devbox --tui
+nextty new ssh://devbox
 ```
 
 `HOST NAME` 选择远程工作区。单个普通名称选择本地工作区；未指定会话名称时，使用 `ssh://alias` 选择 SSH 别名。远程会话从远程 `HOME` 启动，相对工作目录也在该目录下解析。
@@ -198,105 +171,6 @@ Agent 显式选择窗格 ID。终端输入会检查期间是否有用户输入�
 
 每个对话有独立的草稿、附件、记录和模型工作线程。本地后台所有者进程在前端分离后维持对话，终止工作区则结束该进程。状态不会跨机器重启保留。长对话保留最近的完整交互，并摘要较早内容。即使使用 SSH 工作区，模型请求也在本地发起；凭据留在本地，配置的模型端点则会收到提交的上下文和工具结果。
 
-## 架构
-
-守护进程拥有 PTY 和终端状态，前端负责呈现与交互。独立的本地 Agent 所有者进程管理对话和模型请求；终端操作与原生文件操作通过工作区协议执行。文件系统操作运行在守护进程所在主机上，因此 SSH 和本地工作区使用相同的工具边界。
-
-```mermaid
-flowchart TB
-    subgraph Frontend["前端进程"]
-        Wayland["Wayland 桌面"]
-        ANSI["ANSI 前端"]
-        UI["共享 UI 状态<br/>焦点、面板、编辑、选择"]
-        Screens["可见屏幕快照"]
-        Wayland <--> UI
-        ANSI <--> UI
-        UI <--> Screens
-    end
-    subgraph Daemon["工作区守护进程 · 本地或远程"]
-        Workspace["标签页、分屏、控制端、命令块"]
-        PTY["PTY I/O 线程"]
-        Core["解析器 + Core<br/>单元格、光标、VT 模式"]
-        History["历史工作线程<br/>归档、分页、重排、导出"]
-        Files["原生文件工作线程<br/>读取、搜索、编辑"]
-        Workspace <--> PTY
-        Workspace <--> Files
-        PTY <--> Core
-        Core <--> History
-    end
-    Screens <-->|"分帧套接字协议<br/>远程时通过 OpenSSH 桥接"| Workspace
-    Owner["本地 Agent 所有者进程<br/>对话工作线程、HTTP、工具"]
-    Owner <-->|"工作区协议<br/>模型状态、请求、PTY 操作"| Workspace
-    PTY <--> Shell["Shell 和终端应用"]
-```
-
-桌面的 UI 线程构建绘制包。渲染工作线程负责字体选择、塑形、字形缓存、图集和 Vulkan 提交：
-
-```mermaid
-flowchart LR
-    Input["Wayland 输入"] --> Actions["前端操作"]
-    Actions --> IO["PTY I/O<br/>直接输入、余量入队"]
-    IO --> Parse["VT 解析器 + Core"]
-    Parse --> Snapshot["可见行更新"]
-    Snapshot --> Paint["损伤跟踪 + 行缓存"]
-    Paint --> Packet["一个待处理绘制包"]
-    Packet --> Worker["渲染工作线程<br/>塑形、栅格化、上传"]
-    Worker --> GPU["Vulkan<br/>一个在途帧"]
-    GPU --> Present["Wayland 合成器"]
-```
-
-ANSI 前端根据这些可见行输出终端转义序列，不经过 GPU 路径。
-
-### 代码地图
-
-- [core.rs](src/core.rs)、[vt.rs](src/vt.rs)、[terminal.rs](src/terminal.rs)：网格、VT 序列、选择、PTY I/O 和进程生命周期。
-- [workspace.rs](src/workspace.rs)、[wire.rs](src/wire.rs)、[bridge.rs](src/bridge.rs)：会话归属、布局、传输和 SSH 桥接。
-- [screen.rs](src/screen.rs)、[ui.rs](src/ui.rs)：可见快照和共享前端状态。
-- [workspace_view.rs](src/workspace_view.rs)、[tui.rs](src/tui.rs)：桌面工作区和 ANSI 前端。
-- [paint.rs](src/paint.rs)、[native/](native/)：绘制包、Wayland、字体塑形和 Vulkan。
-- [history.rs](src/history.rs)：有上限的磁盘历史和异步历史操作。
-- [agent/owner.rs](src/agent/owner.rs)、[agent/harness.rs](src/agent/harness.rs)、[agent/http.rs](src/agent/http.rs)、[agent/mod.rs](src/agent/mod.rs)：对话归属、模型/工具循环、HTTP 和终端操作。
-- [agent_files.rs](src/agent_files.rs)、[worker.rs](src/worker.rs)：守护进程侧文件操作，以及供文件导航和 Markdown 解析使用的可复用后台工作线程。
-- [files.rs](src/files.rs)、[monitor.rs](src/monitor.rs)、[system_stats.rs](src/system_stats.rs)：文件导航和本地资源监控。
-
-## 性能细节
-
-以下描述的是实现选择，并不保证每台机器都能达到特定帧率或输入延迟。
-
-### 输入与输出调度
-
-输入队列为空时，先尝试非阻塞写入 PTY，未写完的部分再进入 PTY 的 I/O 线程队列。单次 PTY 读取最多 **8 KiB**。工作区解析每次持有 Core 锁最多处理 16 KiB，并以最多 **512 字节**的块检查历史背压。I/O 循环在批次之间处理待写入输入。历史背压会暂停输出消费，同时保留输入写入能力。
-
-普通 ANSI 输入没有合并延迟。单独的 Escape 最多等待 **25 ms**，以便与转义序列区分。Linux eventfd 通知唤醒消费端，冗余的终端重绘通知会合并。
-
-同步输出会立即解析，包括终端查询回复。显示更新等待同步结束序列、**150 ms** 截止时间或 EOF。历史背压仍限制解析量，同步帧不会额外保留一份 PTY 字节副本。
-
-### 渲染与帧节奏
-
-只重建受损的行。缓存的行布局可在更新和滚动时复用，没有装饰的普通尾随空格无需字形布局。Fontconfig 选择字体，utf8proc 查找字素边界，FriBidi 提供方向层级，HarfBuzz 则以整行为上下文对文本段塑形。字形簇仍锚定在终端列上。Cairo 的 FreeType 后端栅格化普通字形和 COLRv1 彩色字形。
-
-GUI 保持**一个待处理绘制包和一个在途 GPU 帧**。栅栏保护上传缓冲区复用和图集生命周期。字形与背景使用实例化四边形。上传缓冲区初始为 256 KiB；连续的字形上传共用图像状态转换，直到绘制需要使用它们。图集描述符在对应图像发生变化前保持不变。
-
-遮罩图集初始为 512²。首次使用彩色字形时分配 1024² RGBA 图集。图集按需增长，最大为 2048²。
-
-绘制按需发生，窗口挂起时停止。提交频率上限为窗口所在输出设备中最高的有效标称刷新率。截止时间基于 UI 提交时刻，工作线程的准备时间不会延长下一次间隔。空闲后的首次更新可以立即提交，重复检查也不会反复重置同一个计时器。实际呈现仍取决于 GPU 和合成器。
-
-### 存储与背压
-
-普通单元格占 **16 字节**。组合附加符号和下划线颜色采用逐行稀疏存储，普通 ASCII 按连续段写入。重排移动已有行数据，协议解码直接读取接收缓冲区。
-
-默认情况下，每个工作区窗格保留可见网格和 **512 行热历史**。更早的行以 UTF-8 文本、样式范围和稀疏附加数据写入磁盘，每段约 **64 KiB**。所有窗格共享 **1 GiB** 工作区预算，按实际分配的文件系统块计入用量，最旧的段优先淘汰。分页、输出复制和大量历史重排在历史工作线程执行。命令块元数据随对应命令保留。历史写入失败会报告错误并禁用该窗格的磁盘历史；Shell 继续运行，使用有上限的内存回滚历史。
-
-大规模剪贴板导出通过匿名文件和文件描述符流式传输。历史和剪贴板缓存所在文件系统必须支持 Linux `O_TMPFILE`。远程剪贴板接收时，运行中和待处理的数据块合计最多保留 **128 KiB**。文件消费端较慢时会施加接收背压，不阻塞向外发送输入。窗格关闭后，进程终止和历史清理由 PTY 的 I/O 线程负责，守护进程因此可以继续服务其他工作区。
-
-### 可选工作按需执行
-
-工作区广播复用同轮读取的窗格状态生成标签页信息，避免独立的重复读取路径；普通前端单独拉取时，隐藏标签页只更新元数据，不计算屏幕布局。文件导航使用独立的常驻扫描与预览工作线程，各自只保留最新的待处理请求，并取消过期工作。浏览文件列表不读取预览，显式打开文件时才异步读取；文本预览最多 256 KiB、4,096 行。窗格搜索只在使用时启动工作线程，搜索快照并最多保留 10,000 个匹配。
-
-资源采样每秒在输入线程之外执行一次。监控器收起时跳过逐核 CPU、压力、物理磁盘 I/O 和交换速率的详细采样，底栏、文件系统、Git 和网络采样继续运行。只有打开进程页面时才扫描进程。
-
-Agent HTTP 使用非阻塞 libcurl multi I/O，取消操作通过 eventfd 唤醒工作线程。空对话标签页不会启动模型工作线程，原生文件操作也仅在使用时启动工作线程。稳定的工具定义和对话前缀支持提供方缓存，有上限的检索避免发送完整历史。输入和终端创建会附带一次观察，避免必须再单独读取。流式对话更新追加变化的内容，过大的显示记录分块裁剪，避免每个增量都重建整个视图。这些选择减少重复工作；实际 token 用量和任务质量仍取决于模型与任务负载。
-
 ## 配置
 
 配置从 `$XDG_CONFIG_HOME/nextty/config.toml` 或 `~/.config/nextty/config.toml` 读取。使用 `--config PATH` 指定其他文件。每行写一个 `key = value` 赋值。字符串使用单引号或双引号，不支持转义或多行值。支持空行和 `#` 注释，包括值后面的注释。十进制数字可包含下划线。所有字段均可省略：
@@ -317,49 +191,6 @@ model = ""
 参见 [nextty.example.toml](nextty.example.toml)。颜色使用 `#RRGGBB`。透明度范围为 0 到 1，终端背景和标签栏背景分别设置。文本和显式 ANSI 背景保持不透明。标签栏透明度仅影响 GUI。
 
 配置在启动时加载。默认文件不存在时使用内置配置；显式指定的文件不存在或配置无效时报告错误。`list` 和 `terminate` 命令跳过默认配置文件，但会检查显式指定的 `--config` 文件。历史预算在创建工作区时确定，连接工作区不会改变它。带版本的工作区套接字位于 `$XDG_RUNTIME_DIR/nextty/` 下。
-
-## 检查与测量工具
-
-```sh
-cargo fmt --all -- --check
-cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --all-targets --all-features --locked
-cargo test --all-targets --locked --no-default-features
-```
-
-仓库还包含用于终端路径不同环节的测量工具。Python 工具要求 Python 3.11 或更高版本：
-
-```sh
-# 解析器/网格吞吐量和原始 PTY 往返
-cargo run --release --locked --example bench
-
-# Core 存储和内存
-cargo run --release --locked --example core_profile
-
-# 从 PTY 输出到 Wayland 呈现反馈
-python3 tools/native_perf.py target/release/nextty \
-  --output-dir target/native-perf --wait-key
-
-# 通过私有本机回环 OpenSSH 服务测试远程 CLI/TUI
-python3 tools/remote_smoke.py --binary target/release/nextty
-
-# Agent 流式输出、工具往返、历史读取和 PTY 输入交付
-python3 tools/agent_bench.py target/release/nextty
-
-# 在私有工作区中执行真实模型任务（使用配置的 API）
-python3 tools/agent_eval.py target/release/nextty --config ~/.config/nextty/config.toml
-
-# 中断 HTTP 流的数分钟真实模型任务
-python3 tools/agent_soak.py target/release/nextty --config ~/.config/nextty/config.toml
-```
-
-[wayland_input.py](tools/wayland_input.py) 在已有的隔离 Mutter 会话中测量合成按键输入到呈现的延迟，并记录前端与守护进程的 CPU/PSS。各工具的参数见 `--help`。合成输入不包含物理键盘和屏幕扫描输出延迟。测量需要记录构建版本、任务负载和环境才有参考价值。
-
-[agent_bench.py](tools/agent_bench.py) 使用本地 SSE 模型和私有工作区，测量真实的 ANSI 前端、Agent 所有者进程和守护进程。其输入延迟范围为 PTY 注入到子应用读取，每个四秒负载中采样 80 次；不测量 GUI 呈现或在线模型。大响应压力场景从 128 KiB Markdown 开始，每秒增加 200 个增量。它验证流式对话内容、工具结果、在未聚焦终端中修复原生工作区文件，以及过早给出最终回复后默认继续执行目标的行为，并以 JSON 报告进程 CPU、负载结束时的 PSS 和工具往返。比较已保存的 release 可执行文件时，应使用同一脚本并重复运行，以计入调度噪声。
-
-[agent_eval.py](tools/agent_eval.py) 通过同一套前端、所有者进程和守护进程运行两个真实模型任务：保留被占用终端并修复文件，以及从长命令输出中检索证据以回答交互式提示。它独立检查结果文件和前台应用，并报告每次请求的工具调用、错误、请求/结果大小、耗时，以及提供方 token/缓存用量。只会提交合成工作区内容。请求使用配置的端点和正常 API 凭据，可能产生费用。这些任务证明可行性；比较任务质量或 token 节省需要使用相同模型和初始状态进行成对运行。
-
-[agent_soak.py](tools/agent_soak.py) 运行一个 24 阶段、至少耗时 192 秒的交互式任务，并在第四阶段后截断一次模型 HTTP 流。它检查是否用同一请求恢复、程序是否只启动一次、每一阶段的实时答案、最终退出状态，以及任务期间向原始终端交付输入的情况。请求和终端证据保存在私有 `/tmp` 目录中，结果以 JSON 输出。
 
 ## 范围与限制
 
