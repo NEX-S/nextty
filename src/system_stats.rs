@@ -242,7 +242,7 @@ impl SystemStats {
             processes_enabled: false,
             process_detail: None,
             next_sample: None,
-            summary: [" —", " —", " —", " —"].map(str::to_owned),
+            summary: [" —", " —", " —", " —"].map(str::to_owned),
         })
     }
 
@@ -320,8 +320,13 @@ impl SystemStats {
                 .disk()
                 .filter(|u| u.used + u.available > 0)
                 .map(|u| u.used as f32 * 100. / (u.used + u.available) as f32);
-            let summary =
-                [values[0], values[1], disk, values[4]].map(|v| format!(" {}", percent(v)));
+            let summary = [
+                (" ", values[0]),
+                (" ", values[1]),
+                (" ", disk),
+                (" ", values[4]),
+            ]
+            .map(|(label, value)| format!("{label}{}", percent(value)));
             changed |= summary != self.summary;
             self.summary = summary;
         }
