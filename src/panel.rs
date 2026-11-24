@@ -55,7 +55,7 @@ pub(crate) struct Grid {
     pub rect: Rect,
     pub rows: Vec<Row>,
     pub flags: Flags,
-    /// When set, only these rows are compared and emitted by `ansi_trim`.
+    /// When set, only these rows are compared and emitted by `ansi`.
     pub damage: Option<Vec<usize>>,
 }
 
@@ -81,11 +81,23 @@ fn packed(color: Color) -> u32 {
     color.packed()
 }
 
-fn sgr_colors(output: &mut Vec<u8>, foreground: Rgb, background: Rgb) -> io::Result<()> {
-    let (f, b) = (foreground, background);
+/// Colors and attributes in one SGR; at most 15 parameters, within what every host accepts.
+fn sgr(output: &mut Vec<u8>, foreground: u32, background: u32, flags: Flags) -> io::Result<()> {
+    output.extend_from_slice(b"\x1b[0");
+    for (flag, code) in [
+        (Flags::BOLD, ";1"),
+        (Flags::DIM, ";2"),
+        (Flags::ITALIC, ";3"),
+        (Flags::STRIKEOUT, ";9"),
+    ] {
+        if flags.contains(flag) {
+            output.extend_from_slice(code.as_bytes());
+        }
+    }
+    let (f, b) = (Rgb::from_packed(foreground), Rgb::from_packed(background));
     write!(
         output,
-        "\x1b[0;38;2;{};{};{};48;2;{};{};{}m",
+        ";38;2;{};{};{};48;2;{};{};{}m",
         f.r, f.g, f.b, b.r, b.g, b.b
     )
 }
@@ -176,11 +188,7 @@ impl Grid {
     }
 
     pub fn put_row(&mut self, x: u16, y: u16, source: &Row, columns: usize) {
-        if y < self.rect.y
-            || y >= self.rect.y + self.rect.rows
-            || x < self.rect.x
-            || x >= self.rect.x + self.rect.cols
-        {
+        if !self.rect.contains(x, y) {
             return;
         }
         let row = &mut self.rows[usize::from(y - self.rect.y)];
@@ -376,23 +384,7 @@ impl Grid {
             );
             if style != Some(next_style) {
                 style = Some(next_style);
-                sgr_colors(
-                    output,
-                    Rgb::from_packed(run.foreground),
-                    Rgb::from_packed(run.background),
-                )?;
-                if run.flags.contains(Flags::BOLD) {
-                    output.extend_from_slice(b"\x1b[1m");
-                }
-                if run.flags.contains(Flags::DIM) {
-                    output.extend_from_slice(b"\x1b[2m");
-                }
-                if run.flags.contains(Flags::ITALIC) {
-                    output.extend_from_slice(b"\x1b[3m");
-                }
-                if run.flags.contains(Flags::STRIKEOUT) {
-                    output.extend_from_slice(b"\x1b[9m");
-                }
+                sgr(output, run.foreground, run.background, run.flags)?;
                 if run.flags.contains(Flags::UNDERLINE) {
                     let color = Rgb::from_packed(run.underline_color.unwrap_or(run.foreground));
                     write!(output, "\x1b[4;58;2;{};{};{}m", color.r, color.g, color.b)?;
@@ -403,18 +395,14 @@ impl Grid {
         })?;
         for (index, row) in self.rows.iter().enumerate() {
             if self.row_changed(previous, index) && row.used < row.cells.len() {
-                let (Color::Spec(foreground), Color::Spec(background)) =
-                    (row.cells[row.used].fg, row.cells[row.used].bg)
-                else {
-                    unreachable!()
-                };
+                let blank = row.cells[row.used];
                 write!(
                     output,
                     "\x1b[{};{}H",
                     self.rect.y + index as u16 + 1,
                     self.rect.x + row.used as u16 + 1
                 )?;
-                sgr_colors(output, foreground, background)?;
+                sgr(output, packed(blank.fg), packed(blank.bg), Flags::empty())?;
                 output.extend_from_slice(b"\x1b[K");
             }
         }

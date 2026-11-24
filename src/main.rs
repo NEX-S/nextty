@@ -187,11 +187,8 @@ fn control_reply(client: &mut Client, list: bool) -> Result<()> {
                 _ => (),
             }
         }
-        let mut fd = client.pollfd();
-        nextty::sys::poll(std::slice::from_mut(&mut fd), -1)?;
-        if fd.revents & libc::POLLOUT != 0 {
-            client.flush()?;
-        }
+        // The next poll also sends what is still queued.
+        nextty::sys::poll(&mut [client.pollfd()], -1)?;
     }
 }
 fn help() {
@@ -207,15 +204,15 @@ fn help() {
     );
     #[cfg(feature = "gui")]
     println!(
-        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nShift+Home/End    Top/bottom of history\nAlt+mouse        Select/scroll when an application captures the mouse\nMiddle click     Paste primary selection\nRight click      Copy highlight; otherwise paste"
+        "\nDesktop input:\nCtrl+Shift+C/V    Copy/paste\nShift+Home/End    Top/bottom of history\nMiddle click     Paste primary selection\nRight click      Paste when there is nothing to copy"
     );
 
     println!(
-        "\nWorkspace input:\nAlt+v/s          Split left/right or top/bottom; drag the divider to resize\nAlt+h/j/k/l      Focus a pane\nAlt+,/.          Previous/next tab\nAlt+Enter        New tab\nAlt+q            Detach; workspace keeps running\nAlt+/            Find pane output; Enter/ShiftEnter next/previous, Esc restores view\nAlt+p/n          Previous/next prompt\nAlt+c            Copy command output; an existing selection takes precedence\n\nNew unnamed sessions use the lowest available number: 0, 1, 2, ...\nAttach takes control; the previous frontend becomes read-only.\nRemote sessions use system ssh and require nextty on PATH at both ends.\nRemote cwd defaults to remote HOME; relative paths are resolved there."
+        "\nWorkspace input:\nAlt+v/s          Split left/right or top/bottom; drag the divider to resize\nAlt+h/j/k/l      Focus a pane\nAlt+,/.          Previous/next tab\nAlt+Enter        New tab\nAlt+q            Detach; workspace keeps running\nAlt+/            Find pane output; Enter/ShiftEnter next/previous, Esc restores view\nAlt+p/n          Previous/next prompt\nAlt+c            Copy command output; an existing selection takes precedence\n\nMouse: drag selects, double-click opens the highlighted object with xdg-open or selects a word,\ntriple-click selects a line, right click copies the highlight or command output.\nAlt+mouse selects or scrolls locally when an application captures the mouse.\n\nNew unnamed sessions use the lowest available number: 0, 1, 2, ...\nAttach takes control; the previous frontend becomes read-only.\nRemote sessions use system ssh and require nextty on PATH at both ends.\nRemote cwd defaults to remote HOME; relative paths are resolved there."
     );
 
     println!(
-        "\nAlt+a            Toggle Agent chat\nDouble-click     Open highlighted object with xdg-open\nAgent editor: Enter sends, Shift+Enter inserts a newline, Ctrl+A selects all.\nEsc twice enters history; j/k selects, Enter rewinds, Esc leaves history.\nCtrl+C clears input; when empty, stops the Agent. Ctrl+h/j/k/l navigates input and prompt history."
+        "\nAlt+a            Toggle Agent chat\nAgent editor: Enter sends, Shift+Enter inserts a newline, Ctrl+A selects all.\nEsc twice enters history; j/k selects, Enter rewinds, Esc leaves history.\nCtrl+C clears input; when empty, stops the Agent. Ctrl+h/j/k/l navigates input and prompt history."
     );
 
     println!(

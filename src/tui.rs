@@ -3,19 +3,15 @@
 #[path = "tui_input.rs"]
 mod input;
 
-use crate::agent::panel::{AgentAction, editor};
-use crate::config::Config;
-use crate::core::{Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize};
-use crate::input::{PasteTarget, TextDecoder, mouse_bytes};
-use crate::panel::{Grid, rect};
+use crate::config::{Config, TabStyle};
+use crate::core::{Flags, Mode, Point, SelectionRange, Side, WindowSize};
+use crate::input::{KeyResult, PasteTarget, PointerKind};
+use crate::panel::{Grid, MUTED, rect, rgb};
 use crate::screen::Screen;
-use crate::ui::{Focus, READ_ONLY, Ui, cursor_bytes};
-use crate::vt::{Color, CursorShape, NamedColor, Rgb};
-use crate::width::text_width;
-use crate::workspace::{
-    Action, Axis, Client, PaneId, PaneView, Rect, Response, Snapshot, SplitDrag,
-};
-use input::{Decoder, Input, PointerEvent, PointerKind};
+use crate::ui::{Area, Effect, Focus, Pointer, READ_ONLY, TabPart, Ui, cursor_bytes, pane_point};
+use crate::vt::{Color, CursorShape, NamedColor};
+use crate::workspace::{Action, Client, PaneId, PaneView, Rect, Response, Snapshot};
+use input::{Decoder, Input, PointerEvent};
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{self, Read, Write};
@@ -25,7 +21,8 @@ use std::time::{Duration, Instant};
 
 const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J";
-const LEAVE: &[u8] = b"\x1b[?2026l\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
+const LEAVE: &[u8] = b"\x1b[?2026l\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
+const PASTE_HINT: &str = "Paste with your host terminal's shortcut";
 
 struct TerminalGuard {
     input: RawFd,
@@ -101,7 +98,9 @@ pub fn run(client: Client, config: Config) -> io::Result<()> {
     let mut frontend = Frontend::new(client, size, config)?;
     // One frame or one clipboard chunk at a time; a slow SSH link never queues more frames.
     let mut output = ENTER.to_vec();
-    frontend.client.send(Action::Resize(frontend.view_size()))?;
+    frontend
+        .client
+        .send(Action::Resize(frontend.layout().view))?;
     let mut stdin = ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDIN_FILENO) });
     let mut stdout = ManuallyDrop::new(unsafe { File::from_raw_fd(libc::STDOUT_FILENO) });
     let mut decoder = Decoder::default();
@@ -109,10 +108,8 @@ pub fn run(client: Client, config: Config) -> io::Result<()> {
     let result = (|| {
         frontend.poll()?;
         while frontend.running {
-            let (changed, _) = frontend
-                .ui
-                .service(&mut frontend.client, &frontend.config, &fds)?;
-            frontend.dirty |= changed;
+            let ui = &mut frontend.ui;
+            frontend.dirty |= ui.service(&mut frontend.client, &frontend.config, &fds)?;
             if output.is_empty() {
                 if let Some(transfer) = frontend.copies.front_mut() {
                     if let Some(message) = transfer.step(&mut output)? {
@@ -222,11 +219,8 @@ pub fn run(client: Client, config: Config) -> io::Result<()> {
             .ui
             .poll_agent(&mut frontend.client, &frontend.config)?;
     }
-    // Closing the connection also detaches if the last nonblocking send cannot flush.
-    let _ = frontend
-        .client
-        .send(Action::Detach)
-        .and_then(|()| frontend.client.flush());
+    // Closing the connection detaches; first send what the last iteration queued, if it can.
+    let _ = frontend.client.flush();
     result
 }
 
@@ -280,6 +274,17 @@ fn terminal_size(fd: RawFd) -> io::Result<WindowSize> {
     })
 }
 
+/// Where the TUI places each region on the host terminal.
+struct Layout {
+    /// The panes' size; they start below the tab row, right of the file panel.
+    view: WindowSize,
+    /// Columns the file panel takes on the left.
+    left: u16,
+    files: Rect,
+    preview: Rect,
+    agent: Rect,
+}
+
 struct Frontend {
     client: Client,
     size: WindowSize,
@@ -295,15 +300,10 @@ struct Frontend {
     drawn: Option<Snapshot>,
     ui: Ui,
     config: Config,
-    panel_utf8: TextDecoder,
     paste: Option<PasteTarget>,
-    selecting: Option<PaneId>,
-    split_drag: Option<SplitDrag>,
-    last_click: Option<(Instant, PaneId, Point)>,
     /// Copies queue behind a running transfer so a cut never loses its text.
     copies: VecDeque<ClipboardTransfer>,
     pointer: Option<(u16, u16)>,
-    agent: agent_ui::AgentState,
 }
 
 impl Frontend {
@@ -319,57 +319,31 @@ impl Frontend {
             drawn: None,
             ui: Ui::new()?,
             config,
-            panel_utf8: TextDecoder::default(),
             paste: None,
-            selecting: None,
-            split_drag: None,
-            last_click: None,
             copies: VecDeque::new(),
             pointer: None,
-            agent: agent_ui::AgentState::default(),
         })
     }
 
-    fn panel_layout(&self) -> crate::ui::PanelLayout {
-        let agent = if self.ui.agent.open {
-            self.agent_width()
-        } else {
-            0
-        };
-        let available = self.size.num_cols.saturating_sub(agent);
-        crate::ui::PanelLayout::new(available, available, self.ui.files_open)
-    }
-
-    fn file_width(&self) -> u16 {
-        self.panel_layout().file_width
-    }
-
-    fn file_rect(&self) -> Rect {
-        rect(
-            0,
-            1,
-            self.file_width(),
-            self.view_size().num_lines.saturating_sub(1),
-        )
-    }
-
-    fn file_preview_rect(&self) -> Rect {
-        crate::file_panel::preview_rect(rect(
-            0,
-            1,
-            self.size.num_cols,
-            self.size.num_lines.saturating_sub(2),
-        ))
-    }
-
-    fn view_size(&self) -> WindowSize {
-        let rows = self.size.num_lines;
-        let resources = &self.ui.resources;
-        let chrome = resources.rows(rows.saturating_sub(2)) + if resources.open { 2 } else { 1 };
-        WindowSize {
-            num_cols: self.panel_layout().terminal_columns,
+    fn layout(&self) -> Layout {
+        let (columns, rows) = (self.size.num_cols, self.size.num_lines);
+        let agent = (columns / 2).clamp(20, 80).min(columns.saturating_sub(2));
+        let available = columns - if self.ui.agent.open { agent } else { 0 };
+        let panels = crate::ui::PanelLayout::new(available, available, self.ui.files_open);
+        let monitor = &self.ui.resources;
+        let chrome = monitor.rows(rows.saturating_sub(2)) + if monitor.open { 2 } else { 1 };
+        let view = WindowSize {
+            num_cols: panels.terminal_columns,
             num_lines: rows.saturating_sub(chrome).max(2),
             ..self.size
+        };
+        let body = view.num_lines.saturating_sub(1);
+        Layout {
+            view,
+            left: panels.file_width,
+            files: rect(0, 1, panels.file_width, body),
+            preview: crate::file_panel::preview_rect(rect(0, 1, columns, rows.saturating_sub(2))),
+            agent: rect(columns - agent, 1, agent, body),
         }
     }
 
@@ -377,14 +351,13 @@ impl Frontend {
         self.ui.search.close(&mut self.client)?;
         self.dirty = true;
         if self.client.controller() {
-            self.client.send(Action::Resize(self.view_size()))?;
+            self.client.send(Action::Resize(self.layout().view))?;
         }
         Ok(())
     }
 
-    fn copy_text(&mut self, text: String, primary: bool) {
-        let target = if primary { b'p' } else { b'c' };
-        self.queue_copy(Box::new(io::Cursor::new(text.into_bytes())), target, false);
+    fn copy_text(&mut self, text: String) {
+        self.queue_copy(Box::new(io::Cursor::new(text.into_bytes())), b'c', false);
     }
 
     fn queue_copy(&mut self, reader: Box<dyn Read>, target: u8, incomplete: bool) {
@@ -397,36 +370,15 @@ impl Frontend {
     }
 
     fn panel_key(&mut self, symbol: u32, modifiers: u32, text: &str) -> io::Result<()> {
-        use crate::input::{Key, KeyResult};
-        let viewport = if self.ui.files_open && self.ui.focus == Focus::Files {
-            self.ui
-                .file_viewport(self.file_rect(), self.file_preview_rect())
-        } else if self.ui.agent.open && self.ui.focus.is_agent() {
-            let rect = editor(&self.ui, self.agent_rect()).0;
-            let columns = self
-                .ui
-                .agent
-                .active()
-                .editor_columns(usize::from(rect.cols));
-            (columns, usize::from(rect.rows))
-        } else {
-            (
-                usize::from(self.size.num_cols),
-                usize::from(self.size.num_lines),
-            )
+        let key = crate::input::Key {
+            symbol,
+            modifiers,
+            text,
         };
-        match self.ui.key(
-            &mut self.client,
-            Key {
-                symbol,
-                modifiers,
-                text,
-            },
-            viewport,
-        )? {
+        match self.ui.key(&mut self.client, key)? {
             KeyResult::Unhandled => return Ok(()),
-            KeyResult::Copy(text) => self.copy_text(text, false),
-            KeyResult::Paste => self.message("Paste with your host terminal's shortcut"),
+            KeyResult::Copy(text) => self.copy_text(text),
+            KeyResult::Paste => self.message(PASTE_HINT),
             KeyResult::Quit => self.running = false,
             KeyResult::Handled => (),
         }
@@ -435,7 +387,7 @@ impl Frontend {
     }
 
     fn panel_paste(&mut self, bytes: &[u8], target: PasteTarget) -> io::Result<()> {
-        let text = self.panel_utf8.decode(bytes);
+        let text = String::from_utf8_lossy(bytes);
         self.ui.paste(&mut self.client, target, &text)?;
         self.dirty = true;
         Ok(())
@@ -443,18 +395,14 @@ impl Frontend {
 
     fn panel_bytes(&mut self, bytes: &[u8]) -> io::Result<()> {
         if let Some((symbol, modifiers)) = crate::input::sequence_key(bytes) {
-            self.panel_utf8.clear();
             return self.panel_key(symbol, modifiers, "");
         }
         if matches!(bytes, [0x1b, b'[' | b'O', ..]) {
             return Ok(());
         }
         // Alt plus a non-ASCII character arrives as ESC and the character.
-        let bytes = match bytes {
-            [0x1b, rest @ ..] if rest.first().is_some_and(|byte| !byte.is_ascii()) => rest,
-            _ => bytes,
-        };
-        let text = self.panel_utf8.decode(bytes);
+        let bytes = bytes.strip_prefix(b"\x1b").unwrap_or(bytes);
+        let text = String::from_utf8_lossy(bytes);
         let mut remaining = text.as_ref();
         while let Some(ch) = remaining.chars().next() {
             if self.ui.text_target().is_some() {
@@ -474,207 +422,186 @@ impl Frontend {
     }
 
     fn draw_resources(&mut self, grid: &mut Grid) {
-        use crate::monitor::{BACKGROUND, Emphasis, MUTED};
+        use crate::monitor::BACKGROUND;
         let (columns, rows) = (self.size.num_cols, self.size.num_lines);
-        let top = self.view_size().num_lines;
+        let top = self.layout().view.num_lines;
         let last = rows - 1;
-        let monitor_focused = self.ui.focus == Focus::Monitor;
-        self.ui.resources.pointer = self
-            .pointer
-            .filter(|&(_, row)| self.ui.resources.open && row > top && row < last)
-            .map(|(column, row)| (column, i32::from(row) - i32::from(top) - 1));
+        let focused = self.ui.focus == Focus::Monitor;
+        let hover = self.pointer.map(|(column, row)| self.locate(column, row));
         for row in top..rows {
             grid.text(0, row, columns, "", MUTED, BACKGROUND);
         }
         if self.ui.resources.open {
             draw_border(grid, 0, top, columns, false);
-            let origin = i32::from(top) + 1;
-            let view = self
-                .ui
-                .resources
-                .view(columns, last.saturating_sub(top + 1));
+            let body = i32::from(top) + 1..i32::from(last);
+            let seconds = self.ui.resources.range as f32;
+            let pointer = match hover {
+                Some((Area::Monitor, column, row)) => Some((column, row)),
+                _ => None,
+            };
+            let height = last.saturating_sub(top + 1);
+            let view = self.ui.resources.view(columns, height, pointer);
             for plot in view.plots {
-                let width = usize::from(plot.width);
-                let seconds = self.ui.resources.range as f32;
+                let (width, height) = (usize::from(plot.width), usize::from(plot.height));
                 for series in &plot.series {
                     let color = crate::monitor::series_color(series.name);
-                    let height = usize::from(plot.height);
                     let graph = braille_trend(&series.points, width, height, seconds, plot.maximum);
                     for (index, &bits) in graph.iter().enumerate().filter(|(_, bits)| **bits != 0) {
-                        let y = origin + plot.y + (index / width) as i32;
-                        if y < origin || y >= i32::from(last) {
+                        let y = body.start + plot.y + (index / width) as i32;
+                        if !body.contains(&y) {
                             continue;
                         }
                         let (x, y) = (plot.x + (index % width) as u16, y as u16);
                         // Series overlap in one braille cell: merge dots, the last series colors it.
-                        let old = grid
-                            .rows
-                            .get(usize::from(y))
-                            .and_then(|row| row.cells.get(usize::from(x)));
-                        let old = old
-                            .and_then(|cell| u32::from(cell.c).checked_sub(0x2800))
-                            .filter(|bits| *bits < 0x100)
-                            .unwrap_or(0);
-                        let braille = char::from_u32(0x2800 + (old | u32::from(bits))).unwrap();
+                        let old = grid.rows[usize::from(y)]
+                            .cells
+                            .get(usize::from(x))
+                            .map_or(0, |cell| u32::from(cell.c).wrapping_sub(0x2800));
+                        let bits = u32::from(bits) | if old < 0x100 { old } else { 0 };
+                        let braille = char::from_u32(0x2800 + bits).unwrap();
                         grid.text(x, y, 1, &braille.to_string(), color, BACKGROUND);
                     }
                 }
             }
             for text in view.texts {
-                let y = origin + text.y;
-                if y >= origin && y < i32::from(last) && text.x < columns {
-                    grid.text(
-                        text.x,
-                        y as u16,
-                        text.width.min(columns - text.x),
-                        &text.text,
-                        text.color,
-                        match text.emphasis(monitor_focused) {
-                            Emphasis::Selected => crate::panel::SELECTED,
-                            Emphasis::Highlighted => crate::panel::HOVER,
-                            Emphasis::None => BACKGROUND,
-                        },
-                    );
-                }
+                let y = (body.start + text.y) as u16;
+                let background = text.background(focused).unwrap_or(BACKGROUND);
+                grid.text(text.x, y, text.width, &text.text, text.color, background);
             }
         }
-        let view =
-            self.ui
-                .resources
-                .footer(columns, self.client.controller(), self.client.is_remote());
-        let right = view
-            .texts
-            .iter()
-            .map(|text| text.x)
-            .min()
-            .unwrap_or(columns);
-        for text in view.texts {
-            let hovered = self
-                .pointer
-                .is_some_and(|(x, y)| y == last && (text.x..text.x + text.width).contains(&x))
-                && view.hits.iter().any(|hit| hit.x == text.x);
-            let highlighted = hovered || text.emphasis(monitor_focused) != Emphasis::None;
-            let background = if highlighted {
-                crate::panel::HOVER
-            } else {
-                BACKGROUND
-            };
+        let pointer = match hover {
+            Some((Area::Footer, column, _)) => Some(column),
+            _ => None,
+        };
+        let (controller, remote) = (self.client.controller(), self.client.is_remote());
+        let footer = self
+            .ui
+            .resources
+            .footer(columns, controller, remote, pointer);
+        for text in &footer.texts {
+            let background = text.background(focused).unwrap_or(BACKGROUND);
             grid.text(text.x, last, text.width, &text.text, text.color, background);
         }
-        if let Some(snapshot) = self.client.snapshot() {
-            let context = self.ui.footer(snapshot, self.client.is_remote());
-            let width = right.saturating_sub(2);
-            let text = crate::width::fit_middle(&context, width);
-            grid.text(1, last, width, &text, MUTED, BACKGROUND);
+        let (label, width) = self.ui.footer_label(&self.client, &footer);
+        let label = crate::width::fit_middle(&label, width);
+        grid.text(1, last, width, &label, MUTED, BACKGROUND);
+    }
+
+    /// The area under the host cell `column`, `row` or holding the pointer, and the pointer's
+    /// cell in that area's grid.
+    fn locate(&self, column: u16, row: u16) -> (Area, u16, u16) {
+        let layout = self.layout();
+        let (top, last) = (layout.view.num_lines, self.size.num_lines - 1);
+        let area = self.ui.capture().unwrap_or(if row == 0 {
+            Area::Tabs
+        } else if row == last {
+            Area::Footer
+        } else if row == top {
+            Area::Divider
+        } else if row > top {
+            Area::Monitor
+        } else if self.ui.agent.open && column >= layout.agent.x {
+            Area::Agent
+        } else if column < layout.left {
+            Area::Files
+        } else {
+            Area::Terminal
+        });
+        match area {
+            Area::Terminal => (area, column.saturating_sub(layout.left), row),
+            Area::Monitor => (area, column, row - top - 1),
+            Area::Footer => (area, column, 0),
+            _ => (area, column, row),
         }
     }
 
-    fn resource_mouse(&mut self, pointer: PointerEvent) -> io::Result<()> {
-        let top = self.view_size().num_lines;
-        let last = self.size.num_lines - 1;
-        let columns = self.size.num_cols;
-        self.dirty = true;
-        if self.ui.resources.dragging {
-            match pointer.kind {
-                PointerKind::Release => self.ui.resources.dragging = false,
-                PointerKind::Motion => {
-                    let height = self.size.num_lines.saturating_sub(2);
-                    self.ui
-                        .resources
-                        .resize(last.saturating_sub(pointer.row + 1), height);
-                    return self.resize();
-                }
-                _ => (),
-            }
-        } else if pointer.kind == PointerKind::Scroll && self.ui.resources.open {
-            let scroll = &mut self.ui.resources.scroll;
-            *scroll = scroll.saturating_add_signed(pointer.wheel());
-        } else if pointer.press(0) {
-            let (view, origin) = if pointer.row == last {
-                let footer = self.ui.resources.footer(
-                    columns,
-                    self.client.controller(),
-                    self.client.is_remote(),
-                );
-                (footer, last)
-            } else if pointer.row == top {
-                self.ui.monitor_drag();
-                return Ok(());
+    fn mouse(&mut self, event: PointerEvent) -> io::Result<()> {
+        let PointerEvent {
+            column,
+            row,
+            kind,
+            modifiers,
+        } = event;
+        let moved = self.pointer.replace((column, row)) != Some((column, row));
+        self.dirty |= moved || kind != PointerKind::Motion;
+        if self.ui.resources.dragging && kind == PointerKind::Motion {
+            let (height, total) = (self.ui.resources.height, self.size.num_lines - 2);
+            let rows = self.size.num_lines.saturating_sub(row + 2);
+            self.ui.resources.resize(rows, total);
+            return if self.ui.resources.height == height {
+                Ok(())
             } else {
-                self.ui.focus = Focus::Monitor;
-                let height = last.saturating_sub(top + 1);
-                (self.ui.resources.view(columns, height), top + 1)
+                self.resize()
             };
-            let hit = view.hits.iter().rfind(|hit| {
-                i32::from(pointer.row) == i32::from(origin) + hit.y
-                    && (hit.x..hit.x + hit.width).contains(&pointer.col)
-            });
-            if let Some(hit) = hit {
-                self.ui.monitor_action(&mut self.client, hit.action)?;
-            }
+        }
+        let (area, column, row) = self.locate(column, row);
+        // The host reports no position within a cell.
+        let side = match kind {
+            PointerKind::Press(_) => Side::Left,
+            _ => Side::Right,
+        };
+        let pointer = Pointer {
+            kind,
+            modifiers,
+            area,
+            column,
+            row,
+            side,
+        };
+        match self.ui.pointer(&mut self.client, pointer)? {
+            Effect::Input(pane, data) => self.send_input(pane, &data)?,
+            Effect::Copy(text) => self.copy_text(text),
+            Effect::Paste(..) => self.message(PASTE_HINT),
+            Effect::Quit => self.running = false,
+            // The host terminal keeps the primary selection.
+            Effect::None | Effect::Primary(_) | Effect::Selected(_) => (),
         }
         Ok(())
     }
 
-    /// `panel_cursor` is the caret of the focused panel, if it has one.
+    /// Shows the focused pane's cursor, else `panel_cursor`, the caret of the focused panel.
     fn draw_cursor(
         &self,
         output: &mut Vec<u8>,
         panel_cursor: Option<(u16, u16)>,
     ) -> io::Result<()> {
         let in_panel = self.ui.close_prompt.is_some() || self.ui.input_target().is_some();
-        let mode = self
-            .client
-            .focused()
-            .filter(|_| !in_panel)
-            .map_or(Mode::NONE, |pane| self.client.mode(pane));
-        output.extend_from_slice(if mode.contains(Mode::APP_CURSOR) {
-            b"\x1b[?1h"
-        } else {
-            b"\x1b[?1l"
-        });
-        output.extend_from_slice(if mode.contains(Mode::APP_KEYPAD) {
-            b"\x1b="
-        } else {
-            b"\x1b>"
-        });
-        let pane_cursor = self.pane_cursor().filter(|_| !in_panel);
-        if let Some((column, row, shape)) = pane_cursor {
-            write!(
-                output,
-                "\x1b[0m\x1b[{shape} q\x1b[{};{}H\x1b[?25h",
-                row + 1,
-                column + 1
-            )
-        } else if let Some((column, row)) = panel_cursor {
+        let pane = (self.client.snapshot())
+            .filter(|snapshot| snapshot.controller && !in_panel)
+            .and_then(Snapshot::focused_pane);
+        let screen = pane.and_then(|pane| self.client.screens().get(&pane.id));
+        // Keypad keys pass through raw; cursor keys are rewritten by `cursor_bytes` instead.
+        let keypad = screen.is_some_and(|screen| screen.mode().contains(Mode::APP_KEYPAD));
+        output.extend_from_slice(if keypad { b"\x1b=" } else { b"\x1b>" });
+        if let (Some(pane), Some(screen)) = (pane, screen) {
+            let (point, shape) = screen.cursor();
+            let layout = self.layout();
+            let row = point.line + screen.display_offset() as i32;
+            let x = u32::from(pane.rect.x) + point.column as u32;
+            let y = i32::from(pane.rect.y) + row;
+            if shape != CursorShape::Hidden
+                && (0..i32::from(pane.rect.rows)).contains(&row)
+                && x < u32::from(layout.view.num_cols)
+                && y < i32::from(layout.view.num_lines)
+            {
+                let shape = match shape {
+                    CursorShape::Underline => 4,
+                    CursorShape::Beam => 6,
+                    _ => 2,
+                };
+                let column = x + u32::from(layout.left) + 1;
+                return write!(
+                    output,
+                    "\x1b[0m\x1b[{shape} q\x1b[{};{column}H\x1b[?25h",
+                    y + 1
+                );
+            }
+        }
+        if let Some((column, row)) = panel_cursor {
             write!(output, "\x1b[{};{}H\x1b[?25h", row + 1, column + 1)
         } else {
             output.write_all(b"\x1b[?25l")
         }
-    }
-
-    fn pane_cursor(&self) -> Option<(u32, i32, u8)> {
-        let snapshot = self.client.snapshot()?;
-        let pane = snapshot.focused_pane()?;
-        let screen = self.client.screens().get(&pane.id)?;
-        let (point, shape) = screen.cursor();
-        let row = point.line + screen.display_offset() as i32;
-        let x = u32::from(pane.rect.x) + point.column as u32;
-        let y = i32::from(pane.rect.y) + row;
-        let size = self.view_size();
-        (snapshot.controller
-            && shape != CursorShape::Hidden
-            && (0..i32::from(pane.rect.rows)).contains(&row)
-            && x < u32::from(size.num_cols)
-            && y < i32::from(size.num_lines))
-        .then(|| {
-            let shape = match shape {
-                CursorShape::Underline => 4,
-                CursorShape::Beam => 6,
-                _ => 2,
-            };
-            (x + u32::from(self.file_width()), y, shape)
-        })
     }
 
     fn message(&mut self, message: impl Into<String>) {
@@ -692,62 +619,44 @@ impl Frontend {
     }
 
     fn poll(&mut self) -> io::Result<()> {
-        for event in self.client.poll()? {
-            self.event(event)?;
-        }
-        Ok(())
-    }
-
-    fn event(&mut self, event: Response) -> io::Result<()> {
-        match event {
-            Response::ScreenDirty => {
-                self.ui.search.observe(&mut self.client)?;
-                self.screen_dirty = true;
-            }
-            Response::Error(error) | Response::CopyError(error) => self.message(error),
-            Response::Detached => self.running = false,
-            Response::Clipboard {
-                file, incomplete, ..
-            } => {
-                if std::env::var("TERM").is_ok_and(|term| term == "dumb" || term == "linux") {
-                    self.message("This host terminal does not support OSC 52 clipboard transfer");
-                } else {
-                    self.queue_copy(Box::new(file), b'c', incomplete);
+        for response in self.client.poll()? {
+            match self.ui.respond(&mut self.client, response)? {
+                None => self.dirty = true,
+                Some(Response::ScreenDirty) => self.screen_dirty = true,
+                Some(Response::Detached) => self.running = false,
+                Some(Response::Clipboard {
+                    primary,
+                    file,
+                    incomplete,
+                }) => {
+                    if std::env::var("TERM").is_ok_and(|term| term == "dumb" || term == "linux") {
+                        self.message(
+                            "This host terminal does not support OSC 52 clipboard transfer",
+                        );
+                    } else {
+                        let target = if primary { b'p' } else { b'c' };
+                        self.queue_copy(Box::new(file), target, incomplete);
+                    }
                 }
+                Some(_) => (),
             }
-            Response::ClipboardStore { primary, text } => self.copy_text(text, primary),
-            Response::Search {
-                pane,
-                request,
-                count,
-                truncated,
-            } => {
-                let count = count as usize;
-                self.dirty |=
-                    self.ui
-                        .search
-                        .result(&mut self.client, pane, request, count, truncated)?;
-            }
-            _ => (),
         }
         Ok(())
     }
 
     fn input(&mut self, event: Input) -> io::Result<()> {
         let panels = self.ui.panel_state();
-        let previous = self.pointer;
-        if let Input::Mouse(pointer) = &event {
-            self.pointer = Some((pointer.col, pointer.row));
-            self.dirty |= previous != self.pointer;
+        match event {
+            Input::Mouse(pointer) => self.mouse(pointer)?,
+            event => self.dispatch(event)?,
         }
-        self.dispatch(event, previous)?;
         if panels != self.ui.panel_state() {
             self.resize()?;
         }
         Ok(())
     }
 
-    fn dispatch(&mut self, event: Input, previous: Option<(u16, u16)>) -> io::Result<()> {
+    fn dispatch(&mut self, event: Input) -> io::Result<()> {
         let modal = self.ui.modal();
         if !modal && let Input::Alt(key) = event {
             if key == b'q' {
@@ -762,12 +671,10 @@ impl Frontend {
         if modal || self.ui.input_target().is_some() {
             match event {
                 Input::Bytes(bytes) => return self.panel_bytes(&bytes),
-                Input::Mouse(pointer) if modal => return self.modal_mouse(pointer),
                 Input::Alt(key) if !modal => {
                     return self.panel_key(u32::from(key), crate::input::ALT, "");
                 }
                 Input::PasteStart if !modal => {
-                    self.panel_utf8.clear();
                     self.paste = self.ui.paste_target();
                     return Ok(());
                 }
@@ -785,8 +692,7 @@ impl Frontend {
             Input::Focus(focused) if mode.contains(Mode::FOCUS_IN_OUT) => {
                 self.send_input(pane, if focused { b"\x1b[I" } else { b"\x1b[O" })?;
             }
-            Input::Focus(_) => (),
-            Input::Mouse(pointer) => self.route_mouse(pointer, previous)?,
+            Input::Focus(_) | Input::Mouse(_) => (),
             Input::PasteStart => {
                 let bracketed = mode.contains(Mode::BRACKETED_PASTE);
                 self.paste = Some(PasteTarget::Pane { pane, bracketed });
@@ -800,7 +706,6 @@ impl Frontend {
                 None => (),
             },
             Input::PasteEnd => {
-                self.panel_utf8.clear();
                 if let Some(PasteTarget::Pane {
                     pane,
                     bracketed: true,
@@ -813,202 +718,15 @@ impl Frontend {
         Ok(())
     }
 
-    fn modal_mouse(&mut self, pointer: PointerEvent) -> io::Result<()> {
-        self.dirty = true;
-        let Some(prompt) = self.ui.close_prompt else {
-            self.file_mouse(pointer);
-            return Ok(());
-        };
-        let close = crate::ui::close_rect(self.size.num_cols, self.size.num_lines);
-        if pointer.press(0)
-            && let Some(terminate) = crate::ui::close_hit(close, prompt, pointer.col, pointer.row)
-            && matches!(
-                self.ui.choose_close(&mut self.client, terminate)?,
-                crate::input::KeyResult::Quit
-            )
-        {
-            self.running = false;
-        }
-        Ok(())
-    }
-
-    fn route_mouse(
-        &mut self,
-        pointer: PointerEvent,
-        previous: Option<(u16, u16)>,
-    ) -> io::Result<()> {
-        if self.agent_captures_mouse() {
-            return self.agent_mouse(pointer).map(drop);
-        }
-        if self.ui.resources.dragging || pointer.row >= self.view_size().num_lines {
-            return self.resource_mouse(pointer);
-        }
-        if pointer.press(0) {
-            self.ui.focus = Focus::Terminal;
-        }
-        if self.agent_mouse(pointer)? {
-            return Ok(());
-        }
-        if self.ui.files_open && self.file_rect().contains(pointer.col, pointer.row) {
-            if pointer.kind != PointerKind::Motion && pointer.kind != PointerKind::Release {
-                self.ui.focus = Focus::Files;
-                self.file_mouse(pointer);
-            }
-            return Ok(());
-        }
-        self.terminal_mouse(pointer, previous)
-    }
-
-    fn terminal_mouse(
-        &mut self,
-        pointer: PointerEvent,
-        previous: Option<(u16, u16)>,
-    ) -> io::Result<()> {
-        if pointer.row == 0 {
-            if pointer.press(0)
-                && let Some(snapshot) = self
-                    .client
-                    .snapshot()
-                    .filter(|snapshot| snapshot.controller)
-                && let Some(hit) =
-                    crate::ui::tab_bar(snapshot, self.view_size().num_cols + self.file_width(), "")
-                        .at(snapshot, pointer.col)
-            {
-                self.ui.tab_click(&mut self.client, hit)?;
-                self.dirty = true;
-            }
-            return Ok(());
-        }
-        let left = self.file_width();
-        let (column, row) = (pointer.col.saturating_sub(left), pointer.row);
-        if let Some(drag) = self.split_drag {
-            if pointer.kind == PointerKind::Release {
-                self.split_drag = None;
-            } else if pointer.kind == PointerKind::Motion
-                && previous.is_none_or(|(old_column, old_row)| match drag.axis {
-                    Axis::LeftRight => old_column != pointer.col,
-                    Axis::TopBottom => old_row != pointer.row,
-                })
-            {
-                self.client.send(drag.action(column, row))?;
-            }
-            return Ok(());
-        }
-        let Some(snapshot) = self
-            .client
-            .snapshot()
-            .filter(|snapshot| snapshot.controller)
-        else {
-            return Ok(());
-        };
-        if pointer.press(0)
-            && let Some(drag) = snapshot.divider_at(column, row)
-        {
-            self.split_drag = Some(drag);
-            return Ok(());
-        }
-        let Some(view) = snapshot.pane_at(column, row) else {
-            return Ok(());
-        };
-        let (pane, rect, focused) = (view.id, view.rect, snapshot.focused);
-        if pointer.press(0) && focused != pane {
-            self.ui.act(&mut self.client, Action::Focus(pane))?;
-        }
-        let Some(screen) = self.client.screens().get(&pane) else {
-            return Ok(());
-        };
-        let mode = screen.mode();
-        let offset = screen.display_offset();
-        let y = row - rect.y;
-        let x = (column - rect.x).min(screen.columns().saturating_sub(1) as u16);
-        let point = Point {
-            line: i32::from(y) - offset as i32,
-            column: usize::from(x),
-        };
-        let alt = pointer.mods & crate::input::ALT != 0;
-        if pointer.press(0) && (!mode.intersects(Mode::MOUSE_MODE) || alt) {
-            let now = Instant::now();
-            let double = self.last_click.is_some_and(|(at, old_pane, old_point)| {
-                old_pane == pane
-                    && old_point == point
-                    && now.duration_since(at) < Duration::from_millis(400)
-            });
-            self.last_click = Some((now, pane, point));
-            if double && let Some(object) = crate::context::object_at(screen, point) {
-                crate::ui::open_object(&self.client, pane, &object.text)?;
-                return Ok(());
-            }
-        }
-        if mode.intersects(Mode::MOUSE_MODE) && !alt {
-            if pointer.kind == PointerKind::Motion
-                && !mode.contains(Mode::MOUSE_MOTION)
-                && (!mode.contains(Mode::MOUSE_DRAG) || pointer.button == 3)
-            {
-                return Ok(());
-            }
-            if let Some(data) = mouse_bytes(
-                pointer.code,
-                usize::from(x),
-                usize::from(y),
-                pointer.kind == PointerKind::Release,
-                mode,
-            ) {
-                self.send_input(pane, &data)?;
-            }
-        } else if pointer.kind == PointerKind::Scroll {
-            let up = pointer.button == 0;
-            if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && !alt {
-                let bytes = if up { *b"\x1b[A" } else { *b"\x1b[B" };
-                self.send_input(pane, &cursor_bytes(bytes, mode))?;
-            } else {
-                self.client.send(Action::Scroll {
-                    pane,
-                    scroll: Scroll::Delta(-pointer.wheel() as i32),
-                })?;
-            }
-        } else if pointer.press(2) {
-            if let Some((_, object)) = self.hovered_object() {
-                self.copy_text(object.text, false);
-            } else {
-                self.message("Paste with your host terminal's shortcut");
-            }
-        } else if pointer.button == 0 {
-            match pointer.kind {
-                PointerKind::Release => self.selecting = None,
-                PointerKind::Motion if self.selecting == Some(pane) => {
-                    self.client.send(Action::SelectionUpdate {
-                        pane,
-                        point,
-                        side: Side::Right,
-                    })?;
-                }
-                PointerKind::Press => {
-                    self.selecting = Some(pane);
-                    self.client.send(Action::SelectionStart {
-                        pane,
-                        point,
-                        side: Side::Left,
-                        kind: SelectionType::Simple,
-                    })?;
-                }
-                _ => (),
-            }
-        }
-        Ok(())
-    }
-
+    /// The pane cell under the pointer, which hover highlights.
     fn hovered(&self) -> Option<(PaneId, Point)> {
-        let (x, y) = self.pointer?;
-        let x = x.checked_sub(self.file_width())?;
-        let pane = self.client.snapshot()?.pane_at(x, y)?;
-        let offset = self.client.screens().get(&pane.id)?.display_offset();
-        Some((
-            pane.id,
-            Point {
-                line: i32::from(y - pane.rect.y) - offset as i32,
-                column: usize::from(x - pane.rect.x),
-            },
-        ))
+        let (column, row) = self.pointer?;
+        let (area, column, row) = self.locate(column, row);
+        if area != Area::Terminal {
+            return None;
+        }
+        let (pane, point, _) = pane_point(&self.client, column, row, Side::Left, None)?;
+        Some((pane, point))
     }
 
     fn hovered_object(&self) -> Option<(PaneId, crate::context::Object)> {
@@ -1024,8 +742,9 @@ impl Frontend {
             return Ok(());
         };
         output.write_all(b"\x1b[?2026h")?;
-        let size = self.view_size();
-        let left = self.file_width();
+        let Layout {
+            view: size, left, ..
+        } = self.layout();
         let host_columns = size.num_cols + left;
         let screen = rect(0, 0, self.size.num_cols, self.size.num_lines);
         let (foreground, background) = (self.config.foreground, self.config.background);
@@ -1058,56 +777,52 @@ impl Frontend {
                 .unwrap_or_else(|| Grid::new(screen, foreground, background));
             frame.reset(screen, foreground, background);
             self.drawn = plain.then(|| snapshot.clone());
-            (frame, self.frame.take())
-        };
-        if !incremental {
-            paint_tabs(
+            let pointer = self.pointer.filter(|&(_, row)| row == 0);
+            let pointer = pointer.map(|(column, _)| column);
+            let config = &self.config;
+            draw_tabs(
                 &mut frame,
+                &mut self.ui,
                 snapshot,
                 host_columns,
-                self.pointer,
-                &self.config,
+                pointer,
+                config,
             );
-        }
+            (frame, self.frame.take())
+        };
         let mut damage = Vec::new();
         for pane in &snapshot.panes {
-            if let Some(screen) = self.client.screens().get(&pane.id) {
-                let rows = screen
-                    .screen_lines()
-                    .min(usize::from(pane.rect.rows))
-                    .min(usize::from(size.num_lines.saturating_sub(pane.rect.y)));
-                for row in 0..rows {
-                    if incremental {
-                        if !screen.dirty[row] {
-                            continue;
-                        }
-                        // Panes side by side share a host row; keep its old cells once.
-                        let y = usize::from(pane.rect.y) + row;
-                        if !damage.contains(&y) {
-                            previous.as_mut().unwrap().rows[y].clone_from(&frame.rows[y]);
-                            damage.push(y);
-                        }
+            let Some(screen) = self.client.screens().get(&pane.id) else {
+                continue;
+            };
+            let rows = screen
+                .screen_lines()
+                .min(usize::from(pane.rect.rows))
+                .min(usize::from(size.num_lines.saturating_sub(pane.rect.y)));
+            let object = object
+                .as_ref()
+                .filter(|(id, _)| *id == pane.id)
+                .map(|(_, object)| object.range);
+            for row in 0..rows {
+                if incremental {
+                    if !screen.dirty[row] {
+                        continue;
                     }
-                    let highlight = hovered.is_some_and(|(id, block)| {
-                        id == pane.id
-                            && screen
-                                .row_output(pane, row)
-                                .is_some_and(|current| current.id == block)
-                    });
-                    let object = object
-                        .as_ref()
-                        .filter(|(id, _)| *id == pane.id)
-                        .map(|(_, object)| object.range);
-                    paint_row(
-                        &mut frame,
-                        screen,
-                        pane,
-                        row,
-                        host_columns,
-                        (highlight, object),
-                        left,
-                    );
+                    // Panes side by side share a host row; keep its old cells once.
+                    let y = usize::from(pane.rect.y) + row;
+                    if !damage.contains(&y) {
+                        previous.as_mut().unwrap().rows[y].clone_from(&frame.rows[y]);
+                        damage.push(y);
+                    }
                 }
+                let highlight = hovered.is_some_and(|(id, block)| {
+                    id == pane.id
+                        && screen
+                            .row_output(pane, row)
+                            .is_some_and(|current| current.id == block)
+                });
+                let painted = (highlight, object);
+                paint_row(&mut frame, screen, pane, row, host_columns, painted, left);
             }
         }
         let mut cursor = None;
@@ -1129,15 +844,17 @@ impl Frontend {
                     .ui
                     .search
                     .display("", usize::from(columns.saturating_sub(2)));
-                let chrome = crate::panel::CHROME;
-                frame.text(0, 0, columns, "", foreground, chrome);
-                frame.text(1, 0, columns.saturating_sub(2), &label, foreground, chrome);
+                let label = [" ", &label].concat();
+                frame.text(0, 0, columns, &label, foreground, crate::panel::CHROME);
                 cursor = Some((caret as u16 + 1, 0));
             }
-            if let Some(prompt) = self.ui.close_prompt {
-                let name = &self.client.snapshot().unwrap().name;
-                let close = crate::ui::close_rect(self.size.num_cols, self.size.num_lines);
-                let grid = crate::ui::close_grid(prompt, name, close, self.pointer, &self.config);
+            let name = &self.client.snapshot().unwrap().name;
+            let (columns, rows) = (self.size.num_cols, self.size.num_lines);
+            let pointer = self.pointer;
+            if let Some(grid) = self
+                .ui
+                .close_dialog(columns, rows, name, pointer, &self.config)
+            {
                 frame.blit(&grid);
                 cursor = None;
             }
@@ -1154,34 +871,26 @@ impl Frontend {
         output.write_all(b"\x1b[?2026l")
     }
 
-    fn file_mouse(&mut self, pointer: PointerEvent) {
-        self.dirty = true;
-        let (list, preview) = (self.file_rect(), self.file_preview_rect());
-        if pointer.kind == PointerKind::Scroll {
-            self.ui.file_wheel(pointer.wheel(), list, preview);
-        } else if pointer.press(0) {
-            self.ui.file_press(list, preview, pointer.col, pointer.row);
+    fn draw_files(&mut self, grid: &mut Grid) {
+        let layout = self.layout();
+        let config = &self.config;
+        let (list, preview) = self.ui.file_grids(layout.files, layout.preview, "", config);
+        grid.blit(&list);
+        if let Some(preview) = preview {
+            grid.blit(&preview);
         }
     }
 
-    fn draw_files(&mut self, grid: &mut Grid) {
-        let rect = self.file_rect();
-        let preview = self.file_preview_rect();
-        let Some(files) = &mut self.ui.files else {
-            return;
-        };
-        let focused =
-            self.ui.focus == Focus::Files && files.focus() == crate::files::FileFocus::List;
-        grid.blit(&crate::file_panel::list(
-            files,
-            rect,
-            "",
-            focused,
-            &self.config,
-        ));
-        if files.focus() == crate::files::FileFocus::Preview {
-            grid.blit(&crate::file_panel::preview(files, preview, &self.config));
+    fn draw_agent(&mut self, frame: &mut Grid) -> io::Result<Option<(u16, u16)>> {
+        let side = self.layout().agent;
+        let (config, size, pointer) = (&self.config, self.size, self.pointer);
+        let panel = crate::agent::panel::draw(&mut self.ui, config, side, size, pointer, "")?;
+        if let Some(backdrop) = &panel.backdrop {
+            frame.blit(backdrop);
         }
+        frame.blit(&panel.grid);
+        self.ui.agent.spare_grid = Some(panel.grid);
+        Ok(panel.cursor)
     }
 }
 
@@ -1196,95 +905,52 @@ fn same_view(a: &Snapshot, b: &Snapshot) -> bool {
         })
 }
 
-fn paint_tabs(
-    grid: &mut Grid,
+/// Draws the tab row, lit at the hovered `pointer` column.
+fn draw_tabs(
+    frame: &mut Grid,
+    ui: &mut Ui,
     snapshot: &Snapshot,
     columns: u16,
-    pointer: Option<(u16, u16)>,
+    pointer: Option<u16>,
     config: &Config,
 ) {
-    use crate::panel::{ACCENT, CHROME};
-    use crate::ui::TabHit;
-    grid.text(0, 0, columns, "", crate::panel::MUTED, CHROME);
-    let controller = snapshot.controller;
-    grid.text(
-        1,
-        0,
-        1,
-        "›",
-        if controller { 0x969696 } else { 0xfe9b30 },
-        CHROME,
-    );
-    let bar = crate::ui::tab_bar(
+    let row = crate::ui::tab_row_color(config);
+    frame.text(0, 0, columns, "", MUTED, row);
+    let (left, right) = match config.tab_style {
+        TabStyle::Angled => ("◢", "◣"),
+        TabStyle::Flat => (" ", " "),
+    };
+    let status = if snapshot.controller {
+        ""
+    } else {
+        "Read-only  "
+    };
+    ui.paint_tabs(
         snapshot,
         columns,
-        if controller { "" } else { "Read-only  " },
-    );
-    let hit = pointer
-        .filter(|&(_, row)| row == 0)
-        .and_then(|(column, _)| bar.at(snapshot, column));
-    let angled = config.tab_style == crate::config::TabStyle::Angled;
-    for &(index, x, width) in &bar.tabs {
-        let tab = &snapshot.tabs[index];
-        let active = tab.id == snapshot.active_tab;
-        let background = if active { 0x202020 } else { 0x1c1c1c };
-        let close_hovered = hit == Some(TabHit::Close(tab.id));
-        let title_color = if close_hovered || hit == Some(TabHit::Select(index)) {
-            0xd4d9d8
-        } else if active {
-            0xcccccc
-        } else {
-            0x969696
-        };
-        let close_color = if close_hovered {
-            0xe87575
-        } else if active {
-            0x949494
-        } else {
-            0x606060
-        };
-        let (left, right) = if angled { ("◢", "◣") } else { (" ", " ") };
-        grid.text(x, 0, 1, left, background, CHROME);
-        grid.text(x + 1, 0, 3, " • ", crate::ui::tab_color(tab), background);
-        grid.text(x + 4, 0, width - 8, &tab.title, title_color, background);
-        grid.text(x + width - 4, 0, 3, " × ", close_color, background);
-        grid.text(x + width - 1, 0, 1, right, background, CHROME);
-        let flat_active = config.tab_style == crate::config::TabStyle::Flat && active;
-        if flat_active || close_hovered {
-            let underline = if close_hovered && !flat_active {
-                0xe87575
-            } else {
-                ACCENT
-            };
-            let row = &mut grid.rows[0];
-            for column in x..x + width {
-                if flat_active || column >= x + width - 4 {
-                    let column = usize::from(column);
-                    row.cells[column].flags.insert(Flags::UNDERLINE);
-                    row.extra_mut(column).underline_color = Some(crate::panel::rgb(underline));
+        status,
+        pointer,
+        config,
+        |part| match part {
+            TabPart::Tab { x, width, color } => {
+                frame.text(x, 0, 1, left, color, row);
+                frame.text(x + 1, 0, width - 2, "", color, color);
+                frame.text(x + width - 1, 0, 1, right, color, row);
+            }
+            TabPart::Text {
+                x,
+                width,
+                text,
+                color,
+                background,
+            } => frame.text(x, 0, width, text, color, background),
+            TabPart::Underline { x, width, color } => {
+                for column in usize::from(x)..usize::from(x + width) {
+                    frame.rows[0].cells[column].flags.insert(Flags::UNDERLINE);
+                    frame.rows[0].extra_mut(column).underline_color = Some(rgb(color));
                 }
             }
-        }
-    }
-    if let Some(x) = bar.plus {
-        let hovered = hit == Some(TabHit::New);
-        let color = if hovered { ACCENT } else { 0x606060 };
-        grid.text(x, 0, 3, "", color, CHROME);
-        grid.text(x + 1, 0, 1, "+", color, CHROME);
-        if hovered {
-            grid.rows[0].cells[usize::from(x + 1)]
-                .flags
-                .insert(Flags::UNDERLINE);
-        }
-    }
-    let width = text_width(&bar.label) as u16;
-    grid.text(
-        bar.label_x,
-        0,
-        width,
-        &bar.label,
-        if controller { 0xb8b8b8 } else { 0xfe9b30 },
-        CHROME,
+        },
     );
 }
 
@@ -1294,7 +960,7 @@ fn paint_row(
     pane: &PaneView,
     row: usize,
     host_columns: u16,
-    (highlight, object): (bool, Option<crate::core::SelectionRange>),
+    (highlight, object): (bool, Option<SelectionRange>),
     left: u16,
 ) {
     let x = pane.rect.x + left;
@@ -1347,17 +1013,9 @@ fn paint_row(
             cell.bg = Color::Spec(bg);
             cell.flags.remove(Flags::INVERSE);
             if selected {
-                cell.bg = Color::Spec(Rgb {
-                    r: 55,
-                    g: 55,
-                    b: 55,
-                });
+                cell.bg = rgb(0x373737);
             } else if highlight && default_background && !inverse {
-                cell.bg = Color::Spec(Rgb {
-                    r: 38,
-                    g: 38,
-                    b: 38,
-                });
+                cell.bg = rgb(0x262626);
             }
             let hide = column >= columns
                 || cell.flags.contains(Flags::HIDDEN)
@@ -1369,7 +1027,7 @@ fn paint_row(
             }
             hide
         };
-        if hide || target.extra(index).is_some() {
+        if target.extra(index).is_some() {
             let extra = target.extra_mut(index);
             if hide {
                 extra.zerowidth.clear();
@@ -1455,6 +1113,5 @@ impl ClipboardTransfer {
     }
 }
 
-mod agent_ui;
 #[cfg(test)]
 mod tests;

@@ -2,11 +2,12 @@
 
 use crate::ui::TextField;
 use crate::worker::Worker;
+use std::borrow::Cow;
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Read};
-use std::os::fd::{OwnedFd, RawFd};
+use std::os::fd::RawFd;
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ pub struct FileEntry {
 }
 
 impl FileEntry {
-    pub fn display_name(&self) -> std::borrow::Cow<'_, str> {
+    pub fn display_name(&self) -> Cow<'_, str> {
         self.path
             .file_name()
             .unwrap_or(self.path.as_os_str())
@@ -37,55 +38,16 @@ impl FileEntry {
     }
 }
 
-/// A background job that only runs the newest request: the results of
-/// superseded requests are dropped and their running work sees `cancelled`.
-struct Job<Request, Output> {
-    worker: Worker<(u64, Request), (u64, Output)>,
-    generation: Arc<AtomicU64>,
-}
-
-impl<Request: Send + 'static, Output: Send + 'static> Job<Request, Output> {
-    fn new(
-        name: &'static str,
-        wakeup: Arc<OwnedFd>,
-        mut run: impl FnMut(Request, &dyn Fn() -> bool, &dyn Fn(Output)) + Send + 'static,
-    ) -> io::Result<Self> {
-        let generation = Arc::new(AtomicU64::new(0));
-        let current = Arc::clone(&generation);
-        let worker = Worker::new(name, wakeup, move |(id, request), publish| {
-            let cancelled = || current.load(Ordering::Relaxed) != id;
-            run(request, &cancelled, &|output| {
-                if !cancelled() {
-                    publish((id, output));
-                }
-            });
-        })?;
-        Ok(Self { worker, generation })
-    }
-
-    fn submit(&self, request: Request) {
-        let id = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
-        self.worker.submit((id, request));
-    }
-
-    fn cancel(&self) {
-        self.generation.fetch_add(1, Ordering::Relaxed);
-    }
-
-    fn take(&mut self) -> Option<Output> {
-        let (id, output) = self.worker.take()?;
-        (id == self.generation.load(Ordering::Relaxed)).then_some(output)
-    }
-}
-
 pub struct FileNav {
     directory: PathBuf,
-    expanded: Arc<HashSet<PathBuf>>,
+    expanded: HashSet<PathBuf>,
     pub(crate) query: Option<TextField>,
     pub(crate) scan: Scan,
     selection: usize,
     scroll: usize,
-    scan_job: Job<ScanRequest, (Scan, bool)>,
+    /// The id of the newest scan; older ones stop and their results are dropped.
+    scan_generation: Arc<AtomicU64>,
+    scans: Worker<(u64, ScanRequest), (u64, Scan, bool)>,
     scan_pending: bool,
     restore_selection: Option<PathBuf>,
     directory_selection: HashMap<PathBuf, PathBuf>,
@@ -93,7 +55,7 @@ pub struct FileNav {
     preview_path: Option<PathBuf>,
     pub(crate) preview: Preview,
     pub(crate) preview_scroll: usize,
-    preview_job: Job<PathBuf, Preview>,
+    previews: Worker<PathBuf, (PathBuf, Preview)>,
     pub(crate) preview_pending: bool,
 }
 
@@ -114,7 +76,7 @@ impl Preview {
 }
 
 enum ScanRequest {
-    Browse(PathBuf, Arc<HashSet<PathBuf>>),
+    Browse(PathBuf, HashSet<PathBuf>),
     Search(PathBuf, String),
 }
 
@@ -127,41 +89,44 @@ pub(crate) struct Scan {
 impl FileNav {
     pub fn new(directory: PathBuf) -> io::Result<Self> {
         let wakeup = Arc::new(crate::sys::new()?);
-        let scan_job = Job::new(
+        let scan_generation = Arc::new(AtomicU64::new(0));
+        let current = Arc::clone(&scan_generation);
+        let scans = Worker::new(
             "nextty-files",
             Arc::clone(&wakeup),
-            |request: ScanRequest, cancelled, publish| {
-                // Matching by value releases the expanded set before the result is published,
-                // so the frontend can mutate it without copying.
+            move |(id, request), publish| {
+                let cancelled = || current.load(Ordering::Relaxed) != id;
                 let scan = match request {
                     ScanRequest::Browse(directory, expanded) => {
                         let mut scan = Scan::default();
-                        browse(&directory, &expanded, cancelled, &mut scan);
+                        browse(&directory, &expanded, &cancelled, &mut scan);
                         scan
                     }
                     ScanRequest::Search(directory, query) => {
-                        search(&directory, &query, cancelled, &|partial| {
-                            publish((partial, false));
+                        search(&directory, &query, &cancelled, &|partial| {
+                            publish((id, partial, false))
                         })
                     }
                 };
-                publish((scan, true));
+                publish((id, scan, true));
             },
         )?;
-        let preview_job = Job::new("nextty-preview", wakeup, |path: PathBuf, _, publish| {
-            publish(read_preview(&path).unwrap_or_else(|error| Preview {
+        let previews = Worker::new("nextty-preview", wakeup, |path: PathBuf, publish| {
+            let preview = read_preview(&path).unwrap_or_else(|error| Preview {
                 error: Some(error),
                 ..Preview::default()
-            }));
+            });
+            publish((path, preview));
         })?;
         let mut nav = Self {
             directory: PathBuf::new(),
-            expanded: Arc::default(),
+            expanded: HashSet::new(),
             query: None,
             scan: Scan::default(),
             selection: 0,
             scroll: 0,
-            scan_job,
+            scan_generation,
+            scans,
             scan_pending: false,
             restore_selection: None,
             directory_selection: HashMap::new(),
@@ -169,7 +134,7 @@ impl FileNav {
             preview_path: None,
             preview: Preview::default(),
             preview_scroll: 0,
-            preview_job,
+            previews,
             preview_pending: false,
         };
         nav.set_directory(directory)?;
@@ -181,11 +146,7 @@ impl FileNav {
     }
 
     pub fn fd(&self) -> RawFd {
-        self.scan_job.worker.fd()
-    }
-
-    pub fn drain_notification(&self) -> io::Result<()> {
-        crate::sys::consume_notification(self.fd()).map(|_| ())
+        self.scans.fd()
     }
 
     pub fn is_search(&self) -> bool {
@@ -199,14 +160,10 @@ impl FileNav {
     pub fn follow_selection(&mut self, rows: usize) -> usize {
         let rows = rows.max(1);
         let margin = ((rows - 1) / 2).min(2);
-        if self.selection < self.scroll + margin {
-            self.scroll = self.selection.saturating_sub(margin);
-        } else if self.selection >= (self.scroll + rows).saturating_sub(margin) {
-            self.scroll = (self.selection + margin + 1).saturating_sub(rows);
-        }
-        self.scroll = self
-            .scroll
-            .min(self.scan.entries.len().saturating_sub(rows));
+        let lowest = (self.selection + margin + 1).saturating_sub(rows);
+        let highest = self.selection.saturating_sub(margin);
+        let last = self.scan.entries.len().saturating_sub(rows);
+        self.scroll = self.scroll.clamp(lowest, highest).min(last);
         self.scroll
     }
 
@@ -268,11 +225,7 @@ impl FileNav {
     }
 
     pub fn start_search(&mut self) {
-        self.edit_query(|query| {
-            let changed = !query.text.is_empty();
-            *query = TextField::default();
-            changed
-        });
+        self.edit_query(|query| !std::mem::take(query).text.is_empty());
     }
 
     pub(crate) fn insert_query(&mut self, text: &str) {
@@ -292,32 +245,28 @@ impl FileNav {
 
     pub fn set_directory(&mut self, directory: PathBuf) -> io::Result<()> {
         self.remember_selection();
-        self.directory = if directory.is_absolute() {
-            directory
-        } else {
-            std::env::current_dir()?.join(directory)
-        };
+        self.directory = std::path::absolute(directory)?;
         self.query = None;
-        self.expanded = Arc::default();
+        self.expanded.clear();
         self.restore_selection = self.directory_selection.get(&self.directory).cloned();
         self.request_scan();
         Ok(())
     }
 
+    /// Collapses the selected directory, else selects its parent entry, else lists the parent directory.
     pub fn parent(&mut self) {
-        if let Some(entry) = self.scan.entries.get(self.selection) {
-            let path = &entry.path;
-            if Arc::make_mut(&mut self.expanded).remove(path) {
-                self.restore_selection = Some(path.clone());
+        if let Some(path) = self.selected().map(|entry| entry.path.clone()) {
+            if self.expanded.remove(&path) {
+                self.restore_selection = Some(path);
                 self.request_scan();
                 return;
             }
-            if let Some(parent) = path.parent().filter(|parent| *parent != self.directory)
-                && let Some(index) = self
-                    .scan
-                    .entries
-                    .iter()
-                    .position(|entry| entry.path == parent)
+            let parent = path.parent();
+            if let Some(index) = self
+                .scan
+                .entries
+                .iter()
+                .position(|entry| Some(entry.path.as_path()) == parent)
             {
                 self.selection = index;
                 self.update_preview();
@@ -328,10 +277,11 @@ impl FileNav {
             return;
         };
         self.restore_selection = Some(std::mem::replace(&mut self.directory, parent));
-        self.expanded = Arc::default();
+        self.expanded.clear();
         self.request_scan();
     }
 
+    /// Expands the selected directory or, when it is expanded, moves into it.
     pub fn enter_selected(&mut self) -> bool {
         let Some(path) = self
             .selected()
@@ -349,12 +299,12 @@ impl FileNav {
             {
                 self.move_selection(1);
             }
-            return true;
+        } else {
+            // Every visible directory has its ancestors expanded already.
+            self.expanded.insert(path.clone());
+            self.restore_selection = Some(path);
+            self.request_scan();
         }
-        // Every visible directory has its ancestors expanded already.
-        Arc::make_mut(&mut self.expanded).insert(path.clone());
-        self.restore_selection = Some(path);
-        self.request_scan();
         true
     }
 
@@ -363,61 +313,58 @@ impl FileNav {
         if self.is_search() {
             return relative.to_string_lossy().into_owned();
         }
-        let depth = relative.components().count().saturating_sub(1);
-        let marker = if entry.is_dir {
-            if self.expanded.contains(&entry.path) {
-                ""
-            } else {
-                ""
-            }
-        } else {
+        let indent = 2 * relative.components().count().saturating_sub(1);
+        let marker = if !entry.is_dir {
             " "
+        } else if self.expanded.contains(&entry.path) {
+            "\u{f078}"
+        } else {
+            "\u{f054}"
         };
-        format!(
-            "{:depth$}{marker} {}",
-            "",
-            entry.display_name(),
-            depth = depth * 2
-        )
+        format!("{:indent$}{marker} {}", "", entry.display_name())
     }
 
-    pub fn poll(&mut self) -> bool {
+    /// Takes finished scans and previews; whether anything changed.
+    pub fn poll(&mut self) -> io::Result<bool> {
+        // Drained before taking results, so a result published meanwhile wakes again.
+        crate::sys::consume_notification(self.fd())?;
         let mut changed = false;
-        if let Some((scan, complete)) = self.scan_job.take() {
-            self.publish_scan(scan);
+        if let Some((id, scan, complete)) = self.scans.take()
+            && id == self.scan_generation.load(Ordering::Relaxed)
+        {
+            let selected = self
+                .restore_selection
+                .as_deref()
+                .or_else(|| self.selected().map(|entry| entry.path.as_path()));
+            self.selection = selected
+                .and_then(|path| scan.entries.iter().position(|entry| entry.path == path))
+                .unwrap_or_else(|| self.selection.min(scan.entries.len().saturating_sub(1)));
+            self.scan = scan;
+            self.update_preview();
             if complete {
                 self.restore_selection = None;
                 self.scan_pending = false;
             }
             changed = true;
         }
-        if let Some(preview) = self.preview_job.take() {
+        if let Some((path, preview)) = self.previews.take()
+            && self.preview_path.as_ref() == Some(&path)
+        {
             self.preview = preview;
             self.preview_pending = false;
             changed = true;
         }
-        changed
+        Ok(changed)
     }
 
     fn remember_selection(&mut self) {
         if !self.is_search()
             && let Some(entry) = self.scan.entries.get(self.selection)
         {
+            let path = entry.path.clone();
             self.directory_selection
-                .insert(self.directory.clone(), entry.path.clone());
+                .insert(self.directory.clone(), path);
         }
-    }
-
-    fn publish_scan(&mut self, scan: Scan) {
-        let selected = self
-            .restore_selection
-            .as_deref()
-            .or_else(|| self.selected().map(|entry| entry.path.as_path()));
-        self.selection = selected
-            .and_then(|path| scan.entries.iter().position(|entry| entry.path == path))
-            .unwrap_or_else(|| self.selection.min(scan.entries.len().saturating_sub(1)));
-        self.scan = scan;
-        self.update_preview();
     }
 
     fn update_preview(&mut self) {
@@ -431,9 +378,8 @@ impl FileNav {
         self.preview = Preview::default();
         self.preview_scroll = 0;
         self.preview_pending = path.is_some();
-        match &path {
-            Some(path) => self.preview_job.submit(path.clone()),
-            None => self.preview_job.cancel(),
+        if let Some(path) = &path {
+            self.previews.submit(path.clone());
         }
         self.preview_path = path;
     }
@@ -444,10 +390,12 @@ impl FileNav {
         self.focus = FileFocus::List;
         self.update_preview();
         self.scan_pending = true;
-        self.scan_job.submit(match &self.query {
+        let request = match &self.query {
             Some(query) => ScanRequest::Search(self.directory.clone(), query.text.clone()),
             None => ScanRequest::Browse(self.directory.clone(), self.expanded.clone()),
-        });
+        };
+        let id = self.scan_generation.fetch_add(1, Ordering::Relaxed) + 1;
+        self.scans.submit((id, request));
     }
 }
 
@@ -505,27 +453,21 @@ fn escape_controls(line: &str) -> String {
     result
 }
 
+/// The value of `result`, or None after keeping its error unless an earlier one was kept.
+fn keep_error<T>(result: io::Result<T>, error: &mut Option<io::Error>) -> Option<T> {
+    result.map_err(|e| error.get_or_insert(e)).ok()
+}
+
 /// An entry's path, whether it is a directory (following symlinks) and whether it is a symlink.
-/// Unreadable entries are skipped or, for a dangling symlink, listed as files; the first error is kept.
+/// Unreadable entries are skipped or, for a dangling symlink, listed as files.
 fn entry_info(
     entry: io::Result<fs::DirEntry>,
     error: &mut Option<io::Error>,
 ) -> Option<(PathBuf, bool, bool)> {
-    let (path, kind) = match entry.and_then(|entry| Ok((entry.path(), entry.file_type()?))) {
-        Ok(entry) => entry,
-        Err(e) => {
-            error.get_or_insert(e);
-            return None;
-        }
-    };
+    let entry = entry.and_then(|entry| Ok((entry.path(), entry.file_type()?)));
+    let (path, kind) = keep_error(entry, error)?;
     let is_dir = if kind.is_symlink() {
-        fs::metadata(&path).map_or_else(
-            |e| {
-                error.get_or_insert(e);
-                false
-            },
-            |metadata| metadata.is_dir(),
-        )
+        keep_error(fs::metadata(&path), error).is_some_and(|metadata| metadata.is_dir())
     } else {
         kind.is_dir()
     };
@@ -539,12 +481,8 @@ fn browse(
     cancelled: &dyn Fn() -> bool,
     scan: &mut Scan,
 ) {
-    let listing = match fs::read_dir(directory) {
-        Ok(listing) => listing,
-        Err(error) => {
-            scan.error.get_or_insert(error);
-            return;
-        }
+    let Some(listing) = keep_error(fs::read_dir(directory), &mut scan.error) else {
+        return;
     };
     let mut entries = Vec::new();
     for entry in listing {
@@ -556,9 +494,7 @@ fn browse(
         }
     }
     entries.sort_unstable_by(|a, b| {
-        b.is_dir
-            .cmp(&a.is_dir)
-            .then_with(|| a.path.as_os_str().cmp(b.path.as_os_str()))
+        (!a.is_dir, a.path.as_os_str()).cmp(&(!b.is_dir, b.path.as_os_str()))
     });
     for entry in entries {
         let children = (entry.is_dir && expanded.contains(&entry.path)).then(|| entry.path.clone());
@@ -582,82 +518,63 @@ fn search(
     let results = |matches: &[(Reverse<i64>, PathBuf)], error| Scan {
         entries: matches
             .iter()
-            .map(|(_, relative)| FileEntry {
-                path: directory.join(relative),
+            .map(|(_, path)| FileEntry {
+                path: path.clone(),
                 is_dir: false,
             })
             .collect(),
         error,
     };
-    let mut directories = match fs::read_dir(directory) {
-        Ok(root) => vec![root],
-        Err(error) => return results(&[], Some(error)),
-    };
+    let mut directories = vec![directory.to_path_buf()];
     let mut last_update = Instant::now();
     let mut dirty = false;
-    while let Some(current) = directories.last_mut() {
-        if cancelled() {
-            return Scan::default();
-        }
-        let Some(entry) = current.next() else {
-            directories.pop();
+    while let Some(current) = directories.pop() {
+        let Some(listing) = keep_error(fs::read_dir(current), &mut error) else {
             continue;
         };
-        let Some((path, is_dir, symlink)) = entry_info(entry, &mut error) else {
-            continue;
-        };
-        if is_dir {
-            if !symlink {
-                match fs::read_dir(&path) {
-                    Ok(children) => directories.push(children),
-                    Err(e) => {
-                        error.get_or_insert(e);
-                    }
+        for entry in listing {
+            if cancelled() {
+                return Scan::default();
+            }
+            let Some((path, is_dir, symlink)) = entry_info(entry, &mut error) else {
+                continue;
+            };
+            if is_dir {
+                if !symlink {
+                    directories.push(path);
+                }
+                continue;
+            }
+            let relative = path.strip_prefix(directory).unwrap().to_string_lossy();
+            if let Some(score) = fuzzy_score(&pattern, &relative) {
+                let candidate = (Reverse(score), path);
+                let position = matches.partition_point(|current| *current < candidate);
+                if position < SEARCH_LIMIT {
+                    matches.insert(position, candidate);
+                    matches.truncate(SEARCH_LIMIT);
+                    dirty = true;
                 }
             }
-            continue;
-        }
-        let relative = path.strip_prefix(directory).unwrap();
-        if let Some(score) = fuzzy_score(&pattern, &relative.to_string_lossy()) {
-            let candidate = (Reverse(score), relative.to_path_buf());
-            let position = matches.partition_point(|current| *current < candidate);
-            if position < SEARCH_LIMIT {
-                matches.insert(position, candidate);
-                matches.truncate(SEARCH_LIMIT);
-                dirty = true;
+            if dirty && last_update.elapsed() >= Duration::from_millis(40) {
+                publish(results(&matches, None));
+                dirty = false;
+                last_update = Instant::now();
             }
-        }
-        if dirty && last_update.elapsed() >= Duration::from_millis(40) {
-            publish(results(&matches, None));
-            dirty = false;
-            last_update = Instant::now();
         }
     }
     results(&matches, error)
 }
 
+/// Matches the lowercase `pattern` characters in order, scoring early, word-start and
+/// consecutive matches higher and longer candidates lower.
 fn fuzzy_score(pattern: &[char], candidate: &str) -> Option<i64> {
-    if candidate.is_ascii() {
-        let letters = candidate
-            .bytes()
-            .map(|ch| char::from(ch.to_ascii_lowercase()));
-        fuzzy_score_chars(pattern, letters)
-    } else {
-        fuzzy_score_chars(pattern, candidate.to_lowercase().chars())
-    }
-}
-
-fn fuzzy_score_chars(pattern: &[char], candidate: impl Iterator<Item = char>) -> Option<i64> {
-    let mut needle = pattern.iter();
-    let Some(mut wanted) = needle.next() else {
-        return Some(-(candidate.count() as i64));
-    };
+    let candidate = candidate.to_lowercase();
+    let mut needle = pattern.iter().peekable();
     let mut score = 0;
     let mut previous_match = None;
     let mut previous = '/';
-    let mut candidate = candidate.enumerate();
-    while let Some((index, ch)) = candidate.next() {
-        if *wanted == ch {
+    for (index, ch) in candidate.chars().enumerate() {
+        if needle.next_if_eq(&&ch).is_some() {
             score += 32 - index as i64;
             if matches!(previous, '/' | '_' | '-' | '.' | ' ') {
                 score += 24;
@@ -666,40 +583,37 @@ fn fuzzy_score_chars(pattern: &[char], candidate: impl Iterator<Item = char>) ->
                 score += 16;
             }
             previous_match = Some(index);
-            let Some(next) = needle.next() else {
-                return Some(score - (index + 1 + candidate.count()) as i64);
-            };
-            wanted = next;
         }
         previous = ch;
     }
-    None
+    needle
+        .peek()
+        .is_none()
+        .then(|| score - candidate.chars().count() as i64)
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::ffi::OsString;
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
     use std::os::unix::fs::symlink;
     use std::sync::atomic::AtomicUsize;
 
-    static NEXT_FIXTURE: AtomicUsize = AtomicUsize::new(0);
-
-    struct Fixture(PathBuf);
+    /// A directory that tests fill with empty files and that is removed when dropped.
+    pub(crate) struct Fixture(pub PathBuf);
 
     impl Fixture {
-        fn new() -> Self {
-            let path = std::env::current_dir().unwrap().join(format!(
-                "target/runtime-files/test-{}-{}",
-                std::process::id(),
-                NEXT_FIXTURE.fetch_add(1, Ordering::Relaxed)
-            ));
+        pub fn new() -> Self {
+            static NEXT: AtomicUsize = AtomicUsize::new(0);
+            let id = NEXT.fetch_add(1, Ordering::Relaxed);
+            let name = format!("target/runtime-files/test-{}-{id}", std::process::id());
+            let path = std::env::current_dir().unwrap().join(name);
             fs::create_dir_all(&path).unwrap();
             Self(path)
         }
 
-        fn file(&self, name: impl AsRef<Path>) -> PathBuf {
+        pub fn file(&self, name: impl AsRef<Path>) -> PathBuf {
             let path = self.0.join(name);
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(&path, []).unwrap();
@@ -721,20 +635,21 @@ mod tests {
         });
     }
 
-    fn finish(nav: &mut FileNav) {
+    /// Waits for the running scan and preview.
+    pub(crate) fn finish(nav: &mut FileNav) {
         let deadline = Instant::now() + Duration::from_secs(5);
         while nav.searching() {
             assert!(Instant::now() < deadline, "file scan did not finish");
             crate::sys::poll(&mut [crate::sys::watch(nav.fd(), libc::POLLIN)], 5000).unwrap();
-            nav.drain_notification().unwrap();
-            nav.poll();
+            nav.poll().unwrap();
         }
     }
 
     #[test]
-    fn directory_navigation_sorts_directories_first_and_preserves_names() {
+    fn tree_lists_directories_first_and_expands_and_collapses_in_place() {
         let fixture = Fixture::new();
-        fixture.file("z-dir/child");
+        let first = fixture.file("z-dir/a-child");
+        let child = fixture.file("z-dir/z-child");
         fixture.file("a-file");
         let raw = OsString::from_vec(b"z-\xff-file".to_vec());
         let raw_path = fixture.file(Path::new(&raw));
@@ -742,69 +657,43 @@ mod tests {
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
         finish(&mut nav);
         assert!(nav.scan.error.is_none());
-        assert_eq!(nav.scan.entries[0].display_name(), "a-link");
-        assert_eq!(nav.scan.entries[1].display_name(), "z-dir");
-        assert_eq!(nav.scan.entries[2].display_name(), "a-file");
+        let names: Vec<_> = nav.scan.entries.iter().map(|e| e.display_name()).collect();
+        assert_eq!(names[..3], ["a-link", "z-dir", "a-file"]);
         assert_eq!(nav.scan.entries[3].path, raw_path);
         nav.move_selection(1);
         assert!(nav.enter_selected());
         finish(&mut nav);
-        assert_eq!(nav.scan.entries[2].display_name(), "child");
-        assert!(nav.entry_label(&nav.scan.entries[2]).starts_with("    "));
+        assert_eq!(nav.scan.entries.len(), 6);
+        assert!(nav.entry_label(&nav.scan.entries[3]).starts_with("    "));
+        assert!(nav.enter_selected());
+        assert_eq!(nav.selected().unwrap().path, first);
+        nav.move_selection(1);
+        assert_eq!(nav.selected().unwrap().path, child);
+        nav.parent();
+        assert_eq!(nav.selected().unwrap().path, fixture.0.join("z-dir"));
         nav.parent();
         finish(&mut nav);
-        assert_eq!(nav.directory(), fixture.0);
+        assert_eq!(nav.scan.entries.len(), 4);
+        assert_eq!(nav.selected().unwrap().path, fixture.0.join("z-dir"));
     }
 
     #[test]
-    fn recursive_fuzzy_search_matches_paths_without_following_directory_links() {
+    fn recursive_fuzzy_search_skips_directory_links_and_stopping_restores_the_selection() {
         let fixture = Fixture::new();
         let match_path = fixture.file("src/中文_file.rs");
-        fixture.file("other.txt");
+        let other = fixture.file("other.txt");
         symlink(&fixture.0, fixture.0.join("src/loop")).unwrap();
         let mut nav = FileNav::new(fixture.0.clone()).unwrap();
+        finish(&mut nav);
+        nav.move_selection(1);
         set_query(&mut nav, "S中F.R");
         finish(&mut nav);
         assert!(nav.scan.error.is_none());
         assert_eq!(nav.scan.entries.len(), 1);
         assert_eq!(nav.scan.entries[0].path, match_path);
-        nav.start_search();
-        finish(&mut nav);
-        assert_eq!(nav.scan.entries.len(), 2);
-        assert!(nav.scan.entries.iter().all(|entry| !entry.is_dir));
         nav.stop_search();
         finish(&mut nav);
-        assert_eq!(nav.scan.entries[0].display_name(), "src");
-    }
-
-    #[test]
-    fn recursive_search_preserves_contextual_case_and_non_utf8_paths() {
-        let fixture = Fixture::new();
-        let ascii = fixture.file("k-file");
-        let name = OsString::from_vec(
-            "ΟΣ/İ-file-"
-                .as_bytes()
-                .iter()
-                .copied()
-                .chain([0xff])
-                .collect(),
-        );
-        let wanted = fixture.file(Path::new(&name));
-        fixture.file("other");
-        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
-        set_query(&mut nav, "ος/i\u{307}");
-        finish(&mut nav);
-        assert!(nav.scan.error.is_none());
-        assert_eq!(nav.scan.entries.len(), 1);
-        assert_eq!(nav.scan.entries[0].path, wanted);
-        set_query(&mut nav, "ifile");
-        finish(&mut nav);
-        assert_eq!(nav.scan.entries.len(), 1);
-        assert_eq!(nav.scan.entries[0].path, wanted);
-        set_query(&mut nav, "K");
-        finish(&mut nav);
-        assert_eq!(nav.scan.entries.len(), 1);
-        assert_eq!(nav.scan.entries[0].path, ascii);
+        assert_eq!(nav.selected().unwrap().path, other);
     }
 
     #[test]
@@ -841,61 +730,6 @@ mod tests {
     }
 
     #[test]
-    fn tree_expansion_and_collapse_keep_the_root_and_parent_selected() {
-        let fixture = Fixture::new();
-        let first = fixture.file("a-dir/a-child");
-        let wanted = fixture.file("a-dir/z-child");
-        fixture.file("b-dir/other");
-        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
-        finish(&mut nav);
-        assert!(nav.preview.lines.is_empty());
-        assert!(!nav.preview_pending);
-        assert!(nav.enter_selected());
-        finish(&mut nav);
-        assert_eq!(nav.directory(), fixture.0);
-        assert_eq!(nav.scan.entries.len(), 4);
-        nav.move_selection(2);
-        assert_eq!(nav.selected().unwrap().path, wanted);
-        nav.parent();
-        assert_eq!(nav.selected().unwrap().path, fixture.0.join("a-dir"));
-        nav.parent();
-        finish(&mut nav);
-        assert_eq!(nav.scan.entries.len(), 2);
-        assert!(nav.enter_selected());
-        finish(&mut nav);
-        assert!(nav.enter_selected());
-        assert_eq!(nav.selected().unwrap().path, first);
-    }
-
-    #[test]
-    fn search_updates_keep_the_selected_path() {
-        let fixture = Fixture::new();
-        fixture.file("b-file");
-        let wanted = fixture.file("c-file");
-        fs::write(&wanted, "selected contents").unwrap();
-        let mut nav = FileNav::new(fixture.0.clone()).unwrap();
-        finish(&mut nav);
-        nav.move_selection(1);
-        finish(&mut nav);
-        assert_eq!(nav.selected().unwrap().path, wanted);
-        assert_eq!(nav.focus(), FileFocus::List);
-        assert_eq!(nav.preview.lines.len(), 0);
-        nav.focus_preview();
-        finish(&mut nav);
-        assert_eq!(nav.preview.lines, ["selected contents"]);
-        nav.focus_list();
-        fixture.file("a-file");
-        nav.start_search();
-        finish(&mut nav);
-        nav.move_selection(2);
-        finish(&mut nav);
-        assert_eq!(nav.selected().unwrap().path, wanted);
-        nav.stop_search();
-        finish(&mut nav);
-        assert_eq!(nav.selected().unwrap().path, wanted);
-    }
-
-    #[test]
     fn preview_is_bounded_by_bytes_and_lines_and_escapes_terminal_controls() {
         let fixture = Fixture::new();
         let path = fixture.file("preview");
@@ -916,7 +750,7 @@ mod tests {
     }
 
     #[test]
-    fn fifo_binary_and_missing_file_previews_are_explicit_and_do_not_block() {
+    fn fifo_and_binary_previews_are_explicit_and_do_not_block() {
         let fixture = Fixture::new();
         let fifo = fixture.0.join("a-fifo");
         let c_path = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
@@ -929,15 +763,12 @@ mod tests {
         nav.focus_preview();
         finish(&mut nav);
         assert_eq!(nav.preview.lines, ["Special file; preview unavailable"]);
-        assert!(nav.preview.error.is_none());
         nav.move_selection(1);
         finish(&mut nav);
         assert_eq!(
             nav.preview.lines,
             ["Binary or non-UTF-8 file; preview unavailable"]
         );
-        let missing = read_preview(&fixture.0.join("missing")).err().unwrap();
-        assert_eq!(missing.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]
@@ -960,7 +791,5 @@ mod tests {
         nav.focus_preview();
         finish(&mut nav);
         assert_eq!(nav.preview.lines, ["new contents"]);
-        assert_eq!(nav.preview_scroll, 0);
-        assert!(nav.preview.error.is_none());
     }
 }

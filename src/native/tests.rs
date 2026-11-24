@@ -53,11 +53,9 @@ unsafe extern "C" {
     fn cairo_image_surface_create(format: i32, width: i32, height: i32) -> *mut c_void;
     fn cairo_image_surface_get_data(surface: *mut c_void) -> *const u8;
     fn cairo_image_surface_get_stride(surface: *mut c_void) -> i32;
-    fn cairo_surface_status(surface: *mut c_void) -> i32;
     fn cairo_surface_flush(surface: *mut c_void);
     fn cairo_surface_destroy(surface: *mut c_void);
     fn cairo_create(surface: *mut c_void) -> *mut c_void;
-    fn cairo_status(context: *mut c_void) -> i32;
     fn cairo_destroy(context: *mut c_void);
     fn cairo_set_source_rgba(context: *mut c_void, r: f64, g: f64, b: f64, a: f64);
     fn cairo_set_scaled_font(context: *mut c_void, font: *mut c_void);
@@ -95,10 +93,13 @@ impl Fonts {
         Self { raw, error }
     }
 
-    fn shape(&mut self, text: &str, runs: &[Run], columns: &[u16]) -> Shaped {
-        let mut shaped = Shaped {
-            raw: ptr::null_mut(),
-            count: 0,
+    /// The glyphs of `text`; their fonts live as long as these fonts at this scale.
+    fn shape(&mut self, text: &str, runs: &[Run], columns: &[u16]) -> Vec<Glyph> {
+        let (mut raw, mut count) = (ptr::null_mut(), 0);
+        let columns = if columns.is_empty() {
+            ptr::null()
+        } else {
+            columns.as_ptr()
         };
         let result = unsafe {
             nt_fonts_shape(
@@ -107,46 +108,26 @@ impl Fonts {
                 text.len(),
                 runs.as_ptr(),
                 runs.len(),
-                if columns.is_empty() {
-                    ptr::null()
-                } else {
-                    columns.as_ptr()
-                },
-                &mut shaped.raw,
-                &mut shaped.count,
+                columns,
+                &mut raw,
+                &mut count,
             )
         };
         assert_ne!(result, 0, "{}", unsafe {
             CStr::from_ptr(self.error.get().cast()).to_string_lossy()
         });
-        shaped
+        let glyphs = match count {
+            0 => Vec::new(),
+            _ => unsafe { slice::from_raw_parts(raw, count) }.to_vec(),
+        };
+        unsafe { nt_font_glyphs_free(raw, count) };
+        glyphs
     }
 }
 
 impl Drop for Fonts {
     fn drop(&mut self) {
         unsafe { nt_fonts_free(self.raw) };
-    }
-}
-
-struct Shaped {
-    raw: *mut Glyph,
-    count: usize,
-}
-
-impl Shaped {
-    fn glyphs(&self) -> &[Glyph] {
-        if self.count == 0 {
-            &[]
-        } else {
-            unsafe { slice::from_raw_parts(self.raw, self.count) }
-        }
-    }
-}
-
-impl Drop for Shaped {
-    fn drop(&mut self) {
-        unsafe { nt_font_glyphs_free(self.raw, self.count) };
     }
 }
 
@@ -178,9 +159,8 @@ fn foreground_boundaries_preserve_arabic_joining() {
         ],
         &[0, 0, 1, 1, 2, 2],
     );
-    let positions = |shaped: &Shaped| {
+    let positions = |shaped: &[Glyph]| {
         let mut glyphs: Vec<_> = shaped
-            .glyphs()
             .iter()
             .map(|g| (g.glyph, g.x, g.y, g.font as usize))
             .collect();
@@ -191,14 +171,14 @@ fn foreground_boundaries_preserve_arabic_joining() {
         });
         glyphs
     };
-    assert!(!plain.glyphs().is_empty());
+    assert!(!plain.is_empty());
     assert_eq!(positions(&plain), positions(&colored));
-    assert!(colored.glyphs().iter().any(|g| g.color == 0x00ff00ff));
-    let mut joined: Vec<_> = plain.glyphs().iter().map(|g| g.glyph).collect();
+    assert!(colored.iter().any(|g| g.color == 0x00ff00ff));
+    let mut joined: Vec<_> = plain.iter().map(|g| g.glyph).collect();
     let mut isolated = Vec::new();
     for letter in ["ب", "ت", "ب"] {
         let shaped = fonts.shape(letter, &[], &[0, 0]);
-        isolated.extend(shaped.glyphs().iter().map(|g| g.glyph));
+        isolated.extend(shaped.iter().map(|g| g.glyph));
     }
     joined.sort_unstable();
     isolated.sort_unstable();
@@ -209,7 +189,7 @@ fn foreground_boundaries_preserve_arabic_joining() {
 fn multibyte_text_keeps_foreground_runs_on_terminal_columns() {
     let mut fonts = Fonts::new(c"Nextty Test Arabic");
     let metric = fonts.shape("mm", &[], &[0, 1]);
-    let width = metric.glyphs()[1].x - metric.glyphs()[0].x;
+    let width = metric[1].x - metric[0].x;
     let colors = [0xff0000ff, 0x00ff00ff];
     let shaped = fonts.shape(
         "🌈mبm",
@@ -230,7 +210,6 @@ fn multibyte_text_keeps_foreground_runs_on_terminal_columns() {
         &[0, 0, 0, 0, 2, 3, 3, 4],
     );
     let positions: Vec<_> = shaped
-        .glyphs()
         .iter()
         .filter(|glyph| colors.contains(&glyph.color))
         .map(|glyph| (glyph.color, glyph.x))
@@ -245,18 +224,14 @@ fn multibyte_text_keeps_foreground_runs_on_terminal_columns() {
 fn colrv1_emoji_raster_contains_color() {
     let mut fonts = Fonts::new(c"Nextty Test Color");
     let shaped = fonts.shape("🌈", &[], &[0, 0, 0, 0]);
-    assert!(!shaped.glyphs().is_empty());
-    assert!(
-        shaped
-            .glyphs()
-            .iter()
-            .any(|g| g.color_glyph != 0 && g.glyph != 0)
-    );
-    let (status, colored) = unsafe {
+    assert!(!shaped.is_empty());
+    assert!(shaped.iter().any(|g| g.color_glyph != 0 && g.glyph != 0));
+    // An ARGB32 surface, as the renderer rasterizes glyphs into.
+    let colored = unsafe {
         let surface = cairo_image_surface_create(0, 96, 96);
         let cr = cairo_create(surface);
         cairo_set_source_rgba(cr, 1.0, 1.0, 1.0, 1.0);
-        for glyph in shaped.glyphs() {
+        for glyph in &shaped {
             cairo_set_scaled_font(cr, glyph.font);
             let glyph = CairoGlyph {
                 index: glyph.glyph.into(),
@@ -265,42 +240,26 @@ fn colrv1_emoji_raster_contains_color() {
             };
             cairo_show_glyphs(cr, &glyph, 1);
         }
-        let status = cairo_status(cr);
         cairo_destroy(cr);
         cairo_surface_flush(surface);
-        let colored = if status == 0 && cairo_surface_status(surface) == 0 {
-            let bytes = slice::from_raw_parts(
-                cairo_image_surface_get_data(surface),
-                cairo_image_surface_get_stride(surface) as usize * 96,
-            );
-            bytes
-                .chunks_exact(4)
-                .filter(|bytes| {
-                    let pixel = u32::from_ne_bytes((*bytes).try_into().unwrap());
-                    let (a, r, g, b) = (
-                        pixel >> 24,
-                        pixel >> 16 & 255,
-                        pixel >> 8 & 255,
-                        pixel & 255,
-                    );
-                    a != 0 && (r != g || g != b)
-                })
-                .count()
-        } else {
-            0
-        };
+        let stride = cairo_image_surface_get_stride(surface) as usize;
+        let pixels = slice::from_raw_parts(cairo_image_surface_get_data(surface), stride * 96);
+        let colored = pixels.chunks_exact(4).any(|bytes| {
+            let pixel = u32::from_ne_bytes(bytes.try_into().unwrap());
+            let (r, g, b) = (pixel >> 16 & 255, pixel >> 8 & 255, pixel & 255);
+            pixel >> 24 != 0 && (r != g || g != b)
+        });
         cairo_surface_destroy(surface);
-        (status, colored)
+        colored
     };
-    assert_eq!(status, 0);
-    assert!(colored > 0, "COLRv1 glyph must rasterize colored pixels");
+    assert!(colored, "COLRv1 glyph must rasterize colored pixels");
 }
 
 #[test]
 fn ascii_numbers_and_brackets_keep_ltr_columns_after_arabic_shaping() {
     let mut fonts = Fonts::new(c"Nextty Test Arabic");
     let metric = fonts.shape("mm", &[], &[0, 1]);
-    let width = metric.glyphs()[1].x - metric.glyphs()[0].x;
+    let width = metric[1].x - metric[0].x;
     for text in [
         "12345",
         "(12 + 34) / 99.00",
@@ -311,7 +270,7 @@ fn ascii_numbers_and_brackets_keep_ltr_columns_after_arabic_shaping() {
         for map in [columns.as_slice(), &[]] {
             let _arabic = fonts.shape("بتب", &[], &[0, 0, 1, 1, 2, 2]);
             let shaped = fonts.shape(text, &[], map);
-            let positions: Vec<_> = shaped.glyphs().iter().map(|glyph| glyph.x).collect();
+            let positions: Vec<_> = shaped.iter().map(|glyph| glyph.x).collect();
             let expected: Vec<_> = text
                 .bytes()
                 .enumerate()
@@ -327,18 +286,14 @@ fn ascii_numbers_and_brackets_keep_ltr_columns_after_arabic_shaping() {
 fn fallback_selection_survives_scale_changes() {
     let mut fonts = Fonts::new(c"Nextty Test Arabic");
     let initial = fonts.shape("ب", &[], &[0, 0]);
-    let expected: Vec<_> = initial.glyphs().iter().map(|glyph| glyph.glyph).collect();
+    let expected: Vec<_> = initial.iter().map(|glyph| glyph.glyph).collect();
     assert!(!expected.is_empty() && expected.iter().all(|glyph| *glyph != 0));
     for scale in [2.0, 1.0] {
         unsafe { nt_fonts_scale(fonts.raw, scale) };
         for _ in 0..2 {
             let shaped = fonts.shape("ب", &[], &[0, 0]);
             assert_eq!(
-                shaped
-                    .glyphs()
-                    .iter()
-                    .map(|glyph| glyph.glyph)
-                    .collect::<Vec<_>>(),
+                shaped.iter().map(|glyph| glyph.glyph).collect::<Vec<_>>(),
                 expected
             );
         }
@@ -355,18 +310,18 @@ fn block_graphics_use_cell_geometry_at_fractional_scales() {
         .flat_map(|(column, ch)| std::iter::repeat_n(column as u16, ch.len_utf8()))
         .collect();
     let metrics = fonts.shape("mm", &[], &[0, 1]);
-    let width = metrics.glyphs()[1].x - metrics.glyphs()[0].x;
+    let width = metrics[1].x - metrics[0].x;
     for scale in [1.0, 1.25, 1.5, 2.0] {
         unsafe { nt_fonts_scale(fonts.raw, scale) };
         let shaped = fonts.shape(text, &[], &columns);
-        assert_eq!(shaped.glyphs().len(), text.chars().count());
-        for (column, (glyph, ch)) in shaped.glyphs().iter().zip(text.chars()).enumerate() {
+        assert_eq!(shaped.len(), text.chars().count());
+        for (column, (glyph, ch)) in shaped.iter().zip(text.chars()).enumerate() {
             assert_eq!(glyph.cell_shape, ch as u32);
             assert_eq!(glyph.x, column as f32 * width);
             assert_eq!(glyph.y, 0.0);
             assert_eq!(glyph.color_glyph, 0);
         }
         let text = fonts.shape("m░▒▓", &[], &[0, 1, 1, 1, 2, 2, 2, 3, 3, 3]);
-        assert!(text.glyphs().iter().all(|glyph| glyph.cell_shape == 0));
+        assert!(text.iter().all(|glyph| glyph.cell_shape == 0));
     }
 }

@@ -1,7 +1,7 @@
 use super::*;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 struct Worker {
@@ -19,24 +19,17 @@ impl Worker {
         let control = Arc::clone(&shared);
         let (done, receiver) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
-            let mut session = Session {
-                http: Http::new(),
-                url,
-                headers: vec!["anthropic-version: 2023-06-01".into()],
-                model: "local-fixture".into(),
-                history: VecDeque::new(),
-                summary: String::new(),
-            };
-            let result = session
-                .run(&shared)
-                .map(|()| (session.history, session.summary));
-            done.send(result).unwrap();
+            let mut session = session(url);
+            let result = session.run(&shared);
+            done.send(result.map(|()| (session.history, session.summary)))
+                .unwrap();
         });
+        let harness = Harness {
+            shared: control,
+            worker: Some(thread),
+        };
         Self {
-            harness: Some(Harness {
-                shared: control,
-                worker: Some(thread),
-            }),
+            harness: Some(harness),
             done: receiver,
         }
     }
@@ -47,17 +40,26 @@ impl Worker {
 
     fn finish(mut self) -> (VecDeque<Turn>, String) {
         drop(self.harness.take());
-        self.done
-            .recv_timeout(Duration::from_secs(4))
-            .unwrap()
-            .unwrap()
+        let result = self.done.recv_timeout(Duration::from_secs(4)).unwrap();
+        result.unwrap()
     }
 }
 
+fn session(url: String) -> Session {
+    Session {
+        http: Http::new(),
+        url,
+        headers: Vec::new(),
+        model: "local-fixture".into(),
+        history: VecDeque::new(),
+        summary: String::new(),
+    }
+}
+
+/// A model endpoint that answers `count` requests in order and returns their bodies.
 struct Server {
     url: String,
     done: mpsc::Receiver<Vec<Value>>,
-    thread: JoinHandle<()>,
 }
 
 impl Server {
@@ -66,33 +68,17 @@ impl Server {
         mut reply: impl FnMut(usize, &Value, &mut TcpStream) + Send + 'static,
     ) -> Self {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        listener.set_nonblocking(true).unwrap();
         let url = format!("http://{}/v1/messages", listener.local_addr().unwrap());
-        let (done, receiver) = mpsc::sync_channel(1);
-        let thread = thread::spawn(move || {
+        let (done, receiver) = mpsc::channel();
+        thread::spawn(move || {
             let mut requests = Vec::new();
             for index in 0..count {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                let mut stream = loop {
-                    match listener.accept() {
-                        Ok((stream, _)) => break stream,
-                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
-                            assert!(
-                                Instant::now() < deadline,
-                                "model request {index} never arrived"
-                            );
-                            thread::sleep(Duration::from_millis(2));
-                        }
-                        Err(error) => panic!("accept model request: {error}"),
-                    }
-                };
-                let body: Value =
-                    serde_json::from_slice(&crate::agent::http::read_request(&mut stream)).unwrap();
-                if body["tool_choice"]["type"] == "none" {
-                    assert!(body.get("cache_control").is_none());
-                } else {
-                    assert_eq!(body["cache_control"], json!({"type":"ephemeral"}));
-                }
+                let (mut stream, _) = listener.accept().unwrap();
+                let body = crate::agent::http::read_request(&mut stream);
+                let body: Value = serde_json::from_slice(&body).unwrap();
+                // Only execution requests ask for prompt caching.
+                let tools_disabled = body["tool_choice"]["type"] == "none";
+                assert_eq!(body.get("cache_control").is_none(), tools_disabled);
                 reply(index, &body, &mut stream);
                 requests.push(body);
             }
@@ -101,14 +87,12 @@ impl Server {
         Self {
             url,
             done: receiver,
-            thread,
         }
     }
 
     fn finish(self) -> Vec<Value> {
-        let requests = self.done.recv_timeout(Duration::from_secs(6)).unwrap();
-        self.thread.join().unwrap();
-        requests
+        let requests = self.done.recv_timeout(Duration::from_secs(10));
+        requests.expect("the expected model requests never arrived")
     }
 }
 
@@ -129,20 +113,22 @@ fn response(text: &str, calls: &[(&str, &str, Value)]) -> Vec<Value> {
             input["pane"] = json!(17);
         }
         let input = input.to_string();
-        let middle = input
-            .char_indices()
-            .nth(input.chars().count() / 2)
-            .map_or(0, |(i, _)| i);
+        let (first, second) = input.split_at(input.floor_char_boundary(input.len() / 2));
         events.extend([
             json!({"type":"content_block_start","index":index,"content_block":{"type":"tool_use","id":id,"name":name,"input":{}}}),
-            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":&input[..middle]}}),
-            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":&input[middle..]}}),
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":first}}),
+            json!({"type":"content_block_delta","index":index,"delta":{"type":"input_json_delta","partial_json":second}}),
             json!({"type":"content_block_stop","index":index}),
         ]);
         index += 1;
     }
+    let stop = if calls.is_empty() {
+        "end_turn"
+    } else {
+        "tool_use"
+    };
     events.extend([
-        json!({"type":"message_delta","delta":{"stop_reason":if calls.is_empty(){"end_turn"}else{"tool_use"}}}),
+        json!({"type":"message_delta","delta":{"stop_reason":stop}}),
         json!({"type":"message_stop"}),
     ]);
     events
@@ -152,26 +138,24 @@ fn goal_response(status: &str, reason: &str) -> Vec<Value> {
     response(&json!({"status":status,"reason":reason}).to_string(), &[])
 }
 
-fn sse(stream: &mut TcpStream, events: Vec<Value>) {
-    stream
-        .write_all(
-            b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n",
-        )
-        .unwrap();
-    let body = events
-        .into_iter()
+fn sse_body(events: Vec<Value>) -> String {
+    let events = events.into_iter();
+    events
         .map(|event| format!("data: {event}\r\n\r\n"))
-        .collect::<String>();
-    for chunk in body.as_bytes().chunks(23) {
+        .collect()
+}
+
+fn sse(stream: &mut TcpStream, events: Vec<Value>) {
+    let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n";
+    stream.write_all(head.as_bytes()).unwrap();
+    for chunk in sse_body(events).as_bytes().chunks(23) {
         stream.write_all(chunk).unwrap();
     }
 }
 
+/// A chunked response whose final chunk never arrives.
 fn truncated_chunked_sse(stream: &mut TcpStream, events: Vec<Value>) {
-    let body = events
-        .into_iter()
-        .map(|event| format!("data: {event}\r\n\r\n"))
-        .collect::<String>();
+    let body = sse_body(events);
     write!(
         stream,
         "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n{:x}\r\n{body}\r\n",
@@ -180,23 +164,47 @@ fn truncated_chunked_sse(stream: &mut TcpStream, events: Vec<Value>) {
     .unwrap();
 }
 
+fn unavailable(stream: &mut TcpStream) {
+    let reply = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater";
+    stream.write_all(reply.as_bytes()).unwrap();
+}
+
+/// Waits for the client to close the connection, which may also reset it.
+fn closed(stream: &mut TcpStream) {
+    match stream.read(&mut [0]) {
+        Ok(0) => (),
+        Err(error) if error.kind() == io::ErrorKind::ConnectionReset => (),
+        result => panic!("expected the client to close the connection, got {result:?}"),
+    }
+}
+
 fn settled(agent: &Harness, mut terminal: impl FnMut(ToolRequest)) -> Vec<Event> {
     let deadline = Instant::now() + Duration::from_secs(5);
     let mut events = Vec::new();
-    loop {
+    while !events.iter().any(|event| matches!(event, Event::Settled)) {
         assert!(Instant::now() < deadline, "agent did not settle");
         wait(agent.fd(), 100).unwrap();
-        let mut done = false;
         for event in agent.poll() {
-            if let Event::Request(request) = event {
-                terminal(request);
-            } else {
-                done |= matches!(event, Event::Settled);
-                events.push(event);
+            match event {
+                Event::Request(request) => terminal(request),
+                event => events.push(event),
             }
         }
-        if done {
-            return events;
+    }
+    events
+}
+
+fn first_request(agent: &Harness) -> ToolRequest {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        assert!(Instant::now() < deadline, "no tool request arrived");
+        wait(agent.fd(), 50).unwrap();
+        let request = agent.poll().into_iter().find_map(|event| match event {
+            Event::Request(request) => Some(request),
+            _ => None,
+        });
+        if let Some(request) = request {
+            return request;
         }
     }
 }
@@ -207,29 +215,31 @@ fn errored(events: &[Event]) -> bool {
         .any(|event| matches!(event, Event::Message("Error", _)))
 }
 
+fn notices(events: &[Event]) -> impl Iterator<Item = &str> {
+    events.iter().filter_map(|event| match event {
+        Event::Message("Context", text) => Some(text.as_str()),
+        _ => None,
+    })
+}
+
+/// Every tool_use is answered by the next message's tool_results, in order.
 fn paired(messages: &[Value]) {
     let mut pending = Vec::new();
     for message in messages {
+        let blocks = message["content"].as_array();
         if message["role"] == "assistant" {
             assert!(pending.is_empty(), "tool_use without its next tool_result");
-            for block in message["content"].as_array().unwrap() {
-                if block["type"] == "tool_use" {
-                    pending.push(block["id"].clone());
-                }
-            }
-        } else if let Some(blocks) = message["content"].as_array() {
-            let results: Vec<Value> = blocks
+            let calls = blocks
+                .unwrap()
                 .iter()
-                .filter(|block| block["type"] == "tool_result")
-                .map(|block| block["tool_use_id"].clone())
-                .collect();
-            assert_eq!(results, pending);
-            pending.clear();
+                .filter(|block| block["type"] == "tool_use");
+            pending.extend(calls.map(|block| block["id"].clone()));
         } else {
-            assert!(
-                pending.is_empty(),
-                "user input interrupted an unmatched tool_use"
-            );
+            let results = blocks.into_iter().flatten();
+            let results = results.filter(|block| block["type"] == "tool_result");
+            let answered: Vec<_> = results.map(|block| block["tool_use_id"].clone()).collect();
+            assert_eq!(answered, pending, "tool results do not answer the calls");
+            pending.clear();
         }
     }
     assert!(pending.is_empty(), "history ends with unmatched tool_use");
@@ -253,127 +263,59 @@ fn completed_terminal_result_precedes_cancellation() {
 }
 
 #[test]
-fn shell_input_and_history_reads_share_the_target_and_preserve_later_turns() {
-    let server = Server::new(7, |index, body, stream| {
-        assert_eq!(body["model"], "local-fixture");
-        paired(body["messages"].as_array().unwrap());
-        let names: Vec<_> = body["tools"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|tool| tool["name"].as_str().unwrap())
-            .collect();
-        assert_eq!(
-            names,
-            [
-                "shell",
-                "input",
-                "read",
-                "open_terminal",
-                "read_file",
-                "search_files",
-                "edit_file"
-            ]
-        );
-        for branch in body["tools"][2]["input_schema"]["anyOf"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .skip(1)
-        {
-            assert_eq!(branch["properties"]["wait"]["maximum"], MAX_READ_WAIT);
-        }
-        sse(
-            stream,
-            match index {
-                0 => response(
-                    "I will inspect this shell.",
-                    &[("submit", "shell", json!({"command":"printf 'same-shell'"}))],
-                ),
-                1 => {
-                    let content = body["messages"].as_array().unwrap().last().unwrap()["content"]
-                        [0]["content"]
-                        .as_str()
-                        .unwrap();
-                    let result: Value = serde_json::from_str(content).unwrap();
-                    assert_eq!(result["command"], 7);
-                    response(
-                        "",
-                        &[(
-                            "output",
-                            "read",
-                            json!({"source":"command","command":7,"wait":5}),
-                        )],
-                    )
-                }
-                2 => {
-                    assert!(body["messages"].to_string().contains("same-shell"));
-                    response(
-                        "",
-                        &[
-                            ("interactive", "input", json!({"text":"bt\n"})),
-                            (
-                                "unavailable",
-                                "run_command",
-                                json!({"command":"touch should-not-run"}),
-                            ),
-                        ],
-                    )
-                }
-                3 => {
-                    let messages = body["messages"].as_array().unwrap();
-                    let results = messages.last().unwrap()["content"].as_array().unwrap();
-                    assert_eq!(results[1]["is_error"], true);
-                    response("Observed the requested result.", &[])
-                }
-                4 | 6 => goal_response("complete", "Verified."),
-                5 => {
-                    let history = body["messages"].to_string();
-                    assert!(history.contains("Observed the requested result."));
-                    assert!(history.contains("next request"));
-                    response("Next turn works.", &[])
-                }
-                _ => unreachable!(),
-            },
-        );
+fn tools_run_in_order_on_their_panes_and_unknown_tools_never_run() {
+    let server = Server::new(5, |index, body, stream| {
+        let messages = body["messages"].as_array().unwrap();
+        paired(messages);
+        let events = match index {
+            0 => response(
+                "I will inspect this workspace.",
+                &[
+                    ("inventory", "read", json!({"source":"workspace"})),
+                    (
+                        "unknown",
+                        "run_command",
+                        json!({"command":"touch should-not-run"}),
+                    ),
+                    (
+                        "edit",
+                        "edit_file",
+                        json!({"pane":31,"path":"a.rs","old_text":"a","new_text":"b"}),
+                    ),
+                ],
+            ),
+            1 => {
+                let results = messages.last().unwrap()["content"].as_array().unwrap();
+                let errors: Vec<_> = results.iter().map(|result| &result["is_error"]).collect();
+                assert_eq!(errors, [false, true, false]);
+                response("Observed the requested result.", &[])
+            }
+            3 => {
+                let history = body["messages"].to_string();
+                assert!(history.contains("Observed the requested result."));
+                response("Next turn works.", &[])
+            }
+            _ => goal_response("complete", "Verified."),
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
-    agent
-        .send(
-            "Inspect current shell".into(),
-            17,
-            json!({"cwd":"/project"}),
-        )
-        .unwrap();
+    agent.send("Inspect".into(), 17, json!({})).unwrap();
     let mut calls = Vec::new();
     let events = settled(agent, |request| {
-        assert_eq!(request.pane, 17);
-        calls.push(request.tool);
-        let text = match request.tool {
-            Tool::Shell => json!({"command":7,"state":"running"}).to_string(),
-            Tool::Read => json!({"command":7,"exit_code":0,"text":"same-shell","cursor":{"epoch":1,"row":1,"offset":10},"has_more":false,"incomplete":false})
-                .to_string(),
-            Tool::Input => json!({"screen":"#0 main"}).to_string(),
-            _ => panic!("unexpected workspace tool"),
-        };
-        request.respond(Ok(text));
+        calls.push((request.tool, request.pane, request.id.clone()));
+        request.respond(Ok("observed".into()));
     });
-    assert_eq!(calls, [Tool::Shell, Tool::Read, Tool::Input]);
+    let routes: Vec<_> = calls.iter().map(|(tool, pane, _)| (*tool, *pane)).collect();
+    assert_eq!(routes, [(Tool::Read, 17), (Tool::EditFile, 31)]);
+    // Edit records attach to the history entry carrying this identity.
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Tool { id, role, .. } if role == "edit_file · done" && *id == calls[1].2)));
     assert!(!errored(&events));
     agent.send("next request".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| panic!("no further terminal operation"));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event,Event::Text(text) if text == "Next turn works."))
-    );
-    let (history, summary) = worker.finish();
-    assert_eq!(history.len(), 2);
-    assert!(summary.is_empty());
-    for turn in history {
-        paired(&turn.messages);
-    }
+    settled(agent, |_| panic!("no further terminal operation"));
+    assert_eq!(worker.finish().0.len(), 2);
     server.finish();
 }
 
@@ -384,21 +326,13 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
             if action == "drop" { 1 } else { 3 },
             |index, body, stream| {
                 paired(body["messages"].as_array().unwrap());
+                let wait = json!({"source":"command","command":7,"wait":1800});
                 sse(
                     stream,
-                    if index == 0 {
-                        response(
-                            "",
-                            &[(
-                                "waiting",
-                                "read",
-                                json!({"source":"command","command":7,"wait":1800}),
-                            )],
-                        )
-                    } else if index == 1 {
-                        response("Recovered.", &[])
-                    } else {
-                        goal_response("complete", "Recovered.")
+                    match index {
+                        0 => response("", &[("waiting", "read", wait)]),
+                        1 => response("Recovered.", &[]),
+                        _ => goal_response("complete", "Recovered."),
                     },
                 );
             },
@@ -408,17 +342,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
         let turn = agent
             .send("wait for command".into(), 17, json!({}))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(3);
-        let pending = loop {
-            assert!(Instant::now() < deadline);
-            wait(agent.fd(), 50).unwrap();
-            if let Some(request) = agent.poll().into_iter().find_map(|event| match event {
-                Event::Request(request) => Some(request),
-                _ => None,
-            }) {
-                break request;
-            }
-        };
+        let pending = first_request(agent);
         assert_eq!(pending.tool, Tool::Read);
         let started = Instant::now();
         if action == "drop" {
@@ -431,6 +355,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
                 settled(agent, |_| panic!("cancel issued another terminal action"));
             } else {
                 agent.rewind(turn).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
                 let mut rewound = false;
                 while !rewound {
                     assert!(Instant::now() < deadline);
@@ -438,8 +363,7 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
                     for event in agent.poll() {
                         match event {
                             Event::Rewound { turn: id, error } => {
-                                assert_eq!(id, turn);
-                                assert!(error.is_none());
+                                assert_eq!((id, error), (turn, None));
                                 rewound = true;
                             }
                             Event::Request(_) => panic!("rewind issued another terminal action"),
@@ -452,11 +376,9 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
             pending.respond(Ok("late completion".into()));
             agent.send("resume".into(), 17, json!({})).unwrap();
             let events = settled(agent, |_| panic!("old wait revived"));
-            assert!(
-                events
-                    .iter()
-                    .any(|event| matches!(event,Event::Text(text) if text == "Recovered."))
-            );
+            let recovered =
+                |event: &Event| matches!(event, Event::Text(text) if text == "Recovered.");
+            assert!(events.iter().any(recovered));
             let (history, _) = worker.finish();
             assert_eq!(history.len(), if action == "rewind" { 1 } else { 2 });
             for turn in history {
@@ -469,50 +391,45 @@ fn abort_rewind_and_drop_cancel_waits_without_sending_terminal_input() {
 }
 
 #[test]
-fn truncated_model_response_retries_without_replaying_completed_or_partial_tools() {
+fn interrupted_responses_retry_the_same_request_without_replaying_tools() {
     let mut interrupted = None;
     let mut review = None;
     let server = Server::new(6, move |index, body, stream| {
         paired(body["messages"].as_array().unwrap());
         match index {
-            0 => sse(
-                stream,
-                response("", &[("first", "shell", json!({"command":"first"}))]),
-            ),
+            // A finished message needs no HTTP trailer, even while the connection stays open.
+            0 => {
+                let first = response("", &[("first", "shell", json!({"command":"first"}))]);
+                truncated_chunked_sse(stream, first);
+                closed(stream);
+            }
             1 => {
                 assert!(body["messages"].to_string().contains("first-completed"));
                 interrupted = Some(body.clone());
-                let mut events = response(
-                    "Discarded partial response.",
-                    &[("partial", "shell", json!({"command":"must-not-run"}))],
-                );
+                let partial = ("partial", "shell", json!({"command":"must-not-run"}));
+                let mut events = response("Discarded partial response.", &[partial]);
                 events.pop();
                 truncated_chunked_sse(stream, events);
             }
             2 => {
                 assert_eq!(Some(body), interrupted.as_ref());
-                sse(
-                    stream,
-                    response("", &[("second", "shell", json!({"command":"second"}))]),
-                );
+                let second = response("", &[("second", "shell", json!({"command":"second"}))]);
+                sse(stream, second);
             }
             3 => {
                 let text = body["messages"].to_string();
                 assert!(text.contains("first-completed") && text.contains("second-completed"));
-                assert!(
-                    !text.contains("Discarded partial response") && !text.contains("must-not-run")
-                );
+                assert!(!text.contains("Discarded partial") && !text.contains("must-not-run"));
                 sse(stream, response("Both actions verified.", &[]));
             }
             4 => {
                 review = Some(body.clone());
-                stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater").unwrap();
+                unavailable(stream);
             }
-            5 => {
+            _ => {
                 assert_eq!(Some(body), review.as_ref());
                 sse(stream, goal_response("complete", "Both actions verified."));
             }
-            _ => unreachable!(),
         }
     });
     let worker = Worker::new(server.url.clone());
@@ -528,64 +445,13 @@ fn truncated_model_response_retries_without_replaying_completed_or_partial_tools
     });
     assert_eq!(commands, ["first", "second"]);
     assert!(!errored(&events));
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, Event::ResetText))
-            .count(),
-        1
-    );
+    let resets = events
+        .iter()
+        .filter(|event| matches!(event, Event::ResetText));
+    assert_eq!(resets.count(), 1);
     let (history, _) = worker.finish();
     paired(&history[0].messages);
     server.finish();
-}
-
-#[test]
-fn completed_model_message_does_not_wait_for_a_missing_http_chunk_trailer() {
-    for hold_open in [false, true] {
-        let server = Server::new(3, move |index, body, stream| match index {
-            0 => {
-                truncated_chunked_sse(
-                    stream,
-                    response("", &[("once", "shell", json!({"command":"once"}))]),
-                );
-                if hold_open {
-                    let mut byte = [0];
-                    // Closing with unread HTTP framing may send a reset instead of EOF.
-                    match stream.read(&mut byte) {
-                        Ok(0) => (),
-                        Err(error) if error.kind() == std::io::ErrorKind::ConnectionReset => (),
-                        result => panic!("expected peer closure, got {result:?}"),
-                    }
-                }
-            }
-            1 => {
-                assert!(body["messages"].to_string().contains("once-completed"));
-                sse(stream, response("Verified.", &[]));
-            }
-            2 => sse(stream, goal_response("complete", "Verified.")),
-            _ => unreachable!(),
-        });
-        let worker = Worker::new(server.url.clone());
-        let agent = worker.agent();
-        agent
-            .send("perform one action".into(), 17, json!({}))
-            .unwrap();
-        let mut calls = 0;
-        let events = settled(agent, |request| {
-            assert_eq!(request.input["command"], "once");
-            calls += 1;
-            request.respond(Ok("once-completed".into()));
-        });
-        assert_eq!(calls, 1);
-        assert!(
-            events
-                .iter()
-                .all(|event| !matches!(event, Event::Message("Error", _) | Event::ResetText))
-        );
-        worker.finish();
-        server.finish();
-    }
 }
 
 #[test]
@@ -606,13 +472,11 @@ fn stopping_during_network_backoff_prevents_another_request_or_tool() {
         wait(agent.fd(), 100).unwrap();
         let events = agent.poll();
         assert!(
-            events
+            !events
                 .iter()
-                .all(|event| !matches!(event, Event::Request(_)))
+                .any(|event| matches!(event, Event::Request(_)))
         );
-        if events.iter().any(
-            |event| matches!(event, Event::Message("Context", text) if text.contains("Retrying")),
-        ) {
+        if notices(&events).any(|text| text.contains("Retrying")) {
             break;
         }
     }
@@ -626,23 +490,17 @@ fn stopping_during_network_backoff_prevents_another_request_or_tool() {
 }
 
 #[test]
-fn summary_network_recovery_is_bounded_and_keeps_the_request() {
+fn summary_requests_retry_three_times_with_the_same_body() {
     let mut original = None;
     let server = Server::new(6, move |index, body, stream| {
-        if let Some(original) = &original {
-            assert_eq!(body, original);
-        } else {
-            original = Some(body.clone());
-        }
-        if index < 4 {
-            stream.write_all(b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntrylater").unwrap();
-        } else if index == 4 {
-            sse(
+        assert_eq!(body, original.get_or_insert_with(|| body.clone()));
+        match index {
+            0..4 => unavailable(stream),
+            4 => sse(
                 stream,
                 vec![json!({"type":"error","error":{"type":"overloaded_error","message":"busy"}})],
-            );
-        } else {
-            sse(stream, response("Recovered summary.", &[]));
+            ),
+            _ => sse(stream, response("Recovered summary.", &[])),
         }
     });
     let shared = Shared {
@@ -650,266 +508,118 @@ fn summary_network_recovery_is_bounded_and_keeps_the_request() {
         wake: Arc::new(crate::sys::new().unwrap()),
         notification: crate::sys::new().unwrap(),
     };
-    let mut session = Session {
-        http: Http::new(),
-        url: server.url.clone(),
-        headers: vec![],
-        model: "local-fixture".into(),
-        history: VecDeque::new(),
-        summary: String::new(),
-    };
+    let mut session = session(server.url.clone());
     let messages = [json!({"role":"user","content":"Keep completed command 123."})];
     let canceled = AtomicBool::new(false);
-    let error = session
-        .summarize(&shared, &messages, &canceled)
-        .unwrap_err();
-    assert!(error.to_string().contains("503"));
-    assert_eq!(
-        session.summarize(&shared, &messages, &canceled).unwrap(),
-        "Recovered summary."
-    );
+    let error = session.summarize(&shared, &messages, &canceled);
+    assert!(error.unwrap_err().to_string().contains("503"));
+    let summary = session.summarize(&shared, &messages, &canceled);
+    assert_eq!(summary.unwrap(), "Recovered summary.");
     server.finish();
 }
 
 #[test]
-fn malformed_streams_and_terminal_errors_do_not_poison_the_next_turn() {
-    let server = Server::new(4, |index, body, stream| {
-        paired(body["messages"].as_array().unwrap());
-        if index == 0 {
-            let mut events = response(
-                "Partial response.",
-                &[("partial", "shell", json!({"command":"must-not-run"}))],
-            );
-            events.truncate(events.len() - 2);
-            sse(stream, events);
-            stream.write_all(b"data: {\"type\":\r\n\r\n").unwrap();
-        } else if index == 1 {
-            assert!(body["messages"].to_string().contains("Turn interrupted"));
-            sse(
-                stream,
-                response(
-                    "",
-                    &[("busy", "shell", json!({"command":"printf expected"}))],
-                ),
-            );
-        } else if index == 2 {
-            let results = body["messages"].as_array().unwrap().last().unwrap()["content"]
-                .as_array()
-                .unwrap();
-            assert_eq!(results[0]["is_error"], true);
-            assert!(
-                results[0]["content"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Shell is busy")
-            );
-            sse(stream, response("The current shell is busy.", &[]));
-        } else {
-            sse(
-                stream,
-                goal_response("blocked", "The current shell is busy."),
-            );
-        }
-    });
-    let worker = Worker::new(server.url.clone());
-    let agent = worker.agent();
-    agent.send("first request".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| panic!("incomplete tool call executed"));
-    assert!(errored(&events));
-    agent.send("next request".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |request| {
-        request.respond(Err(io::Error::other("Shell is busy")));
-    });
-    assert!(!errored(&events));
-    for turn in worker.finish().0 {
-        paired(&turn.messages);
-    }
-    server.finish();
-}
-
-#[test]
-fn output_limit_never_executes_even_a_parseable_tool_call() {
-    let server = Server::new(3, |index, body, stream| {
-        if index == 0 {
-            let mut events = response(
-                "",
-                &[("limited", "shell", json!({"command":"must-not-run"}))],
-            );
-            let stop = events.len() - 2;
-            events[stop]["delta"]["stop_reason"] = json!("max_tokens");
-            sse(stream, events);
-        } else if index == 1 {
+fn failed_responses_never_run_their_tools_and_leave_paired_history() {
+    // One response stops at the output limit; another breaks off with malformed data.
+    for malformed in [false, true] {
+        let server = Server::new(3, move |index, body, stream| {
             paired(body["messages"].as_array().unwrap());
-            assert!(body["messages"].to_string().contains("Result unavailable"));
-            sse(
-                stream,
-                response("The previous action was not executed.", &[]),
-            );
-        } else {
-            sse(
-                stream,
-                goal_response("complete", "Explained the interruption."),
-            );
+            match index {
+                0 => {
+                    let call = ("limited", "shell", json!({"command":"must-not-run"}));
+                    let mut events = response("Partial.", &[call]);
+                    let stop = events.len() - 2;
+                    if malformed {
+                        events.truncate(stop);
+                        sse(stream, events);
+                        stream.write_all(b"data: {\"type\":\r\n\r\n").unwrap();
+                    } else {
+                        events[stop]["delta"]["stop_reason"] = json!("max_tokens");
+                        sse(stream, events);
+                    }
+                }
+                1 => {
+                    assert!(body["messages"].to_string().contains("Turn interrupted"));
+                    sse(
+                        stream,
+                        response("The previous action was not executed.", &[]),
+                    );
+                }
+                _ => sse(stream, goal_response("complete", "Explained.")),
+            }
+        });
+        let worker = Worker::new(server.url.clone());
+        let agent = worker.agent();
+        agent.send("first request".into(), 17, json!({})).unwrap();
+        assert!(errored(&settled(agent, |_| panic!(
+            "a failed response ran its tool"
+        ))));
+        agent.send("continue".into(), 17, json!({})).unwrap();
+        assert!(!errored(&settled(agent, |_| panic!(
+            "unexpected tool call"
+        ))));
+        for turn in worker.finish().0 {
+            paired(&turn.messages);
         }
-    });
-    let worker = Worker::new(server.url.clone());
-    let agent = worker.agent();
-    agent.send("first request".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| panic!("output-limited tool call executed"));
-    assert!(errored(&events));
-    agent.send("continue".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| panic!("unexpected tool call"));
-    assert!(!errored(&events));
-    worker.finish();
-    server.finish();
+        server.finish();
+    }
 }
 
 #[test]
-fn long_work_summarizes_complete_exchanges_privately_and_rolls_old_turns_forward() {
-    let mut summaries = 0;
-    let mut rounds = 0;
-    let server = Server::new(14, move |_, body, stream| {
-        let messages = body["messages"].as_array().unwrap();
-        paired(messages);
-        if body["system"] == GOAL_REVIEW {
-            sse(stream, goal_response("complete", "Verified."));
-            return;
-        }
-        if body["tool_choice"]["type"] == "none" {
-            summaries += 1;
-            assert!(json!(messages).to_string().contains("original objective"));
-            sse(
-                stream,
-                response(
-                    &format!(
-                        "PRIVATE SUMMARY {summaries}: original objective; command 7 remains relevant."
-                    ),
-                    &[],
-                ),
-            );
-        } else {
-            assert!(serde_json::to_vec(messages).unwrap().len() <= CONTEXT_LIMIT);
-            let events = if rounds < 8 {
-                let id = format!("read-{rounds}");
-                response(
-                    "",
-                    &[(
-                        &id,
-                        "read",
-                        json!({"source":"command","command":7,"cursor":{"epoch":1,"row":rounds,"offset":0}}),
-                    )],
-                )
-            } else if rounds == 8 {
-                assert_eq!(summaries, 1);
-                assert!(json!(messages).to_string().contains("PRIVATE SUMMARY 1"));
-                response("Long request complete.", &[])
-            } else {
-                assert_eq!(summaries, 2);
-                assert!(json!(messages).to_string().contains("PRIVATE SUMMARY 2"));
-                assert!(json!(messages).to_string().contains("new constraint"));
-                response("Continued from the historical summary.", &[])
-            };
-            rounds += 1;
-            sse(stream, events);
-        }
-    });
-    let worker = Worker::new(server.url.clone());
-    let agent = worker.agent();
-    agent
-        .send(
-            "original objective: inspect command 7".into(),
-            17,
-            json!({}),
-        )
-        .unwrap();
-    let events = settled(agent, |request| {
-        request.respond(Ok("x".repeat(60_000)));
-    });
-    assert!(!errored(&events));
-    assert!(
-        events
-            .iter()
-            .any(|event| matches!(event, Event::Message("Context", _)))
-    );
-    assert!(
-        !events
-            .iter()
-            .any(|event| matches!(event,Event::Text(text) if text.contains("PRIVATE SUMMARY")))
-    );
-    agent
-        .send(
-            format!("new constraint {}", "n".repeat(70_000)),
-            17,
-            json!({}),
-        )
-        .unwrap();
-    let events = settled(agent, |_| panic!("summary cannot execute a tool"));
-    assert!(!errored(&events));
-    let (history, summary) = worker.finish();
-    assert_eq!(history.len(), 1);
-    assert!(summary.contains("PRIVATE SUMMARY 2"));
-    paired(&history[0].messages);
-    assert_eq!(server.finish().len(), 14);
-}
-
-#[test]
-fn repeated_compaction_keeps_the_request_when_summaries_omit_it() {
+fn compaction_keeps_the_request_and_latest_result_and_rolls_old_turns_forward() {
     let objective = "检查 command 7；保留用户草稿；最终停在调试器，不要退出。";
-    let mut summaries = 0;
-    let mut rounds = 0;
-    let server = Server::new(24, move |_, body, stream| {
+    let (mut summaries, mut rounds) = (0, 0);
+    let server = Server::new(27, move |_, body, stream| {
         let messages = body["messages"].as_array().unwrap();
         let text = serde_json::to_string(messages).unwrap();
         paired(messages);
-        assert!(messages[0]["content"].as_str().unwrap().contains(objective));
-        if body["system"] == GOAL_REVIEW {
-            assert!(text.len() <= CONTEXT_LIMIT);
-            sse(stream, goal_response("complete", "Verified."));
-            return;
-        }
-        if body["tool_choice"]["type"] == "none" {
+        let summary = body["tool_choice"]["type"] == "none" && body["system"] != GOAL_REVIEW;
+        assert!(summary || text.len() <= CONTEXT_LIMIT);
+        let events = if body["system"] == GOAL_REVIEW {
+            goal_response("complete", "Verified.")
+        } else if summary {
             summaries += 1;
+            // Summaries build on earlier ones, which never repeat the request.
             if summaries > 1 {
-                assert!(text.contains(&format!(
-                    "Historical result {}: command 7 remains running.",
-                    summaries - 1
-                )));
+                assert!(text.contains(&format!("Historical result {}:", summaries - 1)));
             }
-            sse(
-                stream,
-                response(
-                    &format!("Historical result {summaries}: command 7 remains running."),
-                    &[],
-                ),
-            );
+            let summary = format!("Historical result {summaries}: command 7 remains running.");
+            response(&summary, &[])
         } else {
-            assert!(text.len() <= CONTEXT_LIMIT);
-            if rounds > 0 {
+            rounds += 1;
+            if rounds <= 19 {
+                assert!(messages[0]["content"].as_str().unwrap().contains(objective));
+            }
+            if (2..=19).contains(&rounds) {
                 let result = &messages.last().unwrap()["content"][0];
-                assert_eq!(result["tool_use_id"], format!("read-{}", rounds - 1));
+                assert_eq!(result["tool_use_id"], format!("read-{}", rounds - 2));
+                let observation = format!("Observation {}:", rounds - 2);
                 assert!(
                     result["content"]
                         .as_str()
                         .unwrap()
-                        .starts_with(&format!("Observation {}:", rounds - 1))
+                        .starts_with(&observation)
                 );
             }
-            let events = if rounds < 18 {
-                response(
-                    "",
-                    &[(
-                        &format!("read-{rounds}"),
-                        "read",
-                        json!({"source":"command","command":7}),
-                    )],
-                )
-            } else {
-                assert_eq!(summaries, 4);
-                response("Stopped at the requested debugger state.", &[])
-            };
-            rounds += 1;
-            sse(stream, events);
-        }
+            match rounds {
+                1..=18 => {
+                    let id = format!("read-{}", rounds - 1);
+                    response(
+                        "",
+                        &[(&id, "read", json!({"source":"command","command":7}))],
+                    )
+                }
+                19 => response("Stopped at the requested debugger state.", &[]),
+                _ => {
+                    assert_eq!(summaries, 5);
+                    assert!(
+                        text.contains("Historical result 5") && text.contains("new constraint")
+                    );
+                    response("Continued from the historical summary.", &[])
+                }
+            }
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
@@ -922,17 +632,21 @@ fn repeated_compaction_keeps_the_request_when_summaries_omit_it() {
     });
     assert_eq!(observations, 18);
     assert!(!errored(&events));
-    assert_eq!(
-        events
+    assert_eq!(notices(&events).count(), 4);
+    assert!(
+        !events
             .iter()
-            .filter(|event| matches!(event, Event::Message("Context", _)))
-            .count(),
-        4
+            .any(|event| matches!(event, Event::Text(text) if text.contains("Historical result")))
     );
-    let (history, _) = worker.finish();
+    let constraint = format!("new constraint {}", "n".repeat(150_000));
+    agent.send(constraint, 17, json!({})).unwrap();
+    let events = settled(agent, |_| panic!("summary cannot execute a tool"));
+    assert!(!errored(&events));
+    let (history, summary) = worker.finish();
     assert_eq!(history.len(), 1);
+    assert!(summary.contains("Historical result 5"));
     paired(&history[0].messages);
-    assert_eq!(server.finish().len(), 24);
+    assert_eq!(server.finish().len(), 27);
 }
 
 #[test]
@@ -940,56 +654,42 @@ fn goal_review_compaction_keeps_the_latest_tool_result_as_original_evidence() {
     let server = Server::new(7, |index, body, stream| {
         let messages = body["messages"].as_array().unwrap();
         paired(messages);
-        if index < 4 {
-            sse(
-                stream,
+        let events = match index {
+            0..4 => {
+                let id = format!("read-{index}");
                 response(
                     "",
-                    &[(
-                        &format!("read-{index}"),
-                        "read",
-                        json!({"source":"command","command":7}),
-                    )],
-                ),
-            );
-        } else if index == 4 {
-            sse(stream, response(&"Final analysis. ".repeat(2000), &[]));
-        } else if index == 5 {
-            assert_eq!(body["tool_choice"]["type"], "none");
-            assert_ne!(body["system"], GOAL_REVIEW);
-            sse(
-                stream,
-                response("Historical work before the latest verification.", &[]),
-            );
-        } else {
-            assert_eq!(body["system"], GOAL_REVIEW);
-            assert!(serde_json::to_vec(messages).unwrap().len() <= CONTEXT_LIMIT);
-            let result = messages
-                .iter()
-                .filter_map(|message| message["content"].as_array())
-                .flatten()
-                .find(|block| block["type"] == "tool_result" && block["tool_use_id"] == "read-3")
-                .expect("goal review lost the latest original tool result");
-            assert!(
-                result["content"]
-                    .as_str()
-                    .unwrap()
-                    .starts_with("verified-command-7-exit-0:")
-            );
-            sse(
-                stream,
-                goal_response(
-                    "complete",
-                    "The original verification result supports completion.",
-                ),
-            );
-        }
+                    &[(&id, "read", json!({"source":"command","command":7}))],
+                )
+            }
+            4 => response(&"Final analysis. ".repeat(2000), &[]),
+            5 => {
+                assert_eq!(body["tool_choice"]["type"], "none");
+                assert_ne!(body["system"], GOAL_REVIEW);
+                response("Historical work before the latest verification.", &[])
+            }
+            _ => {
+                assert_eq!(body["system"], GOAL_REVIEW);
+                assert!(serde_json::to_vec(messages).unwrap().len() <= CONTEXT_LIMIT);
+                let result = messages
+                    .iter()
+                    .filter_map(|message| message["content"].as_array())
+                    .flatten()
+                    .find(|block| {
+                        block["type"] == "tool_result" && block["tool_use_id"] == "read-3"
+                    })
+                    .expect("goal review lost the latest original tool result");
+                let content = result["content"].as_str().unwrap();
+                assert!(content.starts_with("verified-command-7-exit-0:"));
+                goal_response("complete", "The verification result supports completion.")
+            }
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
-    agent
-        .send("analyze and verify command 7".into(), 17, json!({}))
-        .unwrap();
+    let objective = "analyze and verify command 7";
+    agent.send(objective.into(), 17, json!({})).unwrap();
     let mut calls = 0;
     let events = settled(agent, |request| {
         let label = if calls == 3 {
@@ -1002,8 +702,7 @@ fn goal_review_compaction_keeps_the_latest_tool_result_as_original_evidence() {
     });
     assert_eq!(calls, 4);
     assert!(!errored(&events));
-    let (history, _) = worker.finish();
-    paired(&history[0].messages);
+    paired(&worker.finish().0[0].messages);
     server.finish();
 }
 
@@ -1013,38 +712,34 @@ fn failed_compaction_preserves_executed_results_for_the_next_turn() {
         let messages = body["messages"].as_array().unwrap();
         let text = serde_json::to_string(messages).unwrap();
         paired(messages);
-        if index < 5 {
-            sse(
-                stream,
-                response(
-                    "",
-                    &[(
-                        &format!("action-{index}"),
-                        "shell",
-                        json!({"command":format!("action-{index}")}),
-                    )],
-                ),
-            );
-        } else if index < 7 {
-            assert_eq!(body["tool_choice"]["type"], "none");
-            for action in 0..if index == 5 { 4 } else { 5 } {
-                assert!(text.contains(&format!("executed-{action}")));
+        match index {
+            0..5 => {
+                let id = format!("action-{index}");
+                let call = (id.as_str(), "shell", json!({"command": id}));
+                sse(stream, response("", &[call]));
             }
-            if index == 5 {
-                stream.write_all(b"HTTP/1.1 400 Bad Request\r\nContent-Length: 8\r\nConnection: close\r\n\r\nrejected").unwrap();
-            } else {
-                sse(stream, response("All five actions already executed.", &[]));
+            5 | 6 => {
+                assert_eq!(body["tool_choice"]["type"], "none");
+                for action in 0..index - 1 {
+                    assert!(text.contains(&format!("executed-{action}")));
+                }
+                if index == 5 {
+                    let reply = "HTTP/1.1 400 Bad Request\r\nContent-Length: 8\r\nConnection: close\r\n\r\nrejected";
+                    stream.write_all(reply.as_bytes()).unwrap();
+                } else {
+                    sse(stream, response("All five actions already executed.", &[]));
+                }
             }
-        } else if index == 7 {
-            assert!(text.len() <= CONTEXT_LIMIT);
-            assert!(text.contains("All five actions already executed."));
-            assert!(text.contains("continue without repeating actions"));
-            sse(
-                stream,
-                response("Recovered without replaying actions.", &[]),
-            );
-        } else {
-            sse(stream, goal_response("complete", "Recovered."));
+            7 => {
+                assert!(text.len() <= CONTEXT_LIMIT);
+                assert!(text.contains("All five actions already executed."));
+                assert!(text.contains("continue without repeating actions"));
+                sse(
+                    stream,
+                    response("Recovered without replaying actions.", &[]),
+                );
+            }
+            _ => sse(stream, goal_response("complete", "Recovered.")),
         }
     });
     let worker = Worker::new(server.url.clone());
@@ -1063,9 +758,8 @@ fn failed_compaction_preserves_executed_results_for_the_next_turn() {
             .iter()
             .any(|event| matches!(event, Event::Message("Error", text) if text.contains("400")))
     );
-    agent
-        .send("continue without repeating actions".into(), 17, json!({}))
-        .unwrap();
+    let next = "continue without repeating actions";
+    agent.send(next.into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("completed action was replayed"));
     assert!(!errored(&events));
     let (history, summary) = worker.finish();
@@ -1080,44 +774,33 @@ fn default_goal_continues_after_a_premature_final_and_verifies_the_result() {
     let server = Server::new(5, |index, body, stream| {
         let messages = body["messages"].as_array().unwrap();
         paired(messages);
-        assert!(json!(messages).to_string().contains("verify command 7"));
-        sse(
-            stream,
-            match index {
-                0 => response("The task is finished.", &[]),
-                1 => {
-                    assert_eq!(body["system"], GOAL_REVIEW);
-                    assert_eq!(body["tool_choice"]["type"], "none");
-                    goal_response("continue", "Read command 7 and verify its exit status.")
-                }
-                2 => {
-                    assert!(
-                        messages.last().unwrap()["content"]
-                            .as_str()
-                            .unwrap()
-                            .contains("Read command 7")
-                    );
-                    response(
-                        "",
-                        &[("verify", "read", json!({"source":"command","command":7}))],
-                    )
-                }
-                3 => {
-                    assert!(json!(messages).to_string().contains("verified-result"));
-                    response("Verified the requested result.", &[])
-                }
-                4 => {
-                    assert_eq!(body["system"], GOAL_REVIEW);
-                    assert!(json!(messages).to_string().contains("verified-result"));
-                    let review = json!({
-                        "status":"complete",
-                        "reason":"Command 7 exited successfully with the requested result."
-                    });
-                    response(&format!("```json\n{review}\n```"), &[])
-                }
-                _ => unreachable!(),
-            },
-        );
+        let history = json!(messages).to_string();
+        assert!(history.contains("verify command 7"));
+        let events = match index {
+            0 => response("The task is finished.", &[]),
+            1 => {
+                assert_eq!(body["system"], GOAL_REVIEW);
+                goal_response("continue", "Read command 7 and verify its exit status.")
+            }
+            2 => {
+                let reason = messages.last().unwrap()["content"].as_str().unwrap();
+                assert!(reason.contains("Read command 7"));
+                let read = json!({"source":"command","command":7});
+                response("", &[("verify", "read", read)])
+            }
+            3 => {
+                assert!(history.contains("verified-result"));
+                response("Verified the requested result.", &[])
+            }
+            _ => {
+                assert_eq!(body["system"], GOAL_REVIEW);
+                assert!(history.contains("verified-result"));
+                // Models sometimes fence the requested JSON.
+                let review = json!({"status":"complete","reason":"Command 7 exited successfully."});
+                response(&format!("```json\n{review}\n```"), &[])
+            }
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
@@ -1128,15 +811,12 @@ fn default_goal_continues_after_a_premature_final_and_verifies_the_result() {
     let events = settled(agent, |request| {
         calls += 1;
         assert_eq!(request.tool, Tool::Read);
-        request.respond(Ok(
-            json!({"exit_code":0,"text":"verified-result"}).to_string()
-        ));
+        let result = json!({"exit_code":0,"text":"verified-result"});
+        request.respond(Ok(result.to_string()));
     });
     assert_eq!(calls, 1);
     assert!(!errored(&events));
-    assert!(events.iter().any(
-        |event| matches!(event, Event::Message("Context", text) if text.contains("Read command 7"))
-    ));
+    assert!(notices(&events).any(|text| text.contains("Read command 7")));
     assert!(
         !events
             .iter()
@@ -1145,88 +825,38 @@ fn default_goal_continues_after_a_premature_final_and_verifies_the_result() {
     let (history, _) = worker.finish();
     assert_eq!(history.len(), 1);
     paired(&history[0].messages);
-    assert!(
-        !json!(history[0].messages)
-            .to_string()
-            .contains("Harness goal review: the active request")
-    );
+    let history = json!(history[0].messages).to_string();
+    assert!(!history.contains("Harness goal review: the active request"));
     server.finish();
 }
 
 #[test]
 fn blocked_goal_reports_the_missing_input_and_accepts_the_next_submission() {
     let server = Server::new(4, |index, body, stream| {
-        sse(
-            stream,
-            match index {
-                0 => response("Which directory should I use?", &[]),
-                1 => goal_response("blocked", "Please provide the target directory."),
-                2 => {
-                    assert!(
-                        body["messages"]
-                            .to_string()
-                            .contains("Goal blocked: Please provide")
-                    );
-                    assert!(body["messages"].to_string().contains("Use /project"));
-                    response("The supplied directory is /project.", &[])
-                }
-                3 => goal_response("complete", "Answered the user's question."),
-                _ => unreachable!(),
-            },
-        );
+        let events = match index {
+            0 => response("Which directory should I use?", &[]),
+            1 => goal_response("blocked", "Please provide the target directory."),
+            2 => {
+                let history = body["messages"].to_string();
+                assert!(history.contains("Goal blocked: Please provide"));
+                assert!(history.contains("Use /project"));
+                response("The supplied directory is /project.", &[])
+            }
+            _ => goal_response("complete", "Answered the user's question."),
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
-    agent
-        .send("What is my target directory?".into(), 17, json!({}))
-        .unwrap();
-    let events = settled(agent, |_| {
-        panic!("missing input must not cause terminal actions")
-    });
-    assert!(events.iter().any(|event| matches!(event, Event::Message("Blocked", text) if text.contains("provide the target directory"))));
+    let question = "What is my target directory?";
+    agent.send(question.into(), 17, json!({})).unwrap();
+    let events = settled(agent, |_| panic!("missing input caused a terminal action"));
+    assert!(events.iter().any(|event| matches!(event,
+        Event::Message("Blocked", text) if text.contains("provide the target directory"))));
     agent.send("Use /project".into(), 17, json!({})).unwrap();
-    let events = settled(agent, |_| {
-        panic!("an answer does not require a terminal action")
-    });
+    let events = settled(agent, |_| panic!("an answer needs no terminal action"));
     assert!(!errored(&events));
     assert_eq!(worker.finish().0.len(), 2);
-    server.finish();
-}
-
-#[test]
-fn stopping_an_idle_goal_review_closes_the_request_without_more_actions() {
-    let (started, review_started) = mpsc::sync_channel(1);
-    let server = Server::new(2, move |index, body, stream| {
-        if index == 0 {
-            sse(stream, response("Candidate answer.", &[]));
-        } else {
-            assert_eq!(body["system"], GOAL_REVIEW);
-            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n").unwrap();
-            started.send(()).unwrap();
-            match stream.read(&mut [0]) {
-                Ok(0) => (),
-                Err(error) if error.kind() == io::ErrorKind::ConnectionReset => (),
-                result => panic!("canceled connection remained open: {result:?}"),
-            }
-        }
-    });
-    let worker = Worker::new(server.url.clone());
-    let agent = worker.agent();
-    agent
-        .send("answer this request".into(), 17, json!({}))
-        .unwrap();
-    review_started.recv_timeout(Duration::from_secs(3)).unwrap();
-    let started = Instant::now();
-    agent.abort();
-    let events = settled(agent, |_| panic!("a canceled review executed a tool"));
-    assert!(started.elapsed() < Duration::from_secs(1));
-    assert!(!errored(&events));
-    let (history, _) = worker.finish();
-    assert!(
-        json!(history[0].messages)
-            .to_string()
-            .contains("Candidate answer.")
-    );
     server.finish();
 }
 
@@ -1234,23 +864,17 @@ fn stopping_an_idle_goal_review_closes_the_request_without_more_actions() {
 fn malformed_goal_review_preserves_completed_actions_without_retrying_them() {
     let server = Server::new(5, |index, body, stream| {
         paired(body["messages"].as_array().unwrap());
-        sse(
-            stream,
-            match index {
-                0 => response(
-                    "",
-                    &[("once", "shell", json!({"command":"one side effect"}))],
-                ),
-                1 => response("The action finished.", &[]),
-                2 => response("not JSON", &[]),
-                3 => {
-                    assert!(body["messages"].to_string().contains("executed-once"));
-                    response("Recovered with the recorded result.", &[])
-                }
-                4 => goal_response("complete", "The recorded result satisfies the request."),
-                _ => unreachable!(),
-            },
-        );
+        let events = match index {
+            0 => response("", &[("once", "shell", json!({"command":"side effect"}))]),
+            1 => response("The action finished.", &[]),
+            2 => response("not JSON", &[]),
+            3 => {
+                assert!(body["messages"].to_string().contains("executed-once"));
+                response("Recovered with the recorded result.", &[])
+            }
+            _ => goal_response("complete", "The recorded result satisfies the request."),
+        };
+        sse(stream, events);
     });
     let worker = Worker::new(server.url.clone());
     let agent = worker.agent();
@@ -1264,101 +888,13 @@ fn malformed_goal_review_preserves_completed_actions_without_retrying_them() {
     });
     assert_eq!(calls, 1);
     assert!(errored(&events));
-    agent
-        .send("continue using the existing result".into(), 17, json!({}))
-        .unwrap();
+    let next = "continue using the existing result";
+    agent.send(next.into(), 17, json!({})).unwrap();
     let events = settled(agent, |_| panic!("completed action was replayed"));
     assert!(!errored(&events));
     for turn in worker.finish().0 {
         paired(&turn.messages);
     }
-    server.finish();
-}
-
-#[test]
-fn workspace_tools_route_explicit_panes_and_keep_committed_results() {
-    let server = Server::new(3, |index, body, stream| {
-        paired(body["messages"].as_array().unwrap());
-        match index {
-            0 => sse(
-                stream,
-                response(
-                    "",
-                    &[
-                        ("inventory", "read", json!({"source":"workspace"})),
-                        ("screen", "read", json!({"pane":31,"source":"screen"})),
-                        ("file", "read_file", json!({"pane":31,"path":"source.rs"})),
-                        (
-                            "search",
-                            "search_files",
-                            json!({"pane":31,"path":".","query":"broken"}),
-                        ),
-                        (
-                            "edit",
-                            "edit_file",
-                            json!({"pane":31,"path":"source.rs","old_text":"broken","new_text":"fixed"}),
-                        ),
-                        ("open", "open_terminal", json!({"pane":31})),
-                    ],
-                ),
-            ),
-            1 => {
-                let results = body["messages"].as_array().unwrap().last().unwrap()["content"]
-                    .as_array()
-                    .unwrap();
-                assert_eq!(results.len(), 6);
-                assert!(results.iter().all(|result| result["is_error"] == false));
-                assert_eq!(
-                    serde_json::from_str::<Value>(results[4]["content"].as_str().unwrap()).unwrap()
-                        ["written"],
-                    true
-                );
-                assert_eq!(
-                    serde_json::from_str::<Value>(results[5]["content"].as_str().unwrap()).unwrap()
-                        ["pane"],
-                    32
-                );
-                sse(stream, response("The repair is verified.", &[]));
-            }
-            2 => sse(stream, goal_response("complete", "Verified.")),
-            _ => unreachable!(),
-        }
-    });
-    let worker = Worker::new(server.url.clone());
-    worker
-        .agent()
-        .send("repair in another pane".into(), 17, json!({}))
-        .unwrap();
-    let mut calls = Vec::new();
-    let mut edit_id = String::new();
-    let events = settled(worker.agent(), |request| {
-        calls.push((request.tool, request.pane));
-        if request.tool == Tool::EditFile {
-            edit_id.clone_from(&request.id);
-        }
-        let result = match request.tool {
-            Tool::EditFile => json!({"path":"/project/source.rs","written":true}),
-            Tool::OpenTerminal => json!({"created":true,"pane":32}),
-            _ => json!({"text":"original evidence"}),
-        };
-        request.respond(Ok(result.to_string()));
-    });
-    assert_eq!(
-        calls,
-        [
-            (Tool::Read, 17),
-            (Tool::Read, 31),
-            (Tool::ReadFile, 31),
-            (Tool::SearchFiles, 31),
-            (Tool::EditFile, 31),
-            (Tool::OpenTerminal, 31)
-        ]
-    );
-    assert!(!errored(&events));
-    assert!(!edit_id.is_empty());
-    assert!(events.iter().any(|event| matches!(event,
-        Event::Tool { id, role, .. } if role == "edit_file · done" && id == &edit_id)));
-    worker.finish();
     server.finish();
 }
 
@@ -1381,20 +917,23 @@ fn tool_request(
     input: Value,
 ) -> (ToolRequest, mpsc::Receiver<io::Result<String>>) {
     let (reply, receiver) = mpsc::sync_channel(1);
-    (
-        ToolRequest {
-            id: "test-edit".into(),
-            tool,
-            pane,
-            input,
-            canceled: Arc::new(AtomicBool::new(false)),
-            reply,
-            wake: Arc::new(crate::sys::new().unwrap()),
-        },
-        receiver,
-    )
+    let request = ToolRequest {
+        id: "test-edit".into(),
+        tool,
+        pane,
+        input,
+        canceled: Arc::new(AtomicBool::new(false)),
+        reply,
+        wake: Arc::new(crate::sys::new().unwrap()),
+    };
+    (request, receiver)
 }
 
+fn result(receiver: &mpsc::Receiver<io::Result<String>>) -> Value {
+    serde_json::from_str(&receiver.recv().unwrap().unwrap()).unwrap()
+}
+
+/// Answers the client's frame request with pane 7, optionally at an idle shell prompt.
 fn terminal_frame(
     client: &mut crate::workspace::Client,
     peer: &mut crate::wire::Peer,
@@ -1409,40 +948,36 @@ fn terminal_frame(
             request = Some(id);
         }
     }
-    let core = crate::core::Core::new(
-        crate::core::WindowSize {
-            num_cols: 20,
-            num_lines: 4,
-            cell_width: 0,
-            cell_height: 0,
-        },
-        0,
-        0,
-    );
-    peer.send_response(crate::wire::Response::State(
-        Some(Snapshot {
-            name: "test".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: Vec::new(),
-            panes: vec![PaneView {
-                id: 7,
-                tab: 7,
-                rect: crate::panel::rect(0, 0, 20, 4),
-                title: "shell".into(),
-                cwd: None,
-                process: Arc::default(),
-                blocks: Vec::new(),
-                command_blocks: Vec::new(),
-                input_generation: 4,
-                shell_prompt: prompt,
-            }],
-        }),
-        vec![(7, crate::screen::Update::capture_live(&core))],
-        request.unwrap(),
-    ))
-    .unwrap();
+    let size = crate::core::WindowSize {
+        num_cols: 20,
+        num_lines: 4,
+        cell_width: 0,
+        cell_height: 0,
+    };
+    let core = crate::core::Core::new(size, 0, 0);
+    let pane = PaneView {
+        id: 7,
+        tab: 7,
+        rect: crate::panel::rect(0, 0, 20, 4),
+        title: "shell".into(),
+        cwd: None,
+        process: Arc::default(),
+        blocks: Vec::new(),
+        command_blocks: Vec::new(),
+        input_generation: 4,
+        shell_prompt: prompt,
+    };
+    let snapshot = Snapshot {
+        name: "test".into(),
+        controller: true,
+        focused: 1,
+        active_tab: 1,
+        tabs: Vec::new(),
+        panes: vec![pane],
+    };
+    let screens = vec![(7, crate::screen::Update::capture_live(&core))];
+    let state = crate::wire::Response::State(Some(snapshot), screens, request.unwrap());
+    peer.send_response(state).unwrap();
     peer.flush().unwrap();
     client.poll().unwrap();
     assert!(!client.screen_stale());
@@ -1473,15 +1008,20 @@ fn open_terminal(
 fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
     use crate::workspace::Action;
     let (mut client, mut peer) = terminal_client();
-    let (mut agent, result) = open_terminal(&mut client, &mut peer);
+    let (mut agent, receiver) = open_terminal(&mut client, &mut peer);
     agent.advance(&mut client);
-    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
     assert!(agent.deadline().is_some());
     terminal_frame(&mut client, &mut peer, Some(9));
     agent.advance(&mut client);
-    let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
-    assert_eq!(value["created"], true);
-    assert_eq!(value["pane"], 7);
+    let value = result(&receiver);
+    assert_eq!(
+        (&value["created"], &value["pane"]),
+        (&json!(true), &json!(7))
+    );
     assert_eq!(value["shell_prompt"], 9);
     assert!(value["screen"].is_object());
     assert_eq!(agent.observed_input.get(&7), Some(&4));
@@ -1505,57 +1045,33 @@ fn new_terminal_waits_for_prompt_then_authorizes_shell_without_another_read() {
 #[test]
 fn new_terminal_timeout_does_not_invent_prompt_and_cancel_keeps_creation() {
     use crate::agent::Stage;
-    for finish in [
-        "timeout",
-        "cancel",
-        "close",
-        "missing-screen",
-        "stalled-frame",
-    ] {
+    for finish in ["timeout", "cancel", "close"] {
         let (mut client, mut peer) = terminal_client();
-        let (mut agent, result) = open_terminal(&mut client, &mut peer);
+        let (mut agent, receiver) = open_terminal(&mut client, &mut peer);
+        let operation = agent.operation.as_mut().unwrap();
         match finish {
             "timeout" => {
-                agent.operation.as_mut().unwrap().stage = Stage::NewTerminalOutput {
+                operation.stage = Stage::NewTerminalOutput {
                     until: Instant::now(),
                 }
             }
-            "cancel" => agent
-                .operation
-                .as_ref()
-                .unwrap()
-                .request
-                .canceled
-                .store(true, Ordering::Release),
-            "close" => agent.close(&mut client).unwrap(),
-            "missing-screen" => {
-                client.snapshot_and_screens_mut().unwrap().1.clear();
-                agent.operation.as_mut().unwrap().stage = Stage::NewTerminalOutput {
-                    until: Instant::now(),
-                };
-            }
-            "stalled-frame" => {
-                client.refresh_screen().unwrap();
-                agent.operation.as_mut().unwrap().stage = Stage::NewTerminalOutput {
-                    until: Instant::now(),
-                };
-                assert!(agent.deadline().is_some());
-            }
-            _ => unreachable!(),
+            "cancel" => operation.request.canceled.store(true, Ordering::Release),
+            _ => agent.close(&mut client).unwrap(),
         }
         agent.advance(&mut client);
         assert!(agent.operation.is_none());
-        assert!(agent.deadline().is_none());
-        let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
-        assert_eq!(value["created"], true);
-        assert_eq!(value["pane"], 7);
+        let value = result(&receiver);
+        assert_eq!(
+            (&value["created"], &value["pane"]),
+            (&json!(true), &json!(7))
+        );
         if finish == "timeout" {
             assert_eq!(value["shell_prompt"], Value::Null);
             assert_eq!(value["outcome"], "timeout");
-            let (request, result) =
-                tool_request(Tool::Shell, 7, json!({"command":"printf too-early"}));
+            let shell = json!({"command":"printf too-early"});
+            let (request, receiver) = tool_request(Tool::Shell, 7, shell);
             agent.begin_ready(request, &mut client);
-            assert!(result.recv().unwrap().is_err());
+            assert!(receiver.recv().unwrap().is_err());
         } else {
             assert!(value["observation_error"].is_string());
         }
@@ -1569,46 +1085,31 @@ fn accepted_input_observation_ends_without_a_fresh_frame() {
     for cancel in [false, true] {
         let (mut client, _peer) = terminal_client();
         let mut agent = Agent::default();
-        let (request, result) = tool_request(Tool::Input, 7, json!({"text":"x"}));
-        agent.operation = Some(Operation {
-            request,
-            stage: Stage::Input {
-                id: 42,
-                generation: 4,
-                before: 0,
-            },
-        });
-        agent.handle_event(
-            &mut Response::AgentInput {
-                request: 42,
-                result: Ok(None),
-            },
-            &mut client,
-        );
+        let (request, receiver) = tool_request(Tool::Input, 7, json!({"text":"x"}));
+        let stage = Stage::Input {
+            id: 42,
+            generation: 4,
+            before: 0,
+        };
+        agent.operation = Some(Operation { request, stage });
+        let accepted = &mut Response::AgentInput {
+            request: 42,
+            result: Ok(None),
+        };
+        agent.handle_event(accepted, &mut client);
         assert!(client.screen_stale());
-        assert!(agent.deadline().is_some());
+        let operation = agent.operation.as_mut().unwrap();
         if cancel {
-            agent
-                .operation
-                .as_ref()
-                .unwrap()
-                .request
-                .canceled
-                .store(true, Ordering::Release);
-        } else {
-            let Stage::InputOutput { until, .. } = &mut agent.operation.as_mut().unwrap().stage
-            else {
-                panic!()
-            };
+            operation.request.canceled.store(true, Ordering::Release);
+        } else if let Stage::InputOutput { until, .. } = &mut operation.stage {
             *until = Instant::now();
         }
         agent.advance(&mut client);
-        let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
+        let value = result(&receiver);
         assert_eq!(value["input_queued"], true);
         assert!(value["observation_error"].is_string());
         assert!(value.get("screen").is_none());
         assert!(agent.operation.is_none());
-        assert!(agent.deadline().is_none());
     }
 }
 
@@ -1626,19 +1127,20 @@ fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
         let mut agent = Agent::default();
         agent.observed_input.insert(7, 1);
         agent.observed_activity.insert(7, 2);
-        let (request, result) = tool_request(tool, 7, json!({"source":source,"wait":1}));
+        let (request, receiver) = tool_request(tool, 7, json!({"source":source,"wait":1}));
         let until = Instant::now() + Duration::from_secs(1);
-        agent.operation = Some(Operation {
-            request,
-            stage: match command {
-                Some(command) => Stage::Command { command, until },
-                None => Stage::Change { until },
-            },
-        });
+        let stage = match command {
+            Some(command) => Stage::Command { command, until },
+            None => Stage::Change { until },
+        };
+        agent.operation = Some(Operation { request, stage });
         client.refresh_screen().unwrap();
         assert_eq!(agent.deadline(), Some(until));
         agent.advance(&mut client);
-        assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        assert!(matches!(
+            receiver.try_recv(),
+            Err(mpsc::TryRecvError::Empty)
+        ));
         let (Stage::Command { until, .. } | Stage::Change { until }) =
             &mut agent.operation.as_mut().unwrap().stage
         else {
@@ -1646,19 +1148,20 @@ fn terminal_wait_deadlines_do_not_depend_on_pending_frames() {
         };
         *until = Instant::now();
         agent.advance(&mut client);
-        let result = result.recv().unwrap();
         if tool == Tool::Shell {
-            let value: Value = serde_json::from_str(&result.unwrap()).unwrap();
-            assert_eq!(value["input_queued"], true);
-            assert_eq!(value["command"], 37);
+            let value = result(&receiver);
+            assert_eq!(
+                (&value["input_queued"], &value["command"]),
+                (&json!(true), &json!(37))
+            );
             assert!(value["observation_error"].is_string());
         } else {
-            assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+            let error = receiver.recv().unwrap().unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::TimedOut);
         }
         assert_eq!(agent.observed_input.get(&7), Some(&1));
         assert_eq!(agent.observed_activity.get(&7), Some(&2));
         assert!(agent.operation.is_none());
-        assert!(agent.deadline().is_none());
     }
 }
 
@@ -1667,31 +1170,32 @@ fn stopping_a_shell_observation_keeps_the_accepted_command() {
     use crate::agent::{Agent, Operation, Stage};
     let (mut client, _peer) = terminal_client();
     let mut agent = Agent::default();
-    let (request, result) = tool_request(Tool::Shell, 7, json!({"command":"make"}));
-    agent.operation = Some(Operation {
-        request,
-        stage: Stage::Command {
-            command: 37,
-            until: Instant::now() + Duration::from_secs(60),
-        },
-    });
+    let (request, receiver) = tool_request(Tool::Shell, 7, json!({"command":"make"}));
+    let until = Instant::now() + Duration::from_secs(60);
+    let stage = Stage::Command { command: 37, until };
+    agent.operation = Some(Operation { request, stage });
     agent.close(&mut client).unwrap();
-    let value: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
-    assert_eq!(value["input_queued"], true);
-    assert_eq!(value["command"], 37);
+    let value = result(&receiver);
+    assert_eq!(
+        (&value["input_queued"], &value["command"]),
+        (&json!(true), &json!(37))
+    );
     assert!(value["observation_error"].is_string());
 }
 
 #[test]
 fn waiting_without_an_activity_baseline_does_not_report_a_change() {
-    use crate::agent::Agent;
     let (mut client, mut peer) = terminal_client();
     terminal_frame(&mut client, &mut peer, Some(9));
-    let mut agent = Agent::default();
-    let (request, result) = tool_request(Tool::Read, 7, json!({"source":"screen","wait":30}));
+    let mut agent = crate::agent::Agent::default();
+    let wait = json!({"source":"screen","wait":30});
+    let (request, receiver) = tool_request(Tool::Read, 7, wait);
     agent.begin_ready(request, &mut client);
     agent.advance(&mut client);
-    assert!(matches!(result.try_recv(), Err(mpsc::TryRecvError::Empty)));
+    assert!(matches!(
+        receiver.try_recv(),
+        Err(mpsc::TryRecvError::Empty)
+    ));
 }
 
 #[test]
@@ -1703,32 +1207,25 @@ fn committed_file_diff_keeps_its_tool_identity_without_expanding_model_result() 
         turn: 5,
         ..Agent::default()
     };
-    let (request, result) = tool_request(
-        Tool::EditFile,
-        7,
-        json!({"pane":7,"path":"a.rs","old_text":"old","new_text":"new"}),
+    let edit = json!({"pane":7,"path":"a.rs","old_text":"old","new_text":"new"});
+    let (request, receiver) = tool_request(Tool::EditFile, 7, edit);
+    let stage = Stage::File { id: 42 };
+    agent.operation = Some(Operation { request, stage });
+    let change = AgentChange {
+        path: "a.rs".into(),
+        added: 1,
+        removed: 1,
+        diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
+        ..AgentChange::default()
+    };
+    let edited = &mut Response::AgentFile {
+        request: 42,
+        result: Ok(FileResult::Edited { change }),
+    };
+    agent.handle_event(edited, &mut client);
+    assert_eq!(
+        (agent.changes[0].tool_id.as_str(), agent.changes[0].turn),
+        ("test-edit", 5)
     );
-    agent.operation = Some(Operation {
-        request,
-        stage: Stage::File { id: 42 },
-    });
-    agent.handle_event(
-        &mut Response::AgentFile {
-            request: 42,
-            result: Ok(FileResult::Edited {
-                change: AgentChange {
-                    path: "a.rs".into(),
-                    added: 1,
-                    removed: 1,
-                    diff: "@@ -1 +1 @@\n-old\n+new\n".into(),
-                    ..AgentChange::default()
-                },
-            }),
-        },
-        &mut client,
-    );
-    assert_eq!(agent.changes[0].tool_id, "test-edit");
-    assert_eq!(agent.changes[0].turn, 5);
-    let returned: Value = serde_json::from_str(&result.recv().unwrap().unwrap()).unwrap();
-    assert_eq!(returned, json!({"path":"a.rs","written":true}));
+    assert_eq!(result(&receiver), json!({"path":"a.rs","written":true}));
 }

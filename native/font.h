@@ -14,7 +14,8 @@ typedef struct {
     unsigned color_glyph, cell_shape;
 } NtFontGlyph;
 
-/* All calls run on the renderer worker. Error storage outlives the font owner. */
+/* Created before the render thread starts, which then makes every other call. Error storage
+ * outlives the fonts. */
 NtFonts *nt_fonts_new(const char *family, float size, char *error, size_t error_size);
 void nt_fonts_free(NtFonts *);
 void nt_fonts_metrics(const NtFonts *, float *width, float *height);

@@ -1,33 +1,148 @@
-use crate::config::Config;
-use crate::core::Point;
-use crate::files::FileNav;
-use crate::input::{KeyResult, keysym};
-use crate::panel::{Grid, mix_color, rect};
-use crate::width::{fit_label, printable_ascii_prefix, scalar_width, text_width};
-use crate::workspace::{Action, Axis, Client, Direction, PaneId, Rect, Snapshot, TabId};
-
 use crate::agent::panel::AgentPanel;
-use crate::monitor::Monitor;
-use std::{
-    borrow::Cow,
-    io,
-    time::{Duration, Instant},
+use crate::config::{Config, TabStyle};
+use crate::core::{Mode, Point, Scroll, SelectionType, Side};
+use crate::files::{FileFocus, FileNav};
+use crate::input::{
+    ALT, Key, KeyResult, LEFT, MIDDLE, PasteTarget, PointerKind, RIGHT, keysym, mouse_bytes,
+    symbol_char,
 };
+use crate::monitor::{Monitor, View};
+use crate::panel::{ACCENT, Grid, INK, MUTED, mix_color, rect};
+use crate::width::{fit_label, scalar_width, text_width};
+use crate::workspace::{
+    Action, Axis, Client, Direction, PaneId, Rect, Response, Snapshot, SplitDrag, TabActivity,
+    TabId, TabView,
+};
+use std::borrow::Cow;
+use std::io;
+use std::time::{Duration, Instant};
 
-pub(crate) const WHEEL_LINES: usize = 3;
+/// Lines one wheel notch scrolls.
+pub(crate) const WHEEL_LINES: i32 = 3;
+const DOUBLE_CLICK: Duration = Duration::from_millis(400);
+const WARNING: u32 = 0xfe9b30;
+const DANGER: u32 = 0xe87575;
 
 pub(crate) const READ_ONLY: &str = "READ ONLY — attach again to take control; Alt+q detach";
 
-pub(crate) fn tab_color(tab: &crate::workspace::TabView) -> u32 {
-    use crate::workspace::TabActivity;
+fn tab_color(tab: &TabView) -> u32 {
     match tab.activity {
-        TabActivity::Running => 0xfe9b30,
-        TabActivity::Finished | TabActivity::Idle | TabActivity::Unknown => 0xb5d2a2,
+        TabActivity::Running => WARNING,
+        TabActivity::Finished | TabActivity::Idle | TabActivity::Unknown => ACCENT,
         TabActivity::Failed => 0xef5350,
     }
 }
 
-pub(crate) fn open_object(client: &Client, pane: PaneId, text: &str) -> io::Result<()> {
+/// The tab row's background, a little darker than the terminal's.
+pub(crate) fn tab_row_color(config: &Config) -> u32 {
+    mix_color(config.background, 0, 230)
+}
+
+/// One part of the tab bar for a frontend to draw on its first row.
+pub(crate) enum TabPart<'a> {
+    /// A tab's background, `width` cells from `x`.
+    Tab {
+        x: u16,
+        width: u16,
+        color: u32,
+    },
+    Text {
+        x: u16,
+        width: u16,
+        text: &'a str,
+        color: u32,
+        background: u32,
+    },
+    Underline {
+        x: u16,
+        width: u16,
+        color: u32,
+    },
+}
+
+/// A part of the window. A pointer's cell is in its area's grid: the workspace view's for the
+/// terminal, the monitor body's or the footer row's from their top left, else the window's.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Area {
+    Tabs,
+    Terminal,
+    Files,
+    Agent,
+    /// The monitor's top edge, which resizes it.
+    Divider,
+    Monitor,
+    Footer,
+    /// Anywhere while a dialog or popup takes the pointer.
+    Overlay,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) struct Pointer {
+    pub kind: PointerKind,
+    pub modifiers: u32,
+    pub area: Area,
+    pub column: u16,
+    pub row: u16,
+    /// The half of the cell under the pointer; without it, frontends press left and drag right.
+    pub side: Side,
+}
+
+/// What a pointer event leaves to the frontend.
+// Only the desktop frontend reads the selections and paste targets.
+#[cfg_attr(not(feature = "gui"), expect(dead_code))]
+pub(crate) enum Effect {
+    None,
+    Input(PaneId, Vec<u8>),
+    Copy(String),
+    /// Text for the primary selection, which only the desktop frontend keeps.
+    Primary(String),
+    /// A finished selection in this pane, likewise for the primary selection.
+    Selected(PaneId),
+    Paste(PasteTarget, bool),
+    Quit,
+}
+
+/// What a press on the panes keeps doing until its release.
+enum Drag {
+    Select {
+        pane: PaneId,
+        point: Point,
+        side: Side,
+        kind: SelectionType,
+    },
+    /// A split divider, with the column or row last sent.
+    Split(SplitDrag, u16),
+    /// The buttons, as bits by number, reported to the application in `pane`.
+    Report { pane: PaneId, buttons: u8 },
+}
+
+/// The pane and point at a workspace view cell, or in `captured`, clamped into it.
+pub(crate) fn pane_point(
+    client: &Client,
+    column: u16,
+    row: u16,
+    side: Side,
+    captured: Option<PaneId>,
+) -> Option<(PaneId, Point, Side)> {
+    let snapshot = client.snapshot()?;
+    let pane = match captured {
+        Some(id) => snapshot.pane(id)?,
+        None => snapshot.pane_at(column, row)?,
+    };
+    let screen = client.screens().get(&pane.id)?;
+    let rect = pane.rect;
+    let last = screen.columns().saturating_sub(1);
+    let (column, side) = match column.checked_sub(rect.x).map(usize::from) {
+        None => (0, Side::Left),
+        Some(column) if column > last => (last, Side::Right),
+        Some(column) => (column, side),
+    };
+    let row = row.clamp(rect.y, rect.y + rect.rows.saturating_sub(1)) - rect.y;
+    let line = i32::from(row) - screen.display_offset() as i32;
+    Some((pane.id, Point { line, column }, side))
+}
+
+fn open_object(client: &Client, pane: PaneId, text: &str) -> io::Result<()> {
     let mut command = std::process::Command::new("xdg-open");
     command.arg(text);
     if !client.is_remote()
@@ -43,30 +158,8 @@ pub(crate) fn open_object(client: &Client, pane: PaneId, text: &str) -> io::Resu
     Ok(())
 }
 
-pub(crate) fn workspace_action(key: char, pane: PaneId) -> Option<Action> {
-    Some(match key {
-        's' => Action::Split {
-            axis: Axis::TopBottom,
-        },
-        'v' => Action::Split {
-            axis: Axis::LeftRight,
-        },
-        'h' => Action::Navigate(Direction::Left),
-        'j' => Action::Navigate(Direction::Down),
-        'k' => Action::Navigate(Direction::Up),
-        'l' => Action::Navigate(Direction::Right),
-        ',' => Action::Tab(-1),
-        '.' => Action::Tab(1),
-        '\r' | '\n' => Action::NewTab { pane },
-        'p' | 'n' => Action::PromptJump {
-            pane,
-            previous: key == 'p',
-        },
-        _ => return None,
-    })
-}
-
-pub(crate) fn copy_action(client: &Client, pane: PaneId) -> Option<Action> {
+/// What Alt+c copies: the selection, else the latest command output.
+fn copy_action(client: &Client, pane: PaneId) -> Option<Action> {
     if client
         .screens()
         .get(&pane)
@@ -108,36 +201,26 @@ pub(crate) fn cursor_bytes<T: AsMut<[u8]>>(mut bytes: T, mode: crate::core::Mode
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TabHit {
     Select(usize),
-    Close(crate::workspace::TabId),
+    Close(TabId),
     New,
     Scroll(i32),
 }
 
 pub(crate) struct TabBar {
-    pub tabs: TabLayout,
+    tabs: TabLayout,
     /// First of the three cells around the new-tab button.
-    pub plus: Option<u16>,
-    pub label: String,
-    pub label_x: u16,
+    plus: Option<u16>,
+    label: String,
+    label_x: u16,
     /// Click boxes (first column, width) of the hidden-tabs counts before and after.
-    pub overflow: [Option<(u16, u16)>; 2],
+    overflow: [Option<(u16, u16)>; 2],
 }
 
 type TabLayout = Vec<(usize, u16, u16)>;
 
-fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout {
-    let text_width = |text: &str, limit: u16| {
-        let prefix = printable_ascii_prefix(&text.as_bytes()[..text.len().min(usize::from(limit))]);
-        let mut width = prefix as u16;
-        for ch in text[prefix..].chars() {
-            let ch = if ch.is_control() { ' ' } else { ch };
-            width = width.saturating_add(u16::from(scalar_width(ch)));
-            if width >= limit {
-                return limit;
-            }
-        }
-        width
-    };
+/// The tabs that fit beside `label`, as (index, column, width), always including the active tab.
+fn tab_layout(snapshot: &Snapshot, columns: u16, label: &str) -> TabLayout {
+    let tab_width = |title: &str| text_width(title).min(22) as u16 + 8;
     let active = snapshot
         .tabs
         .iter()
@@ -146,33 +229,27 @@ fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout
     let active_width = snapshot
         .tabs
         .get(active)
-        .map(|tab| text_width(&tab.title, 22) + 8);
+        .map_or(9, |tab| tab_width(&tab.title));
+    // A read-only viewer keeps room for its indicator even beside a wide active tab.
     let minimum = if snapshot.controller { 0 } else { 12 };
-    let reserve = text_width(right_label, columns)
-        .saturating_add(3)
-        .min(columns.saturating_sub(5 + active_width.unwrap_or(9)))
+    let reserve = (text_width(label).min(usize::from(columns)) as u16 + 3)
+        .min(columns.saturating_sub(5 + active_width))
         .max(minimum.min(columns.saturating_sub(5 + 9)));
     let available = columns.saturating_sub(5 + reserve);
-    let tab_width = |title: &str, available| (text_width(title, 22) + 8).min(available);
     let mut start = active;
-    let mut used = active_width.unwrap_or(0).min(available);
+    let mut used = active_width.min(available);
     while start > 0 {
-        let width = tab_width(&snapshot.tabs[start - 1].title, available);
-        if used.saturating_add(width + 1) > available {
+        let width = tab_width(&snapshot.tabs[start - 1].title).min(available) + 1;
+        if used + width > available {
             break;
         }
-        used += width + 1;
+        used += width;
         start -= 1;
     }
     let mut x = 3;
     let mut layout = Vec::new();
     for (index, tab) in snapshot.tabs.iter().enumerate().skip(start) {
-        let remaining = (3 + available).saturating_sub(x);
-        let width = if index == active {
-            active_width.unwrap_or(0).min(remaining)
-        } else {
-            tab_width(&tab.title, remaining)
-        };
+        let width = tab_width(&tab.title).min((3 + available).saturating_sub(x));
         if width < 9 {
             break;
         }
@@ -182,54 +259,33 @@ fn tab_layout(snapshot: &Snapshot, columns: u16, right_label: &str) -> TabLayout
     layout
 }
 
-fn tab_chrome<'a>(
-    snapshot: &Snapshot,
-    columns: u16,
-    base: &'a str,
-) -> (TabLayout, Cow<'a, str>, usize, usize) {
+fn tab_bar(snapshot: &Snapshot, columns: u16, status: &str) -> TabBar {
     // How many tabs the layout leaves off before and after the shown ones.
     let hidden = |tabs: &TabLayout| {
-        (
-            tabs.first().map_or(0, |tab| tab.0),
-            tabs.last()
-                .map_or(0, |tab| snapshot.tabs.len().saturating_sub(tab.0 + 1)),
-        )
+        let (first, last) = (tabs.first(), tabs.last());
+        let after = last.map_or(0, |tab| snapshot.tabs.len() - tab.0 - 1);
+        (first.map_or(0, |tab| tab.0), after)
     };
-    let label = |(before, after)| {
-        let mut label = match (before, after) {
-            (0, 0) => return Cow::Borrowed(base),
-            (0, _) => format!("{after}›"),
-            (_, 0) => format!("‹{before}"),
-            _ => format!("‹{before} {after}›"),
-        };
-        if !base.is_empty() {
-            label.push(' ');
-            label.push_str(base);
-        }
-        Cow::Owned(label)
+    let label = |(before, after): (usize, usize)| {
+        let before = (before > 0).then(|| format!("‹{before}"));
+        let after = (after > 0).then(|| format!("{after}›"));
+        let status = (!status.is_empty()).then(|| status.to_owned());
+        let parts: Vec<_> = [before, after, status].into_iter().flatten().collect();
+        parts.join(" ")
     };
-    let mut tabs = tab_layout(snapshot, columns, base);
+    let mut tabs = tab_layout(snapshot, columns, status);
     let mut counts = hidden(&tabs);
-    let mut text = label(counts);
-    // The label takes columns from the tabs, which can change what is hidden.
+    // The counts take columns from the tabs, which can change what is hidden.
     if counts != (0, 0) {
-        tabs = tab_layout(snapshot, columns, &text);
-        if hidden(&tabs) != counts {
-            counts = hidden(&tabs);
-            text = label(counts);
-        }
+        tabs = tab_layout(snapshot, columns, &label(counts));
+        counts = hidden(&tabs);
     }
-    (tabs, text, counts.0, counts.1)
-}
-
-pub(crate) fn tab_bar(snapshot: &Snapshot, columns: u16, status: &str) -> TabBar {
-    let (tabs, label, before, after) = tab_chrome(snapshot, columns, status);
     let end = tabs.last().map_or(3, |&(_, x, width)| x + width + 1);
-    let label = fit_label(&label, columns.saturating_sub(end + 4)).into_owned();
+    let label = fit_label(&label(counts), columns.saturating_sub(end + 4)).into_owned();
     let label_width = text_width(&label) as u16;
     let label_x = columns.saturating_sub(label_width + 2);
     let mut column = label_x;
-    let overflow = [before, after].map(|count| {
+    let overflow = [counts.0, counts.1].map(|count| {
         let width = count.checked_ilog10()? as u16 + 2;
         let hit = (column + width <= label_x + label_width).then_some((column, width));
         column += width + 1;
@@ -245,7 +301,7 @@ pub(crate) fn tab_bar(snapshot: &Snapshot, columns: u16, status: &str) -> TabBar
 }
 
 impl TabBar {
-    pub fn at(&self, snapshot: &Snapshot, column: u16) -> Option<TabHit> {
+    fn at(&self, snapshot: &Snapshot, column: u16) -> Option<TabHit> {
         if let Some(&(index, x, width)) = self
             .tabs
             .iter()
@@ -277,36 +333,6 @@ pub(crate) fn block_at(client: &Client, pane: PaneId, point: Point) -> Option<(P
         .map(|block| (pane, block.id))
 }
 
-pub(crate) fn agent_hit(
-    hits: &[(Rect, crate::agent::panel::AgentAction)],
-    column: u16,
-    row: u16,
-) -> Option<crate::agent::panel::AgentAction> {
-    hits.iter()
-        .rfind(|(rect, _)| rect.contains(column, row))
-        .map(|(_, action)| *action)
-}
-
-pub(crate) fn transcript_point(
-    session: &crate::agent::panel::AgentSession,
-    rows: &[(usize, Rect)],
-    column: u16,
-    row: u16,
-    clamp: bool,
-) -> Option<crate::agent::panel::TranscriptPoint> {
-    let (line, rect) = if clamp {
-        rows.iter()
-            .rfind(|(_, rect)| rect.y <= row)
-            .or_else(|| rows.first())?
-    } else {
-        rows.iter().find(|(_, rect)| rect.contains(column, row))?
-    };
-    session.point(
-        *line,
-        usize::from(column.saturating_sub(rect.x)).min(usize::from(rect.cols)),
-    )
-}
-
 #[derive(Clone, Copy)]
 pub(crate) struct PanelLayout {
     pub terminal_columns: u16,
@@ -333,12 +359,6 @@ pub(crate) struct ClosePrompt {
     pub terminate: bool,
 }
 
-pub(crate) fn close_rect(columns: u16, rows: u16) -> Rect {
-    let cols = columns.saturating_sub(4).min(64);
-    let height = rows.saturating_sub(2).min(7);
-    rect((columns - cols) / 2, (rows - height) / 2, cols, height)
-}
-
 fn close_buttons(area: Rect, tab: bool) -> [(Rect, &'static str); 2] {
     let [cancel, confirm] = if tab {
         [" Cancel ", " Close tab "]
@@ -351,77 +371,6 @@ fn close_buttons(area: Rect, tab: bool) -> [(Rect, &'static str); 2] {
     [(first, cancel), (second, confirm)]
 }
 
-pub(crate) fn close_grid(
-    prompt: ClosePrompt,
-    name: &str,
-    rect: Rect,
-    pointer: Option<(u16, u16)>,
-    config: &Config,
-) -> Grid {
-    let background = mix_color(config.foreground, config.background, 9);
-    let muted = mix_color(config.foreground, config.background, 176);
-    let mut grid = Grid::new(rect, config.foreground, background);
-    let columns = rect.cols.saturating_sub(4);
-    let (title, detail, effect) = if prompt.tab.is_some() {
-        (
-            format!("Close tab · {name}"),
-            "Programs may still be running in this tab",
-            "Closing terminates all panes in this tab".to_string(),
-        )
-    } else {
-        let quoted = if name
-            .bytes()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
-        {
-            name.to_string()
-        } else {
-            format!("'{}'", name.replace('\'', "'\\''"))
-        };
-        (
-            format!("Close window · {name}"),
-            "End session to stop tasks and delete history",
-            format!("Resume with: nextty attach {quoted}"),
-        )
-    };
-    for (row, text, color) in [
-        (0, title.as_str(), config.foreground),
-        (2, detail, muted),
-        (3, effect.as_str(), muted),
-        (5, "Tab select   Enter confirm   Esc cancel", muted),
-    ] {
-        if row < rect.rows.saturating_sub(1) {
-            grid.text(rect.x + 2, rect.y + row, columns, text, color, background);
-        }
-    }
-    for (index, (button, label)) in close_buttons(rect, prompt.tab.is_some())
-        .into_iter()
-        .enumerate()
-    {
-        let terminate = index == 1;
-        let lit = prompt.terminate == terminate
-            || pointer.is_some_and(|(column, row)| button.contains(column, row));
-        let color = match (terminate, lit) {
-            (true, true) => 0xe87575,
-            (false, true) => crate::panel::ACCENT,
-            _ => muted,
-        };
-        let fill = if lit {
-            mix_color(config.foreground, config.background, 24)
-        } else {
-            background
-        };
-        grid.text(button.x, button.y, button.cols, label, color, fill);
-    }
-    grid
-}
-
-pub(crate) fn close_hit(rect: Rect, prompt: ClosePrompt, column: u16, row: u16) -> Option<bool> {
-    close_buttons(rect, prompt.tab.is_some())
-        .iter()
-        .position(|(button, _)| button.contains(column, row))
-        .map(|index| index == 1)
-}
-
 pub(crate) struct Ui {
     pub status: Option<(String, Instant)>,
     pub focus: Focus,
@@ -431,6 +380,13 @@ pub(crate) struct Ui {
     pub resources: Monitor,
     pub files: Option<FileNav>,
     pub files_open: bool,
+    drag: Option<Drag>,
+    /// The last press on the panes and how many quick presses there it ends.
+    click: Option<(Instant, PaneId, Point, u8)>,
+    // Where the last frame drew what the pointer can hit.
+    tabs: Option<TabBar>,
+    file_rects: (Rect, Rect),
+    close_rect: Rect,
 }
 
 impl Ui {
@@ -448,15 +404,308 @@ impl Ui {
             resources: Monitor::new()?,
             files: None,
             files_open: false,
+            drag: None,
+            click: None,
+            tabs: None,
+            file_rects: Default::default(),
+            close_rect: Rect::default(),
+        })
+    }
+
+    /// The area whose grid keeps the pointer whatever is under it.
+    pub fn capture(&self) -> Option<Area> {
+        let session = self.agent.active();
+        if self.modal() || session.context.preview.is_some() {
+            Some(Area::Overlay)
+        } else if session.selecting() || self.agent.selecting_editor {
+            Some(Area::Agent)
+        } else {
+            self.drag.as_ref().map(|_| Area::Terminal)
+        }
+    }
+
+    /// Applies the pointer rules both frontends share.
+    pub fn pointer(&mut self, client: &mut Client, pointer: Pointer) -> io::Result<Effect> {
+        let Pointer {
+            kind,
+            area,
+            column,
+            row,
+            ..
+        } = pointer;
+        if let Some(prompt) = self.close_prompt {
+            let hit = close_buttons(self.close_rect, prompt.tab.is_some())
+                .iter()
+                .position(|(button, _)| button.contains(column, row));
+            if kind == PointerKind::Press(LEFT)
+                && let Some(index) = hit
+                && let KeyResult::Quit = self.choose_close(client, index == 1)?
+            {
+                return Ok(Effect::Quit);
+            }
+            return Ok(Effect::None);
+        }
+        if self.file_preview_open() {
+            self.file_pointer(kind, column, row);
+            return Ok(Effect::None);
+        }
+        match self.capture() {
+            Some(Area::Terminal) => return self.pane_pointer(client, pointer),
+            Some(_) => return Ok(self.agent_pointer(client, pointer)),
+            None => (),
+        }
+        match (kind, area) {
+            (PointerKind::Press(button), _) => return self.press(client, button, pointer),
+            (PointerKind::Release(LEFT), _) => self.resources.dragging = false,
+            (_, Area::Terminal) => return self.pane_pointer(client, pointer),
+            (PointerKind::Wheel(_), Area::Agent) => return Ok(self.agent_pointer(client, pointer)),
+            (PointerKind::Wheel(_), Area::Files) => self.file_pointer(kind, column, row),
+            (PointerKind::Wheel(lines), Area::Divider | Area::Monitor | Area::Footer)
+                if self.resources.open =>
+            {
+                let scroll = &mut self.resources.scroll;
+                *scroll = scroll.saturating_add_signed(-(lines * WHEEL_LINES) as isize);
+            }
+            _ => (),
+        }
+        Ok(Effect::None)
+    }
+
+    /// A press focuses the region under it; the monitor's controls keep its focus.
+    fn press(&mut self, client: &mut Client, button: u8, pointer: Pointer) -> io::Result<Effect> {
+        let Pointer {
+            area, column, row, ..
+        } = pointer;
+        if area != Area::Agent || self.agent.hit(column, row).is_none() {
+            self.agent.active_mut().context.menu = false;
+        }
+        if button == LEFT && !matches!(area, Area::Divider | Area::Monitor | Area::Footer) {
+            self.focus = Focus::Terminal;
+            self.resources.searching = false;
+            if area != Area::Agent {
+                self.cancel_rewind();
+            }
+        }
+        match area {
+            Area::Terminal => return self.pane_pointer(client, pointer),
+            Area::Agent => return Ok(self.agent_pointer(client, pointer)),
+            Area::Tabs if button == LEFT && client.controller() => {
+                let snapshot = client.snapshot().unwrap();
+                if let Some(hit) = self.tabs.as_ref().and_then(|bar| bar.at(snapshot, column)) {
+                    self.tab_click(client, hit)?;
+                }
+            }
+            Area::Files => {
+                self.focus = Focus::Files;
+                self.file_pointer(pointer.kind, column, row);
+            }
+            Area::Divider if button == LEFT => self.monitor_drag(),
+            Area::Monitor | Area::Footer => {
+                if area == Area::Monitor && button == LEFT {
+                    self.focus_monitor();
+                }
+                let action = self.resources.hit(area == Area::Footer, column, row);
+                match (button, action) {
+                    (LEFT, Some(action)) => self.monitor_action(client, action)?,
+                    (MIDDLE, Some(action @ crate::monitor::Action::Search)) => {
+                        self.monitor_action(client, action)?;
+                        return Ok(Effect::Paste(PasteTarget::Monitor, true));
+                    }
+                    _ => (),
+                }
+            }
+            _ => (),
+        }
+        Ok(Effect::None)
+    }
+
+    /// Splits, selections, clicks, copies, pastes, mouse reports and the wheel on the panes.
+    fn pane_pointer(&mut self, client: &mut Client, pointer: Pointer) -> io::Result<Effect> {
+        let Pointer {
+            kind,
+            modifiers,
+            column,
+            row,
+            side,
+            ..
+        } = pointer;
+        let along = |split: SplitDrag| match split.axis {
+            Axis::LeftRight => column,
+            Axis::TopBottom => row,
+        };
+        let controller = client.controller();
+        if let Some(Drag::Split(split, position)) = &mut self.drag
+            && controller
+        {
+            match kind {
+                PointerKind::Release(LEFT) => self.drag = None,
+                PointerKind::Motion if along(*split) != *position => {
+                    *position = along(*split);
+                    client.send(split.action(column, row))?;
+                }
+                _ => (),
+            }
+            return Ok(Effect::None);
+        }
+        if kind == PointerKind::Press(LEFT)
+            && controller
+            && let Some(split) = client.snapshot().unwrap().divider_at(column, row)
+        {
+            self.drag = Some(Drag::Split(split, along(split)));
+            return Ok(Effect::None);
+        }
+        let captured = match self.drag {
+            Some(Drag::Select { pane, .. } | Drag::Report { pane, .. }) => Some(pane),
+            _ => None,
+        };
+        let Some((pane, point, side)) = pane_point(client, column, row, side, captured) else {
+            return Ok(Effect::None);
+        };
+        let screen = &client.screens()[&pane];
+        let (mode, offset) = (screen.mode(), screen.display_offset());
+        if kind == PointerKind::Press(RIGHT) {
+            if let Some(object) = crate::context::object_at(screen, point) {
+                return Ok(Effect::Copy(object.text));
+            }
+            if let Some((pane, block)) = block_at(client, pane, point) {
+                client.send(Action::CopyBlock { pane, block })?;
+                return Ok(Effect::None);
+            }
+        }
+        if !controller {
+            // A drag that lost control of the workspace ends.
+            self.drag = None;
+            return Ok(Effect::None);
+        }
+        // Alt keeps the pointer local while the application captures it.
+        let reporting = mode.intersects(Mode::MOUSE_MODE) && modifiers & ALT == 0;
+        let cell = (point.column, (point.line + offset as i32) as usize);
+        let report = |button, release, count| {
+            mouse_bytes(button, modifiers, cell, release, mode)
+                .map_or(Effect::None, |data| Effect::Input(pane, data.repeat(count)))
+        };
+        let paste = PasteTarget::Pane {
+            pane,
+            bracketed: mode.contains(Mode::BRACKETED_PASTE),
+        };
+        match kind {
+            PointerKind::Press(button) => {
+                if client.focused() != Some(pane) {
+                    self.act(client, Action::Focus(pane))?;
+                }
+                if reporting {
+                    let held = match self.drag {
+                        Some(Drag::Report { buttons, .. }) => buttons,
+                        _ => 0,
+                    };
+                    let buttons = held | 1 << button;
+                    self.drag = Some(Drag::Report { pane, buttons });
+                    return Ok(report(button, false, 1));
+                }
+                match button {
+                    LEFT => self.select(client, pane, point, side)?,
+                    MIDDLE => return Ok(Effect::Paste(paste, true)),
+                    _ => return Ok(Effect::Paste(paste, false)),
+                }
+            }
+            PointerKind::Motion => match self.drag {
+                Some(Drag::Select { .. }) => {
+                    client.send(Action::SelectionUpdate { pane, point, side })?;
+                }
+                Some(Drag::Report { buttons, .. })
+                    if reporting && mode.intersects(Mode::MOUSE_DRAG | Mode::MOUSE_MOTION) =>
+                {
+                    return Ok(report(32 + buttons.trailing_zeros() as u8, false, 1));
+                }
+                None if reporting && mode.contains(Mode::MOUSE_MOTION) => {
+                    return Ok(report(32 + 3, false, 1));
+                }
+                _ => (),
+            },
+            PointerKind::Release(button) => match self.drag {
+                Some(Drag::Select {
+                    point: start,
+                    side: start_side,
+                    kind,
+                    ..
+                }) if button == LEFT => {
+                    // The release comes where the last motion already moved the selection.
+                    self.drag = None;
+                    if kind != SelectionType::Simple || (point, side) != (start, start_side) {
+                        return Ok(Effect::Selected(pane));
+                    }
+                }
+                Some(Drag::Report { buttons, .. }) if buttons & 1 << button != 0 => {
+                    let buttons = buttons & !(1 << button);
+                    self.drag = (buttons != 0).then_some(Drag::Report { pane, buttons });
+                    return Ok(report(button, true, 1));
+                }
+                _ => (),
+            },
+            PointerKind::Wheel(lines) => {
+                let count = lines.unsigned_abs() as usize;
+                if reporting {
+                    return Ok(report(if lines > 0 { 64 } else { 65 }, false, count));
+                }
+                if mode.contains(Mode::ALT_SCREEN | Mode::ALTERNATE_SCROLL) && modifiers & ALT == 0
+                {
+                    let arrow = cursor_bytes(if lines > 0 { *b"\x1b[A" } else { *b"\x1b[B" }, mode);
+                    let arrows = arrow.repeat(count * WHEEL_LINES as usize);
+                    return Ok(Effect::Input(pane, arrows));
+                }
+                let scroll = Scroll::Delta(lines * WHEEL_LINES);
+                client.send(Action::Scroll { pane, scroll })?;
+            }
+        }
+        Ok(Effect::None)
+    }
+
+    /// A left press on a pane: one starts a selection, two open the object under it or
+    /// select a word, three select lines.
+    fn select(
+        &mut self,
+        client: &mut Client,
+        pane: PaneId,
+        point: Point,
+        side: Side,
+    ) -> io::Result<()> {
+        let now = Instant::now();
+        let count = match self.click {
+            Some((at, clicked, place, count))
+                if (clicked, place) == (pane, point) && now.duration_since(at) < DOUBLE_CLICK =>
+            {
+                count % 3 + 1
+            }
+            _ => 1,
+        };
+        self.click = Some((now, pane, point, count));
+        if count == 2
+            && let Some(object) = crate::context::object_at(&client.screens()[&pane], point)
+        {
+            return open_object(client, pane, &object.text);
+        }
+        let kind = [
+            SelectionType::Simple,
+            SelectionType::Semantic,
+            SelectionType::Lines,
+        ][usize::from(count - 1)];
+        self.drag = Some(Drag::Select {
+            pane,
+            point,
+            side,
+            kind,
+        });
+        client.send(Action::SelectionStart {
+            pane,
+            point,
+            side,
+            kind,
         })
     }
 
     pub fn file_preview_open(&self) -> bool {
         self.files_open
-            && self
-                .files
-                .as_ref()
-                .is_some_and(|files| files.focus() == crate::files::FileFocus::Preview)
+            && (self.files.as_ref()).is_some_and(|files| files.focus() == FileFocus::Preview)
     }
 
     /// A popup that takes every key and click until dismissed.
@@ -464,31 +713,24 @@ impl Ui {
         self.close_prompt.is_some() || self.file_preview_open()
     }
 
-    pub fn input_target(&self) -> Option<crate::input::PasteTarget> {
-        use crate::input::PasteTarget;
-        if self.file_preview_open() {
-            return Some(PasteTarget::Files);
-        }
-        if self.agent.active().context.preview.is_some() {
-            return Some(PasteTarget::Agent(self.agent.active().id));
-        }
-        if self.search.open {
-            return Some(PasteTarget::Search);
-        }
-        if self.resources.open && self.focus == Focus::Monitor {
-            return Some(PasteTarget::Monitor);
-        }
-        if self.agent.open && self.focus.is_agent() {
-            return Some(PasteTarget::Agent(self.agent.active().id));
-        }
-        if self.files_open && self.focus == Focus::Files {
-            return Some(PasteTarget::Files);
-        }
-        None
+    /// The panel that receives typed input, in order of precedence; `None` is the terminal.
+    pub fn input_target(&self) -> Option<PasteTarget> {
+        let agent = PasteTarget::Agent(self.agent.active().id);
+        let monitor = self.resources.open && self.focus == Focus::Monitor;
+        let files = self.files_open && self.focus == Focus::Files;
+        [
+            (self.file_preview_open(), PasteTarget::Files),
+            (self.agent.active().context.preview.is_some(), agent),
+            (self.search.open, PasteTarget::Search),
+            (monitor, PasteTarget::Monitor),
+            (self.agent.open && self.focus.is_agent(), agent),
+            (files, PasteTarget::Files),
+        ]
+        .into_iter()
+        .find_map(|(active, target)| active.then_some(target))
     }
 
-    pub fn paste_target(&self) -> Option<crate::input::PasteTarget> {
-        use crate::input::PasteTarget;
+    pub fn paste_target(&self) -> Option<PasteTarget> {
         match self.input_target()? {
             PasteTarget::Monitor if !self.resources.searching => None,
             PasteTarget::Agent(_)
@@ -500,22 +742,15 @@ impl Ui {
         }
     }
 
-    pub fn text_target(&self) -> Option<crate::input::PasteTarget> {
+    pub fn text_target(&self) -> Option<PasteTarget> {
         self.paste_target().filter(|target| {
-            *target != crate::input::PasteTarget::Files
-                || self.files.as_ref().is_some_and(|files| {
-                    files.is_search() && files.focus() == crate::files::FileFocus::List
-                })
+            *target != PasteTarget::Files
+                || (self.files.as_ref())
+                    .is_some_and(|files| files.is_search() && files.focus() == FileFocus::List)
         })
     }
 
-    pub fn key(
-        &mut self,
-        client: &mut crate::workspace::Client,
-        key: crate::input::Key<'_>,
-        viewport: (usize, usize),
-    ) -> io::Result<KeyResult> {
-        use crate::input::symbol_char;
+    pub fn key(&mut self, client: &mut Client, key: Key<'_>) -> io::Result<KeyResult> {
         if key.modifiers & crate::input::SUPER != 0 {
             return Ok(KeyResult::Handled);
         }
@@ -535,7 +770,7 @@ impl Ui {
             }
             return Ok(KeyResult::Handled);
         }
-        if let Some(result) = self.agent_key_input(client, &key, viewport)? {
+        if let Some(result) = self.agent_key_input(client, &key)? {
             return Ok(result);
         }
         if self.search.open {
@@ -552,110 +787,90 @@ impl Ui {
             if paste && self.resources.searching {
                 return Ok(KeyResult::Paste);
             }
-            self.resources.key(
-                if key.symbol == keysym::TAB && shift {
-                    keysym::LEFT_TAB
-                } else {
-                    key.symbol
-                },
-                key.text,
-                control,
-            );
+            let symbol = if key.symbol == keysym::TAB && shift {
+                keysym::LEFT_TAB
+            } else {
+                key.symbol
+            };
+            self.resources.key(symbol, key.text, control);
             self.monitor_jump(client)?;
             if !self.resources.open {
                 self.focus = Focus::Terminal;
             }
             return Ok(KeyResult::Handled);
         }
-
         if self.files_open && self.focus == Focus::Files {
-            use crate::files::FileFocus;
-            if paste {
-                return Ok(if self.file_preview_open() {
-                    KeyResult::Handled
-                } else {
-                    KeyResult::Paste
-                });
-            }
-            let Some(files) = &mut self.files else {
-                return Ok(KeyResult::Handled);
-            };
-            let preview = files.focus() == FileFocus::Preview;
-            let search = files.is_search() && !preview;
-            let shortcut = if !search {
-                match symbol_char(key.symbol) {
-                    Some('h') => Some(keysym::LEFT),
-                    Some('j') => Some(keysym::DOWN),
-                    Some('k') => Some(keysym::UP),
-                    Some('l') => Some(keysym::RIGHT),
-                    Some('/') if !preview => Some(u32::from('/')),
-                    _ => None,
-                }
-            } else {
-                None
-            };
-            let symbol = shortcut.unwrap_or(key.symbol);
-            match symbol {
-                keysym::TAB | keysym::LEFT_TAB => {
-                    if preview {
-                        files.focus_list();
-                    } else {
-                        files.focus_preview();
-                    }
-                }
-                keysym::ESCAPE | keysym::BACKSPACE | keysym::LEFT if preview => files.focus_list(),
-                keysym::ESCAPE => {
-                    if files.is_search() {
-                        files.stop_search();
-                    } else {
-                        self.files_open = false;
-                        self.focus = Focus::Terminal;
-                    }
-                }
-                keysym::BACKSPACE | keysym::LEFT => {
-                    if files.is_search() {
-                        files.key_query(symbol, control);
-                    } else {
-                        files.parent();
-                    }
-                }
-                keysym::HOME | keysym::END | keysym::DELETE if files.is_search() => {
-                    files.key_query(symbol, control)
-                }
-                keysym::UP | keysym::DOWN => {
-                    let delta = if symbol == keysym::UP { -1 } else { 1 };
-                    files.scroll(delta, viewport.1);
-                }
-                keysym::RIGHT => {
-                    if !files.enter_selected() {
-                        files.focus_preview();
-                    }
-                }
-                keysym::RETURN | keysym::KP_ENTER => {
-                    if let Some(entry) = files.selected() {
-                        let path = entry.path.to_string_lossy().into_owned();
-                        files.focus_list();
-                        if let Some(pane) = client.snapshot().and_then(|view| view.focused_pane()) {
-                            client.send(Action::Input {
-                                pane: pane.id,
-                                data: path.into_bytes(),
-                            })?;
-                            self.focus = Focus::Terminal;
-                        }
-                        return Ok(KeyResult::Handled);
-                    }
-                }
-                0x2f if shortcut.is_some() => files.start_search(),
-                _ if search && control => files.key_query(symbol, true),
-                _ if search && !key.text.is_empty() => files.insert_query(key.text),
-                _ => (),
-            }
-            return Ok(KeyResult::Handled);
+            return self.file_key(client, &key);
         }
         Ok(KeyResult::Unhandled)
     }
 
-    pub fn choose_close(&mut self, client: &mut Client, terminate: bool) -> io::Result<KeyResult> {
+    fn file_key(&mut self, client: &mut Client, key: &Key<'_>) -> io::Result<KeyResult> {
+        if key.paste() {
+            return Ok(if self.file_preview_open() {
+                KeyResult::Handled
+            } else {
+                KeyResult::Paste
+            });
+        }
+        // Only the preview scrolls by its height.
+        let rows = usize::from(crate::panel::popup_body(self.file_rects.1).rows);
+        let files = self.files.as_mut().unwrap();
+        let preview = files.focus() == FileFocus::Preview;
+        let search = files.is_search();
+        let typing = search && !preview;
+        // Unless a query is being typed, h/j/k/l move like the arrow keys and / starts a query.
+        let symbol = match symbol_char(key.symbol).filter(|_| !typing) {
+            Some('h') => keysym::LEFT,
+            Some('j') => keysym::DOWN,
+            Some('k') => keysym::UP,
+            Some('l') => keysym::RIGHT,
+            Some('/') if !preview => {
+                files.start_search();
+                return Ok(KeyResult::Handled);
+            }
+            _ => key.symbol,
+        };
+        match symbol {
+            keysym::TAB | keysym::LEFT_TAB if preview => files.focus_list(),
+            keysym::TAB | keysym::LEFT_TAB => files.focus_preview(),
+            keysym::ESCAPE | keysym::BACKSPACE | keysym::LEFT if preview => files.focus_list(),
+            keysym::ESCAPE if search => files.stop_search(),
+            keysym::ESCAPE => {
+                self.files_open = false;
+                self.focus = Focus::Terminal;
+            }
+            keysym::BACKSPACE | keysym::LEFT | keysym::HOME | keysym::END | keysym::DELETE
+                if search =>
+            {
+                files.key_query(symbol, key.control())
+            }
+            keysym::BACKSPACE | keysym::LEFT => files.parent(),
+            keysym::UP => files.scroll(-1, rows),
+            keysym::DOWN => files.scroll(1, rows),
+            keysym::RIGHT => {
+                if !files.enter_selected() {
+                    files.focus_preview();
+                }
+            }
+            keysym::RETURN | keysym::KP_ENTER => {
+                if let Some(entry) = files.selected() {
+                    let data = entry.path.to_string_lossy().into_owned().into_bytes();
+                    files.focus_list();
+                    if let Some(pane) = client.focused() {
+                        client.send(Action::Input { pane, data })?;
+                        self.focus = Focus::Terminal;
+                    }
+                }
+            }
+            _ if typing && key.control() => files.key_query(symbol, true),
+            _ if typing && !key.text.is_empty() => files.insert_query(key.text),
+            _ => (),
+        }
+        Ok(KeyResult::Handled)
+    }
+
+    fn choose_close(&mut self, client: &mut Client, terminate: bool) -> io::Result<KeyResult> {
         let prompt = self.close_prompt.take().unwrap();
         match (prompt.tab, terminate) {
             (Some(tab), true) => self.act(client, Action::CloseTab(tab))?,
@@ -694,29 +909,36 @@ impl Ui {
             return Ok(false);
         };
         let (pane, controller) = (snapshot.focused, snapshot.controller);
-        if key == '/' {
-            if self.search.open {
-                self.search.close(client)?;
-            } else {
-                self.search.begin(client, pane)?;
-            }
-            return Ok(true);
-        }
-        let action = if key == 'c' {
-            copy_action(client, pane)
-        } else {
-            workspace_action(key, pane)
+        let split = |axis| Some(Action::Split { axis });
+        let navigate = |direction| Some(Action::Navigate(direction));
+        let action = match key {
+            '/' if self.search.open => return self.search.close(client).map(|()| true),
+            '/' => return self.search.begin(client, pane).map(|()| true),
+            'a' | 'f' | 'm' => None,
+            'c' => copy_action(client, pane),
+            's' => split(Axis::TopBottom),
+            'v' => split(Axis::LeftRight),
+            'h' => navigate(Direction::Left),
+            'j' => navigate(Direction::Down),
+            'k' => navigate(Direction::Up),
+            'l' => navigate(Direction::Right),
+            ',' => Some(Action::Tab(-1)),
+            '.' => Some(Action::Tab(1)),
+            '\r' | '\n' => Some(Action::NewTab { pane }),
+            'p' | 'n' => Some(Action::PromptJump {
+                pane,
+                previous: key == 'p',
+            }),
+            _ => return Ok(false),
         };
-        if action.is_none() && !matches!(key, 'a' | 'f' | 'm' | 'c') {
-            return Ok(false);
-        }
         self.search.close(client)?;
         match (key, action) {
             ('a', _) => self.toggle_agent(),
             ('f', _) => self.toggle_files(client)?,
             ('m', _) => {
                 self.agent.active_mut().context.menu = false;
-                self.toggle_monitor();
+                self.resources.toggle();
+                self.focus_monitor();
             }
             (_, None) => self.message("No command output to copy"),
             (key, Some(action)) => {
@@ -731,48 +953,51 @@ impl Ui {
         Ok(true)
     }
 
-    /// Columns and rows the file panel's keys scroll by.
-    pub fn file_viewport(&self, list: Rect, preview: Rect) -> (usize, usize) {
-        if self.file_preview_open() {
-            (
-                usize::from(preview.cols),
-                usize::from(preview.rows.saturating_sub(5)),
-            )
-        } else {
-            (usize::from(list.cols), usize::from(list.rows))
-        }
+    /// The file list and its open preview popup, whose places the pointer and keys then use.
+    pub fn file_grids(
+        &mut self,
+        list: Rect,
+        preview: Rect,
+        preedit: &str,
+        config: &Config,
+    ) -> (Grid, Option<Grid>) {
+        self.file_rects = (list, preview);
+        let files = self.files.as_mut().unwrap();
+        let open = files.focus() == FileFocus::Preview;
+        let focused = self.focus == Focus::Files && !open;
+        let grid = crate::file_panel::list(files, list, preedit, focused, config);
+        (
+            grid,
+            open.then(|| crate::file_panel::preview(files, preview, config)),
+        )
     }
 
-    /// A left press in the file panel; the open preview popup captures all of them.
-    pub fn file_press(&mut self, list: Rect, preview: Rect, column: u16, row: u16) {
-        let Some(files) = &mut self.files else {
-            return;
-        };
-        if files.focus() == crate::files::FileFocus::Preview {
-            if !preview.contains(column, row)
-                || crate::panel::popup_close(preview).contains(column, row)
-            {
-                files.focus_list();
+    /// A left press or the wheel on the file panel; the open preview popup takes all of them.
+    fn file_pointer(&mut self, kind: PointerKind, column: u16, row: u16) {
+        let (list, preview) = self.file_rects;
+        let files = self.files.as_mut().unwrap();
+        let open = files.focus() == FileFocus::Preview;
+        match kind {
+            PointerKind::Press(LEFT) if open => {
+                if !preview.contains(column, row)
+                    || crate::panel::popup_close(preview).contains(column, row)
+                {
+                    files.focus_list();
+                }
             }
-        } else if let Some(index) =
-            crate::file_panel::Layout::new(list, files).entry_at(files, column, row)
-        {
-            files.move_selection(index as isize - files.selection() as isize);
-            files.focus_preview();
+            PointerKind::Press(LEFT) => {
+                let layout = crate::file_panel::Layout::new(list, files);
+                if let Some(index) = layout.entry_at(files, column, row) {
+                    files.move_selection(index as isize - files.selection() as isize);
+                    files.focus_preview();
+                }
+            }
+            PointerKind::Wheel(lines) => {
+                let rows = crate::panel::popup_body(preview).rows;
+                files.scroll(-(lines * WHEEL_LINES) as isize, usize::from(rows));
+            }
+            _ => (),
         }
-    }
-
-    /// Wheel travel in lines, positive towards the end of the list or preview.
-    pub fn file_wheel(&mut self, down: isize, list: Rect, preview: Rect) {
-        let Some(files) = &mut self.files else {
-            return;
-        };
-        let rows = if files.focus() == crate::files::FileFocus::Preview {
-            crate::panel::popup_body(preview).rows
-        } else {
-            list.rows.saturating_sub(2)
-        };
-        files.scroll(down, usize::from(rows));
     }
 
     pub fn toggle_files(&mut self, client: &Client) -> io::Result<()> {
@@ -824,29 +1049,12 @@ impl Ui {
         self.act(client, action)
     }
 
-    /// Wheel over the agent panel: the preview if open, else the editor when
-    /// given its (first row, total rows, visible rows), else the transcript.
-    pub fn agent_wheel(&mut self, down: isize, editor: Option<(usize, usize, usize)>) {
-        let session = self.agent.active_mut();
-        if let Some(preview) = &mut session.context.preview {
-            preview.scroll = preview.scroll.saturating_add_signed(down);
-        } else if let Some((first, total, rows)) = editor {
-            session.editor_scroll = Some(
-                first
-                    .saturating_add_signed(down)
-                    .min(total.saturating_sub(rows)),
-            );
-        } else {
-            session.model.scroll = session.model.scroll.saturating_add_signed(-down);
-        }
-    }
-
-    pub fn monitor_drag(&mut self) {
+    fn monitor_drag(&mut self) {
         self.resources.dragging = true;
         self.focus_monitor();
     }
 
-    pub fn monitor_action(
+    fn monitor_action(
         &mut self,
         client: &mut Client,
         action: crate::monitor::Action,
@@ -869,20 +1077,14 @@ impl Ui {
 
     pub fn paste(
         &mut self,
-        client: &mut crate::workspace::Client,
-        target: crate::input::PasteTarget,
+        client: &mut Client,
+        target: PasteTarget,
         text: &str,
     ) -> io::Result<()> {
-        use crate::input::PasteTarget;
         match target {
             PasteTarget::Search => self.search.edit(client, text)?,
             PasteTarget::Monitor => self.resources.insert_query(text),
-            PasteTarget::Files => {
-                if let Some(files) = &mut self.files {
-                    files.insert_query(text);
-                }
-            }
-
+            PasteTarget::Files => self.files.as_mut().unwrap().insert_query(text),
             PasteTarget::Agent(id) => {
                 if let Err(error) = self.agent.insert(id, text) {
                     self.message(error);
@@ -902,12 +1104,8 @@ impl Ui {
                 .map_or(-1, FileNav::fd),
             self.agent.layout_fd(),
         ]
+        .map(|fd| crate::sys::watch(fd, libc::POLLIN))
         .into_iter()
-        .map(|fd| libc::pollfd {
-            fd,
-            events: libc::POLLIN,
-            revents: 0,
-        })
     }
 
     pub fn deadline(&self) -> Option<Instant> {
@@ -920,15 +1118,15 @@ impl Ui {
         .min()
     }
 
-    /// Polls everything the frontend's event loop waits on besides the workspace;
-    /// returns whether to redraw and whether the agent's messages changed.
+    /// Polls everything the frontend's event loop waits on besides the workspace; returns
+    /// whether to redraw.
     pub fn service(
         &mut self,
         client: &mut Client,
         config: &Config,
         fds: &[libc::pollfd],
-    ) -> io::Result<(bool, bool)> {
-        let (agent, messages) = self.poll_agent(client, config)?;
+    ) -> io::Result<bool> {
+        let agent = self.poll_agent(client, config)?;
         let ready = |fd| {
             fds.iter()
                 .any(|source| source.fd == fd && source.revents != 0)
@@ -959,40 +1157,46 @@ impl Ui {
             && let Some(files) = &mut self.files
             && ready(files.fd())
         {
-            files.drain_notification()?;
-            changed |= files.poll();
+            changed |= files.poll()?;
         }
-        Ok((changed, messages))
+        Ok(changed)
     }
 
-    pub fn request_close_tab(&mut self, tab: &crate::workspace::TabView) -> bool {
-        use crate::workspace::TabActivity;
-        if matches!(tab.activity, TabActivity::Running | TabActivity::Unknown) {
+    /// Whether `tab` may close at once; otherwise this asks for confirmation first.
+    pub fn request_close_tab(&mut self, tab: &TabView) -> bool {
+        let busy = matches!(tab.activity, TabActivity::Running | TabActivity::Unknown);
+        if busy {
             self.close_prompt = Some(ClosePrompt {
                 tab: Some(tab.id),
                 terminate: false,
             });
-            false
-        } else {
-            true
         }
+        !busy
     }
 
     pub fn message(&mut self, message: impl Into<String>) {
         self.status = Some((message.into(), Instant::now() + Duration::from_secs(4)));
     }
 
-    pub fn footer<'a>(&'a self, snapshot: &'a Snapshot, remote: bool) -> Cow<'a, str> {
+    /// The status message, else the directory and its Git branch, and the columns it has left of
+    /// the `footer` counters.
+    pub fn footer_label<'a>(&'a self, client: &'a Client, footer: &View) -> (Cow<'a, str>, u16) {
+        let left = footer.texts.iter().map(|text| text.x).min();
+        let columns = left.unwrap_or(0).saturating_sub(2);
         if let Some((message, _)) = &self.status {
-            return Cow::Borrowed(message);
+            return (Cow::Borrowed(message), columns);
         }
+        let Some(snapshot) = client.snapshot() else {
+            return (Cow::Borrowed(""), columns);
+        };
+        let remote = client.is_remote();
         let directory = if self.files_open && self.focus == Focus::Files {
             self.files.as_ref().map(FileNav::directory)
         } else {
             snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
         };
         let Some(directory) = directory else {
-            return Cow::Borrowed("");
+            return (Cow::Borrowed(""), columns);
         };
         let path = if !remote
             && let Some(relative) = std::env::var_os("HOME")
@@ -1007,29 +1211,188 @@ impl Ui {
         } else {
             directory.to_string_lossy()
         };
-        match self.resources.stats.branch().filter(|_| !remote) {
+        let label = match self.resources.stats.branch().filter(|_| !remote) {
             Some(branch) => Cow::Owned([path.as_ref(), " 󱐋 ", branch].concat()),
             None => path,
-        }
+        };
+        (label, columns)
     }
 
-    pub fn monitor_jump(&mut self, client: &mut crate::workspace::Client) -> io::Result<()> {
+    /// Applies a daemon response both frontends handle alike; the others come back.
+    pub fn respond(
+        &mut self,
+        client: &mut Client,
+        response: Response,
+    ) -> io::Result<Option<Response>> {
+        match response {
+            Response::ScreenDirty => {
+                self.search.observe(client)?;
+                return Ok(Some(response));
+            }
+            Response::Error(error) => self.message(error),
+            Response::Search {
+                pane,
+                request,
+                count,
+                truncated,
+            } => {
+                let count = count as usize;
+                self.search
+                    .result(client, pane, request, count, truncated)?;
+            }
+            response => return Ok(Some(response)),
+        }
+        Ok(None)
+    }
+
+    /// The close dialog, if open, centered in a window of `columns` by `rows` cells.
+    pub fn close_dialog(
+        &mut self,
+        columns: u16,
+        rows: u16,
+        name: &str,
+        pointer: Option<(u16, u16)>,
+        config: &Config,
+    ) -> Option<Grid> {
+        let prompt = self.close_prompt?;
+        let cols = columns.saturating_sub(4).min(64);
+        let height = rows.saturating_sub(2).min(7);
+        let rect = rect((columns - cols) / 2, (rows - height) / 2, cols, height);
+        self.close_rect = rect;
+        let background = mix_color(config.foreground, config.background, 9);
+        let muted = mix_color(config.foreground, config.background, 176);
+        let mut grid = Grid::new(rect, config.foreground, background);
+        let columns = rect.cols.saturating_sub(4);
+        let (title, detail, effect) = if prompt.tab.is_some() {
+            (
+                format!("Close tab · {name}"),
+                "Programs may still be running in this tab",
+                "Closing terminates all panes in this tab".to_string(),
+            )
+        } else {
+            let quoted = if name
+                .bytes()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, b'_' | b'-' | b'.'))
+            {
+                name.to_string()
+            } else {
+                format!("'{}'", name.replace('\'', "'\\''"))
+            };
+            (
+                format!("Close window · {name}"),
+                "End session to stop tasks and delete history",
+                format!("Resume with: nextty attach {quoted}"),
+            )
+        };
+        for (row, text, color) in [
+            (0, title.as_str(), config.foreground),
+            (2, detail, muted),
+            (3, effect.as_str(), muted),
+            (5, "Tab select   Enter confirm   Esc cancel", muted),
+        ] {
+            if row < rect.rows.saturating_sub(1) {
+                grid.text(rect.x + 2, rect.y + row, columns, text, color, background);
+            }
+        }
+        let buttons = close_buttons(rect, prompt.tab.is_some());
+        for ((button, label), terminate) in buttons.into_iter().zip([false, true]) {
+            let lit = prompt.terminate == terminate
+                || pointer.is_some_and(|(column, row)| button.contains(column, row));
+            let color = match (terminate, lit) {
+                (true, true) => DANGER,
+                (false, true) => ACCENT,
+                _ => muted,
+            };
+            let fill = if lit {
+                mix_color(config.foreground, config.background, 24)
+            } else {
+                background
+            };
+            grid.text(button.x, button.y, button.cols, label, color, fill);
+        }
+        Some(grid)
+    }
+
+    /// Lays out the tab bar for clicks and has `draw` draw its parts, lit under `pointer`.
+    pub fn paint_tabs(
+        &mut self,
+        snapshot: &Snapshot,
+        columns: u16,
+        status: &str,
+        pointer: Option<u16>,
+        config: &Config,
+        mut draw: impl FnMut(TabPart<'_>),
+    ) {
+        let bar = tab_bar(snapshot, columns, status);
+        let hit = pointer.and_then(|column| bar.at(snapshot, column));
+        let row = tab_row_color(config);
+        let (prompt, label) = if snapshot.controller {
+            (MUTED, 0xb8b8b8)
+        } else {
+            (WARNING, WARNING)
+        };
+        let text = |x, width, text, color, background| TabPart::Text {
+            x,
+            width,
+            text,
+            color,
+            background,
+        };
+        let underline = |x, width, color| TabPart::Underline { x, width, color };
+        draw(text(1, 1, "›", prompt, row));
+        for &(index, x, width) in &bar.tabs {
+            let tab = &snapshot.tabs[index];
+            let active = tab.id == snapshot.active_tab;
+            let close = hit == Some(TabHit::Close(tab.id));
+            let color = if active {
+                config.background
+            } else {
+                mix_color(config.background, 0, 204)
+            };
+            let title = if active || close || hit == Some(TabHit::Select(index)) {
+                config.foreground
+            } else {
+                MUTED
+            };
+            draw(TabPart::Tab { x, width, color });
+            draw(text(x + 2, 1, "•", tab_color(tab), color));
+            draw(text(x + 4, width - 8, &tab.title, title, color));
+            let close_color = if close { DANGER } else { MUTED };
+            draw(text(x + width - 3, 1, "×", close_color, color));
+            if close {
+                draw(underline(x + width - 3, 1, DANGER));
+            }
+            if active && config.tab_style == TabStyle::Flat {
+                draw(underline(x, width, ACCENT));
+            }
+        }
+        if let Some(plus) = bar.plus {
+            let hovered = hit == Some(TabHit::New);
+            let color = if hovered { ACCENT } else { 0x606060 };
+            draw(text(plus + 1, 1, "+", color, row));
+            if hovered {
+                draw(underline(plus + 1, 1, color));
+            }
+        }
+        if let Some(TabHit::Scroll(direction)) = hit
+            && let Some((x, width)) = bar.overflow[usize::from(direction > 0)]
+        {
+            draw(underline(x, width, INK));
+        }
+        let width = text_width(&bar.label) as u16;
+        draw(text(bar.label_x, width, &bar.label, label, row));
+        self.tabs = Some(bar);
+    }
+
+    fn monitor_jump(&mut self, client: &mut Client) -> io::Result<()> {
         if let Some(pane) = self.resources.jump.take() {
             let snapshot = client.snapshot().unwrap();
-            let target = snapshot
-                .pane(pane)
-                .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "task pane closed"))?
-                .tab;
-            let current = snapshot
-                .tabs
-                .iter()
-                .position(|tab| tab.id == snapshot.active_tab)
-                .unwrap();
-            let target = snapshot
-                .tabs
-                .iter()
-                .position(|tab| tab.id == target)
-                .unwrap();
+            let Some(target) = snapshot.pane(pane).map(|pane| pane.tab) else {
+                self.message("Task pane closed");
+                return Ok(());
+            };
+            let index = |id| snapshot.tabs.iter().position(|tab| tab.id == id).unwrap();
+            let (current, target) = (index(snapshot.active_tab), index(target));
             if target != current {
                 client.send(Action::Tab(target as i32 - current as i32))?;
             }
@@ -1037,11 +1400,6 @@ impl Ui {
             self.focus = Focus::Terminal;
         }
         Ok(())
-    }
-
-    pub fn toggle_monitor(&mut self) {
-        self.resources.toggle();
-        self.focus_monitor();
     }
 }
 
@@ -1068,6 +1426,30 @@ pub(crate) struct TextField {
 }
 
 impl TextField {
+    /// A search glyph and the text with a caret at the cursor, after `preedit`, scrolled to keep
+    /// the caret within `columns`; returns it and the caret's column.
+    pub fn label(&self, preedit: &str, columns: usize) -> (String, usize) {
+        let before = [&self.text[..self.cursor], preedit].concat();
+        let budget = columns.saturating_sub(3);
+        let mut width = 0;
+        let kept: usize = before
+            .chars()
+            .rev()
+            .take_while(|&ch| {
+                let next = width + usize::from(scalar_width(ch));
+                let fits = next <= budget;
+                if fits {
+                    width = next;
+                }
+                fits
+            })
+            .map(char::len_utf8)
+            .sum();
+        let after = fit_label(&self.text[self.cursor..], (budget - width) as u16);
+        let label = format!("⌕ {}▏{after}", &before[before.len() - kept..]);
+        (label, 2 + width)
+    }
+
     pub fn insert(&mut self, text: &str) -> bool {
         let text: String = text.chars().filter(|ch| !ch.is_control()).collect();
         if text.is_empty() {
@@ -1081,7 +1463,7 @@ impl TextField {
     pub fn key(&mut self, symbol: u32, control: bool) -> bool {
         let before = self.text.floor_char_boundary(self.cursor.saturating_sub(1));
         let after = self.text.ceil_char_boundary(self.cursor + 1);
-        let letter = crate::input::symbol_char(symbol).filter(|_| control);
+        let letter = symbol_char(symbol).filter(|_| control);
         let range = match (symbol, letter.map(|ch| ch.to_ascii_lowercase())) {
             (keysym::LEFT, _) => {
                 self.cursor = before;
@@ -1128,11 +1510,13 @@ pub(crate) struct Search {
 impl Search {
     pub fn begin(&mut self, client: &mut Client, pane: PaneId) -> io::Result<()> {
         self.close(client)?;
-        self.open = true;
-        self.controller = client
-            .snapshot()
-            .is_some_and(|snapshot| snapshot.controller);
-        self.pane = pane;
+        *self = Self {
+            open: true,
+            pane,
+            controller: client.controller(),
+            request: self.request,
+            ..Self::default()
+        };
         self.submit(client)
     }
     pub fn observe(&mut self, client: &mut Client) -> io::Result<()> {
@@ -1167,12 +1551,9 @@ impl Search {
         Ok(())
     }
     pub fn close(&mut self, client: &mut Client) -> io::Result<()> {
-        self.field = TextField::default();
         if !std::mem::take(&mut self.open) {
             return Ok(());
         }
-        self.pending = false;
-        self.count = 0;
         client.send(Action::SearchCancel {
             pane: self.pane,
             request: self.request,
@@ -1188,6 +1569,9 @@ impl Search {
         } else {
             (self.index + 1) % self.count
         };
+        self.select(client)
+    }
+    fn select(&self, client: &mut Client) -> io::Result<()> {
         client.send(Action::SearchSelect {
             pane: self.pane,
             request: self.request,
@@ -1211,24 +1595,17 @@ impl Search {
         self.count = count;
         self.truncated = truncated;
         if self.controller && self.count != 0 {
-            client.send(Action::SearchSelect {
-                pane,
-                request,
-                index: self.index as u32,
-            })?;
+            self.select(client)?;
         }
         Ok(true)
     }
-    pub fn key(
+    fn key(
         &mut self,
         client: &mut Client,
         symbol: u32,
         shift: bool,
         control: bool,
     ) -> io::Result<()> {
-        if !self.open {
-            return Ok(());
-        }
         match symbol {
             keysym::ESCAPE => self.close(client)?,
             keysym::RETURN | keysym::KP_ENTER => self.next(client, shift)?,
@@ -1243,11 +1620,7 @@ impl Search {
         let mut status = if self.pending {
             "searching".into()
         } else {
-            format!(
-                "{}/{}",
-                if self.count == 0 { 0 } else { self.index + 1 },
-                self.count
-            )
+            format!("{}/{}", (self.index + 1).min(self.count), self.count)
         };
         if self.truncated {
             status.push('+');
@@ -1257,34 +1630,12 @@ impl Search {
         }
         let status = fit_label(&status, (columns.saturating_sub(5).min(columns / 2)) as u16);
         let status_width = text_width(&status);
-        let budget = columns.saturating_sub(status_width + 4);
-        let before = [&self.field.text[..self.field.cursor], preedit].concat();
-        let mut width = 0;
-        let kept: usize = before
-            .chars()
-            .rev()
-            .take_while(|&ch| {
-                let next = width + usize::from(scalar_width(ch));
-                let fits = next <= budget.saturating_sub(1);
-                if fits {
-                    width = next;
-                }
-                fits
-            })
-            .map(char::len_utf8)
-            .sum();
-        let after = fit_label(
-            &self.field.text[self.field.cursor..],
-            budget.saturating_sub(width + 1) as u16,
-        );
-        let caret = 2 + width;
-        let padding = columns.saturating_sub(caret + 1 + text_width(&after) + status_width);
-        let label = format!(
-            "⌕ {}▏{after}{:padding$}{status}",
-            &before[before.len() - kept..],
-            ""
-        );
-        let label = fit_label(&label, columns as u16).into_owned();
+        let (field, caret) = self
+            .field
+            .label(preedit, columns.saturating_sub(status_width + 2));
+        let padding = columns.saturating_sub(text_width(&field) + status_width);
+        let label =
+            fit_label(&format!("{field}{:padding$}{status}", ""), columns as u16).into_owned();
         (label, caret.min(columns.saturating_sub(1)))
     }
 }
@@ -1396,13 +1747,13 @@ pub(crate) mod tests {
         let mut ui = Ui::new().unwrap();
         let tab = client.snapshot().unwrap().tabs[0].clone();
         let mut press = |ui: &mut Ui, symbol, text| {
-            let key = crate::input::Key {
+            let key = Key {
                 symbol,
                 modifiers: 0,
                 text,
             };
             assert!(matches!(
-                ui.key(&mut client, key, (1, 1)).unwrap(),
+                ui.key(&mut client, key).unwrap(),
                 KeyResult::Handled
             ));
         };
@@ -1429,7 +1780,7 @@ pub(crate) mod tests {
         assert!(ui.files_open && ui.agent.open && ui.focus == Focus::Editor);
         ui.paste(
             &mut client,
-            crate::input::PasteTarget::Agent(ui.agent.active().id),
+            PasteTarget::Agent(ui.agent.active().id),
             "keep draft",
         )
         .unwrap();
@@ -1451,35 +1802,49 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn tab_bar_hits_share_the_overflow_geometry() {
-        let tabs = (1..=8)
-            .map(|id| crate::workspace::TabView {
-                id,
-                title: format!("long terminal title {id}"),
-                activity: TabActivity::Idle,
-            })
-            .collect();
+    fn tab_bar_keeps_the_active_tab_and_status_visible_and_hits_its_geometry() {
         let mut snapshot = Snapshot {
             name: "tabs".into(),
             controller: true,
             focused: 1,
-            active_tab: 4,
-            tabs,
+            active_tab: 1,
+            tabs: (1..=12)
+                .map(|id| TabView {
+                    id,
+                    title: format!("long terminal title {id}"),
+                    activity: TabActivity::Idle,
+                })
+                .collect(),
             panes: Vec::new(),
         };
-        let bar = tab_bar(&snapshot, 60, "SSH");
-        let &(index, x, width) = bar
-            .tabs
-            .iter()
-            .find(|tab| snapshot.tabs[tab.0].id == 4)
-            .unwrap();
-        assert_eq!(bar.at(&snapshot, x + 5), Some(TabHit::Select(index)));
-        assert_eq!(bar.at(&snapshot, x + width - 3), Some(TabHit::Close(4)));
-        assert_eq!(bar.at(&snapshot, bar.plus.unwrap() + 1), Some(TabHit::New));
-        let (column, _) = bar.overflow[1].unwrap();
-        assert_eq!(bar.at(&snapshot, column), Some(TabHit::Scroll(1)));
-        snapshot.tabs.truncate(2);
-        assert!(tab_bar(&snapshot, 60, "").overflow[1].is_none());
+        for active in [1, 6, 12] {
+            snapshot.active_tab = active;
+            let bar = tab_bar(&snapshot, 80, "SSH");
+            let &(index, x, width) = (bar.tabs.iter())
+                .find(|tab| snapshot.tabs[tab.0].id == active)
+                .unwrap();
+            assert_eq!(bar.at(&snapshot, x + 5), Some(TabHit::Select(index)));
+            assert_eq!(
+                bar.at(&snapshot, x + width - 3),
+                Some(TabHit::Close(active))
+            );
+            assert_eq!(bar.at(&snapshot, bar.plus.unwrap() + 1), Some(TabHit::New));
+            let after = snapshot.tabs.len() - 1 - bar.tabs.last().unwrap().0;
+            for ((hidden, direction), hit) in [(bar.tabs[0].0, -1), (after, 1)]
+                .into_iter()
+                .zip(bar.overflow)
+            {
+                assert_eq!(hit.is_some(), hidden > 0);
+                if let Some((column, _)) = hit {
+                    assert_eq!(bar.at(&snapshot, column), Some(TabHit::Scroll(direction)));
+                }
+            }
+            assert!(bar.label.ends_with("SSH") && bar.plus.unwrap() + 3 <= bar.label_x);
+        }
+        snapshot.tabs.truncate(1);
+        snapshot.controller = false;
+        let bar = tab_bar(&snapshot, 40, "Read-only  CPU 100%  MEM 100%  DSK 100%");
+        assert!(bar.label.starts_with("Read-only"), "{}", bar.label);
     }
 
     #[test]
@@ -1496,77 +1861,5 @@ pub(crate) mod tests {
         assert!(label.starts_with("⌕ A▏中预▏B"));
         assert!(label.ends_with("0/0"));
         assert_eq!(caret, 8);
-    }
-
-    #[test]
-    fn search_label_clamps_scalar_width_to_terminal_cells() {
-        let search = Search {
-            field: TextField {
-                text: "A\u{17d8}BCDEF".into(),
-                cursor: "A\u{17d8}B".len(),
-            },
-            controller: true,
-            ..Search::default()
-        };
-        assert_eq!(search.display("", 16), ("⌕ A\u{17d8}B▏CDEF  0/0".into(), 6));
-        let search = Search {
-            field: TextField {
-                text: "ABCDEF".into(),
-                cursor: 2,
-            },
-            ..search
-        };
-        assert_eq!(
-            search.display("\u{17d8}", 16),
-            ("⌕ AB\u{17d8}▏CDEF  0/0".into(), 6)
-        );
-    }
-
-    #[test]
-    fn tab_layout_keeps_the_active_tab_and_the_status_label_visible() {
-        let tabs = |titles: Vec<String>| -> Vec<TabView> {
-            (1..)
-                .zip(titles)
-                .map(|(id, title)| TabView {
-                    id,
-                    title,
-                    activity: TabActivity::Idle,
-                })
-                .collect()
-        };
-        let mut snapshot = Snapshot {
-            name: "dev".into(),
-            controller: true,
-            focused: 1,
-            active_tab: 1,
-            tabs: tabs(vec!["shell".into(), "logs".into(), "editor".into()]),
-            panes: Vec::new(),
-        };
-        assert_eq!(
-            tab_layout(&snapshot, 104, "CPU 10%  MEM 20%  DSK 30%"),
-            [(0, 3, 13), (1, 17, 12), (2, 30, 14)]
-        );
-        let mut overflow = snapshot.clone();
-        overflow.tabs = tabs((0..12).map(|i| format!("tab-{i}")).collect());
-        for active in [1, 6, 12] {
-            overflow.active_tab = active;
-            let (layout, label, before, after) = tab_chrome(&overflow, 80, "");
-            assert!(
-                layout
-                    .iter()
-                    .any(|&(index, _, _)| index as u64 + 1 == active)
-            );
-            assert_eq!(before + layout.len() + after, overflow.tabs.len());
-            let (_, x, width) = layout.last().unwrap();
-            assert!(x + width + text_width(&label) as u16 + 2 < 80);
-        }
-        snapshot.tabs.truncate(1);
-        snapshot.controller = false;
-        let readonly = tab_layout(&snapshot, 40, "Read-only  CPU 100%  MEM 100%  DSK 100%");
-        let (_, x, width) = readonly[0];
-        assert!(
-            40 - (x + width + 1) - 4 >= 9,
-            "read-only indicator remains visible"
-        );
     }
 }

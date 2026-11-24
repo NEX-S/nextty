@@ -14,6 +14,11 @@ pub(crate) fn owned_fd(result: i32) -> io::Result<OwnedFd> {
     check(result).map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
+/// An anonymous file in memory.
+pub(crate) fn memfd(name: &std::ffi::CStr) -> io::Result<std::fs::File> {
+    owned_fd(unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) }).map(Into::into)
+}
+
 pub(crate) fn new() -> io::Result<OwnedFd> {
     owned_fd(unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) })
 }
@@ -38,14 +43,9 @@ pub(crate) fn notify(fd: RawFd) {
 
 pub(crate) fn consume_notification(fd: RawFd) -> io::Result<bool> {
     let mut value = 0u64;
-    if unsafe { libc::read(fd, (&mut value as *mut u64).cast(), 8) } >= 0 {
-        return Ok(true);
-    }
-    let error = io::Error::last_os_error();
-    if error.kind() == io::ErrorKind::WouldBlock {
-        Ok(false)
-    } else {
-        Err(error)
+    match check(unsafe { libc::read(fd, (&raw mut value).cast(), 8) } as i32) {
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(false),
+        result => result.map(|_| true),
     }
 }
 
@@ -74,18 +74,12 @@ pub fn timeout_until(timeout: i32, deadline: Instant) -> i32 {
     }
 }
 
-pub fn poll(fds: &mut [libc::pollfd], mut timeout: i32) -> io::Result<()> {
-    let deadline = (timeout > 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
+/// A wait that a signal interrupts starts again with the whole timeout.
+pub fn poll(fds: &mut [libc::pollfd], timeout: i32) -> io::Result<()> {
     loop {
-        if unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) } >= 0 {
-            return Ok(());
+        match check(unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as _, timeout) }) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => (),
+            result => return result.map(drop),
         }
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::Interrupted {
-            return Err(error);
-        }
-        timeout = deadline.map_or(timeout, |deadline| {
-            timeout_millis(deadline.saturating_duration_since(Instant::now()))
-        });
     }
 }

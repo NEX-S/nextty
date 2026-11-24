@@ -2,12 +2,9 @@ use crate::history::{
     BATCH, HOT_ROWS, History, HistoryBudget, HistoryCopy, HistoryCopyRequest, HistoryCursor,
     HistoryPage, HistoryRead, HistorySearch, Reply,
 };
-use crate::vt::{
-    ClearMode, Color, CursorShape, LineClearMode, NamedColor, PALETTE_SIZE, Rgb, StandardCharset,
-};
+use crate::vt::{Color, Csi, CursorShape, NamedColor, PALETTE_SIZE, Rgb, StandardCharset};
 use crate::{base64::decode_utf8, width::scalar_width};
 use serde::{Deserialize, Serialize};
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
@@ -15,6 +12,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMarker {
@@ -42,8 +40,8 @@ struct Block {
     end: Option<BlockPoint>,
     status: Option<i32>,
     incomplete: bool,
-    started: Option<std::time::Instant>,
-    finished: Option<std::time::Instant>,
+    started: Option<Instant>,
+    finished: Option<Instant>,
 }
 
 impl Block {
@@ -70,7 +68,7 @@ impl Block {
             has_output: self.output.is_some(),
             elapsed_ms: self.started.map(|start| {
                 self.finished
-                    .unwrap_or_else(std::time::Instant::now)
+                    .unwrap_or_else(Instant::now)
                     .duration_since(start)
                     .as_millis() as u64
             }),
@@ -98,15 +96,12 @@ fn line_offset(row: u64, base: u64) -> i32 {
     (i128::from(row) - i128::from(base)).clamp(i128::from(i32::MIN), i128::from(i32::MAX)) as i32
 }
 
-type Request = Box<dyn FnOnce(&Core) + Send>;
-
+/// Rows above the main screen's hot area are on disk; `Core::block_origin` minus the hot rows is
+/// the id of the first hot row.
 struct DiskHistory {
     io: History,
+    /// Id of the oldest retained row.
     first: u64,
-    hot_start: u64,
-    // Rows that left the hot area and are not with the writer yet.
-    spool: VecDeque<Row>,
-    requests: VecDeque<Request>,
     epoch: u64,
     layout_epoch: u64,
     page_start: u64,
@@ -119,32 +114,12 @@ struct DiskHistory {
     failed: bool,
 }
 
-const DEFAULT_PALETTE: [Rgb; 256] = {
-    const ANSI: [u32; 16] = [
-        0x252932, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
-        0xff7a85, 0xb1df90, 0xffd68a, 0x80c7ff, 0xda98ee, 0x70d0dc, 0xf0f3f8,
-    ];
-    let mut colors = [Rgb { r: 0, g: 0, b: 0 }; 256];
-    let mut index = 0;
-    while index < 256 {
-        colors[index] = if index < 16 {
-            Rgb::from_packed(ANSI[index])
-        } else if index < 232 {
-            let levels = [0, 95, 135, 175, 215, 255];
-            let n = index - 16;
-            Rgb {
-                r: levels[n / 36],
-                g: levels[n / 6 % 6],
-                b: levels[n % 6],
-            }
-        } else {
-            let c = 8 + (index as u8 - 232) * 10;
-            Rgb { r: c, g: c, b: c }
-        };
-        index += 1;
-    }
-    colors
-};
+const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
+
+const ANSI: [u32; 16] = [
+    0x252932, 0xe06c75, 0x98c379, 0xe5c07b, 0x61afef, 0xc678dd, 0x56b6c2, 0xabb2bf, 0x5c6370,
+    0xff7a85, 0xb1df90, 0xffd68a, 0x80c7ff, 0xda98ee, 0x70d0dc, 0xf0f3f8,
+];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WindowSize {
@@ -690,157 +665,6 @@ pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
     Ok(())
 }
 
-pub(crate) fn object_selection<'a>(
-    point: (i64, usize),
-    row: impl Fn(i64) -> Option<&'a Row>,
-) -> Option<[(i64, usize); 2]> {
-    // Bound work on one user gesture, even for output containing enormous soft-wrapped lines.
-    const LIMIT: usize = 4096;
-    let anchor_row = row(point.0)?;
-    if point.1 >= anchor_row.used() {
-        return None;
-    }
-    let mut first = point.0;
-    let mut before = point.1;
-    while before < LIMIT {
-        let Some(previous) = row(first - 1) else {
-            break;
-        };
-        if !previous.wrapped {
-            break;
-        }
-        before += previous.used();
-        first -= 1;
-    }
-    let mut cells = Vec::new();
-    let mut anchor = None;
-    let mut line = first;
-    let right_limited = 'rows: loop {
-        let Some(current) = row(line) else {
-            break false;
-        };
-        let begin = if line == first {
-            before.saturating_sub(LIMIT)
-        } else {
-            0
-        };
-        for (column, cell) in current
-            .cells
-            .iter()
-            .enumerate()
-            .take(current.used())
-            .skip(begin)
-        {
-            if cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
-                if (line, column) == point && !cells.is_empty() {
-                    anchor = Some(cells.len() - 1);
-                }
-                continue;
-            }
-            if (line, column) == point {
-                anchor = Some(cells.len());
-            }
-            cells.push((cell.c, (line, column)));
-            if anchor.is_some_and(|anchor| cells.len() - anchor > LIMIT) {
-                break 'rows true;
-            }
-        }
-        if !current.wrapped {
-            break false;
-        }
-        line += 1;
-    };
-    let anchor = anchor?;
-    let mut quote = None;
-    let mut escaped = false;
-    for (index, &(ch, _)) in cells.iter().enumerate() {
-        if escaped {
-            escaped = false;
-        } else if ch == '\\' {
-            escaped = true;
-        } else if let Some((delimiter, start)) = quote {
-            if ch == delimiter {
-                if (start..=index).contains(&anchor) {
-                    return Some([cells[start].1, cells[index].1]);
-                }
-                quote = None;
-            }
-        } else if matches!(ch, '\'' | '"' | '`')
-            && (index == 0 && before < LIMIT
-                || index > 0
-                    && (cells[index - 1].0.is_whitespace()
-                        || matches!(cells[index - 1].0, '=' | '(' | '[' | '{' | ',' | ':')))
-        {
-            quote = Some((ch, index));
-        }
-    }
-    let boundary = |ch: char| {
-        ch.is_whitespace()
-            || matches!(ch, ',' | '|' | '"' | '\'' | '`' | '<' | '>')
-            || matches!(ch, '，' | '。' | '；' | '！' | '？' | '、' | '：')
-            || matches!(ch, '（' | '）' | '【' | '】' | '《' | '》')
-            || matches!(ch, '\u{2500}'..='\u{257f}')
-    };
-    if boundary(cells[anchor].0) {
-        return Some([cells[anchor].1; 2]);
-    }
-    let mut start = anchor;
-    let mut end = anchor + 1;
-    while start > 0 && !boundary(cells[start - 1].0) {
-        start -= 1;
-    }
-    while end < cells.len() && !boundary(cells[end].0) {
-        end += 1;
-    }
-    if start == 0 && before >= LIMIT || end == cells.len() && right_limited {
-        return None;
-    }
-    if !cells[start..end].iter().any(|&(ch, _)| ch == '/')
-        && let Some(register_start) = (start..=anchor).rfind(|&index| cells[index].0 == '%')
-    {
-        let register_end = register_start
-            + 1
-            + cells[register_start + 1..end]
-                .iter()
-                .take_while(|(ch, _)| ch.is_ascii_alphanumeric())
-                .count();
-        if anchor < register_end {
-            return Some([cells[register_start].1, cells[register_end - 1].1]);
-        }
-    }
-    while start < end && matches!(cells[start].0, '(' | '[' | '{' | '=') {
-        start += 1;
-    }
-    if let Some(equal) = (start..end).find(|&index| cells[index].0 == '=')
-        && equal > start
-        && cells[start..equal]
-            .iter()
-            .all(|&(ch, _)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
-    {
-        if anchor > equal {
-            start = equal + 1;
-        } else {
-            end = equal;
-        }
-    }
-    while end > start && matches!(cells[end - 1].0, '.' | ';') {
-        end -= 1;
-    }
-    for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
-        let mut balance = cells[start..end].iter().fold(0i32, |balance, &(ch, _)| {
-            balance + i32::from(ch == open) - i32::from(ch == close)
-        });
-        while end > start && balance < 0 && cells[end - 1].0 == close {
-            end -= 1;
-            balance += 1;
-        }
-    }
-    if !(start..end).contains(&anchor) {
-        return Some([cells[anchor].1; 2]);
-    }
-    Some([cells[start].1, cells[end - 1].1])
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SelectionRange {
     pub start: Point,
@@ -985,7 +809,7 @@ pub struct Core {
     palette_revision: u64,
     events: Vec<Event>,
     title: Option<String>,
-    titles: Vec<Option<Box<str>>>,
+    titles: Vec<Option<String>>,
     history: Option<DiskHistory>,
     // Rows that left the hot area, kept to be cleared and scrolled in again.
     recycled: VecDeque<Row>,
@@ -998,6 +822,10 @@ pub struct Core {
     prompt_dirty: bool,
     // Lines that moved up through the live view; frontends shift their rows by the delta.
     scrolls: u64,
+    // The last printed character, for REP.
+    last_char: Option<char>,
+    // A synchronized update not ended by then is shown anyway.
+    sync_deadline: Option<Instant>,
 }
 
 impl Core {
@@ -1035,6 +863,8 @@ impl Core {
             input_generation: 0,
             prompt_dirty: false,
             scrolls: 0,
+            last_char: None,
+            sync_deadline: None,
         }
     }
 
@@ -1048,12 +878,10 @@ impl Core {
         self.active.rows.len().saturating_sub(self.screen_lines())
     }
     pub fn history_size(&self) -> usize {
-        if !self.mode.contains(Mode::ALT_SCREEN)
-            && let Some(history) = &self.history
-        {
-            return (history.hot_start - history.first) as usize + self.hot_history_size();
+        if self.mode.contains(Mode::ALT_SCREEN) {
+            return 0;
         }
-        self.hot_history_size()
+        (self.block_origin - self.first_row()) as usize
     }
     pub fn display_offset(&self) -> usize {
         self.active.offset
@@ -1161,7 +989,7 @@ impl Core {
         if !self.mode.contains(Mode::ALT_SCREEN)
             && let Some(history) = &self.history
         {
-            let id = history.hot_start.checked_add_signed(index)?;
+            let id = self.block_origin.checked_add_signed(i64::from(line))?;
             return id
                 .checked_sub(history.page_start)
                 .and_then(|offset| history.page.get(offset as usize));
@@ -1224,6 +1052,7 @@ impl Core {
                 recycled.clear(blank);
                 let base = self.hot_history_size();
                 self.active.rows.insert(base + bottom, recycled);
+                self.block_origin += 1;
                 if self.active.offset > 0 {
                     self.active.offset = (self.active.offset + 1).min(self.history_size());
                 }
@@ -1240,7 +1069,6 @@ impl Core {
         self.shift_selection(top, bottom, delta, history);
 
         if history {
-            self.block_origin += count as u64;
             self.trim_blocks();
             self.spill_history();
             if !full_page {
@@ -1294,12 +1122,26 @@ impl Core {
         if let Some(color) = self.colors[index] {
             return color;
         }
-        let value = match index {
-            0..=255 => return DEFAULT_PALETTE[index],
-            257 => self.background,
-            _ => self.foreground,
-        };
-        Rgb::from_packed(value)
+        // The xterm 6x6x6 color cube follows the 16 ANSI colors, then 24 grays.
+        let level = |n: usize| [0, 95, 135, 175, 215, 255][n];
+        match index {
+            0..16 => Rgb::from_packed(ANSI[index]),
+            16..232 => Rgb {
+                r: level((index - 16) / 36),
+                g: level((index - 16) / 6 % 6),
+                b: level((index - 16) % 6),
+            },
+            232..=255 => {
+                let gray = 8 + (index - 232) as u8 * 10;
+                Rgb {
+                    r: gray,
+                    g: gray,
+                    b: gray,
+                }
+            }
+            257 => Rgb::from_packed(self.background),
+            _ => Rgb::from_packed(self.foreground),
+        }
     }
 
     pub fn selection_start(&mut self, point: Point, side: Side, kind: SelectionType) {
@@ -1332,46 +1174,33 @@ impl Core {
             (selection.end, selection.end_side),
         ];
         ends.sort_by_key(|&(point, side)| (point, side == Side::Right));
-        let [(mut start, start_side), (mut end, end_side)] = ends;
+        let [(start, start_side), (end, end_side)] = ends;
         let columns = self.columns();
-        let source_row =
-            |line: i64| Ok::<_, std::convert::Infallible>(self.absolute_row(line as i32));
-        let to_point = |(line, column): (i64, usize)| Point {
-            line: line as i32,
-            column,
+        let (mut start, mut end) = if selection.kind == SelectionType::Simple {
+            // An end's side decides whether its own cell is selected.
+            let width = columns as i64;
+            let index = |point: Point| i64::from(point.line) * width + point.column as i64;
+            let point = |index: i64| Point {
+                line: index.div_euclid(width) as i32,
+                column: index.rem_euclid(width) as usize,
+            };
+            let first = index(start) + i64::from(start_side == Side::Right);
+            let last = index(end) - i64::from(end_side == Side::Left);
+            if first > last {
+                return None;
+            }
+            (point(first), point(last))
+        } else {
+            let mut first = (i64::from(start.line), start.column);
+            let mut last = (i64::from(end.line), end.column);
+            let row = |line: i64| Ok::<_, std::convert::Infallible>(self.absolute_row(line as i32));
+            expand_selection(selection.kind, &mut first, &mut last, row).unwrap();
+            let point = |(line, column): (i64, usize)| Point {
+                line: line as i32,
+                column,
+            };
+            (point(first), point(last))
         };
-        match selection.kind {
-            SelectionType::Simple => {
-                if start == end && start_side == end_side {
-                    return None;
-                }
-                if start_side == Side::Right {
-                    start.column += 1;
-                    if start.column == columns {
-                        start.line += 1;
-                        start.column = 0;
-                    }
-                }
-                if end_side == Side::Left {
-                    if end.column == 0 {
-                        end.line -= 1;
-                        end.column = columns - 1;
-                    } else {
-                        end.column -= 1;
-                    }
-                }
-                if end < start {
-                    return None;
-                }
-            }
-            SelectionType::Lines | SelectionType::Semantic => {
-                let mut first = (i64::from(start.line), start.column);
-                let mut last = (i64::from(end.line), end.column);
-                expand_selection(selection.kind, &mut first, &mut last, source_row).unwrap();
-                start = to_point(first);
-                end = to_point(last);
-            }
-        }
         start.line = start.line.max(-(self.history_size() as i32));
         end.line = end.line.min(self.screen_lines() as i32 - 1);
         start.column = start.column.min(columns - 1);
@@ -1406,6 +1235,8 @@ impl Core {
         self.selection = None;
         self.damage_all();
         if !enabled {
+            // A resize during the alternate screen can leave the main screen's hot area full.
+            self.spill_history();
             self.request_history_page();
         }
     }
@@ -1450,16 +1281,7 @@ impl Core {
             points.push(point.at(old_base));
             block_points.push(point);
         }
-        let retained = self.history.as_ref().map_or(0, |_| HOT_ROWS);
-        let mapped = resize_screen(
-            main,
-            old_columns,
-            old_lines,
-            columns,
-            lines,
-            &points,
-            retained,
-        );
+        let mapped = resize_screen(main, old_columns, old_lines, columns, lines, &points);
         for (cursor, point) in [&mut main.cursor, &mut main.saved].into_iter().zip(&mapped) {
             cursor.point = Point {
                 column: point.column.min(columns - 1),
@@ -1501,7 +1323,20 @@ impl Core {
         self.scroll_bottom = lines;
         // A resized frontend screen is rebuilt and needs the palette again.
         self.damage_palette();
+        self.spill_history();
         self.request_history_page();
+    }
+
+    pub fn sync_deadline(&self) -> Option<Instant> {
+        self.sync_deadline
+    }
+    /// Ends a synchronized update that timed out or whose input ended; false without one.
+    pub fn finish_sync(&mut self) -> bool {
+        if self.sync_deadline.is_none() {
+            return false;
+        }
+        self.set_private(2026, false);
+        true
     }
 
     // Rare sequences stay out of the shared parser dispatch path.
@@ -1528,13 +1363,17 @@ impl Core {
                     self.inactive.clear();
                 }
             }
-            1048 if enabled => self.save_cursor_position(),
+            1048 if enabled => self.active.saved = self.active.cursor,
             1048 => self.restore_cursor_position(),
             1049 => self.set_alternate(enabled, true),
+            2026 => {
+                self.mode.set(Mode::SYNC_UPDATE, enabled);
+                self.sync_deadline = enabled.then(|| Instant::now() + SYNC_TIMEOUT);
+            }
             3 => {
                 self.scroll_top = 0;
                 self.scroll_bottom = self.screen_lines();
-                self.clear_screen(ClearMode::All);
+                self.clear_screen(2);
                 self.goto(0, 0);
             }
             _ => {
@@ -1661,7 +1500,6 @@ fn resize_screen(
     columns: usize,
     lines: usize,
     points: &[Point],
-    history_rows: usize,
 ) -> Vec<Point> {
     let old_history = screen.rows.len() - old_lines;
     let mut anchors: Vec<_> = points
@@ -1719,13 +1557,9 @@ fn resize_screen(
     while output.len() < lines {
         output.push_back(Row::new(columns, Cell::default()));
     }
-    let limit = history_rows + lines;
-    let discarded = output.len().saturating_sub(limit);
-    output.drain(..discarded);
     let new_history = output.len() - lines;
     for (index, point) in mapped.iter_mut().enumerate() {
-        point.line -= (discarded + new_history) as i32;
-        point.line = point.line.max(-(new_history as i32)).min(lines as i32 - 1);
+        point.line = (point.line - new_history as i32).min(lines as i32 - 1);
         point.column = point
             .column
             .min(if index < 2 { columns } else { columns - 1 });
@@ -1735,7 +1569,7 @@ fn resize_screen(
     screen.offset = if screen.offset == 0 {
         0
     } else {
-        new_history.saturating_sub(mapped_view_top.saturating_sub(discarded))
+        new_history.saturating_sub(mapped_view_top)
     };
     screen.rows = output;
     mapped
@@ -1751,6 +1585,7 @@ impl Core {
 
     #[inline]
     pub(crate) fn input_text(&mut self, mut text: &str) {
+        self.last_char = text.chars().next_back().or(self.last_char);
         if text.len() == 1
             || self.mode.contains(Mode::INSERT)
             || !matches!(
@@ -1888,7 +1723,7 @@ impl Core {
                 self.screen_row_mut(point.line as usize).wrapped = true;
                 self.damage_line(point.line as usize);
                 self.linefeed();
-                self.carriage_return();
+                self.goto_col(0);
             } else {
                 self.active.cursor.wrap_pending = false;
             }
@@ -1903,7 +1738,7 @@ impl Core {
                 row.wrapped = true;
                 self.damage_line(point.line as usize);
                 self.linefeed();
-                self.carriage_return();
+                self.goto_col(0);
                 point = self.active.cursor.point;
             } else {
                 return;
@@ -1921,7 +1756,7 @@ impl Core {
         self.finish_write(point.column + width);
     }
 
-    pub(crate) fn goto(&mut self, line: i32, column: usize) {
+    fn goto(&mut self, line: i32, column: usize) {
         let (top, bottom) = if self.active.cursor.origin {
             (self.scroll_top, self.scroll_bottom)
         } else {
@@ -1929,14 +1764,10 @@ impl Core {
         };
         self.move_cursor((line.max(0) as usize + top).min(bottom - 1), column);
     }
-    pub(crate) fn goto_line(&mut self, line: i32) {
-        let column = self.active.cursor.point.column;
-        self.goto(line, column);
-    }
-    pub(crate) fn goto_col(&mut self, column: usize) {
+    fn goto_col(&mut self, column: usize) {
         self.move_cursor(self.active.cursor.point.line as usize, column);
     }
-    pub(crate) fn move_vertical(&mut self, count: usize, down: bool) {
+    fn move_vertical(&mut self, count: usize, down: bool) {
         let point = self.active.cursor.point;
         let line = point.line as usize;
         let line = if down {
@@ -1956,18 +1787,7 @@ impl Core {
         };
         self.move_cursor(line, point.column);
     }
-    pub(crate) fn move_forward(&mut self, count: usize) {
-        let point = self.active.cursor.point;
-        self.move_cursor(point.line as usize, point.column.saturating_add(count));
-    }
-    pub(crate) fn move_backward(&mut self, count: usize) {
-        let point = self.active.cursor.point;
-        self.move_cursor(point.line as usize, point.column.saturating_sub(count));
-    }
-    pub(crate) fn carriage_return(&mut self) {
-        self.goto_col(0);
-    }
-    pub(crate) fn linefeed(&mut self) {
+    fn linefeed(&mut self) {
         let point = self.active.cursor.point;
         if point.line as usize + 1 == self.scroll_bottom {
             self.scroll_region(self.scroll_top, self.scroll_bottom, 1, false);
@@ -1976,22 +1796,7 @@ impl Core {
         }
         self.active.cursor.wrap_pending = false;
     }
-    pub(crate) fn newline(&mut self) {
-        self.linefeed();
-        if self.mode.contains(Mode::LINE_FEED_NEW_LINE) {
-            self.carriage_return();
-        }
-    }
-    pub(crate) fn reverse_index(&mut self) {
-        let point = self.active.cursor.point;
-        if point.line as usize == self.scroll_top {
-            self.scroll_region(self.scroll_top, self.scroll_bottom, 1, true);
-            self.active.cursor.wrap_pending = false;
-        } else {
-            self.move_vertical(1, false);
-        }
-    }
-    pub(crate) fn move_tabs(&mut self, count: u16, forward: bool) {
+    fn move_tabs(&mut self, count: usize, forward: bool) {
         let column = self.active.cursor.point.column;
         let range = if forward {
             column + 1..self.columns()
@@ -1999,32 +1804,14 @@ impl Core {
             0..column
         };
         let mut stops = range.filter(|x| self.tabs[*x]);
-        let count = usize::from(count - 1);
         self.goto_col(if forward {
-            stops.nth(count).unwrap_or(self.columns() - 1)
+            stops.nth(count - 1).unwrap_or(self.columns() - 1)
         } else {
-            stops.nth_back(count).unwrap_or(0)
+            stops.nth_back(count - 1).unwrap_or(0)
         });
     }
-    pub(crate) fn set_horizontal_tabstop(&mut self) {
-        let column = self.active.cursor.point.column;
-        self.tabs[column] = true;
-    }
-    pub(crate) fn clear_tabs(&mut self, all: bool) {
-        if all {
-            self.tabs.fill(false);
-        } else {
-            self.tabs[self.active.cursor.point.column] = false;
-        }
-    }
-    pub(crate) fn set_tabs(&mut self, interval: u16) {
-        let interval = usize::from(interval);
-        for (column, tab) in self.tabs.iter_mut().enumerate() {
-            *tab = interval != 0 && column != 0 && column % interval == 0;
-        }
-    }
 
-    pub(crate) fn shift_chars(&mut self, count: usize, right: bool) {
+    fn shift_chars(&mut self, count: usize, right: bool) {
         let point = self.active.cursor.point;
         let columns = self.columns();
         let count = count.min(columns - point.column);
@@ -2074,102 +1861,72 @@ impl Core {
         self.active.cursor.wrap_pending = false;
         self.damage_line(point.line as usize);
     }
-    pub(crate) fn erase_chars(&mut self, count: usize) {
-        let point = self.active.cursor.point;
-        let end = point.column.saturating_add(count).min(self.columns());
-        let blank = self.blank();
-        self.screen_row_mut(point.line as usize)
-            .clear_range(point.column, end, blank);
-        self.active.cursor.wrap_pending = false;
-        self.damage_line(point.line as usize);
-    }
-    pub(crate) fn clear_line(&mut self, mode: LineClearMode) {
+    /// EL: erases right of the cursor (0), left of it (1) or the whole line (2).
+    fn clear_line(&mut self, mode: u16) {
         let Point { line, column } = self.active.cursor.point;
         let blank = self.blank();
         let columns = self.columns();
         let row = self.screen_row_mut(line as usize);
         match mode {
-            LineClearMode::Left if column + 1 < columns => row.clear_range(0, column + 1, blank),
-            LineClearMode::Right if column > 0 => row.clear_range(column, columns, blank),
-            _ => row.clear(blank),
+            0 if column > 0 => row.clear_range(column, columns, blank),
+            1 if column + 1 < columns => row.clear_range(0, column + 1, blank),
+            0..=2 => row.clear(blank),
+            _ => return,
         }
         self.active.cursor.wrap_pending = false;
         self.damage_line(line as usize);
     }
-    pub(crate) fn clear_screen(&mut self, mode: ClearMode) {
+    /// ED: erases below the cursor (0), above it (1), the screen (2) or the saved lines (3).
+    fn clear_screen(&mut self, mode: u16) {
         let line = self.active.cursor.point.line as usize;
+        let lines = self.screen_lines();
         let blank = self.blank();
-        let offset = self.display_offset();
         match mode {
-            ClearMode::Saved => {
+            0 => {
+                self.clear_line(0);
+                for y in line + 1..lines {
+                    self.screen_row_mut(y).clear(blank);
+                }
+                self.damage_range(line, lines);
+            }
+            1 => {
+                self.clear_line(1);
+                for y in 0..line {
+                    self.screen_row_mut(y).clear(blank);
+                }
+                self.damage_range(0, line + 1);
+            }
+            2 => {
+                for y in 0..lines {
+                    self.screen_row_mut(y).clear(blank);
+                }
+                self.active.cursor.wrap_pending = false;
+                self.damage_all();
+            }
+            3 => {
                 self.active.rows.drain(..self.hot_history_size());
-
                 if !self.mode.contains(Mode::ALT_SCREEN) {
                     self.clear_disk_history();
                     self.blocks.clear();
                     self.block_origin = 0;
                 }
                 self.active.rows.shrink_to_fit();
-                self.active.offset = 0;
+                if self.active.offset != 0 {
+                    self.active.offset = 0;
+                    self.damage_all();
+                }
                 if self
                     .selection
                     .is_some_and(|selection| selection.start.line < 0 || selection.end.line < 0)
                 {
                     self.selection = None;
                 }
+                self.active.cursor.wrap_pending = false;
             }
-            ClearMode::All => {
-                for y in 0..self.screen_lines() {
-                    self.screen_row_mut(y).clear(blank);
-                }
-            }
-            ClearMode::Below => {
-                self.clear_line(LineClearMode::Right);
-                for y in line + 1..self.screen_lines() {
-                    self.screen_row_mut(y).clear(blank);
-                }
-                self.damage_range(line, self.screen_lines());
-                return;
-            }
-            ClearMode::Above => {
-                self.clear_line(LineClearMode::Left);
-                for y in 0..line {
-                    self.screen_row_mut(y).clear(blank);
-                }
-                self.damage_range(0, line + 1);
-                return;
-            }
-        }
-        self.active.cursor.wrap_pending = false;
-        if !matches!(mode, ClearMode::Saved) || offset != 0 {
-            self.damage_all();
+            _ => (),
         }
     }
-    pub(crate) fn scroll(&mut self, count: usize, down: bool) {
-        self.scroll_region(self.scroll_top, self.scroll_bottom, count, down);
-    }
-    pub(crate) fn shift_lines(&mut self, count: usize, down: bool) {
-        let line = self.active.cursor.point.line as usize;
-        if line >= self.scroll_top && line < self.scroll_bottom {
-            self.scroll_region(line, self.scroll_bottom, count, down);
-            self.carriage_return();
-        }
-    }
-    pub(crate) fn set_scrolling_region(&mut self, top: usize, bottom: Option<usize>) {
-        let top = top.saturating_sub(1);
-        let bottom = bottom
-            .unwrap_or(self.screen_lines())
-            .min(self.screen_lines());
-        if top < bottom.saturating_sub(1) {
-            self.scroll_top = top;
-            self.scroll_bottom = bottom;
-            self.goto(0, 0);
-        }
-    }
-    pub(crate) fn save_cursor_position(&mut self) {
-        self.active.saved = self.active.cursor;
-    }
-    pub(crate) fn restore_cursor_position(&mut self) {
+    fn restore_cursor_position(&mut self) {
         let mut cursor = self.active.saved;
         let (top, bottom) = if cursor.origin {
             (self.scroll_top, self.scroll_bottom)
@@ -2180,71 +1937,23 @@ impl Core {
         cursor.point.column = cursor.point.column.min(self.columns() - 1);
         self.active.cursor = cursor;
     }
-    pub(crate) fn set_active_charset(&mut self, index: usize) {
-        self.active.cursor.charset = index;
-    }
-    pub(crate) fn configure_charset(&mut self, index: usize, charset: StandardCharset) {
-        self.active.cursor.charsets[index] = charset;
-    }
-    pub(crate) fn set_cursor_shape(&mut self, shape: CursorShape) {
-        self.cursor_shape = shape;
-    }
-    pub(crate) fn style_mut(&mut self) -> (&mut Cell, &mut Option<Color>) {
-        let cursor = &mut self.active.cursor;
-        (&mut cursor.template, &mut cursor.underline_color)
-    }
-    pub(crate) fn set_mode(&mut self, mode: u16, enabled: bool) {
-        if let Some(flag) = ansi_mode(mode) {
-            self.mode.set(flag, enabled);
-        }
-    }
-    pub(crate) fn set_keypad_application_mode(&mut self, enabled: bool) {
-        self.mode.set(Mode::APP_KEYPAD, enabled);
-    }
-    pub(crate) fn reset_state(&mut self) {
-        let mut events = std::mem::take(&mut self.events);
-
-        let history = self.history.take();
-        let (revision, scrolls) = (self.revision, self.scrolls);
-        *self = Self::new(self.size, self.foreground, self.background);
+    fn reset_state(&mut self) {
         // Frontends compare revisions and scroll counts, so a reset must not repeat old ones.
-        self.revision = revision;
-        self.scrolls = scrolls;
+        *self = Self {
+            history: self.history.take(),
+            events: std::mem::take(&mut self.events),
+            revision: self.revision,
+            scrolls: self.scrolls,
+            // The Agent holds command ids and input generations across a reset.
+            next_block: self.next_block,
+            input_generation: self.input_generation,
+            ..Self::new(self.size, self.foreground, self.background)
+        };
         self.damage_palette();
-        self.history = history;
         self.clear_disk_history();
-        events.push(Event::Title(None));
-        self.events = events;
+        self.events.push(Event::Title(None));
     }
-    pub(crate) fn decaln(&mut self) {
-        for y in 0..self.screen_lines() {
-            let row = self.screen_row_mut(y);
-            row.clear(Cell::default());
-            for cell in &mut row.cells {
-                cell.c = 'E';
-            }
-            row.used = row.cells.len();
-        }
-        self.goto(0, 0);
-        self.damage_all();
-    }
-    pub(crate) fn device_status(&mut self, status: usize) {
-        match status {
-            5 => self.write_reply(format_args!("\x1b[0n")),
-            6 => {
-                let point = self.active.cursor.point;
-                let top = if self.active.cursor.origin {
-                    self.scroll_top as i32
-                } else {
-                    0
-                };
-                let line = (point.line - top).max(0) as usize;
-                self.write_reply(format_args!("\x1b[{};{}R", line + 1, point.column + 1));
-            }
-            _ => {}
-        }
-    }
-    pub(crate) fn report_mode(&mut self, mode: u16, private: bool) {
+    fn report_mode(&mut self, mode: u16, private: bool) {
         let flag = if private {
             match mode {
                 6 => Some(Mode::ORIGIN),
@@ -2261,55 +1970,449 @@ impl Core {
             flag.map_or(0, |flag| if self.mode().contains(flag) { 1 } else { 2 })
         ));
     }
-    pub(crate) fn set_color(&mut self, index: usize, color: Option<Rgb>) {
+    fn set_color(&mut self, index: usize, color: Option<Rgb>) {
         if self.colors[index] != color {
             self.colors[index] = color;
             self.damage_palette();
         }
     }
-    pub(crate) fn dynamic_color_sequence(
+    /// `?` queries a palette slot; anything else sets it.
+    fn color_spec(
         &mut self,
         prefix: impl std::fmt::Display,
         index: usize,
+        value: &[u8],
         terminator: &str,
     ) {
-        let color = self.palette_color(index);
-        self.write_reply(format_args!(
-            "\x1b]{prefix};rgb:{r:04x}/{g:04x}/{b:04x}{terminator}",
-            r = u16::from_be_bytes([color.r; 2]),
-            g = u16::from_be_bytes([color.g; 2]),
-            b = u16::from_be_bytes([color.b; 2]),
-        ));
-    }
-    pub(crate) fn clipboard_store(&mut self, primary: bool, data: &[u8]) {
-        if let Some(text) = decode_utf8(data) {
-            self.events.push(Event::ClipboardStore { primary, text });
+        if value == b"?" {
+            let color = self.palette_color(index);
+            self.write_reply(format_args!(
+                "\x1b]{prefix};rgb:{r:04x}/{g:04x}/{b:04x}{terminator}",
+                r = u16::from_be_bytes([color.r; 2]),
+                g = u16::from_be_bytes([color.g; 2]),
+                b = u16::from_be_bytes([color.b; 2]),
+            ));
+        } else if let Some(color) = parse_color(value) {
+            self.set_color(index, Some(color));
         }
     }
-    pub(crate) fn clipboard_load(&mut self, clipboard: u8, terminator: &str) {
-        self.write_reply(format_args!(
-            "\x1b]52;{};{terminator}",
-            char::from(clipboard)
-        ));
+    fn set_title(&mut self, title: Option<String>) {
+        if self.title != title {
+            self.title = title.clone();
+            self.events.push(Event::Title(title));
+        }
     }
-    pub(crate) fn set_title(&mut self, title: Option<Cow<'_, str>>) {
-        if self.title.as_deref() == title.as_deref() {
+
+    pub(crate) fn control(&mut self, byte: u8) {
+        match byte {
+            0x08 => self.goto_col(self.active.cursor.point.column.saturating_sub(1)),
+            0x09 => self.move_tabs(1, true),
+            0x0a..=0x0c => {
+                self.linefeed();
+                if self.mode.contains(Mode::LINE_FEED_NEW_LINE) {
+                    self.goto_col(0);
+                }
+            }
+            0x0d => self.goto_col(0),
+            0x0e => self.active.cursor.charset = 1,
+            0x0f => self.active.cursor.charset = 0,
+            _ => (),
+        }
+    }
+
+    pub(crate) fn escape(&mut self, intermediate: u8, final_byte: u8) {
+        match (intermediate, final_byte) {
+            (0, b'7') => self.active.saved = self.active.cursor,
+            (0, b'8') => self.restore_cursor_position(),
+            (0, b'D') => self.linefeed(),
+            (0, b'E') => {
+                self.linefeed();
+                self.goto_col(0);
+            }
+            (0, b'H') => self.tabs[self.active.cursor.point.column] = true,
+            (0, b'M') if self.active.cursor.point.line as usize == self.scroll_top => {
+                self.scroll_region(self.scroll_top, self.scroll_bottom, 1, true);
+                self.active.cursor.wrap_pending = false;
+            }
+            (0, b'M') => self.move_vertical(1, false),
+            (0, b'Z') => self.write_reply("\x1b[?6c"),
+            (0, b'=' | b'>') => self.mode.set(Mode::APP_KEYPAD, final_byte == b'='),
+            (0, b'c') => self.reset_state(),
+            (b'#', b'8') => {
+                for y in 0..self.screen_lines() {
+                    let row = self.screen_row_mut(y);
+                    row.clear(Cell::default());
+                    for cell in &mut row.cells {
+                        cell.c = 'E';
+                    }
+                    row.used = row.cells.len();
+                }
+                self.goto(0, 0);
+                self.damage_all();
+            }
+            (b'('..=b'+', b'0' | b'B') => {
+                self.active.cursor.charsets[usize::from(intermediate - b'(')] =
+                    if final_byte == b'0' {
+                        StandardCharset::SpecialGraphics
+                    } else {
+                        StandardCharset::Ascii
+                    }
+            }
+            _ => (),
+        }
+    }
+
+    pub(crate) fn csi(&mut self, p: &Csi, final_byte: u8) {
+        if p.colons != 0 && (p.prefix != 0 || p.intermediate != 0 || final_byte != b'm') {
             return;
         }
-        let title = title.map(Cow::into_owned);
-        self.title = title.clone();
-        self.events.push(Event::Title(title));
-    }
-    pub(crate) fn push_title(&mut self) {
-        if self.titles.len() < 4096 {
-            self.titles.push(self.title.as_deref().map(Into::into));
+        let count = p.count(0);
+        let point = self.active.cursor.point;
+        let line = point.line as usize;
+        match (p.prefix, p.intermediate, final_byte) {
+            (0, 0, b'@' | b'P') => self.shift_chars(count, final_byte == b'@'),
+            (0, 0, b'A' | b'B' | b'e' | b'E' | b'F') => {
+                self.move_vertical(count, matches!(final_byte, b'B' | b'e' | b'E'));
+                if matches!(final_byte, b'E' | b'F') {
+                    self.goto_col(0);
+                }
+            }
+            (0, 0, b'C' | b'a') => self.goto_col(point.column.saturating_add(count)),
+            (0, 0, b'D') => self.goto_col(point.column.saturating_sub(count)),
+            (0, 0, b'G' | b'`') => self.goto_col(count - 1),
+            (0, 0, b'H' | b'f') => self.goto((count - 1) as i32, p.count(1) - 1),
+            (0, 0, b'd') => self.goto((count - 1) as i32, point.column),
+            (0, 0, b'I' | b'Z') => self.move_tabs(count, final_byte == b'I'),
+            (0, 0, b'J') => self.clear_screen(p.value(0)),
+            (0, 0, b'K') => self.clear_line(p.value(0)),
+            (0, 0, b'L' | b'M') if (self.scroll_top..self.scroll_bottom).contains(&line) => {
+                self.scroll_region(line, self.scroll_bottom, count, final_byte == b'L');
+                self.goto_col(0);
+            }
+            (0, 0, b'S' | b'T') => self.scroll_region(
+                self.scroll_top,
+                self.scroll_bottom,
+                count,
+                final_byte == b'T',
+            ),
+            (0, 0, b'X') => {
+                let end = point.column.saturating_add(count).min(self.columns());
+                let blank = self.blank();
+                self.screen_row_mut(line)
+                    .clear_range(point.column, end, blank);
+                self.active.cursor.wrap_pending = false;
+                self.damage_line(line);
+            }
+            (0, 0, b'b') => {
+                if let Some(c) = self.last_char {
+                    self.repeat(c, count);
+                }
+            }
+            (0, 0, b'g') => match p.value(0) {
+                0 => self.tabs[point.column] = false,
+                3 => self.tabs.fill(false),
+                _ => (),
+            },
+            (0, 0, b'h' | b'l') => {
+                for flag in p.params().iter().filter_map(|mode| ansi_mode(*mode)) {
+                    self.mode.set(flag, final_byte == b'h');
+                }
+            }
+            (b'?', 0, b'h' | b'l') => {
+                for mode in p.params() {
+                    self.set_private(*mode, final_byte == b'h');
+                }
+            }
+            (0, 0, b'm') => self.sgr(p),
+            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => self.write_reply(match p.prefix {
+                0 => "\x1b[?6c",
+                b'>' => "\x1b[>0;1;0c",
+                _ => "\x1bP!|00000000\x1b\\",
+            }),
+            (0, 0, b'n') if p.value(0) == 5 => self.write_reply("\x1b[0n"),
+            (0, 0, b'n') if p.value(0) == 6 => {
+                let top = if self.active.cursor.origin {
+                    self.scroll_top as i32
+                } else {
+                    0
+                };
+                let line = (point.line - top).max(0) + 1;
+                self.write_reply(format_args!("\x1b[{line};{}R", point.column + 1));
+            }
+            (0 | b'?', b'$', b'p') => self.report_mode(p.value(0), p.prefix == b'?'),
+            (0, b' ', b'q') => {
+                self.cursor_shape = match p.value(0) {
+                    0..=2 => CursorShape::Block,
+                    3..=4 => CursorShape::Underline,
+                    5..=6 => CursorShape::Beam,
+                    _ => return,
+                }
+            }
+            (0, 0, b'r') => {
+                let top = count - 1;
+                let lines = self.screen_lines();
+                let bottom = match p.value(1) {
+                    0 => lines,
+                    bottom => usize::from(bottom).min(lines),
+                };
+                if top + 1 < bottom {
+                    self.scroll_top = top;
+                    self.scroll_bottom = bottom;
+                    self.goto(0, 0);
+                }
+            }
+            (0, 0, b's') => self.active.saved = self.active.cursor,
+            (0, 0, b'u') => self.restore_cursor_position(),
+            (b'?', 0, b'u') => self.write_reply("\x1b[?0u"),
+            (b'?', 0, b'm') if p.value(0) == 4 => self.write_reply("\x1b[>4;0m"),
+            (0, 0, b't') => match p.value(0) {
+                14 => self.write_reply(format_args!(
+                    "\x1b[4;{};{}t",
+                    u32::from(self.size.num_lines) * u32::from(self.size.cell_height),
+                    u32::from(self.size.num_cols) * u32::from(self.size.cell_width)
+                )),
+                18 => {
+                    let WindowSize {
+                        num_lines,
+                        num_cols,
+                        ..
+                    } = self.size;
+                    self.write_reply(format_args!("\x1b[8;{num_lines};{num_cols}t"));
+                }
+                22 if self.titles.len() < 4096 => {
+                    self.titles.push(self.title.clone());
+                }
+                23 => {
+                    if let Some(title) = self.titles.pop() {
+                        self.set_title(title);
+                    }
+                }
+                _ => (),
+            },
+            (b'?', 0, b'W') if p.value(0) == 5 => {
+                self.tabs = (0..self.columns()).map(|x| x != 0 && x % 8 == 0).collect()
+            }
+            _ => (),
         }
     }
-    pub(crate) fn pop_title(&mut self) {
-        if let Some(title) = self.titles.pop() {
-            self.set_title(title.map(|title| Cow::Owned(title.into_string())));
+
+    // Rare sequences stay out of the shared CSI dispatch path.
+    #[inline(never)]
+    fn repeat(&mut self, c: char, count: usize) {
+        self.input_text(&c.to_string().repeat(count));
+    }
+
+    fn sgr(&mut self, p: &Csi) {
+        let cursor = &mut self.active.cursor;
+        let cell = &mut cursor.template;
+        let mut index = 0;
+        while index < p.params().len() {
+            let value = p.params()[index];
+            let mut end = index + 1;
+            while end < p.params().len() && p.colon(end) {
+                end += 1;
+            }
+            let colon = end > index + 1;
+            match value {
+                0 => {
+                    *cell = Cell::default();
+                    cursor.underline_color = None;
+                }
+                1 => cell.flags.insert(Flags::BOLD),
+                2 => cell.flags.insert(Flags::DIM),
+                3 => cell.flags.insert(Flags::ITALIC),
+                4 => {
+                    let style = if colon { p.value(index + 1) } else { 1 };
+                    if let Some(underline) = [
+                        Flags::empty(),
+                        Flags::UNDERLINE,
+                        Flags::DOUBLE_UNDERLINE,
+                        Flags::UNDERCURL,
+                        Flags::DOTTED_UNDERLINE,
+                        Flags::DASHED_UNDERLINE,
+                    ]
+                    .get(usize::from(style))
+                    {
+                        cell.flags.remove(Flags::ALL_UNDERLINES);
+                        cell.flags.insert(*underline);
+                    }
+                }
+                7 => cell.flags.insert(Flags::INVERSE),
+                8 => cell.flags.insert(Flags::HIDDEN),
+                9 => cell.flags.insert(Flags::STRIKEOUT),
+                21 => cell.flags.remove(Flags::BOLD),
+                22 => cell.flags.remove(Flags::BOLD | Flags::DIM),
+                23 => cell.flags.remove(Flags::ITALIC),
+                24 => cell.flags.remove(Flags::ALL_UNDERLINES),
+                27 => cell.flags.remove(Flags::INVERSE),
+                28 => cell.flags.remove(Flags::HIDDEN),
+                29 => cell.flags.remove(Flags::STRIKEOUT),
+                30..=37 => cell.fg = Color::Indexed(value as u8 - 30),
+                90..=97 => cell.fg = Color::Indexed(value as u8 - 82),
+                39 => cell.fg = Color::Named(NamedColor::Foreground),
+                40..=47 => cell.bg = Color::Indexed(value as u8 - 40),
+                100..=107 => cell.bg = Color::Indexed(value as u8 - 92),
+                49 => cell.bg = Color::Named(NamedColor::Background),
+                38 | 48 | 58 => {
+                    let mode = p.value(index + 1);
+                    let channels = match mode {
+                        2 => 3,
+                        5 => 1,
+                        _ => 0,
+                    };
+                    let start = if colon && mode == 2 && end - index == 6 {
+                        index + 3
+                    } else {
+                        index + 2
+                    };
+                    let available = if colon { end } else { p.params().len() };
+                    let values = &p.params()[start.min(available)..available];
+                    let color = match *values {
+                        [index, ..] if mode == 5 => u8::try_from(index).ok().map(Color::Indexed),
+                        [r, g, b, ..] if mode == 2 => match [r, g, b].map(u8::try_from) {
+                            [Ok(r), Ok(g), Ok(b)] => Some(Color::Spec(Rgb { r, g, b })),
+                            _ => None,
+                        },
+                        _ => None,
+                    };
+                    if !colon {
+                        end = (start + channels).min(p.params().len());
+                    }
+                    if let Some(color) = color {
+                        match value {
+                            38 => cell.fg = color,
+                            48 => cell.bg = color,
+                            _ => cursor.underline_color = Some(color),
+                        }
+                    }
+                }
+                59 => cursor.underline_color = None,
+                _ => {}
+            }
+            index = end;
         }
     }
+
+    pub(crate) fn osc(&mut self, osc: &[u8], terminator: &str) {
+        let mut parts = osc.split(|b| *b == b';');
+        let command_bytes = parts.next().unwrap();
+        let Some(command) = decimal(command_bytes) else {
+            return;
+        };
+        match command {
+            0 | 2 => {
+                let offset = (command_bytes.len() + 1).min(osc.len());
+                self.set_title(Some(String::from_utf8_lossy(&osc[offset..]).into_owned()));
+            }
+            7 => {
+                if let Some(directory) = parts.next() {
+                    self.set_directory_uri(directory);
+                }
+            }
+            133 => {
+                if let Some(marker) = parts.next() {
+                    self.shell_marker(marker, parts.next());
+                }
+            }
+            4 => {
+                while let (Some(index), Some(value)) = (parts.next(), parts.next()) {
+                    if let Some(index) = decimal(index).filter(|i| *i < 256) {
+                        self.color_spec(format_args!("4;{index}"), index, value, terminator);
+                    }
+                }
+            }
+            10..=12 => {
+                for (command, value) in (command..=12).zip(parts) {
+                    self.color_spec(command, command + 246, value, terminator);
+                }
+            }
+            50 => {
+                if let Some(value) = parts
+                    .next()
+                    .and_then(|part| part.strip_prefix(b"CursorShape="))
+                {
+                    self.cursor_shape = match value.first() {
+                        Some(b'0') => CursorShape::Block,
+                        Some(b'1') => CursorShape::Beam,
+                        Some(b'2') => CursorShape::Underline,
+                        _ => return,
+                    };
+                }
+            }
+            52 => {
+                if let (Some(target), Some(data)) = (parts.next(), parts.next()) {
+                    let clipboard = target.first().copied().unwrap_or(b'c');
+                    if !matches!(clipboard, b'c' | b'p' | b's') {
+                        return;
+                    }
+                    if data == b"?" {
+                        let clipboard = char::from(clipboard);
+                        self.write_reply(format_args!("\x1b]52;{clipboard};{terminator}"));
+                    } else if let Some(text) = decode_utf8(data) {
+                        self.events.push(Event::ClipboardStore {
+                            primary: clipboard == b'p',
+                            text,
+                        });
+                    }
+                }
+            }
+            104 => {
+                let mut supplied = false;
+                for part in parts {
+                    supplied |= !part.is_empty();
+                    if let Some(index) = decimal(part).filter(|i| *i < 256) {
+                        self.set_color(index, None);
+                    }
+                }
+                if !supplied {
+                    for index in 0..256 {
+                        self.set_color(index, None);
+                    }
+                }
+            }
+            110..=112 => self.set_color(command + 146, None),
+            _ => (),
+        }
+    }
+}
+
+fn decimal(bytes: &[u8]) -> Option<usize> {
+    std::str::from_utf8(bytes).ok()?.parse().ok()
+}
+
+fn parse_color(bytes: &[u8]) -> Option<Rgb> {
+    fn hex_value(bytes: &[u8]) -> Option<u16> {
+        if bytes.is_empty() || bytes.len() > 4 {
+            return None;
+        }
+        bytes.iter().try_fold(0u16, |value, byte| {
+            Some(value * 16 + char::from(*byte).to_digit(16)? as u16)
+        })
+    }
+    fn channel(bytes: &[u8]) -> Option<u8> {
+        let value = u32::from(hex_value(bytes)?);
+        Some((value * 255 / ((1u32 << (bytes.len() * 4)) - 1)) as u8)
+    }
+    if let Some(hex) = bytes.strip_prefix(b"#") {
+        if !matches!(hex.len(), 3 | 6 | 9 | 12) {
+            return None;
+        }
+        let width = hex.len() / 3;
+        let legacy = |part: &[u8]| Some((hex_value(part)? << (16 - 4 * width) >> 8) as u8);
+        return Some(Rgb {
+            r: legacy(&hex[..width])?,
+            g: legacy(&hex[width..width * 2])?,
+            b: legacy(&hex[width * 2..])?,
+        });
+    }
+    let rgb = bytes.strip_prefix(b"rgb:")?;
+    let mut parts = rgb.split(|b| *b == b'/');
+    let color = Rgb {
+        r: channel(parts.next()?)?,
+        g: channel(parts.next()?)?,
+        b: channel(parts.next()?)?,
+    };
+    parts.next().is_none().then_some(color)
 }
 
 // A view this far outside the cached cold rows loads a new page, so scrolling does not show blanks.
@@ -2319,10 +2422,7 @@ impl Core {
     pub fn enable_history(&mut self, budget: Arc<HistoryBudget>) {
         self.history = Some(DiskHistory {
             io: History::new(budget),
-            first: 0,
-            hot_start: 0,
-            spool: VecDeque::new(),
-            requests: VecDeque::new(),
+            first: self.block_origin,
             epoch: 0,
             layout_epoch: 0,
             page_start: 0,
@@ -2332,7 +2432,6 @@ impl Core {
             clearing: false,
             failed: false,
         });
-        self.spill_history();
     }
     /// A duplicate of the history writer's wakeup fd, for threads that outlive their request.
     pub(crate) fn history_waker(&self) -> io::Result<Option<OwnedFd>> {
@@ -2341,75 +2440,67 @@ impl Core {
             .map(|history| history.io.budget().waker())
             .transpose()
     }
+    /// Parsing waits while the rows leaving the hot area are ahead of the history writer.
     pub(crate) fn history_read_ready(&self) -> bool {
-        self.mode.contains(Mode::ALT_SCREEN)
-            || self
-                .history
-                .as_ref()
-                .is_none_or(|history| history.spool.len() < 64)
+        self.mode.contains(Mode::ALT_SCREEN) || self.hot_history_size() < HOT_ROWS + 2 * BATCH
     }
+    /// Id of the first row of the main screen's hot area.
+    fn hot_start(&self) -> u64 {
+        self.block_origin - (self.main_screen().rows.len() - self.screen_lines()) as u64
+    }
+    /// Sends the rows beyond the hot area to the writer in batches; without a working archive
+    /// they are dropped.
     fn spill_history(&mut self) {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
         let lines = self.screen_lines();
-        let Some(history) = &mut self.history else {
-            let excess = self.active.rows.len().saturating_sub(lines);
-            self.recycled.extend(self.active.rows.drain(..excess));
-            return;
-        };
-        while self.active.rows.len() > lines + HOT_ROWS {
-            let row = self.active.rows.pop_front().unwrap();
-            history.hot_start += 1;
-            if history.failed {
-                history.first = history.hot_start;
-                self.recycled.push_back(row);
-            } else {
-                history.spool.push_back(row);
+        let rows = &mut self.active.rows;
+        match &mut self.history {
+            Some(history) if !history.failed => {
+                while rows.len() >= lines + HOT_ROWS + BATCH && !history.io.busy() {
+                    let start = self.block_origin - (rows.len() - lines) as u64;
+                    history.io.append(start, rows.drain(..BATCH).collect());
+                }
+            }
+            history => {
+                let kept = lines + history.as_ref().map_or(0, |_| HOT_ROWS);
+                self.recycled
+                    .extend(rows.drain(..rows.len().saturating_sub(kept)));
+                if let Some(history) = history {
+                    history.first = self.block_origin - (rows.len() - lines) as u64;
+                }
             }
         }
-        self.flush_history(false);
-    }
-    fn flush_history(&mut self, final_batch: bool) {
-        let Some(history) = &mut self.history else {
-            return;
-        };
-        if history.clearing || history.failed {
-            return;
-        }
-        while !history.io.busy()
-            && (history.spool.len() >= BATCH || final_batch && !history.spool.is_empty())
-        {
-            let count = history.spool.len().min(BATCH);
-            let start = history.hot_start - history.spool.len() as u64;
-            history
-                .io
-                .append(start, history.spool.drain(..count).collect());
+        // Discarded rows can leave a scrolled view past the history that remains.
+        let retained = self.history_size();
+        if self.active.offset > retained {
+            self.active.offset = retained;
+            self.damage_all();
         }
     }
     fn request_history_page(&mut self) {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
-        let lines = self.screen_lines();
-        let hot_history = self.hot_history_size();
-        let offset = self.display_offset();
+        let lines = self.screen_lines() as u64;
+        let hot_start = self.hot_start();
+        let top = self
+            .block_origin
+            .saturating_sub(self.display_offset() as u64);
         let Some(history) = &mut self.history else {
             return;
         };
-        if offset <= hot_history {
+        if top >= hot_start {
             history.requested = None;
             return;
         }
-        let top = history
-            .hot_start
-            .saturating_sub((offset - hot_history) as u64)
-            .max(history.first);
-        let bottom = (top + lines as u64).min(history.hot_start);
+        let top = top.max(history.first);
+        let bottom = (top + lines).min(hot_start);
         let load = |margin: u64| {
             (
                 top.saturating_sub(margin).max(history.first),
-                (bottom + margin).min(history.hot_start),
+                (bottom + margin).min(hot_start),
             )
         };
         let (need_start, need_end) = load(PAGE_MARGIN / 4);
@@ -2418,15 +2509,12 @@ impl Core {
         if covered(&cached) || history.requested.as_ref().is_some_and(covered) {
             return;
         }
-        // Rows still in the spool are not on disk yet.
-        if history.spool.is_empty() {
-            let (start, end) = load(PAGE_MARGIN);
-            history.epoch += 1;
-            history
-                .io
-                .page(history.epoch, start, (end - start) as usize);
-            history.requested = Some(start..end);
-        }
+        let (start, end) = load(PAGE_MARGIN);
+        history.epoch += 1;
+        history
+            .io
+            .page(history.epoch, start, (end - start) as usize);
+        history.requested = Some(start..end);
     }
     pub(crate) fn poll_history(&mut self) -> bool {
         let Some(history) = &mut self.history else {
@@ -2438,7 +2526,9 @@ impl Core {
         for reply in history.io.poll() {
             match reply {
                 Reply::Stored(rows) => self.recycled.extend(rows),
-                Reply::First(first) if !history.clearing && !history.failed => {
+                // Later batches of a failed archive fail too.
+                _ if history.failed => (),
+                Reply::First(first) if !history.clearing => {
                     changed |= history.first != first;
                     history.first = first;
                 }
@@ -2464,34 +2554,28 @@ impl Core {
         }
         if let Some(error) = failure {
             self.history_failed(error);
-            return true;
-        }
-        if changed {
+            changed = true;
+        } else if changed {
             let offset = self.active.offset.min(self.history_size());
             if page_loaded || offset != self.active.offset {
                 self.damage_all();
-                if let Some(history) = &mut self.history {
-                    for row in &mut history.page {
-                        row.revision = self.revision;
-                    }
-                }
             }
             self.active.offset = offset;
             self.trim_blocks();
         }
-        self.flush_history_requests();
+        self.spill_history();
         self.request_history_page();
         changed
     }
     /// A failed archive is dropped. The hot rows stay, so copying and searching still work on
     /// them, and rows that leave the hot area are discarded from now on.
     fn history_failed(&mut self, error: io::Error) {
+        let hot_start = self.hot_start();
         let history = self.history.as_mut().unwrap();
         history.io.clear();
         history.failed = true;
         history.clearing = false;
-        history.spool.clear();
-        history.first = history.hot_start;
+        history.first = hot_start;
         history.page.clear();
         history.requested = None;
         history.layout_epoch += 1;
@@ -2504,7 +2588,6 @@ impl Core {
         main.offset = main.offset.min(main.rows.len() - lines);
         self.trim_blocks();
         self.damage_all();
-        self.flush_history_requests();
         self.events.push(Event::HistoryError(io::Error::new(
             error.kind(),
             format!("disk history disabled; retained history is incomplete: {error}"),
@@ -2515,8 +2598,6 @@ impl Core {
             return;
         };
         history.first = 0;
-        history.hot_start = 0;
-        history.spool.clear();
         history.page.clear();
         history.requested = None;
         history.epoch += 1;
@@ -2597,36 +2678,27 @@ impl Core {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
-        if marker == b"P" {
-            match status {
-                Some(b"1" | b"2") => {
-                    self.prompt_scope = Flags::PROMPT;
-                    let point = self.active.cursor.point;
-                    let row = self.screen_row_mut(point.line as usize);
-                    // Cursor-positioned right prompts own their blank padding too.
-                    if row.used < point.column {
-                        for cell in &mut row.cells[row.used..point.column] {
-                            cell.flags.insert(Flags::PROMPT);
-                        }
-                        self.damage_line(point.line as usize);
-                    }
-                }
-                Some(b"0") => self.prompt_scope = Flags::empty(),
-                _ => {}
-            }
-            return;
-        }
-        if !matches!(marker, b"A" | b"B" | b"C" | b"D") {
-            return;
-        }
-        self.prompt_scope = if marker == b"A" {
-            Flags::PROMPT
-        } else {
-            Flags::empty()
-        };
         let point = self.cursor_block_point();
-        match marker {
-            b"A" => {
+        match (marker, status) {
+            (b"P", Some(b"1" | b"2")) => {
+                self.prompt_scope = Flags::PROMPT;
+                let cursor = self.active.cursor.point;
+                let row = self.screen_row_mut(cursor.line as usize);
+                // Cursor-positioned right prompts own their blank padding too.
+                if row.used < cursor.column {
+                    for cell in &mut row.cells[row.used..cursor.column] {
+                        cell.flags.insert(Flags::PROMPT);
+                    }
+                    self.damage_line(cursor.line as usize);
+                }
+                return;
+            }
+            (b"P", Some(b"0")) => {
+                self.prompt_scope = Flags::empty();
+                return;
+            }
+            (b"A", _) => {
+                self.prompt_scope = Flags::PROMPT;
                 // Repainting the same prompt must not grow metadata indefinitely.
                 if let Some(block) = self.blocks.back_mut()
                     && block.prompt == point
@@ -2656,34 +2728,29 @@ impl Core {
                 self.prompt_dirty = false;
                 self.next_block += 1;
             }
-            b"B" => {
-                if let Some(block) = self.blocks.back_mut()
-                    && block.output.is_none()
-                {
-                    block.command = Some(point);
+            (b"B" | b"C" | b"D", _) => {
+                self.prompt_scope = Flags::empty();
+                let Some(block) = self.blocks.back_mut() else {
+                    return;
+                };
+                match marker {
+                    b"B" if block.output.is_none() => block.command = Some(point),
+                    b"C" if block.end.is_none() => {
+                        block.started.get_or_insert_with(Instant::now);
+                        block.output = Some(point);
+                        self.prompt_dirty = false;
+                    }
+                    b"D" if block.end.is_none() => {
+                        block.end = Some(point);
+                        block.finished = Some(Instant::now());
+                        block.status = status
+                            .and_then(|s| std::str::from_utf8(s).ok())
+                            .and_then(|s| s.parse().ok());
+                    }
+                    _ => (),
                 }
             }
-            b"C" => {
-                if let Some(block) = self.blocks.back_mut()
-                    && block.end.is_none()
-                {
-                    block.started.get_or_insert_with(std::time::Instant::now);
-                    block.output = Some(point);
-                    self.prompt_dirty = false;
-                }
-            }
-            b"D" => {
-                if let Some(block) = self.blocks.back_mut()
-                    && block.end.is_none()
-                {
-                    block.end = Some(point);
-                    block.finished = Some(std::time::Instant::now());
-                    block.status = status
-                        .and_then(|s| std::str::from_utf8(s).ok())
-                        .and_then(|s| s.parse().ok());
-                }
-            }
-            _ => {}
+            _ => return,
         }
         self.trim_blocks();
     }
@@ -2712,13 +2779,9 @@ impl Core {
     }
     /// Id of the oldest row still retained.
     fn first_row(&self) -> u64 {
-        self.history.as_ref().map_or_else(
-            || {
-                let hot = self.main_screen().rows.len() - self.screen_lines();
-                self.block_origin.saturating_sub(hot as u64)
-            },
-            |history| history.first,
-        )
+        self.history
+            .as_ref()
+            .map_or_else(|| self.hot_start(), |history| history.first)
     }
     fn trim_blocks(&mut self) {
         let first = self.first_row();
@@ -2843,11 +2906,12 @@ impl Core {
         self.submit(move |core, sender| {
             let history = core.history.as_ref().unwrap();
             let alternate = core.mode.contains(Mode::ALT_SCREEN);
+            let (hot_start, hot) = core.copy_rows(!alternate, 0, u64::MAX);
             history.io.search(
                 HistorySearch {
                     query,
-                    hot_start: if alternate { 0 } else { history.hot_start },
-                    hot: core.active.rows.iter().cloned().collect(),
+                    hot_start,
+                    hot,
                     columns: core.columns(),
                     alternate,
                     cancelled,
@@ -2885,21 +2949,19 @@ impl Core {
             .saturating_sub((self.screen_lines() / 2) as u64);
         let offset = base.saturating_sub(top).min(self.history_size() as u64) as usize;
         self.set_display_offset(offset);
-        self.selection_start(
-            Point {
+        self.selection = Some(Selection {
+            start: Point {
                 line: line_offset(found.start_row, base),
                 column: usize::from(found.start_column),
             },
-            Side::Left,
-            SelectionType::Simple,
-        );
-        self.selection_update(
-            Point {
+            start_side: Side::Left,
+            end: Point {
                 line: line_offset(found.end_row, base),
                 column: usize::from(found.end_column.saturating_sub(1)),
             },
-            Side::Right,
-        );
+            end_side: Side::Right,
+            kind: SelectionType::Simple,
+        });
         self.damage_all();
         Ok(())
     }
@@ -2921,12 +2983,7 @@ impl Core {
         self.submit(move |core, sender| {
             let (block, start, end) = core.block_output(id)?;
             let history = core.history.as_ref().unwrap();
-            let (hot_start, hot) = Self::copy_rows(
-                &core.main_screen().rows,
-                history.hot_start,
-                start.row,
-                end.row,
-            );
+            let (hot_start, hot) = core.copy_rows(true, start.row, end.row);
             history.io.copy(
                 HistoryCopyRequest {
                     start: (start.row, start.column),
@@ -2949,11 +3006,6 @@ impl Core {
                 .selection_range()
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "no selection"))?;
             let history = core.history.as_ref().unwrap();
-            let hot_start = if core.mode.contains(Mode::ALT_SCREEN) {
-                0
-            } else {
-                history.hot_start
-            };
             let base = core.screen_base();
             let start = (
                 base.saturating_add_signed(i64::from(range.start.line)),
@@ -2963,7 +3015,8 @@ impl Core {
                 base.saturating_add_signed(i64::from(range.end.line)),
                 range.end.column + 1,
             );
-            let (hot_start, hot) = Self::copy_rows(&core.active.rows, hot_start, start.0, end.0);
+            let alternate = core.mode.contains(Mode::ALT_SCREEN);
+            let (hot_start, hot) = core.copy_rows(!alternate, start.0, end.0);
             history.io.copy(
                 HistoryCopyRequest {
                     start,
@@ -3013,7 +3066,7 @@ impl Core {
                     .rows
                     .iter()
                     .rposition(|row| row.used() != 0)
-                    .map_or(cursor_row, |index| history.hot_start + index as u64);
+                    .map_or(cursor_row, |index| core.hot_start() + index as u64);
                 (
                     (0, 0),
                     (cursor_row.max(last_used), core.columns()),
@@ -3032,8 +3085,7 @@ impl Core {
                     "History cursor is outside the requested command or history range",
                 ));
             }
-            let (hot_start, hot) =
-                Self::copy_rows(&main.rows, history.hot_start, cursor.row, end.0);
+            let (hot_start, hot) = core.copy_rows(true, cursor.row, end.0);
             history.io.read(
                 HistoryRead {
                     start,
@@ -3055,7 +3107,14 @@ impl Core {
 }
 
 impl Core {
-    fn copy_rows(rows: &VecDeque<Row>, hot_start: u64, start: u64, end: u64) -> (u64, Vec<Row>) {
+    /// The first id and the rows of the hot area that cover rows `start..=end`, of the main screen
+    /// or else the alternate one, whose ids start at 0.
+    fn copy_rows(&self, main: bool, start: u64, end: u64) -> (u64, Vec<Row>) {
+        let (rows, hot_start) = if main {
+            (&self.main_screen().rows, self.hot_start())
+        } else {
+            (&self.active.rows, 0)
+        };
         let count = rows.len();
         let index = |id: u64| id.saturating_sub(hot_start).min(count as u64) as usize;
         // Line and word selections may widen over soft-wrapped rows.
@@ -3074,42 +3133,15 @@ impl Core {
         )
     }
 
-    /// Requests wait while the rows they describe are still moving to disk, or a frame is
-    /// half drawn.
-    fn history_read_blocked(&mut self) -> bool {
-        self.flush_history(true);
-        self.history.as_ref().is_some_and(|history| {
-            self.mode.contains(Mode::SYNC_UPDATE) || !history.spool.is_empty() || history.clearing
-        })
-    }
-
     fn submit<T: Send + 'static>(
         &mut self,
         run: impl FnOnce(&Core, &mpsc::Sender<io::Result<T>>) -> io::Result<()> + Send + 'static,
     ) -> mpsc::Receiver<io::Result<T>> {
         let (sender, receiver) = mpsc::channel();
-        let task: Request = Box::new(move |core| {
-            if let Err(error) = run(core, &sender) {
-                let _ = sender.send(Err(error));
-            }
-        });
-        self.history.as_mut().unwrap().requests.push_back(task);
-        self.flush_history_requests();
-        receiver
-    }
-
-    /// Submits the requests that waited for a half-drawn frame or for rows on their way to disk.
-    pub(crate) fn flush_history_requests(&mut self) {
-        while !self.history_read_blocked() {
-            let Some(task) = self
-                .history
-                .as_mut()
-                .and_then(|history| history.requests.pop_front())
-            else {
-                break;
-            };
-            task(self);
+        if let Err(error) = run(self, &sender) {
+            let _ = sender.send(Err(error));
         }
+        receiver
     }
 }
 

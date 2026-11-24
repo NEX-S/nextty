@@ -279,17 +279,10 @@ mod tests {
     #[test]
     fn completed_chunked_http_responses_reuse_the_same_connection() {
         let (url, server) = server(|mut stream| {
-            let body = b"data: {\"type\":\"end\"}\n\n";
-            let mut reply = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n",
-                body.len()
-            )
-            .into_bytes();
-            reply.extend_from_slice(body);
-            reply.extend_from_slice(b"\r\n0\r\n\r\n");
-            stream.write_all(&reply).unwrap();
+            let reply = b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n16\r\ndata: {\"type\":\"end\"}\n\n\r\n0\r\n\r\n";
+            stream.write_all(reply).unwrap();
             assert_eq!(read_request(&mut stream), b"{}");
-            stream.write_all(&reply).unwrap();
+            stream.write_all(reply).unwrap();
         });
         let mut http = Http::new();
         let wake = crate::sys::new().unwrap();
@@ -363,11 +356,7 @@ mod tests {
             received.recv_timeout(Duration::from_secs(2)).unwrap();
             let start = Instant::now();
             cancel.store(true, Ordering::Release);
-            let value = 1u64;
-            assert_eq!(
-                unsafe { libc::write(notify.as_raw_fd(), (&value as *const u64).cast(), 8) },
-                8
-            );
+            crate::sys::notify(notify.as_raw_fd());
             start
         });
         let error = Http::new()

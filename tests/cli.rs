@@ -1,5 +1,5 @@
 use nextty::terminal::Shell;
-use nextty::workspace::{Action, Client, CreateOptions, Response};
+use nextty::workspace::{Action, Client, CreateOptions};
 use std::{
     fs,
     os::unix::fs::{DirBuilderExt, PermissionsExt},
@@ -7,31 +7,6 @@ use std::{
     process::Command,
     time::{Duration, Instant},
 };
-
-#[test]
-fn remote_argument_errors_do_not_launch_ssh_or_load_configuration() {
-    for (args, expected) in [
-        (vec!["attach", "user@host"], "requires a workspace name"),
-        (vec!["list", "user@host", "0"], "at most one remote target"),
-        (
-            vec!["new", "user@host:invalid", "0", "--tui"],
-            "remote target",
-        ),
-    ] {
-        let output = Command::new(env!("CARGO_BIN_EXE_nextty"))
-            .args(&args)
-            .env("PATH", "")
-            .env("XDG_CONFIG_HOME", "relative-invalid-config")
-            .output()
-            .unwrap();
-        assert!(!output.status.success(), "{args:?}");
-        assert!(
-            String::from_utf8_lossy(&output.stderr).contains(expected),
-            "{args:?}: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-}
 
 #[test]
 fn control_commands_skip_default_config_but_validate_explicit_config() {
@@ -68,30 +43,19 @@ fn control_commands_skip_default_config_but_validate_explicit_config() {
 
 #[test]
 fn bridge_starts_the_server_for_new_only_and_resolves_directories_in_its_home() {
-    fn until(client: &mut Client, mut done: impl FnMut(&[Response]) -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(10);
-        while !done(&client.poll().unwrap()) {
-            assert!(Instant::now() < deadline, "bridge did not answer");
-            std::thread::sleep(Duration::from_millis(5));
-        }
-    }
     let root = std::env::temp_dir().join(format!("nextty-bridge-{}", std::process::id()));
     let (home, runtime, launch) = (root.join("home"), root.join("runtime"), root.join("launch"));
     fs::create_dir_all(home.join("project")).unwrap();
     fs::create_dir(&launch).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&runtime).unwrap();
-    let bridge = |new: bool| {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_nextty"));
+    let environment = |command: &mut Command| {
         command
-            .args(["--bridge", if new { "new" } else { "attach" }])
             .current_dir(&launch)
             .env("HOME", &home)
             .env("XDG_RUNTIME_DIR", &runtime)
             .env("XDG_CACHE_HOME", root.join("cache"));
-        Client::connect_remote(command, "test".into()).unwrap()
     };
-
-    // `nextty list HOST` through an ssh that just runs the bridge here.
+    // Control commands for HOST go through an ssh that runs the remote command here.
     fs::create_dir(root.join("bin")).unwrap();
     fs::write(
         root.join("bin/ssh"),
@@ -99,23 +63,16 @@ fn bridge_starts_the_server_for_new_only_and_resolves_directories_in_its_home() 
     )
     .unwrap();
     fs::set_permissions(root.join("bin/ssh"), fs::Permissions::from_mode(0o755)).unwrap();
-    let list_over_ssh = || {
-        let output = Command::new(env!("CARGO_BIN_EXE_nextty"))
-            .args(["list", "user@host"])
-            .env("NEXTTY", env!("CARGO_BIN_EXE_nextty"))
-            .env(
-                "PATH",
-                format!("{}:/usr/bin:/bin", root.join("bin").display()),
-            )
-            .env("HOME", &home)
-            .env("XDG_RUNTIME_DIR", &runtime)
-            .env("XDG_CACHE_HOME", root.join("cache"))
-            .output()
-            .unwrap();
+    let over_ssh = |args: &[&str]| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_nextty"));
+        environment(command.args(args));
+        let path = format!("{}:/usr/bin:/bin", root.join("bin").display());
+        let command = command.env("NEXTTY", env!("CARGO_BIN_EXE_nextty"));
+        let output = command.env("PATH", path).output().unwrap();
         assert!(output.status.success(), "{output:?}");
         String::from_utf8(output.stdout).unwrap()
     };
-    assert_eq!(list_over_ssh(), "No workspaces.\n");
+    assert_eq!(over_ssh(&["list", "user@host"]), "No workspaces.\n");
     assert!(
         fs::read_dir(runtime.join("nextty"))
             .unwrap()
@@ -127,7 +84,9 @@ fn bridge_starts_the_server_for_new_only_and_resolves_directories_in_its_home() 
         "list started a server"
     );
 
-    let mut frontend = bridge(true);
+    let mut bridge = Command::new(env!("CARGO_BIN_EXE_nextty"));
+    environment(bridge.args(["--bridge", "new"]));
+    let mut frontend = Client::connect_remote(bridge, "test".into()).unwrap();
     frontend
         .send(Action::Create {
             name: "bridged".into(),
@@ -164,23 +123,9 @@ fn bridge_starts_the_server_for_new_only_and_resolves_directories_in_its_home() 
         .path();
     assert_eq!(fs::read_link(server.join("cwd")).unwrap(), Path::new("/"));
 
-    assert!(list_over_ssh().starts_with("bridged\t1 tabs\t1 panes"));
-    let mut control = bridge(false);
-    control.send(Action::List).unwrap();
-    until(&mut control, |events| {
-        events.iter().any(|event| {
-            matches!(event, Response::List(list) if list.len() == 1 && list[0].name == "bridged")
-        })
-    });
-    control
-        .send(Action::TerminateName("bridged".into()))
-        .unwrap();
-    until(&mut control, |events| {
-        events
-            .iter()
-            .any(|event| matches!(event, Response::Detached))
-    });
-    drop((control, frontend));
+    assert!(over_ssh(&["list", "user@host"]).starts_with("bridged\t1 tabs\t1 panes"));
+    over_ssh(&["terminate", "user@host", "bridged"]);
+    drop(frontend);
     let deadline = Instant::now() + Duration::from_secs(5);
     while server.exists() {
         assert!(

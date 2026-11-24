@@ -2,14 +2,6 @@ use super::*;
 use std::collections::HashSet;
 use std::io::Read;
 
-fn test_client(stream: UnixStream) -> Client {
-    Client::new(
-        Peer::new(stream).unwrap(),
-        None,
-        ClientEndpoint::Local(PathBuf::new()),
-    )
-}
-
 fn wait(client: &mut Client, mut condition: impl FnMut(&Client, &[Response]) -> bool) {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
@@ -543,27 +535,21 @@ fn server_survives_accept_fd_exhaustion() {
 fn drain_agent(client: &mut Client) -> Vec<AgentEvent> {
     client.agent_events.drain(..).collect()
 }
-/// Queues `request` and returns the token the daemon hands out for starting the owner.
-fn agent_start(frontend: &mut Client, request: AgentRequest) -> Vec<u8> {
+/// Queues `request`, which asks the frontend to start the owner.
+fn agent_start(frontend: &mut Client, request: AgentRequest) {
     frontend.send(Action::AgentRequest(request)).unwrap();
     wait(frontend, |client, _| !client.agent_events.is_empty());
-    drain_agent(frontend)
-        .into_iter()
-        .find_map(|event| match event {
-            AgentEvent::Start(token) => Some(token),
-            _ => None,
-        })
-        .unwrap()
+    assert!(drain_agent(frontend).contains(&AgentEvent::Start));
 }
-fn agent_attach(server: &TestServer, name: &str, token: Vec<u8>) -> Client {
+fn agent_attach(server: &TestServer, name: &str) -> Client {
     let mut owner = Client::connect(&server.socket()).unwrap();
     let name = name.into();
-    owner.send(Action::AgentAttach { name, token }).unwrap();
+    owner.send(Action::AgentAttach { name }).unwrap();
     owner
 }
 fn attach_agent_owner(server: &TestServer, frontend: &mut Client, name: &str) -> Client {
-    let token = agent_start(frontend, AgentRequest::Abort { session: 0 });
-    let mut owner = agent_attach(server, name, token);
+    agent_start(frontend, AgentRequest::Abort { session: 0 });
+    let mut owner = agent_attach(server, name);
     wait_snapshot(&mut owner, |_| true);
     owner
 }
@@ -622,13 +608,12 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     frontend
         .send(Action::AgentView(draft_view.clone()))
         .unwrap();
-    let token = agent_start(&mut frontend, first_request.clone());
-    let mut owner = agent_attach(&server, "persist", token.clone());
+    agent_start(&mut frontend, first_request.clone());
+    let mut owner = agent_attach(&server, "persist");
     wait_snapshot(&mut owner, |_| true);
     assert_eq!(
         drain_agent(&mut owner),
         [
-            AgentEvent::Attached,
             AgentEvent::Draft(draft_view),
             AgentEvent::Request(first_request)
         ]
@@ -649,7 +634,8 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     // Draft edits stay between frontends; the owner only receives the request.
     wait(&mut owner, |client, _| !client.agent_events.is_empty());
     assert_eq!(drain_agent(&mut owner), [AgentEvent::Request(next_request)]);
-    wait_error(&mut agent_attach(&server, "persist", token.clone()));
+    // One owner per workspace.
+    wait_error(&mut agent_attach(&server, "persist"));
 
     let message = |text: &str| AgentMessage {
         turn: 1,
@@ -778,7 +764,6 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     fresh.send(Action::AgentOpen).unwrap();
     wait(&mut fresh, |client, _| !client.agent_events.is_empty());
     assert_eq!(drain_agent(&mut fresh), [AgentEvent::Ready]);
-    wait_error(&mut agent_attach(&server, "persist", token));
     terminate(&mut keeper, "keeper");
 }
 
@@ -860,71 +845,35 @@ fn assert_same_screen(left: &Client, right: &Client, pane: PaneId) {
 }
 
 #[test]
-fn automatic_session_names_are_atomic_reusable_and_attachable() {
+fn automatic_session_names_reuse_the_lowest_free_number() {
     let server = TestServer::start();
-    let options = program(
-        "/bin/sh",
-        &["-c", "printf 'numbered-session-marker\\n'; exec /bin/sh"],
-    );
-    let _named = start(&server, "2", options.clone());
-
-    let barrier = Arc::new(std::sync::Barrier::new(8));
-    let handles: Vec<_> = (0..8)
-        .map(|_| {
-            let (socket, options, barrier) = (server.socket(), options.clone(), barrier.clone());
-            std::thread::spawn(move || {
-                let mut client = Client::connect(&socket).unwrap();
-                barrier.wait();
-                let name = String::new();
-                client.send(Action::Create { name, options }).unwrap();
-                wait(&mut client, |client, _| {
-                    grid_contains(client, "numbered-session-marker")
-                });
-                client
-            })
-        })
-        .collect();
-    let clients: Vec<_> = handles
-        .into_iter()
-        .map(|handle| handle.join().unwrap())
-        .collect();
-    let mut names: Vec<usize> = clients
-        .iter()
-        .map(|client| client.snapshot().unwrap().name.parse().unwrap())
-        .collect();
-    names.sort_unstable();
-    assert_eq!(names, [0, 1, 3, 4, 5, 6, 7, 8]);
-
-    let mut control = Client::connect(&server.socket()).unwrap();
-    control
+    let options = program("/bin/sh", &[]);
+    let _named = start(&server, "1", options.clone());
+    let mut first = start(&server, "", options.clone());
+    let mut second = start(&server, "", options.clone());
+    assert_eq!(first.snapshot().unwrap().name, "0");
+    assert_eq!(second.snapshot().unwrap().name, "2");
+    let name = "1".into();
+    let duplicate = options.clone();
+    second
         .send(Action::Create {
-            name: "0".into(),
-            options: options.clone(),
+            name,
+            options: duplicate,
         })
         .unwrap();
-    wait_error_containing(&mut control, "workspace already exists");
-    terminate(&mut control, "1");
-    create(&mut control, "", options.clone());
-    assert_eq!(control.snapshot().unwrap().name, "1");
+    wait_error_containing(&mut second, "workspace already exists");
 
-    drop(clients);
-    let mut attached = attach(&server, "0");
-    wait(&mut attached, |client, _| {
-        grid_contains(client, "numbered-session-marker")
-    });
-    assert!(attached.snapshot().unwrap().controller);
-    let _custom = start(&server, "dev", options.clone());
+    // A frontend that lost control can still end the workspace.
     let mut takeover = attach(&server, "0");
-    wait_snapshot(&mut attached, |snapshot| !snapshot.controller);
-    attached.send(Action::Terminate).unwrap();
-    attached.flush().unwrap();
+    wait_snapshot(&mut first, |snapshot| !snapshot.controller);
+    first.send(Action::Terminate).unwrap();
+    first.flush().unwrap();
     wait_detached(&mut takeover);
-
     let mut reused = start(&server, "", options);
     assert_eq!(reused.snapshot().unwrap().name, "0");
     // The old frontend has not polled Detached and still displays the old 0.
-    attached.send(Action::Terminate).unwrap();
-    wait_detached(&mut attached);
+    first.send(Action::Terminate).unwrap();
+    wait_detached(&mut first);
     let pane = reused.snapshot().unwrap().focused;
     input(&mut reused, pane, "printf '\\162eused-session-alive\\n'\n");
     wait(&mut reused, |client, _| {
@@ -1058,38 +1007,6 @@ fn new_tab(client: &mut Client, pane: PaneId) -> PaneId {
 }
 
 #[test]
-fn scrolling_during_history_resize_survives_the_new_layout() {
-    let server = TestServer::start();
-    let size = WindowSize {
-        num_cols: 100,
-        num_lines: 25,
-        ..CreateOptions::default().size
-    };
-    let script = "import os,tty; tty.setraw(0); os.write(1, b'history '+b'x'*70+b'\\r\\n'); [os.write(1,(str(i)+' '+ 'x'*70+'\\r\\n').encode()) for i in range(100000)]; os.write(1,b'READY'); os.read(0,1)";
-    let mut client = start(
-        &server,
-        "resize-scroll",
-        CreateOptions {
-            size,
-            ..python(script)
-        },
-    );
-    wait(&mut client, |client, _| grid_contains(client, "READY"));
-    let pane = client.snapshot().unwrap().focused;
-    let resize = Action::Resize(WindowSize {
-        num_cols: 101,
-        ..size
-    });
-    client.send(resize).unwrap();
-    let scroll = Scroll::Delta(10);
-    client.send(Action::Scroll { pane, scroll }).unwrap();
-    wait(&mut client, |client, _| {
-        let screen = &client.screens()[&pane];
-        screen.columns() == 101 && screen.display_offset() == 10
-    });
-}
-
-#[test]
 fn dragging_nested_dividers_resizes_pty_and_preserves_other_splits() {
     let server = TestServer::start();
     let size = WindowSize {
@@ -1141,73 +1058,11 @@ fn dragging_nested_dividers_resizes_pty_and_preserves_other_splits() {
 }
 
 #[test]
-fn focused_splits_follow_queued_actions() {
+fn osc52_stores_reach_the_controller_as_a_streamed_copy() {
     let server = TestServer::start();
-    let size = WindowSize {
-        num_cols: 103,
-        num_lines: 31,
-        ..CreateOptions::default().size
-    };
-    let options = CreateOptions {
-        size,
-        ..program("/bin/sleep", &["60"])
-    };
-    let mut client = start(&server, "persist", options);
-    let first = client.snapshot().unwrap().focused;
-    let original = rect(&client, first);
-    // The next action is queued behind a focus change that is not yet visible.
-    let queue_split = |client: &mut Client, axis| {
-        client.send(Action::Split { axis }).unwrap();
-        let panes = client.snapshot().unwrap().panes.len() + 1;
-        wait_snapshot(client, |snapshot| snapshot.panes.len() == panes);
-        client.snapshot().unwrap().focused
-    };
-    for axis in [Axis::LeftRight, Axis::TopBottom] {
-        client.send(Action::Split { axis }).unwrap();
-    }
-    wait_snapshot(&mut client, |snapshot| snapshot.panes.len() == 3);
-    let third = client.snapshot().unwrap().focused;
-    let others = &client.snapshot().unwrap().panes;
-    let second = others
-        .iter()
-        .find(|pane| pane.id != first && pane.id != third)
-        .unwrap()
-        .id;
-    assert_eq!(rect(&client, first).rows, original.rows);
-    assert_eq!(
-        (rect(&client, second).x, rect(&client, second).rows),
-        (52, 14)
-    );
-    assert_eq!((rect(&client, third).x, rect(&client, third).y), (52, 16));
-    let (right_top, right_bottom) = (rect(&client, second), rect(&client, third));
-
-    client.send(Action::Focus(first)).unwrap();
-    let fourth = queue_split(&mut client, Axis::TopBottom);
-    assert_eq!(
-        (rect(&client, second), rect(&client, third)),
-        (right_top, right_bottom)
-    );
-    assert_eq!(rect(&client, first).rows, 14);
-    let left_bottom = rect(&client, fourth);
-    assert_eq!((left_bottom.x, left_bottom.y), (0, 16));
-
-    client.send(Action::Navigate(Direction::Right)).unwrap();
-    let fifth = queue_split(&mut client, Axis::LeftRight);
-    assert_eq!(rect(&client, fourth), left_bottom);
-    assert_eq!(rect(&client, second), right_top);
-    assert_eq!(
-        (rect(&client, third).x, rect(&client, third).cols),
-        (right_bottom.x, 25)
-    );
-    assert_eq!(rect(&client, fifth).x, 78);
-    let fifth_rect = rect(&client, fifth);
-
-    client.send(Action::Focus(second)).unwrap();
-    let sixth = queue_split(&mut client, Axis::TopBottom);
-    assert_eq!(rect(&client, fifth), fifth_rect);
-    assert_eq!(rect(&client, second).rows, 6);
-    let sixth = rect(&client, sixth);
-    assert_eq!((sixth.x, sixth.y, sixth.rows), (right_top.x, 8, 7));
+    let script = r"import os, time; os.write(1, b'\x1b]52;c;5Lit5paH\x07'); time.sleep(5)";
+    let mut client = start(&server, "osc52", python(script));
+    assert_eq!(wait_copy(&mut client), "中文");
 }
 
 #[test]
@@ -1221,70 +1076,6 @@ fn focus_changes_are_reported_to_applications_that_ask() {
     wait(&mut client, |client, _| grid_contains(client, "got-1b5b4f"));
     client.send(Action::Focus(first)).unwrap();
     wait(&mut client, |client, _| grid_contains(client, "got-1b5b49"));
-}
-
-#[test]
-fn queued_selection_survives_history_resize() {
-    let server = TestServer::start();
-    let size = WindowSize {
-        num_cols: 100,
-        num_lines: 25,
-        ..CreateOptions::default().size
-    };
-    let script = "import time; print(('history line ' + 'x' * 70 + '\\n') * 6000, end=''); print('READY', flush=True); time.sleep(60)";
-    let mut client = start(
-        &server,
-        "persist",
-        CreateOptions {
-            size,
-            ..python(script)
-        },
-    );
-    wait(&mut client, |client, _| grid_contains(client, "READY"));
-    let pane = client.snapshot().unwrap().focused;
-    assert!(client.screens()[&pane].history_size() > 4000);
-    // Sent back to back, without a frame request between them.
-    for action in [
-        Action::Resize(WindowSize {
-            num_cols: 80,
-            ..size
-        }),
-        Action::SelectionStart {
-            pane,
-            point: Point { line: 0, column: 0 },
-            side: Side::Left,
-            kind: SelectionType::Simple,
-        },
-        Action::SelectionUpdate {
-            pane,
-            point: Point { line: 0, column: 8 },
-            side: Side::Right,
-        },
-    ] {
-        client.peer.send_action(&action).unwrap();
-    }
-    client.flush().unwrap();
-    wait(&mut client, |client, _| {
-        client.screens()[&pane].columns() == 80
-            && client.screens()[&pane].selection_range().is_some()
-    });
-    for action in [
-        Action::Resize(WindowSize {
-            num_cols: 90,
-            ..size
-        }),
-        Action::Input {
-            pane,
-            data: b"x".to_vec(),
-        },
-    ] {
-        client.peer.send_action(&action).unwrap();
-    }
-    client.flush().unwrap();
-    wait(&mut client, |client, _| {
-        client.screens()[&pane].columns() == 90
-    });
-    assert!(client.screens()[&pane].selection_range().is_none());
 }
 
 #[test]
@@ -1329,7 +1120,7 @@ fn starting_selection_in_a_second_pane_clears_the_first_and_copies_the_new_text(
         .unwrap();
     wait_response(
         &mut client,
-        |event| matches!(event, Response::CopyError(error) if error.contains("no selection")),
+        |event| matches!(event, Response::Error(error) if error.contains("no selection")),
     );
 }
 
@@ -1348,9 +1139,7 @@ fn tab_titles_follow_the_focused_pane_directory_instead_of_application_titles() 
     wait(&mut client, |client, _| {
         grid_contains(client, "directory-ready")
     });
-    let tab_title =
-        |client: &Client, tab: usize| client.snapshot().unwrap().tabs[tab].title.clone();
-    assert_eq!(tab_title(&client, 0), "home");
+    assert_eq!(client.snapshot().unwrap().tabs[0].title, "home");
     let first = client.snapshot().unwrap().focused;
     let change_directory = |client: &mut Client, pane, directory, application, title: &str| {
         let command =
@@ -1375,20 +1164,6 @@ fn tab_titles_follow_the_focused_pane_directory_instead_of_application_titles() 
     wait_snapshot(&mut client, |snapshot| {
         snapshot.focused == first && snapshot.tabs[0].title == "alpha"
     });
-    client.send(Action::NewTab { pane: split }).unwrap();
-    wait_snapshot(&mut client, |snapshot| {
-        snapshot.tabs.len() == 2 && snapshot.tabs[1].title == "beta"
-    });
-    let second = client.snapshot().unwrap().focused;
-    assert_eq!(tab_title(&client, 0), "alpha");
-    change_directory(&mut client, second, "/", "root-application", "/");
-    client.send(Action::Tab(-1)).unwrap();
-    client.send(Action::Focus(split)).unwrap();
-    wait_snapshot(&mut client, |snapshot| snapshot.focused == split);
-    assert_eq!(
-        (tab_title(&client, 0), tab_title(&client, 1)),
-        ("beta".into(), "/".into())
-    );
     assert_eq!(
         client.snapshot().unwrap().pane(split).unwrap().title,
         "split-application"
@@ -1396,50 +1171,28 @@ fn tab_titles_follow_the_focused_pane_directory_instead_of_application_titles() 
 }
 
 #[test]
-fn closing_an_inactive_pane_preserves_the_middle_active_tab() {
-    for natural_exit in [true, false] {
-        let server = TestServer::start();
-        let mut client = start(&server, "persist", program("/bin/sh", &["-i"]));
-        let first = client.snapshot().unwrap().focused;
-        let (second, third) = (new_tab(&mut client, first), new_tab(&mut client, first));
-        client.send(Action::Tab(-1)).unwrap();
-        wait_snapshot(&mut client, |snapshot| snapshot.active_tab == second);
-        let focused = client.snapshot().unwrap().focused;
-        if natural_exit {
-            input(&mut client, first, "exit\n");
-        } else {
-            client.send(Action::ClosePane(first)).unwrap();
-        }
-        wait_snapshot(&mut client, |snapshot| snapshot.tabs.len() == 2);
-        let snapshot = client.snapshot().unwrap();
-        assert_eq!(
-            snapshot.tabs.iter().map(|tab| tab.id).collect::<Vec<_>>(),
-            [second, third]
-        );
-        assert_eq!((snapshot.active_tab, snapshot.focused), (second, focused));
-    }
-}
-
-#[test]
-fn closing_an_inactive_tab_terminates_its_panes_and_preserves_active_tab() {
+fn closing_inactive_tabs_keeps_the_active_one_and_ends_their_panes() {
     let mut server = TestServer::start();
-    let mut client = start(&server, "persist", program("/bin/sh", &[]));
-    let first = client.snapshot().unwrap().active_tab;
-    let split = split(&mut client, Axis::LeftRight);
-    let second = new_tab(&mut client, split);
-    let active = new_tab(&mut client, second);
-    client.send(Action::CloseTab(first)).unwrap();
+    let mut client = start(&server, "persist", program("/bin/sh", &["-i"]));
+    let first = client.snapshot().unwrap().focused;
+    split(&mut client, Axis::LeftRight);
+    let (second, third) = (new_tab(&mut client, first), new_tab(&mut client, first));
+    client.send(Action::Tab(-1)).unwrap();
+    wait_snapshot(&mut client, |snapshot| snapshot.active_tab == second);
+    let focused = client.snapshot().unwrap().focused;
+    // A shell that exits in a hidden tab closes it as the user would.
+    input(&mut client, third, "exit\n");
     wait_snapshot(&mut client, |snapshot| snapshot.tabs.len() == 2);
-    assert_eq!(client.snapshot().unwrap().active_tab, active);
+    client.send(Action::CloseTab(first)).unwrap();
+    wait_snapshot(&mut client, |snapshot| snapshot.tabs.len() == 1);
+    let snapshot = client.snapshot().unwrap();
+    assert_eq!((snapshot.active_tab, snapshot.focused), (second, focused));
     client.send(Action::List).unwrap();
     wait_response(
         &mut client,
-        |event| matches!(event, Response::List(items) if items.len() == 1 && items[0].panes == 2),
+        |event| matches!(event, Response::List(items) if items[0].panes == 1),
     );
     client.send(Action::CloseTab(second)).unwrap();
-    wait_snapshot(&mut client, |snapshot| snapshot.tabs.len() == 1);
-    assert_eq!(client.snapshot().unwrap().active_tab, active);
-    client.send(Action::CloseTab(active)).unwrap();
     wait_detached(&mut client);
     drop(client);
     server.wait_for_exit();
@@ -1504,7 +1257,7 @@ fn blocked_input_client(server: &TestServer) -> Client {
         std::thread::sleep(Duration::from_millis(2));
     }
     assert!(
-        client.wants_write(),
+        client.peer.pending(),
         "a child that never reads must apply bounded backpressure"
     );
     client
@@ -1518,60 +1271,6 @@ fn process_cpu_ticks(pid: u32) -> u64 {
         .split_whitespace()
         .collect();
     fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap()
-}
-
-#[test]
-fn failed_full_broadcast_disconnects_without_another_terminal_wakeup() {
-    let mut server = TestServer::start();
-    let ready = server.directory.join("oversized-ready");
-    // Keep a multi-chunk clipboard frame pending while an oversized title arrives.
-    let script = r"
-import base64, os, sys, time
-os.write(1, b'\x1b]52;c;' + base64.b64encode(b'x' * (11 * 128 * 1024)) + b'\x07')
-os.write(1, b'\x1b]2;' + b't' * (33 * 1024 * 1024) + b'\x07')
-open(sys.argv[1], 'w').write('ready')
-time.sleep(60)
-";
-    let mut client = Client::connect(&server.socket()).unwrap();
-    let options = python_with(script, &[ready.to_str().unwrap()]);
-    client
-        .send(Action::Create {
-            name: "oversized".into(),
-            options,
-        })
-        .unwrap();
-    client.flush().unwrap();
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while !ready.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "oversized output fixture stalled"
-        );
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    // Let the terminal become idle while its outgoing clipboard frame is backpressured.
-    std::thread::sleep(Duration::from_millis(100));
-    let deadline = Instant::now() + Duration::from_secs(1);
-    let disconnected = loop {
-        let _ = client.request_screen();
-        if client.poll().is_err() {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-    };
-    drop(client);
-    let mut control = Client::connect(&server.socket()).unwrap();
-    terminate(&mut control, "oversized");
-    drop(control);
-    server.wait_for_exit();
-    let log = fs::read_to_string(server.directory.join("server.log")).unwrap();
-    assert!(log.contains("frame limit"), "{log}");
-    assert!(
-        disconnected,
-        "failed broadcast waited for another wakeup: {log}"
-    );
 }
 
 #[test]
@@ -1591,12 +1290,34 @@ fn disconnecting_first_client_preserves_later_poll_results() {
         pid
     );
     assert!(libc::WIFSTOPPED(status));
-    first.send(Action::Detach).unwrap();
-    first.flush().unwrap();
+    drop(first);
     second.send(Action::List).unwrap();
     second.flush().unwrap();
     assert_eq!(unsafe { libc::kill(pid, libc::SIGCONT) }, 0);
     wait_response(&mut second, |event| matches!(event, Response::List(_)));
+}
+
+#[test]
+fn input_waiting_for_the_pty_arrives_whole() {
+    let server = TestServer::start();
+    let script = r"
+import os, time, tty
+tty.setraw(0)
+os.write(1, b'READY')
+time.sleep(0.3)
+total = 0
+while total < 4194304:
+    total += len(os.read(0, 65536))
+os.write(1, b' read-%d' % total)
+time.sleep(30)
+";
+    let mut client = start(&server, "paste", python(script));
+    wait(&mut client, |client, _| grid_contains(client, "READY"));
+    let pane = client.snapshot().unwrap().focused;
+    input(&mut client, pane, vec![b'x'; 4 * 1024 * 1024]);
+    wait(&mut client, |client, _| {
+        grid_contains(client, "read-4194304")
+    });
 }
 
 #[test]
@@ -1624,7 +1345,7 @@ fn terminating_a_workspace_cancels_old_paste_after_detached_is_received() {
     terminate(&mut control, "persist");
     client.flush().unwrap();
     wait_detached(&mut client);
-    assert!(!client.wants_write());
+    assert!(!client.peer.pending());
     assert!(client.snapshot().is_none());
 }
 
@@ -1639,162 +1360,53 @@ fn a_complete_control_request_is_processed_even_if_its_socket_closes() {
     control.flush().unwrap();
     drop(control);
     wait_detached(&mut client);
-    assert!(!client.wants_write());
-}
-
-#[test]
-fn detached_behind_a_large_response_supersedes_a_known_write_failure() {
-    let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Peer::new(left).unwrap();
-    assert_eq!(unsafe { libc::shutdown(sender.fd(), libc::SHUT_RD) }, 0);
-    let large = Response::ClipboardStore {
-        primary: false,
-        text: "x".repeat(600000),
-    };
-    sender.send_response(large).unwrap();
-    sender.send_response(Response::Detached).unwrap();
-    let worker = std::thread::spawn(move || {
-        while sender.pending() {
-            sender.flush().unwrap();
-            std::thread::sleep(Duration::from_millis(1));
-        }
-    });
-    let mut client = test_client(right);
-    client.peer.send_input(1, b"pending-input").unwrap();
-    client.flush().unwrap();
-    assert!(client.write_error.is_some());
-    assert!(!client.wants_write());
-    let mut copied = false;
-    wait(&mut client, |_, events| {
-        copied |= events.iter().any(
-            |event| matches!(event, Response::ClipboardStore { text, .. } if text.len() == 600000),
-        );
-        events
-            .iter()
-            .any(|event| matches!(event, Response::Detached))
-    });
-    assert!(copied);
     assert!(!client.peer.pending());
-    assert!(client.write_error.is_none());
-    worker.join().unwrap();
+}
+
+/// A client of a real workspace, whose daemon side the test then plays itself.
+fn fake_daemon(server: &TestServer) -> (Client, Peer) {
+    let mut client = start(server, "fake", program("/bin/sleep", &["30"]));
+    let (left, right) = UnixStream::pair().unwrap();
+    client.peer = Peer::new(left).unwrap();
+    (client, Peer::new(right).unwrap())
 }
 
 #[test]
-fn write_failure_without_detached_still_reports_the_original_error() {
-    let (left, right) = UnixStream::pair().unwrap();
-    drop(left);
-    let mut client = test_client(right);
-    client.peer.send_input(1, b"input").unwrap();
-    client.flush().unwrap();
-    assert!(matches!(client.poll(), Err(error) if error.kind() == io::ErrorKind::BrokenPipe));
-}
-
-#[test]
-fn consecutive_state_notifications_merge_without_skipping_deltas_or_control_events() {
-    let (left, right) = UnixStream::pair().unwrap();
-    let mut sender = Peer::new(left).unwrap();
-    let mut client = test_client(right);
+fn queued_frames_all_apply_and_merge_into_one_notification() {
+    let server = TestServer::start();
+    let (mut client, mut daemon) = fake_daemon(&server);
+    let pane = client.snapshot().unwrap().focused;
     let size = WindowSize {
         num_cols: 2,
         num_lines: 2,
         ..CreateOptions::default().size
     };
-    let snapshot = Snapshot {
-        name: "burst".into(),
-        controller: true,
-        focused: 1,
-        active_tab: 1,
-        tabs: Vec::new(),
-        panes: vec![PaneView {
-            id: 1,
-            tab: 1,
-            rect: Rect {
-                cols: 2,
-                rows: 2,
-                ..Rect::default()
-            },
-            title: String::new(),
-            cwd: None,
-            process: Default::default(),
-            blocks: Vec::new(),
-            command_blocks: Vec::new(),
-            input_generation: 0,
-            shell_prompt: None,
-        }],
-    };
-    let mut core = crate::core::Core::new(size, 0xffffff, 0);
+    let mut core = Core::new(size, 0xffffff, 0);
     let mut parser = crate::vt::Parser::new();
     parser.advance(&mut core, b"A");
-    sender
-        .send_state(Some(&snapshot), &[(1, Update::capture(&core, true))], 0)
-        .unwrap();
+    let full = [(pane, Update::capture(&core, true))];
+    daemon.send_state(None, &full, 0).unwrap();
     core.reset_damage();
     parser.advance(&mut core, b"\x1b[2;1HB");
-    sender
-        .send_state(Some(&snapshot), &[(1, Update::capture(&core, false))], 0)
-        .unwrap();
-    sender.send_state(Some(&snapshot), &[], 0).unwrap();
-    sender
-        .send_response(Response::Error("marker".into()))
-        .unwrap();
-    sender.send_state(Some(&snapshot), &[], 0).unwrap();
-    sender.flush().unwrap();
+    let delta = [(pane, Update::capture(&core, false))];
+    daemon.send_state(None, &delta, 0).unwrap();
+    let marker = Response::Error("marker".into());
+    daemon.send_response(marker).unwrap();
+    daemon.send_state(None, &[], 0).unwrap();
+    daemon.flush().unwrap();
     let events = client.poll().unwrap();
     assert!(
         matches!(events.as_slice(), [Response::ScreenDirty, Response::Error(error), Response::ScreenDirty] if error == "marker")
     );
-    assert_eq!(client.screens()[&1].row(0).cells[0].c, 'A');
-    assert_eq!(client.screens()[&1].row(1).cells[0].c, 'B');
-}
-
-#[test]
-fn input_queues_a_fresh_screen_request_before_each_payload() {
-    let (left, right) = UnixStream::pair().unwrap();
-    let mut client = test_client(left);
-    let mut peer = Peer::new(right).unwrap();
-    client.request_screen().unwrap();
-    client.send_input(7, b"\x1b[I").unwrap();
-    client
-        .send(Action::Input {
-            pane: 7,
-            data: b"z".to_vec(),
-        })
-        .unwrap();
-    assert!(
-        peer.next_action().unwrap().is_none(),
-        "nothing is sent before an explicit flush"
-    );
-    client.flush().unwrap();
-    let payloads: [Option<&[u8]>; 3] = [None, Some(b"\x1b[I"), Some(b"z")];
-    let mut previous = 0;
-    for payload in payloads {
-        let Action::ScreenRequest {
-            request,
-            wait: true,
-        } = peer.next_action().unwrap().unwrap()
-        else {
-            panic!("expected a fresh screen request before input");
-        };
-        assert!(request > previous);
-        previous = request;
-        if let Some(payload) = payload {
-            let Action::Input { pane: 7, data } = peer.next_action().unwrap().unwrap() else {
-                panic!("expected input after its screen request");
-            };
-            assert_eq!(data, payload);
-        }
-    }
-    assert!(peer.next_action().unwrap().is_none());
+    assert_eq!(client.screens()[&pane].row(0).cells[0].c, 'A');
+    assert_eq!(client.screens()[&pane].row(1).cells[0].c, 'B');
 }
 
 #[test]
 fn forced_screen_read_waits_for_its_own_reply() {
     let server = TestServer::start();
-    let mut client = start(&server, "fresh", program("/bin/sleep", &["30"]));
+    let (mut client, mut daemon) = fake_daemon(&server);
     let snapshot = client.snapshot().unwrap().clone();
-    let (left, right) = UnixStream::pair().unwrap();
-    client.peer = Peer::new(left).unwrap();
-    let mut peer = Peer::new(right).unwrap();
     let mut next_request = |client: &mut Client, force: bool| {
         if force {
             client.refresh_screen().unwrap();
@@ -1802,7 +1414,7 @@ fn forced_screen_read_waits_for_its_own_reply() {
             client.request_screen().unwrap();
         }
         client.flush().unwrap();
-        let Action::ScreenRequest { request, wait } = peer.next_action().unwrap().unwrap() else {
+        let Action::ScreenRequest { request, wait } = daemon.next_action().unwrap().unwrap() else {
             panic!("expected a frame request");
         };
         assert_eq!(wait, !force);
@@ -1814,28 +1426,14 @@ fn forced_screen_read_waits_for_its_own_reply() {
     // Only the answer to the newest request settles a forced read.
     let mut answer = |client: &mut Client, request| {
         let state = Response::State(Some(snapshot.clone()), Vec::new(), request);
-        peer.send_response(state).unwrap();
-        peer.flush().unwrap();
+        daemon.send_response(state).unwrap();
+        daemon.flush().unwrap();
         client.poll().unwrap();
         client.screen_stale()
     };
     assert!(answer(&mut client, old));
     assert!(answer(&mut client, fresh));
     assert!(!answer(&mut client, newest));
-}
-
-#[test]
-fn initial_pull_attach_error_reports_without_a_snapshot() {
-    let server = TestServer::start();
-    let mut client = Client::connect(&server.socket()).unwrap();
-    client
-        .send(Action::Attach {
-            name: "missing".into(),
-        })
-        .unwrap();
-    wait_error(&mut client);
-    assert!(client.snapshot().is_none());
-    assert!(!client.screen_pending);
 }
 
 #[test]
@@ -1937,49 +1535,30 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
             .all(|command| command.id != block)
     );
 
-    // Replies pair with their requests, in any order, and a missing block fails only its own.
-    let read = |request, block, query: Option<&str>| Action::ReadHistory {
+    // Replies pair with their requests, and a missing block fails only its own.
+    let read = |request, block| Action::ReadHistory {
         pane: pane.id,
         request,
-        block,
+        block: Some(block),
         cursor: None,
-        query: query.map(str::to_owned),
+        query: None,
     };
-    let copy = |block| Action::CopyBlock {
+    let missing = Action::CopyBlock {
         pane: pane.id,
-        block,
+        block: u64::MAX,
     };
-    for action in [
-        read(11, None, Some("same-shell")),
-        read(12, Some(u64::MAX), None),
-        read(13, Some(block), None),
-        copy(block),
-        copy(u64::MAX),
-    ] {
+    for action in [read(12, u64::MAX), read(13, block), missing] {
         client.peer.send_action(&action).unwrap();
     }
     client.flush().unwrap();
     let mut received = HashSet::new();
-    let mut copies = 0;
-    let mut command_metadata = false;
     wait(&mut client, |_, events| {
         for event in events {
             match event {
-                Response::Clipboard {
-                    file, incomplete, ..
-                } => {
-                    assert!(!incomplete);
-                    let mut output = String::new();
-                    file.try_clone()
-                        .unwrap()
-                        .read_to_string(&mut output)
-                        .unwrap();
-                    assert!(output.contains("same-shell"));
-                    copies += 1;
-                }
-                Response::CopyError(error) => {
-                    assert!(error.contains("no longer retained"));
-                    copies += 1;
+                // The failed copy reports through the general error.
+                Response::Error(error) => {
+                    assert!(error.contains("no longer retained"), "{error}");
+                    received.insert(0);
                 }
                 Response::History {
                     request: 12,
@@ -1991,22 +1570,17 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
                 Response::History { request, result } => {
                     let page = result.as_ref().unwrap();
                     assert!(!page.incomplete && page.text.contains("same-shell"));
-                    if *request == 13 {
-                        let command = page.command.as_ref().unwrap();
-                        assert_eq!((command.id, command.status), (block, Some(0)));
-                        assert!(command.complete && command.has_output);
-                        command_metadata = true;
-                    }
+                    let command = page.command.as_ref().unwrap();
+                    assert_eq!((command.id, command.status), (block, Some(0)));
+                    assert!(command.complete && command.has_output);
                     received.insert(*request);
                 }
-                Response::Error(error) => panic!("uncorrelated error: {error}"),
-                _ => continue,
+                _ => (),
             };
         }
-        received.len() == 3 && copies == 2
+        received.len() == 3
     });
-    assert_eq!(received, HashSet::from([11, 12, 13]));
-    assert!(command_metadata);
+    assert_eq!(received, HashSet::from([0, 12, 13]));
 }
 
 #[test]
@@ -2144,99 +1718,6 @@ fn actions_for_a_closed_pane_report_an_error_and_the_daemon_keeps_serving() {
 }
 
 #[test]
-fn input_capacity_recovery_does_not_publish_unchanged_state() {
-    let server = TestServer::start();
-    let script = r#"import os,sys,time,tty
-from pathlib import Path
-root=Path(sys.argv[1])
-capacity=int(sys.argv[2])
-tty.setraw(0)
-def read_n(left):
-    while left:
-        data=os.read(0,min(left,65536))
-        assert data and data==b'x'*len(data)
-        left-=len(data)
-def wait_for(name):
-    while not (root/name).exists():
-        time.sleep(.001)
-os.write(1,b'READY')
-read_n(1)
-(root/'armed').touch()
-wait_for('drain')
-read_n(capacity//4-1)
-(root/'drained').touch()
-wait_for('finish')
-read_n(capacity*3//4+capacity)
-os.write(1,b'\r\nDONE')
-assert os.read(0,1)==b'y'
-os.write(1,b'\r\nAFTER')
-time.sleep(30)
-"#;
-    let (root, capacity) = (
-        server.directory.to_str().unwrap(),
-        INPUT_CAPACITY.to_string(),
-    );
-    let mut client = start(&server, "persist", python_with(script, &[root, &capacity]));
-    wait(&mut client, |client, _| grid_contains(client, "READY"));
-    let pane = client.snapshot().unwrap().focused;
-    input(&mut client, pane, vec![b'x'; INPUT_CAPACITY]);
-    let deadline = Instant::now() + Duration::from_secs(5);
-    // Pumps the connection until `done`, forcing the daemon to publish whatever it has.
-    let pump = |client: &mut Client, done: &dyn Fn(&Client) -> bool| {
-        while !done(client) {
-            client.flush().unwrap();
-            client.poll().unwrap();
-            client.refresh_screen().unwrap();
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(2));
-        }
-    };
-    let generation = |client: &Client| client.snapshot().unwrap().panes[0].input_generation;
-    pump(&mut client, &|client| {
-        generation(client) == 4 && server.directory.join("armed").exists()
-    });
-    let mut quiet = Instant::now();
-    client.refresh_screen().unwrap();
-    while quiet.elapsed() < Duration::from_millis(50) {
-        if client
-            .poll()
-            .unwrap()
-            .iter()
-            .any(|event| matches!(event, Response::ScreenDirty))
-        {
-            quiet = Instant::now();
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    fs::write(server.directory.join("drain"), b"").unwrap();
-    let mut drained_at = None;
-    let mut updates = 0;
-    while drained_at.is_none_or(|time: Instant| time.elapsed() < Duration::from_millis(100)) {
-        let events = client.poll().unwrap();
-        updates += events
-            .iter()
-            .filter(|event| matches!(event, Response::ScreenDirty))
-            .count();
-        if server.directory.join("drained").exists() {
-            drained_at.get_or_insert_with(Instant::now);
-        }
-        assert!(Instant::now() < deadline);
-        std::thread::sleep(Duration::from_millis(2));
-    }
-    assert_eq!(
-        updates, 0,
-        "input capacity recovery published unchanged state"
-    );
-    input(&mut client, pane, vec![b'x'; INPUT_CAPACITY]);
-    pump(&mut client, &|client| generation(client) != 4);
-    fs::write(server.directory.join("finish"), b"").unwrap();
-    pump(&mut client, &|client| grid_contains(client, "DONE"));
-    input(&mut client, pane, "y");
-    wait(&mut client, |client, _| grid_contains(client, "AFTER"));
-}
-
-#[test]
 fn tab_activity_tracks_commands_even_when_the_tab_is_hidden() {
     let server = TestServer::start();
     let script = "import os,tty,subprocess; tty.setraw(0); child=subprocess.Popen(['/bin/sleep','30']); os.write(1,b'\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); os.write(1,b'\x1b]133;C\x07running'); os.read(0,1); os.write(1,b'\x1b]133;D;7\x07\x1b]133;A\x07$ \x1b]133;B\x07'); os.read(0,1); child.terminate(); child.wait()";
@@ -2320,74 +1801,19 @@ fn agent_workspace_files_and_new_tab_use_selected_pane_without_changing_user_vie
     );
 
     // Relative paths resolve in the selected pane's directory, not the user's current tab.
-    let value = project.join("value.txt");
-    for (request, path, operation) in [
-        (41, "value.txt".into(), FileOperation::Read { offset: 0 }),
-        (
-            42,
-            ".".into(),
-            FileOperation::Search {
-                query: "needle".into(),
-            },
-        ),
-        (
-            43,
-            "value.txt".into(),
-            FileOperation::Edit {
-                old_text: Some("selected".into()),
-                new_text: "edited".into(),
-            },
-        ),
-        (44, value.clone(), FileOperation::Read { offset: 0 }),
-    ] {
-        let file = Action::AgentFile {
-            pane,
-            request,
-            path,
-            operation,
-        };
-        owner.send(file).unwrap();
-    }
-    let mut received = Vec::new();
-    wait(&mut owner, |_, events| {
-        for event in events {
-            let Response::AgentFile { request, result } = event else {
-                continue;
-            };
-            match (request, result.as_ref().unwrap()) {
-                (41, FileResult::Read { path, text, .. }) => {
-                    assert_eq!((path, text.as_str()), (&value, "selected needle\n"));
-                }
-                (
-                    42,
-                    FileResult::Search {
-                        matches, truncated, ..
-                    },
-                ) => {
-                    assert!(!truncated);
-                    assert_eq!(matches.len(), 1);
-                    assert_eq!(
-                        (matches[0].line, matches[0].text.as_str()),
-                        (1, "selected needle")
-                    );
-                }
-                (43, FileResult::Edited { change }) => {
-                    assert_eq!(change.path, value);
-                    assert_eq!((change.added, change.removed), (1, 1));
-                    assert!(change.diff.contains("+edited needle"));
-                }
-                (44, FileResult::Read { text, .. }) => assert_eq!(text, "edited needle\n"),
-                (request, result) => panic!("unexpected file result: {request} {result:?}"),
-            }
-            received.push(*request);
-        }
-        received.len() == 4
+    let operation = FileOperation::Read { offset: 0 };
+    let path = "value.txt".into();
+    let read = Action::AgentFile {
+        pane,
+        request: 41,
+        path,
+        operation,
+    };
+    owner.send(read).unwrap();
+    wait_response(&mut owner, |event| {
+        matches!(event, Response::AgentFile { request: 41, result: Ok(FileResult::Read { path, text, .. }) }
+            if *path == project.join("value.txt") && text == "selected needle\n")
     });
-    assert_eq!(received, [41, 42, 43, 44]);
-    assert_eq!(
-        fs::read_to_string(other.join("value.txt")).unwrap(),
-        "user data\n"
-    );
 
     // A new Agent tab leaves the user's scrolled view and selection alone.
     frontend

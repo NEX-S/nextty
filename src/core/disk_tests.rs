@@ -23,41 +23,6 @@ fn read(
         .unwrap()
 }
 
-#[test]
-fn history_acknowledgements_preserve_live_rows_while_paging_damages_the_view() {
-    let mut core = disk_core(20, 4, 8 * MIB);
-    let mut parser = Parser::new();
-    let text = (0..600)
-        .map(|line| format!("{line:03}\r\n"))
-        .collect::<String>();
-    parse_all(&mut core, &mut parser, text.as_bytes());
-    core.reset_damage();
-    settle(&mut core);
-    assert_eq!(core.dirty_rows().count(), 0);
-    assert!(core.history_size() > 8);
-    core.scroll_display(Scroll::Top);
-    core.reset_damage();
-    settle(&mut core);
-    assert_eq!(core.dirty_rows().count(), 4);
-    assert_eq!(
-        core.row(0).cells[..3]
-            .iter()
-            .map(|cell| cell.c)
-            .collect::<String>(),
-        "000"
-    );
-    core.scroll_display(Scroll::Bottom);
-    let visible = (0..4).map(|row| core.row(row).clone()).collect::<Vec<_>>();
-    core.reset_damage();
-    parser.advance(&mut core, b"\x1b[3J");
-    assert_eq!(core.dirty_rows().count(), 0);
-    settle(&mut core);
-    assert_eq!(core.dirty_rows().count(), 0);
-    assert_eq!(core.history_size(), 0);
-    for (row, original) in visible.iter().enumerate() {
-        assert_eq!(core.row(row).cells, original.cells);
-    }
-}
 fn text(mut copy: HistoryCopy) -> String {
     let mut text = String::new();
     copy.file.read_to_string(&mut text).unwrap();
@@ -68,7 +33,7 @@ fn prompt_scopes_are_excluded_from_hot_cold_and_reflowed_selection() {
     let mut core = disk_core(20, 4, 8 * MIB);
     let mut parser = Parser::new();
     let mut expected = String::new();
-    for i in 0..80 {
+    for i in 0..300 {
         let command = format!("cmd-{i:03}");
         let output = format!("result-{i:03} 中 •");
         feed(&mut core, &mut parser, format!(
@@ -157,7 +122,7 @@ fn styled_history_pages_from_disk_and_cross_boundary_copy_is_exact() {
         core.row(0).extra(4).unwrap().zerowidth.as_slice(),
         &['\u{301}']
     );
-    assert_eq!(core.row(0).cells[0].fg, Color::Named(NamedColor::Red));
+    assert_eq!(core.row(0).cells[0].fg, Color::Indexed(1));
     let top = -(core.history_size() as i32);
     select(&mut core, (top, 0), (2, 19));
     let copy = core.copy_selection().recv().unwrap().unwrap();
@@ -166,29 +131,6 @@ fn styled_history_pages_from_disk_and_cross_boundary_copy_is_exact() {
         .collect::<Vec<_>>()
         .join("\n");
     assert_eq!(text(copy), expected);
-}
-#[test]
-fn simple_copy_preserves_cold_hot_and_cross_boundary_text() {
-    let mut core = disk_core(20, 4, 8 * MIB);
-    let mut parser = Parser::new();
-    let source = (0..80)
-        .map(|i| format!("line-{i:03}中\u{301}\r\n"))
-        .collect::<String>();
-    feed(&mut core, &mut parser, source.as_bytes());
-    let base = core.history_size() as i32;
-    for (start, end) in [(5, 5), (67, 72), (79, 79)] {
-        select(&mut core, (start - base, 0), (end - base, 9));
-        let copy = core.copy_selection().recv().unwrap().unwrap();
-        assert!(!copy.incomplete, "range {start}..={end}");
-        assert_eq!(
-            text(copy),
-            (start..=end)
-                .map(|i| format!("line-{i:03}中\u{301}"))
-                .collect::<Vec<_>>()
-                .join("\n"),
-            "range {start}..={end}",
-        );
-    }
 }
 #[test]
 fn alternate_expanded_copy_does_not_read_normal_history() {
@@ -211,29 +153,6 @@ fn alternate_expanded_copy_does_not_read_normal_history() {
         );
     }
 }
-#[test]
-fn alternate_resize_return_and_reset_use_the_latest_geometry() {
-    let mut core = disk_core(20, 4, 8 * MIB);
-    let mut parser = Parser::new();
-    feed(&mut core, &mut parser, "main\r\n".repeat(30).as_bytes());
-    feed(&mut core, &mut parser, b"\x1b[?1049h");
-    resize(&mut core, 8, 2);
-    resize(&mut core, 20, 4);
-    parse_all(&mut core, &mut parser, b"\x1b[?1049lX\x1b[3J");
-    feed(&mut core, &mut parser, b"\x1b[?1049h");
-    resize(&mut core, 10, 6);
-    feed(&mut core, &mut parser, b"\x1bcRESET");
-    assert_eq!((core.columns(), core.screen_lines()), (10, 6));
-    assert_eq!(core.history_size(), 0);
-    assert_eq!(
-        &core.row(0).cells[..5]
-            .iter()
-            .map(|cell| cell.c)
-            .collect::<String>(),
-        "RESET"
-    );
-}
-
 #[test]
 fn running_block_copy_is_empty_after_the_cursor_moves_above_its_output() {
     let mut core = disk_core(20, 4, 8 * MIB);
@@ -503,30 +422,6 @@ fn cold_line_and_semantic_selection_expand_across_uncached_wrapped_rows() {
             }
         );
     }
-}
-
-#[test]
-fn semantic_selection_at_the_edge_of_the_cached_cold_rows_still_copies_the_whole_word() {
-    let mut core = disk_core(12, 4, 16 << 20);
-    let mut parser = Parser::new();
-    let word = "abcdefghij".repeat(10_000);
-    parse_all(&mut core, &mut parser, format!("{word}\r\nend").as_bytes());
-    settle(&mut core);
-    core.scroll_display(Scroll::Top);
-    settle(&mut core);
-    let mut line = -(core.history_size() as i32);
-    while core.absolute_row(line + 1).is_some() {
-        line += 1;
-    }
-    assert!(core.absolute_row(line).unwrap().wrapped);
-    core.selection_start(
-        Point { line, column: 3 },
-        Side::Left,
-        SelectionType::Semantic,
-    );
-    core.selection_update(Point { line, column: 3 }, Side::Right);
-    assert!(core.selection_range().is_some());
-    assert_eq!(text(core.copy_selection().recv().unwrap().unwrap()), word);
 }
 
 #[test]

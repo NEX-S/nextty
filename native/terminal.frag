@@ -1,6 +1,5 @@
 #version 450
-layout(set = 0, binding = 0) uniform sampler2D mask_atlas;
-layout(set = 0, binding = 1) uniform sampler2D color_atlas;
+layout(set = 0, binding = 0) uniform sampler2D atlas;
 layout(location = 0) in vec2 texcoord;
 layout(location = 1) in vec4 rgba;
 layout(location = 2) flat in int kind;
@@ -8,19 +7,19 @@ layout(location = 3) flat in vec3 shape;
 layout(location = 0) out vec4 pixel;
 void main() {
     if (kind == 2) {
-        pixel = texture(color_atlas, texcoord).bgra * rgba.a;
+        pixel = texture(atlas, texcoord).bgra * rgba.a;
         return;
     }
     float a = rgba.a;
-    if (kind == 1) a *= texture(mask_atlas, texcoord).r;
-    if (kind == 5) {
+    if (kind == 1) a *= texture(atlas, texcoord).a;
+    if (kind == 4) {
         float edge = shape.z * (1.0 - texcoord.y / shape.y);
         float d = min(texcoord.x, shape.x - texcoord.x) - edge;
         a *= clamp(.5 + d / max(fwidth(d), .001), 0.0, 1.0);
     }
-    if (kind == 6 || kind == 7) {
+    if (kind == 5 || kind == 6) {
         float padding = shape.z + 1.0;
-        vec2 start = vec2(padding, kind == 7 ? shape.y - padding : padding);
+        vec2 start = vec2(padding, kind == 6 ? shape.y - padding : padding);
         vec2 direction = shape.xy - start * 2.0;
         vec2 point = texcoord - start;
         float t = clamp(dot(point, direction) / max(dot(direction, direction), .000001), 0.0, 1.0);

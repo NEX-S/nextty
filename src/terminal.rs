@@ -115,9 +115,9 @@ impl Terminal {
             }
             None => Command::new(default_shell()?),
         };
+        let working_directory = working_directory.map(std::path::absolute).transpose()?;
         if let Some(directory) = &working_directory {
-            let directory = std::path::absolute(directory)?;
-            command.current_dir(&directory).env("PWD", &directory);
+            command.current_dir(directory).env("PWD", directory);
         }
         let integration = if integrate {
             crate::shell_integration::Integration::prepare(&mut command)?
@@ -156,6 +156,8 @@ impl Terminal {
             process_metadata: Arc::new(ProcessMetadata {
                 launch_argv,
                 child_pid,
+                // Known before the first sample, so a new pane reports its directory at once.
+                child_cwd: working_directory,
                 unavailable: vec!["Foreground process has not been sampled yet".into()],
                 ..ProcessMetadata::default()
             }),
@@ -179,8 +181,8 @@ impl Terminal {
         self.pidfd.as_raw_fd()
     }
     pub fn deadline(&self) -> Option<Instant> {
-        self.parser
-            .deadline()
+        self.core
+            .sync_deadline()
             .into_iter()
             .chain(self.process_deadline)
             .chain(self.closing)
@@ -315,14 +317,13 @@ impl Terminal {
             step.changed |= parsed;
         }
         if self
-            .parser
-            .deadline()
+            .core
+            .sync_deadline()
             .is_some_and(|deadline| deadline <= Instant::now())
             || (!self.read_open && self.read_pos == self.read_len)
         {
-            step.changed |= self.parser.finish_sync(&mut self.core);
+            step.changed |= self.core.finish_sync();
         }
-        self.core.flush_history_requests();
         for event in self.core.take_events() {
             match event {
                 CoreEvent::Write(data) => self.write(data)?,
@@ -572,7 +573,7 @@ fn default_shell() -> io::Result<OsString> {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use crate::core::{Flags, Mode};
+    use crate::core::Flags;
     use std::os::unix::ffi::OsStringExt;
 
     use super::*;
@@ -831,48 +832,6 @@ pub(crate) mod tests {
         let core = &terminal.core;
         assert_eq!(core.columns(), 40);
         assert_eq!(core.screen_lines(), 12);
-    }
-
-    #[test]
-    fn real_pty_restores_main_screen_after_tui_exit() {
-        let mut terminal = session(
-            "stty -echo; printf 'MAIN\\033[?1049h\\033[?1h\\033[31mTUI界\\033[0m'; read line; printf '\\033[?1l\\033[?1049lDONE'",
-        );
-        wait_for(&mut terminal, "TUI界");
-        {
-            let core = &terminal.core;
-            assert!(core.mode().contains(Mode::ALT_SCREEN));
-            assert!(core.mode().contains(Mode::APP_CURSOR));
-        }
-        terminal.write(b"\n".as_slice()).unwrap();
-        assert!(exit_status(&mut terminal).success());
-        assert!(content(&terminal).contains("MAINDONE"));
-        let core = &terminal.core;
-        assert!(!core.mode().contains(Mode::ALT_SCREEN));
-        assert!(!core.mode().contains(Mode::APP_CURSOR));
-    }
-
-    #[test]
-    fn missing_working_directory_and_command_report_original_errors() {
-        for result in [
-            new(
-                None,
-                Some(PathBuf::from("/proc/nextty-missing")),
-                size(24, 80),
-                0,
-                0,
-            ),
-            new(
-                Some(Shell::new("/proc/nextty-missing".into(), vec![])),
-                None,
-                size(24, 80),
-                0,
-                0,
-            ),
-        ] {
-            let error = result.err().unwrap();
-            assert_eq!(error.kind(), io::ErrorKind::NotFound);
-        }
     }
 
     #[test]

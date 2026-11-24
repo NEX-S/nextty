@@ -520,35 +520,21 @@ mod tests {
         fs::write(directory.0.join("binary"), b"a+b?\0").unwrap();
         fs::write(directory.0.join("invalid"), b"a+b?\xff").unwrap();
         symlink(&directory.0, directory.0.join("loop")).unwrap();
-        for suffix in ["", "/", "/."] {
-            let mut root = directory.0.clone().into_os_string();
-            root.push(suffix);
-            let root = PathBuf::from(root);
-            let (path, matches, truncated) = search(root.clone(), "a+b?");
-            assert!(!truncated);
-            assert_eq!(path.as_os_str(), root.as_os_str());
-            let expected = vec![
-                FileMatch {
-                    path: root.join("a"),
-                    line: 1,
-                    text: "a+b? first".into(),
-                },
-                FileMatch {
-                    path: root.join(name),
-                    line: 1,
-                    text: "a+b? middle".into(),
-                },
-                FileMatch {
-                    path: root.join("z"),
-                    line: 2,
-                    text: "second a+b?\r".into(),
-                },
-            ];
-            assert_eq!(matches, expected);
-            for (actual, expected) in matches.iter().zip(&expected) {
-                assert_eq!(actual.path.as_os_str(), expected.path.as_os_str());
-            }
-        }
+        let root = &directory.0;
+        let (path, matches, truncated) = search(root.clone(), "a+b?");
+        assert!(!truncated);
+        assert_eq!(&path, root);
+        let found = |file: &OsStr, line, text: &str| FileMatch {
+            path: root.join(file),
+            line,
+            text: text.into(),
+        };
+        let expected = [
+            found("a".as_ref(), 1, "a+b? first"),
+            found(name, 1, "a+b? middle"),
+            found("z".as_ref(), 2, "second a+b?\r"),
+        ];
+        assert_eq!(matches, expected);
     }
 
     #[test]

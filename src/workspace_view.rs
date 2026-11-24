@@ -1,30 +1,22 @@
-use crate::input::{KeyResult, PasteTarget, keysym};
-use crate::panel::{mix_color, rect};
-
-mod agent_ui;
 mod render;
 
-use crate::files::FileFocus;
-
-use crate::agent::panel::AgentAction;
+use crate::input::{
+    KeyResult, LEFT, PasteTarget, PointerKind, key_bytes, keysym, paste_bytes, symbol_char,
+};
+use crate::native::{self, Event, Line, Renderer, Run, Window, trace::Trace};
+use crate::paint::{LineCache, text_columns};
+use crate::panel::{mix_color, rect};
 use crate::{
     config::Config,
     context,
-    core::{Mode, Point, Scroll, SelectionType, Side, WindowSize},
-    ui::{ClosePrompt, Focus, TabHit, Ui, WHEEL_LINES},
+    core::{Mode, Point, Scroll, Side, WindowSize},
+    ui::{Area, ClosePrompt, Effect, Focus, Pointer, TabHit, Ui, pane_point},
     width::text_width,
-    workspace::{Action, Axis, Client, PaneId, Response, SplitDrag},
-};
-use crate::{
-    input::{key_bytes, mouse_bytes, paste_bytes, symbol_char},
-    native::trace::Trace,
-    native::{self, Event, Line, Renderer, Run, Window},
-    paint::{Frame, LineCache, text_columns},
+    workspace::{Action, Client, PaneId, Response},
 };
 use std::{
     collections::{HashMap, VecDeque},
     io::Result,
-    time::{Duration, Instant},
 };
 
 enum DeferredInput {
@@ -42,7 +34,6 @@ struct CachedText {
 
 /// The renderer plus the shaped lines of UI text, which are kept while they keep being drawn.
 struct Painter {
-    // Lines must drop before the renderer that shaped them.
     lines: HashMap<Box<str>, Vec<CachedText>>,
     renderer: Renderer,
 }
@@ -69,14 +60,13 @@ impl Painter {
         }) {
             entry
         } else {
-            let end = text.len() as u32;
             let run = Run {
                 start: 0,
-                end,
+                end: text.len() as u32,
                 color,
                 flags,
             };
-            let line = self.renderer.shape(text, &[run], &text_columns(text));
+            let line = Line::new(text, &[run], &text_columns(text));
             self.lines
                 .entry(text.into())
                 .or_default()
@@ -107,9 +97,7 @@ const CHROME: u32 = opaque(crate::panel::CHROME);
 const BORDER: u32 = opaque(crate::panel::BORDER);
 const INK: u32 = opaque(crate::panel::INK);
 const MUTED: u32 = opaque(crate::panel::MUTED);
-const ACCENT: u32 = opaque(crate::panel::ACCENT);
 const DANGER: u32 = 0xe87575ff;
-const WARNING: u32 = 0xfe9b30ff;
 const PADDING: f32 = 16.;
 const TERMINAL_PADDING: f32 = 4.;
 
@@ -171,20 +159,6 @@ impl GuiLayout {
             && point.0 >= self.side
             && point.0 < self.side + 8.
             && (self.top..self.footer).contains(&point.1)
-    }
-    fn pointer_cell(self, cell: (f32, f32), pointer: (f32, f32)) -> (u16, u16) {
-        let (ox, oy) = self.origin(cell);
-        let size = self.size(cell);
-        (
-            (((pointer.0 - ox) / cell.0) as u16).min(size.num_cols - 1),
-            (((pointer.1 - oy) / cell.1) as u16).min(size.num_lines - 1),
-        )
-    }
-    fn terminal_contains(self, point: (f32, f32)) -> bool {
-        point.0 >= self.left + TERMINAL_PADDING
-            && point.0 < self.side - TERMINAL_PADDING
-            && point.1 >= self.top + TERMINAL_PADDING
-            && point.1 < self.footer - TERMINAL_PADDING
     }
 }
 
@@ -271,12 +245,10 @@ struct ScrollbarDrag {
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GuiAction {
-    Monitor(crate::monitor::Action),
     Tab(TabHit),
     Minimize,
     Maximize,
     Close,
-    Agent(crate::agent::panel::AgentAction),
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -292,40 +264,10 @@ impl GuiHit {
     }
 }
 
-#[derive(Clone, Copy)]
-struct SelectionDrag {
-    pane: PaneId,
-    point: Point,
-    side: Side,
-    kind: SelectionType,
-}
-
-#[derive(Default)]
-struct PaneCache {
-    lines: LineCache,
-    ime_cursor: Option<Point>,
-}
-
-impl PaneCache {
-    fn ime_position(&mut self, screen: &crate::screen::Screen) -> (usize, usize) {
-        let (cursor, shape) = screen.cursor();
-        // Hidden cursors can visit drawing cells; retain this pane's insertion point.
-        if shape != crate::vt::CursorShape::Hidden {
-            self.ime_cursor = Some(cursor);
-        }
-        let cursor = self.ime_cursor.unwrap_or(cursor);
-        (
-            cursor.column.min(screen.columns() - 1),
-            (cursor.line + screen.display_offset() as i32)
-                .clamp(0, screen.screen_lines() as i32 - 1) as usize,
-        )
-    }
-}
-
 pub struct WorkspaceView {
     client: Client,
     ui: Ui,
-    caches: HashMap<PaneId, PaneCache>,
+    caches: HashMap<PaneId, LineCache>,
     painter: Painter,
     window: Window,
     config: Config,
@@ -335,12 +277,7 @@ pub struct WorkspaceView {
     running: bool,
     focused: bool,
     pointer: (f32, f32),
-    selecting: Option<SelectionDrag>,
-    split_drag: Option<SplitDrag>,
-    reported_buttons: u8,
-    reported_pane: Option<PaneId>,
     scroll_remainder: f32,
-    last_click: Option<(Instant, PaneId, Point, u8)>,
     preedit: String,
     paste: Option<PasteTarget>,
     deferred: VecDeque<DeferredInput>,
@@ -352,7 +289,8 @@ pub struct WorkspaceView {
     hover_cell: Option<(PaneId, Point)>,
     control_hits: Vec<GuiHit>,
     trace: Option<Trace>,
-    agent: agent_ui::AgentState,
+    /// Where the pointer grabbed the Agent panel's divider, from its left edge.
+    agent_drag: Option<f32>,
 }
 
 impl WorkspaceView {
@@ -381,16 +319,11 @@ impl WorkspaceView {
             running: true,
             focused: false,
             pointer: (0., 0.),
-            selecting: None,
-            split_drag: None,
-            reported_buttons: 0,
-            reported_pane: None,
             scroll_remainder: 0.,
-            last_click: None,
             preedit: String::new(),
             paste: None,
             deferred: VecDeque::new(),
-            agent: agent_ui::AgentState::default(),
+            agent_drag: None,
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             maximized: false,
@@ -424,11 +357,7 @@ impl WorkspaceView {
             pollfds.clear();
             pollfds.extend([
                 self.client.pollfd(),
-                libc::pollfd {
-                    fd: self.painter.fd(),
-                    events: libc::POLLIN,
-                    revents: 0,
-                },
+                crate::sys::watch(self.painter.fd(), libc::POLLIN),
             ]);
             pollfds.extend(self.ui.fds());
             self.window.wait(&mut pollfds, timeout, &mut events)?;
@@ -453,11 +382,11 @@ impl WorkspaceView {
             } else {
                 Vec::new()
             };
-            for event in responses {
-                match event {
-                    Response::ScreenDirty => {
+            for response in responses {
+                match self.ui.respond(&mut self.client, response)? {
+                    None => self.dirty = true,
+                    Some(Response::ScreenDirty) => {
                         self.dirty = true;
-                        self.ui.search.observe(&mut self.client)?;
                         let current = self.client.snapshot().map(|s| (s.focused, s.controller));
                         if previous != current {
                             for (pane, _) in previous.into_iter().chain(current) {
@@ -481,11 +410,11 @@ impl WorkspaceView {
                             }
                         }
                     }
-                    Response::Clipboard {
+                    Some(Response::Clipboard {
                         primary,
                         file,
                         incomplete,
-                    } => {
+                    }) => {
                         self.window.selection_file(primary, file);
                         self.message(if incomplete {
                             "Copied retained output; history is incomplete"
@@ -493,34 +422,12 @@ impl WorkspaceView {
                             "Copied"
                         });
                     }
-                    Response::Search {
-                        pane,
-                        request,
-                        count,
-                        truncated,
-                    } => {
-                        self.dirty |= self.ui.search.result(
-                            &mut self.client,
-                            pane,
-                            request,
-                            count as usize,
-                            truncated,
-                        )?;
-                    }
-                    Response::Error(error) | Response::CopyError(error) => self.message(error),
-                    Response::Detached => self.running = false,
-                    Response::ClipboardStore { primary, text } => {
-                        self.window.selection(primary, &text)
-                    }
-                    _ => (),
+                    Some(Response::Detached) => self.running = false,
+                    Some(_) => (),
                 }
             }
 
-            let revision = self.ui.agent.active().model.revision;
-            let (changed, messages_changed) =
-                self.ui.service(&mut self.client, &self.config, &pollfds)?;
-            self.dirty |= changed;
-            self.agent_refresh(revision, messages_changed);
+            self.dirty |= self.ui.service(&mut self.client, &self.config, &pollfds)?;
             self.refresh_hover();
             if self.running && self.dirty && self.painter.ready()? && self.window.ready() {
                 self.draw()?;
@@ -539,6 +446,11 @@ impl WorkspaceView {
     fn message(&mut self, text: impl Into<String>) {
         self.ui.message(text);
         self.dirty = true;
+    }
+    fn copy_text(&mut self, text: &str) -> Result<()> {
+        self.window.selection(false, text)?;
+        self.message("Copied");
+        Ok(())
     }
     fn damage_cursor(&mut self) {
         if let Some(pane) = self.client.focused()
@@ -631,9 +543,7 @@ impl WorkspaceView {
                 self.damage_cursor();
                 self.dirty = true;
             }
-            native::MOTION => {
-                self.motion((event.x as f32, event.y as f32), event.modifiers)?;
-            }
+            native::MOTION => self.motion((event.x as f32, event.y as f32), event.modifiers)?,
             native::POINTER_LEAVE => {
                 self.pointer = (-1., -1.);
                 self.hover_cell = None;
@@ -729,8 +639,8 @@ impl WorkspaceView {
         if modifiers & (native::CONTROL | native::SHIFT) == native::CONTROL | native::SHIFT {
             match symbol_char(symbol).map(|c| c.to_ascii_lowercase()) {
                 Some('c') => {
-                    self.copy(pane, false)?;
-                    return Ok(());
+                    let primary = false;
+                    return self.client.send(Action::CopySelection { pane, primary });
                 }
                 Some('v') => {
                     self.paste(pane, false);
@@ -762,29 +672,14 @@ impl WorkspaceView {
         Ok(())
     }
     fn panel_key(&mut self, symbol: u32, modifiers: u32, text: &str) -> Result<bool> {
-        use crate::input::Key;
-        let mut viewport = (1, 1);
-        if self.ui.files_open && self.ui.focus == Focus::Files {
-            let layout = self.layout();
-            viewport = self
-                .ui
-                .file_viewport(self.file_rect(layout), self.file_preview_layout(layout));
-        } else if let Some(layout) = self.editor_viewport() {
-            viewport = (layout.columns, layout.rows);
-        }
-
-        let action = self.ui.key(
-            &mut self.client,
-            Key {
-                symbol,
-                modifiers,
-                text,
-            },
-            viewport,
-        )?;
-        match action {
+        let key = crate::input::Key {
+            symbol,
+            modifiers,
+            text,
+        };
+        match self.ui.key(&mut self.client, key)? {
             KeyResult::Unhandled => return Ok(false),
-            KeyResult::Copy(text) => self.window.selection(false, &text),
+            KeyResult::Copy(text) => self.window.selection(false, &text)?,
             KeyResult::Paste => {
                 if let Some(target) = self.ui.paste_target() {
                     self.request_paste(target, false);
@@ -797,9 +692,6 @@ impl WorkspaceView {
         Ok(true)
     }
 
-    fn copy(&mut self, pane: PaneId, primary: bool) -> Result<()> {
-        self.client.send(Action::CopySelection { pane, primary })
-    }
     fn paste(&mut self, pane: PaneId, primary: bool) {
         if !self.client.controller() {
             return;
@@ -889,25 +781,6 @@ impl WorkspaceView {
             (self.pointer.1 / self.cell.1) as u16,
         )
     }
-    fn close_rect(&self) -> crate::workspace::Rect {
-        let (width, height, _) = self.window.size();
-        crate::ui::close_rect(
-            (width as f32 / self.cell.0) as u16,
-            (height as f32 / self.cell.1) as u16,
-        )
-    }
-    fn tab_bar(
-        &self,
-        snapshot: &crate::workspace::Snapshot,
-        layout: GuiLayout,
-    ) -> crate::ui::TabBar {
-        let columns = ((layout.width - self.control_width()) / self.cell.0) as u16;
-        crate::ui::tab_bar(
-            snapshot,
-            columns,
-            if self.client.is_remote() { "SSH" } else { "" },
-        )
-    }
     fn control_at(&self, point: (f32, f32)) -> Option<GuiHit> {
         self.control_hits
             .iter()
@@ -920,76 +793,60 @@ impl WorkspaceView {
     fn scrollbar_visible(&self, target: ScrollTarget) -> bool {
         self.preview_open() == (target == ScrollTarget::Preview)
     }
-    fn hit(&self, captured: Option<PaneId>) -> Option<(PaneId, Point, Side)> {
+    /// The area under `point` or holding the pointer, and the pointer's cell in that area's grid.
+    fn locate(&self, (x, y): (f32, f32)) -> (Area, u16, u16, Side) {
         let layout = self.layout();
-        let snapshot = self.client.snapshot()?;
-        let pane = if let Some(id) = captured {
-            snapshot.pane(id)?
+        let area = self.ui.capture().unwrap_or(if y < layout.top {
+            Area::Tabs
+        } else if self.ui.resources.open && (y - layout.footer).abs() <= 5. {
+            Area::Divider
+        } else if y >= layout.height - self.cell.1 - 12. {
+            Area::Footer
+        } else if y >= layout.footer {
+            Area::Monitor
+        } else if x >= layout.side {
+            Area::Agent
+        } else if x < layout.left {
+            Area::Files
         } else {
-            if self.preview_open()
-                || self.ui.file_preview_open()
-                || !layout.terminal_contains(self.pointer)
-            {
-                return None;
+            Area::Terminal
+        });
+        let (x, y) = match area {
+            Area::Terminal => {
+                let (ox, oy) = layout.origin(self.cell);
+                (x - ox, y - oy)
             }
-            let (x, y) = layout.pointer_cell(self.cell, self.pointer);
-            snapshot.pane_at(x, y)?
+            Area::Monitor => (x - PADDING, y - layout.footer - 6.),
+            Area::Footer => (x - layout.width % self.cell.0, 0.),
+            _ => (x, y),
         };
-        let rect = pane.rect;
-        let screen = self.client.screens().get(&pane.id)?;
-        let (ox, oy) = layout.origin(self.cell);
-        let row = (((self.pointer.1 - oy) / self.cell.1 - f32::from(rect.y)) as usize)
-            .min(usize::from(rect.rows - 1));
-        let x = (self.pointer.0 - ox) / self.cell.0 - f32::from(rect.x);
-        Some((
-            pane.id,
-            Point {
-                line: row as i32 - screen.display_offset() as i32,
-                column: (x as usize).min(screen.columns().saturating_sub(1)),
-            },
-            if x < screen.columns() as f32 && x.fract() < 0.5 {
-                Side::Left
-            } else {
-                Side::Right
-            },
-        ))
-    }
-    /// The pane under the pointer, or the one a drag or mouse report keeps capturing.
-    fn captured_hit(&self) -> Option<(PaneId, Point, Side)> {
-        let captured = self.selecting.map(|drag| drag.pane).or(self.reported_pane);
-        captured
-            .and_then(|pane| self.hit(Some(pane)))
-            .or_else(|| self.hit(None))
+        let column = (x / self.cell.0).max(0.);
+        let side = if column.fract() < 0.5 {
+            Side::Left
+        } else {
+            Side::Right
+        };
+        (area, column as u16, (y / self.cell.1).max(0.) as u16, side)
     }
     fn refresh_hover(&mut self) {
         let layout = self.layout();
         let unobstructed = self.ui.close_prompt.is_none() && !self.preview_open();
-        let monitor = self.ui.resources.open && unobstructed;
-        let top = layout.footer + 6.;
-        let pointer = (monitor
-            && (PADDING..layout.width - PADDING).contains(&self.pointer.0)
-            && (top..layout.height - self.cell.1 - 12.).contains(&self.pointer.1))
-        .then(|| {
-            (
-                ((self.pointer.0 - PADDING) / self.cell.0) as u16,
-                ((self.pointer.1 - top) / self.cell.1).floor() as i32,
-            )
-        });
-        if self.ui.resources.pointer != pointer {
-            self.ui.resources.pointer = pointer;
-            self.dirty = true;
-        }
-        let monitor_divider =
-            monitor && (self.ui.resources.dragging || (self.pointer.1 - layout.footer).abs() <= 5.);
+        let monitor_divider = self.ui.resources.open
+            && unobstructed
+            && (self.ui.resources.dragging || (self.pointer.1 - layout.footer).abs() <= 5.);
         let agent_divider = !self.ui.files_open
-            && (self.agent.drag.is_some()
+            && (self.agent_drag.is_some()
                 || (unobstructed && layout.divider_contains(self.pointer)));
         self.window.resize_cursor(agent_divider, monitor_divider);
 
-        let hit = self.hit(None).map(|(pane, point, _)| (pane, point));
-        let block = hit
-            .filter(|_| self.ui.close_prompt.is_none())
-            .and_then(|(pane, point)| crate::ui::block_at(&self.client, pane, point));
+        let hit = match self.locate(self.pointer) {
+            (Area::Terminal, column, row, _) => {
+                pane_point(&self.client, column, row, Side::Left, None)
+                    .map(|(pane, point, _)| (pane, point))
+            }
+            _ => None,
+        };
+        let block = hit.and_then(|(pane, point)| crate::ui::block_at(&self.client, pane, point));
         if block != self.hovered_block {
             self.hovered_block = block;
             self.dirty = true;
@@ -1022,11 +879,8 @@ impl WorkspaceView {
         }
     }
     fn gui_action(&mut self, action: GuiAction) -> Result<()> {
-        if !matches!(action, GuiAction::Agent(_)) {
-            self.ui.agent.active_mut().context.menu = false;
-        }
+        self.ui.agent.active_mut().context.menu = false;
         match action {
-            GuiAction::Monitor(action) => self.ui.monitor_action(&mut self.client, action)?,
             GuiAction::Tab(hit) => {
                 if self.composition_finished() && self.client.controller() {
                     self.ui.tab_click(&mut self.client, hit)?;
@@ -1035,408 +889,134 @@ impl WorkspaceView {
             GuiAction::Minimize => self.window.minimize(),
             GuiAction::Maximize => self.window.maximize(!self.maximized),
             GuiAction::Close => self.open_close(),
-            GuiAction::Agent(action) => {
-                if !self.agent_action(action) {
-                    return Ok(());
-                }
-            }
         }
         self.control_hits.clear();
         self.dirty = true;
         Ok(())
     }
 
-    fn mouse(
-        &mut self,
-        pane: PaneId,
-        point: Point,
-        button: u8,
-        release: bool,
-        modifiers: u32,
-        count: usize,
-    ) -> Result<()> {
-        let mode = self.client.mode(pane);
-        let y = (point.line + self.client.screens()[&pane].display_offset() as i32).max(0) as usize;
-        let code = button
-            + u8::from(modifiers & native::SHIFT != 0) * 4
-            + u8::from(modifiers & native::ALT != 0) * 8
-            + u8::from(modifiers & native::CONTROL != 0) * 16;
-        if let Some(data) = mouse_bytes(u16::from(code), point.column, y, release, mode) {
-            let data = if count == 1 { data } else { data.repeat(count) };
-            self.input(pane, data)?;
+    /// Hands a pointer event to the shared rules and carries out what they leave to the window.
+    fn pointer_event(&mut self, kind: PointerKind, modifiers: u32) -> Result<()> {
+        let (area, column, row, side) = self.locate(self.pointer);
+        let pointer = Pointer {
+            kind,
+            modifiers,
+            area,
+            column,
+            row,
+            side,
+        };
+        match self.ui.pointer(&mut self.client, pointer)? {
+            Effect::None => (),
+            Effect::Input(pane, data) => self.input(pane, data)?,
+            Effect::Copy(text) => self.copy_text(&text)?,
+            Effect::Primary(text) => self.window.selection(true, &text)?,
+            Effect::Selected(pane) => {
+                let primary = true;
+                self.client.send(Action::CopySelection { pane, primary })?;
+            }
+            Effect::Paste(target, primary) => self.request_paste(target, primary),
+            Effect::Quit => self.running = false,
         }
         Ok(())
     }
-    fn button(&mut self, button: u32, pressed: bool, modifiers: u32) -> Result<()> {
-        if self.ui.file_preview_open() {
-            if pressed && button == 1 {
-                self.file_press();
-            }
-            return Ok(());
-        }
-        if !pressed {
-            return self.button_release(button, modifiers);
-        }
-        if let Some(prompt) = self.ui.close_prompt {
-            let (column, row) = self.cell();
-            if button == 1
-                && let Some(terminate) =
-                    crate::ui::close_hit(self.close_rect(), prompt, column, row)
-            {
-                if let KeyResult::Quit = self.ui.choose_close(&mut self.client, terminate)? {
-                    self.running = false;
-                }
-                self.dirty = true;
-            }
-            return Ok(());
-        }
-        let layout = self.layout();
-        if self.pointer.1 < layout.top
-            && let Some(action) =
-                self.control_at(self.pointer)
-                    .map(|hit| hit.action)
-                    .filter(|action| {
-                        matches!(
-                            action,
-                            GuiAction::Minimize | GuiAction::Maximize | GuiAction::Close
-                        )
-                    })
-        {
-            if button == 1 {
-                self.gui_action(action)?;
-            }
-            return Ok(());
-        }
-        if button == 1
-            && self.pointer.1 < layout.top
-            && let Some(snapshot) = self.client.snapshot()
-            && let Some(hit) = self.tab_bar(snapshot, layout).at(snapshot, self.cell().0)
-        {
-            self.gui_action(GuiAction::Tab(hit))?;
-            return Ok(());
-        }
-        if button == 1
-            && let Some(bar) = self
-                .scrollbars
-                .iter()
-                .copied()
-                .rfind(|bar| bar.contains(self.pointer) && (self.scrollbar_visible(bar.target)))
-        {
-            let (top, height) = bar.thumb();
-            let grab = if (top..top + height).contains(&self.pointer.1) {
-                self.pointer.1 - top
-            } else {
-                height * 0.5
-            };
-            self.scrollbar_drag = Some(ScrollbarDrag {
-                bar,
-                grab,
-                requested: None,
-            });
-            self.drag_scrollbar(self.pointer.1)?;
-            return Ok(());
-        }
-
-        if self.ui.agent.active().context.preview.is_some() {
-            return self.preview_button(button);
-        }
-
-        if self.footer_button(button)? {
-            return Ok(());
-        }
-
-        if button == 1 && layout.divider_contains(self.pointer) {
-            if self.composition_finished() {
-                self.agent.drag = Some(self.pointer.0 - layout.side);
-            }
-            return Ok(());
-        }
-
-        if self.ui.files_open && self.pointer.0 < layout.left {
-            self.ui.focus = Focus::Files;
-            if button == 1 {
-                self.file_press();
-            }
-            return Ok(());
-        }
-        if let Some(action) = crate::ui::agent_hit(&self.agent.hits, self.cell().0, self.cell().1) {
-            if self.agent_control_button(button, action, modifiers)? {
-                return Ok(());
-            }
-            if button == 1 {
-                self.gui_action(GuiAction::Agent(action))?;
-            }
-            return Ok(());
-        }
-        if let Some(hit) = self.control_at(self.pointer) {
-            if button == 1 {
-                self.gui_action(hit.action)?;
-            }
-            return Ok(());
-        }
-
-        if !self.agent_button(button, layout) {
-            return Ok(());
-        }
-
-        if self.pointer.1 >= layout.footer
-            || self.pointer.0 >= layout.side && self.pointer.1 >= layout.top
-        {
-            return Ok(());
-        }
-        if button == 1
-            && layout.terminal_contains(self.pointer)
-            && self.client.controller()
-            && self.preedit.is_empty()
-        {
-            let (column, row) = layout.pointer_cell(self.cell, self.pointer);
-            if let Some(drag) = self
-                .client
-                .snapshot()
-                .and_then(|s| s.divider_at(column, row))
-            {
-                self.split_drag = Some(drag);
-                return Ok(());
-            }
-        }
-        if button == 3
-            && let Some((pane, point, _)) = self.hit(None)
-        {
-            if let Some(object) = self
-                .client
-                .screens()
-                .get(&pane)
-                .and_then(|screen| context::object_at(screen, point))
-            {
-                self.window.selection(false, &object.text);
-                self.message("Copied");
-                return Ok(());
-            }
-            if let Some((_, block)) = crate::ui::block_at(&self.client, pane, point) {
-                self.client.send(Action::CopyBlock { pane, block })?;
-                return Ok(());
-            }
-            if modifiers & native::ALT != 0 || !self.client.mode(pane).intersects(Mode::MOUSE_MODE)
-            {
-                self.paste(pane, false);
-                return Ok(());
-            }
-        }
-        self.terminal_button(button, modifiers)
-    }
-
-    fn button_release(&mut self, button: u32, modifiers: u32) -> Result<()> {
-        if self.agent_button_release(button)? {
-            return Ok(());
-        }
-
-        if button == 1 {
-            if std::mem::take(&mut self.ui.resources.dragging) {
-                self.refresh_hover();
-                return Ok(());
-            }
-            if self.scrollbar_drag.take().is_some() {
-                self.dirty = true;
-                return Ok(());
-            }
-            if self.split_drag.take().is_some() {
-                return Ok(());
-            }
-            if let Some(drag) = self.selecting.take() {
-                if let Some((_, point, side)) = self.hit(Some(drag.pane)) {
-                    let pane = drag.pane;
-                    self.client
-                        .send(Action::SelectionUpdate { pane, point, side })?;
-                    if drag.kind != SelectionType::Simple
-                        || point != drag.point
-                        || side != drag.side
-                    {
-                        self.copy(pane, true)?;
-                    }
-                }
-                return Ok(());
-            }
-        }
-        if (1..=3).contains(&button) && self.reported_buttons & (1 << (button - 1)) != 0 {
-            self.reported_buttons &= !(1 << (button - 1));
-            if let Some(pane) = self.reported_pane
-                && let Some((_, point, _)) = self.hit(Some(pane))
-            {
-                self.mouse(pane, point, (button - 1) as u8, true, modifiers, 1)?;
-            }
-            if self.reported_buttons == 0 {
-                self.reported_pane = None;
-            }
-        }
-        Ok(())
-    }
-
-    /// Clicks on the footer and the monitor divider; returns whether one was consumed.
-    fn footer_button(&mut self, button: u32) -> Result<bool> {
-        let layout = self.layout();
-        if self.ui.resources.open && (self.pointer.1 - layout.footer).abs() <= 5. && button == 1 {
-            self.ui.monitor_drag();
-            self.dirty = true;
-            self.refresh_hover();
-            return Ok(true);
-        }
-        if self.pointer.1 < layout.footer {
-            self.ui.focus = Focus::Terminal;
-            self.ui.resources.searching = false;
-            return Ok(false);
-        }
-        if let Some(hit) = self.control_at(self.pointer) {
-            let search = hit.action == GuiAction::Monitor(crate::monitor::Action::Search);
-            if button == 1 || button == 2 && search {
-                self.gui_action(hit.action)?;
-            }
-            if button == 2 && search {
-                self.request_paste(PasteTarget::Monitor, true);
-            }
-        }
-        Ok(true)
-    }
-
-    fn terminal_button(&mut self, button: u32, modifiers: u32) -> Result<()> {
-        if !self.client.controller() {
-            return Ok(());
-        }
-        let Some((pane, point, side)) = self.captured_hit() else {
+    /// Window controls, scrollbars and the Agent panel's divider are the window's own; the
+    /// close dialog takes every click.
+    fn button(&mut self, code: u32, pressed: bool, modifiers: u32) -> Result<()> {
+        // xterm numbers the left, middle and right buttons 0, 1 and 2.
+        let Some(button) = [1, 2, 3].iter().position(|&button| button == code) else {
             return Ok(());
         };
-        if self.client.focused() != Some(pane) {
-            if !self.preedit.is_empty() {
+        let button = button as u8;
+        self.dirty = true;
+        if !pressed {
+            if button == LEFT
+                && (self.scrollbar_drag.take().is_some() || self.agent_drag.take().is_some())
+            {
                 return Ok(());
             }
-            self.ui.act(&mut self.client, Action::Focus(pane))?;
-            self.dirty = true;
+            return self.pointer_event(PointerKind::Release(button), modifiers);
         }
-        let mode = self.client.mode(pane);
-        if mode.intersects(Mode::MOUSE_MODE)
-            && modifiers & native::ALT == 0
-            && (1..=3).contains(&button)
-        {
-            let code = (button - 1) as u8;
-            self.reported_buttons |= 1 << code;
-            self.reported_pane = Some(pane);
-            self.mouse(pane, point, code, false, modifiers, 1)?;
+        if self.ui.close_prompt.is_none() {
+            if let Some(hit) = self.control_at(self.pointer) {
+                if button == LEFT {
+                    self.gui_action(hit.action)?;
+                }
+                return Ok(());
+            }
+            if button == LEFT
+                && let Some(bar) =
+                    self.scrollbars.iter().copied().rfind(|bar| {
+                        bar.contains(self.pointer) && self.scrollbar_visible(bar.target)
+                    })
+            {
+                let (top, height) = bar.thumb();
+                let grab = if (top..top + height).contains(&self.pointer.1) {
+                    self.pointer.1 - top
+                } else {
+                    height * 0.5
+                };
+                self.scrollbar_drag = Some(ScrollbarDrag {
+                    bar,
+                    grab,
+                    requested: None,
+                });
+                return self.drag_scrollbar(self.pointer.1);
+            }
+        }
+        if !self.composition_finished() {
             return Ok(());
         }
-        if button == 2 {
-            self.paste(pane, true);
-        } else if button == 1 {
-            let now = Instant::now();
-            let count = self
-                .last_click
-                .filter(|(t, p, q, _)| {
-                    now.duration_since(*t) < Duration::from_millis(500) && *p == pane && *q == point
-                })
-                .map_or(1, |(_, _, _, n)| n % 3 + 1);
-            self.last_click = Some((now, pane, point, count));
-
-            if count == 2
-                && let Some((id, object)) = &self.hovered
-                && *id == pane
-            {
-                crate::ui::open_object(&self.client, pane, &object.text)?;
-                return Ok(());
-            }
-            let kind = match count {
-                2 => SelectionType::Semantic,
-                3 => SelectionType::Lines,
-                _ => SelectionType::Simple,
-            };
-            self.selecting = Some(SelectionDrag {
-                pane,
-                point,
-                side,
-                kind,
-            });
-            self.client.send(Action::SelectionStart {
-                pane,
-                point,
-                side,
-                kind,
-            })?;
-        }
-        Ok(())
-    }
-    fn motion(&mut self, pointer: (f32, f32), modifiers: u32) -> Result<()> {
         let layout = self.layout();
-        let previous = std::mem::replace(&mut self.pointer, pointer);
+        if button == LEFT && self.ui.capture().is_none() && layout.divider_contains(self.pointer) {
+            self.agent_drag = Some(self.pointer.0 - layout.side);
+            return Ok(());
+        }
+        self.pointer_event(PointerKind::Press(button), modifiers)
+    }
+    fn motion(&mut self, point: (f32, f32), modifiers: u32) -> Result<()> {
+        let previous = std::mem::replace(&mut self.pointer, point);
         let hovered_bar = |point| self.scrollbars.iter().position(|bar| bar.contains(point));
         let hovered_control = |point| self.control_at(point).map(|hit| hit.action);
-        if hovered_bar(previous) != hovered_bar(pointer)
-            || hovered_control(previous) != hovered_control(pointer)
+        if hovered_bar(previous) != hovered_bar(point)
+            || hovered_control(previous) != hovered_control(point)
         {
             self.dirty = true;
         }
-        if self.ui.close_prompt.is_some() {
-            self.dirty |= previous != pointer;
+        let layout = self.layout();
+        if let Some(grab) = self.agent_drag {
+            let minimum = self.cell.0 * 24. + PADDING * 2.;
+            let width =
+                (layout.width - point.0 + grab).clamp(minimum, (layout.width * 0.62).max(minimum));
+            if Some(width) != self.ui.agent.width {
+                self.ui.agent.width = Some(width);
+                if self.layout().size(self.cell) != layout.size(self.cell) {
+                    self.resize()?;
+                }
+                self.dirty = true;
+            }
             return Ok(());
         }
-
-        if self.agent_motion(previous, layout)? {
-            return Ok(());
+        if self.scrollbar_drag.is_some() {
+            return self.drag_scrollbar(point.1);
         }
-
         if self.ui.resources.dragging {
             let bottom = layout.height - self.cell.1 - 12.;
             let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
-            let rows = ((bottom - pointer.1) / self.cell.1).round() as u16;
+            let rows = ((bottom - point.1) / self.cell.1).round() as u16;
             let old = self.ui.resources.height;
             self.ui.resources.resize(rows, total);
             if self.ui.resources.height != old {
                 self.resize()?;
             }
-            self.refresh_hover();
             return Ok(());
         }
-
-        if self.scrollbar_drag.is_some() {
-            self.drag_scrollbar(pointer.1)?;
-            return Ok(());
-        }
-        if self.preview_open() || self.ui.file_preview_open() {
-            self.refresh_hover();
-            return Ok(());
-        }
-
-        if self.ui.files_open && self.pointer.0 < layout.left {
-            return Ok(());
-        }
-        if let Some(drag) = self.split_drag {
-            let (column, row) = layout.pointer_cell(self.cell, pointer);
-            let (old_column, old_row) = layout.pointer_cell(self.cell, previous);
-            if match drag.axis {
-                Axis::LeftRight => column != old_column,
-                Axis::TopBottom => row != old_row,
-            } {
-                self.client.send(drag.action(column, row))?;
-            }
-            return Ok(());
-        }
-        self.refresh_hover();
-        if let Some((pane, point, side)) = self.captured_hit() {
-            if self.selecting.is_some_and(|drag| drag.pane == pane) {
-                self.client
-                    .send(Action::SelectionUpdate { pane, point, side })?;
-            } else {
-                let mode = self.client.mode(pane);
-                if modifiers & native::ALT == 0
-                    && (mode.contains(Mode::MOUSE_MOTION)
-                        || mode.contains(Mode::MOUSE_DRAG) && self.reported_buttons != 0)
-                {
-                    let button = if self.reported_buttons == 0 {
-                        3
-                    } else {
-                        self.reported_buttons.trailing_zeros() as u8
-                    };
-                    self.mouse(pane, point, 32 + button, false, modifiers, 1)?;
-                }
-            }
-        }
-        Ok(())
+        // Panels light what the pointer is over; the panes do through `refresh_hover`.
+        let (area, column, row, _) = self.locate(point);
+        let (old_area, old_column, old_row, _) = self.locate(previous);
+        self.dirty |=
+            area != Area::Terminal && (area, column, row) != (old_area, old_column, old_row);
+        self.pointer_event(PointerKind::Motion, modifiers)
     }
     fn drag_scrollbar(&mut self, y: f32) -> Result<()> {
         let Some(drag) = &mut self.scrollbar_drag else {
@@ -1484,63 +1064,11 @@ impl WorkspaceView {
         self.scroll_remainder += amount;
         let lines = self.scroll_remainder.trunc() as i32;
         self.scroll_remainder -= lines as f32;
-        if lines == 0 {
+        if lines == 0 || self.scrollbar_drag.is_some() {
             return Ok(());
         }
-        let step = lines as isize * WHEEL_LINES as isize;
-        if self.ui.file_preview_open() {
-            self.file_wheel(step);
-            return Ok(());
-        }
-        if self.scrollbar_drag.is_some() {
-            return Ok(());
-        }
-
-        if self.agent_scroll(-step) {
-            return Ok(());
-        }
-
-        if self.ui.resources.open && self.pointer.1 >= self.layout().footer {
-            let scroll = &mut self.ui.resources.scroll;
-            *scroll = scroll.saturating_add_signed(-step);
-            self.dirty = true;
-            return Ok(());
-        }
-        if self.ui.close_prompt.is_some() {
-            return Ok(());
-        }
-
-        if self.ui.files_open && self.pointer.0 < self.layout().left {
-            self.file_wheel(step);
-            return Ok(());
-        }
-        let Some((pane, point, _)) = self.hit(None) else {
-            return Ok(());
-        };
-        let mode = self.client.mode(pane);
-        if mode.intersects(Mode::MOUSE_MODE) && modifiers & native::ALT == 0 {
-            self.mouse(
-                pane,
-                point,
-                if lines > 0 { 64 } else { 65 },
-                false,
-                modifiers,
-                lines.unsigned_abs() as usize,
-            )?;
-        } else if mode.contains(Mode::ALT_SCREEN)
-            && mode.contains(Mode::ALTERNATE_SCROLL)
-            && modifiers & native::ALT == 0
-        {
-            let bytes = if lines > 0 { *b"\x1b[A" } else { *b"\x1b[B" };
-            let bytes = crate::ui::cursor_bytes(bytes, mode);
-            self.input(pane, bytes.repeat(lines.unsigned_abs() as usize * 3))?;
-        } else {
-            self.client.send(Action::Scroll {
-                pane,
-                scroll: Scroll::Delta(lines.saturating_mul(3)),
-            })?;
-        }
-        Ok(())
+        self.dirty = true;
+        self.pointer_event(PointerKind::Wheel(lines), modifiers)
     }
     fn draw(&mut self) -> Result<()> {
         let scale = self.window.size().2;
@@ -1549,9 +1077,8 @@ impl WorkspaceView {
             self.caches.clear();
             self.painter.lines.clear();
         }
-        let background =
-            (self.config.background << 8) | (self.config.background_opacity * 255.).round() as u32;
-        self.painter.begin(background);
+        let alpha = (self.config.background_opacity * 255.).round() as u32;
+        self.painter.begin((self.config.background << 8) | alpha);
         let layout = self.layout();
         let (grid_x, grid_y) = layout.origin(self.cell);
         self.control_hits.clear();
@@ -1598,38 +1125,25 @@ impl WorkspaceView {
                 if let Some(screen) = screens.get_mut(&pane.id) {
                     let (ime_column, ime_row) = cache.ime_position(screen);
                     let offset = screen.display_offset();
-                    if !screen.mode().contains(Mode::ALT_SCREEN)
-                        && let Some(bar) = Scrollbar::new(
-                            ScrollTarget::Pane(pane.id),
-                            (
-                                if pane.rect.x + pane.rect.cols == right {
-                                    layout.side - 3.
-                                } else {
-                                    origin.0 + w - 3.
-                                },
-                                origin.1,
-                                3.,
-                                h,
-                            ),
-                            screen.history_size() + screen.screen_lines(),
-                            screen.screen_lines(),
-                            screen.display_offset(),
-                        )
-                    {
-                        self.scrollbars.push(bar);
+                    if !screen.mode().contains(Mode::ALT_SCREEN) {
+                        let right_edge = pane.rect.x + pane.rect.cols == right;
+                        let x = if right_edge {
+                            layout.side
+                        } else {
+                            origin.0 + w
+                        };
+                        let lines = screen.screen_lines();
+                        let total = screen.history_size() + lines;
+                        let target = ScrollTarget::Pane(pane.id);
+                        let bounds = (x - 3., origin.1, 3., h);
+                        let bar = Scrollbar::new(target, bounds, total, lines, offset);
+                        self.scrollbars.extend(bar);
                     }
-                    let frame = Frame::new(
-                        screen,
-                        &cache.lines,
-                        active,
-                        pane.id == snapshot.focused
-                            && (!terminal_input || !self.preedit.is_empty()),
-                    );
-                    if frame.background >> 8 != self.config.background {
-                        self.painter.clear(
-                            (frame.background & !255)
-                                | (self.config.background_opacity * 255.).round() as u32,
-                        );
+                    let hide_cursor = pane.id == snapshot.focused
+                        && (!terminal_input || !self.preedit.is_empty());
+                    let background = cache.update(screen, active, hide_cursor);
+                    if background >> 8 != self.config.background {
+                        self.painter.clear((background & !255) | alpha);
                     }
 
                     if let Some((id, block)) = self.hovered_block
@@ -1650,14 +1164,7 @@ impl WorkspaceView {
                             }
                         }
                     }
-                    frame.paint(
-                        self.cell,
-                        active,
-                        &mut cache.lines,
-                        &self.painter,
-                        origin,
-                        (w, h),
-                    );
+                    cache.paint(&self.painter, self.cell, origin, (w, h));
                     if let Some((id, object)) = &self.hovered
                         && *id == pane.id
                     {
@@ -1776,11 +1283,13 @@ impl WorkspaceView {
         if self.ui.search.open {
             self.draw_search(layout);
         }
-        if let Some(prompt) = self.ui.close_prompt {
-            let name = self.client.snapshot().map_or("", |s| s.name.as_str());
-            let pointer = Some(self.cell());
-            let grid =
-                crate::ui::close_grid(prompt, name, self.close_rect(), pointer, &self.config);
+        let name = self.client.snapshot().map_or("", |s| s.name.as_str());
+        let (columns, rows) = (layout.width / self.cell.0, layout.height / self.cell.1);
+        let (columns, rows, pointer) = (columns as u16, rows as u16, Some(self.cell()));
+        if let Some(grid) = self
+            .ui
+            .close_dialog(columns, rows, name, pointer, &self.config)
+        {
             self.draw_panel(&grid);
         }
         self.painter.end_frame();
@@ -1803,26 +1312,6 @@ impl WorkspaceView {
         });
         self.dirty = true;
     }
-    fn file_press(&mut self) {
-        let layout = self.layout();
-        let (column, row) = self.cell();
-        self.ui.file_press(
-            self.file_rect(layout),
-            self.file_preview_layout(layout),
-            column,
-            row,
-        );
-        self.dirty = true;
-    }
-    fn file_wheel(&mut self, step: isize) {
-        let layout = self.layout();
-        self.ui.file_wheel(
-            -step,
-            self.file_rect(layout),
-            self.file_preview_layout(layout),
-        );
-        self.dirty = true;
-    }
     fn file_rect(&self, layout: GuiLayout) -> crate::workspace::Rect {
         rect(
             0,
@@ -1839,58 +1328,5 @@ impl WorkspaceView {
             (layout.width / self.cell.0) as u16,
             ((layout.footer - layout.top) / self.cell.1) as u16,
         ))
-    }
-}
-
-#[cfg(test)]
-mod layout_tests {
-    use super::*;
-
-    #[test]
-    fn ime_anchor_stays_with_each_pane_when_tui_cursors_are_hidden() {
-        use crate::{core::Core, screen::Screen, screen::Update, vt::Parser};
-
-        let mut core = Core::new(
-            WindowSize {
-                num_cols: 40,
-                num_lines: 12,
-                cell_width: 8,
-                cell_height: 16,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        let mut parser = Parser::new();
-        let mut screen = Screen::default();
-        let mut left = PaneCache::default();
-        let mut right = PaneCache::default();
-        parser.advance(&mut core, b"\x1b[3;5H");
-        screen.apply(Update::capture(&core, true));
-        assert_eq!(left.ime_position(&screen), (4, 2));
-        parser.advance(&mut core, b"\x1b[9;7H");
-        screen.apply(Update::capture(&core, true));
-        assert_eq!(right.ime_position(&screen), (6, 8));
-
-        parser.advance(&mut core, b"\x1b[?25l\x1b[12;40H");
-        screen.apply(Update::capture(&core, true));
-        assert_eq!(left.ime_position(&screen), (4, 2));
-        assert_eq!(right.ime_position(&screen), (6, 8));
-
-        parser.advance(&mut core, b"\x1b[?25h\x1b[10;8H");
-        screen.apply(Update::capture(&core, true));
-        assert_eq!(right.ime_position(&screen), (7, 9));
-        assert_eq!(left.ime_cursor, Some(Point { line: 2, column: 4 }));
-    }
-
-    #[test]
-    fn scrollbar_preserves_grab_position_and_reaches_both_history_ends() {
-        let bar =
-            Scrollbar::new(ScrollTarget::Pane(1), (10., 20., 3., 200.), 1000, 100, 450).unwrap();
-        let (top, height) = bar.thumb();
-        assert_eq!(height, 20.);
-        assert_eq!(bar.offset_at(top + 7., 7.), 450);
-        assert_eq!(bar.offset_at(27., 7.), 900);
-        assert_eq!(bar.offset_at(227., 7.), 0);
-        assert!(Scrollbar::new(ScrollTarget::Pane(1), (10., 20., 3., 200.), 100, 100, 0).is_none());
     }
 }

@@ -1,8 +1,12 @@
-//! Streaming contracts from xterm's control-sequence reference and kitty's underlines protocol.
+//! Screen contents, protocol replies and streaming contracts from xterm's control-sequence
+//! reference and kitty's underlines protocol.
 //! https://invisible-island.net/xterm/ctlseqs/ctlseqs.html
 //! https://sw.kovidgoyal.net/kitty/underlines/
 
-use nextty::core::{Cell, Core, Event, Extra, Flags, Mode, Point, WindowSize};
+use nextty::core::{
+    Cell, Core, Event, Extra, Flags, Mode, Point, Scroll, SelectionType, Side, WindowSize,
+};
+use nextty::history::HistoryBudget;
 use nextty::vt::{Color, CursorShape, NamedColor, Parser, Rgb};
 
 struct Terminal {
@@ -11,24 +15,27 @@ struct Terminal {
 }
 
 impl Terminal {
-    fn new() -> Self {
+    fn new(columns: u16, lines: u16) -> Self {
         Self {
-            core: Core::new(
-                WindowSize {
-                    num_cols: 16,
-                    num_lines: 3,
-                    cell_width: 10,
-                    cell_height: 22,
-                },
-                0xd8dee9,
-                0x14161b,
-            ),
+            core: Core::new(window_size(columns, lines), 0xd8dee9, 0x14161b),
             parser: Parser::new(),
         }
     }
 
-    fn write(&mut self, input: &[u8]) -> bool {
-        self.parser.advance(&mut self.core, input).1
+    fn with_history(columns: u16, lines: u16) -> Self {
+        let mut terminal = Self::new(columns, lines);
+        let directory = std::env::temp_dir().join(format!(
+            "nextty-vt-stream-{}-{columns}x{lines}",
+            std::process::id()
+        ));
+        terminal
+            .core
+            .enable_history(HistoryBudget::new(directory, 1 << 20).unwrap());
+        terminal
+    }
+
+    fn write(&mut self, input: impl AsRef<[u8]>) -> bool {
+        self.parser.advance(&mut self.core, input.as_ref()).1
     }
 
     fn line(&self, row: usize) -> String {
@@ -68,6 +75,19 @@ impl Terminal {
     }
 }
 
+fn window_size(columns: u16, lines: u16) -> WindowSize {
+    WindowSize {
+        num_cols: columns,
+        num_lines: lines,
+        cell_width: 10,
+        cell_height: 22,
+    }
+}
+
+fn point(line: i32, column: usize) -> Point {
+    Point { line, column }
+}
+
 #[derive(Debug, PartialEq, Eq)]
 struct Snapshot {
     rows: Vec<RowSnapshot>,
@@ -84,20 +104,20 @@ struct RowSnapshot {
 }
 
 fn assert_all_splits(input: &[u8], check: impl Fn(&mut Terminal)) {
-    let mut complete = Terminal::new();
+    let mut complete = Terminal::new(16, 3);
     complete.write(input);
     check(&mut complete);
     let expected = complete.snapshot();
     for split in 0..=input.len() {
-        let mut terminal = Terminal::new();
+        let mut terminal = Terminal::new(16, 3);
         terminal.write(&input[..split]);
         terminal.write(&input[split..]);
         check(&mut terminal);
         assert_eq!(terminal.snapshot(), expected, "split at byte {split}");
     }
-    let mut bytewise = Terminal::new();
+    let mut bytewise = Terminal::new(16, 3);
     for byte in input {
-        bytewise.write(&[*byte]);
+        bytewise.write([*byte]);
     }
     check(&mut bytewise);
     assert_eq!(bytewise.snapshot(), expected, "one byte per advance");
@@ -166,8 +186,8 @@ fn malformed_utf8_replaces_invalid_subparts_and_reprocesses_escape() {
     assert_all_splits(b"A\xe4\xb8\x1b[31mB\xc0\xafC\xf0\x9f\x1b[0mD", |terminal| {
         assert_line(terminal, 0, "A\u{fffd}B\u{fffd}\u{fffd}C\u{fffd}D");
         let row = terminal.core.row(0);
-        assert_eq!(row.cells[2].fg, Color::Named(NamedColor::Red));
-        assert_eq!(row.cells[5].fg, Color::Named(NamedColor::Red));
+        assert_eq!(row.cells[2].fg, Color::Indexed(1));
+        assert_eq!(row.cells[5].fg, Color::Indexed(1));
         assert_eq!(row.cells[7].fg, Color::Named(NamedColor::Foreground));
     });
 }
@@ -219,7 +239,7 @@ fn overflowing_csi_is_ignored_as_a_whole_then_normal_parsing_resumes() {
         assert_eq!(row.cells[1].fg, Color::Named(NamedColor::Foreground));
         assert_eq!(row.cells[2].fg, Color::Named(NamedColor::Foreground));
         assert!(!row.cells[2].flags.contains(Flags::BOLD));
-        assert_eq!(row.cells[3].fg, Color::Named(NamedColor::Green));
+        assert_eq!(row.cells[3].fg, Color::Indexed(2));
     });
 }
 
@@ -298,10 +318,10 @@ fn omitted_and_zero_csi_parameters_use_the_documented_defaults() {
 fn synchronized_output_defers_presentation_until_the_entire_esu_arrives() {
     let end = b"\x1b[?2026l";
     for split in 0..=end.len() {
-        let mut terminal = Terminal::new();
+        let mut terminal = Terminal::new(16, 3);
         assert!(terminal.write(b"old"));
         terminal.write(b"\x1b[?2026h");
-        assert!(terminal.parser.deadline().is_some());
+        assert!(terminal.core.sync_deadline().is_some());
         terminal.core.reset_damage();
         assert!(!terminal.write("\r\x1b[2K新".as_bytes()));
         assert_line(&terminal, 0, "新");
@@ -315,8 +335,8 @@ fn synchronized_output_defers_presentation_until_the_entire_esu_arrives() {
             assert!(changed);
         }
         assert_line(&terminal, 0, "新");
-        assert!(terminal.parser.deadline().is_none());
-        assert!(!terminal.parser.finish_sync(&mut terminal.core));
+        assert!(terminal.core.sync_deadline().is_none());
+        assert!(!terminal.core.finish_sync());
         terminal.write(b"!");
         assert_line(&terminal, 0, "新 !");
     }
@@ -328,7 +348,7 @@ fn ris_ends_synchronized_output_and_the_next_frame_still_waits_for_esu() {
         b"old\x1b[?2026hbuffered\x1bcfresh\x1b[?2026$p",
         |terminal| {
             assert_line(terminal, 0, "fresh");
-            assert!(terminal.parser.deadline().is_none());
+            assert!(terminal.core.sync_deadline().is_none());
             assert!(!terminal.core.mode().contains(Mode::SYNC_UPDATE));
             assert_eq!(terminal.replies(), b"\x1b[?2026;2$y");
             terminal.write(b"\x1b[?2026h\r\x1b[2Knext");
@@ -341,20 +361,17 @@ fn ris_ends_synchronized_output_and_the_next_frame_still_waits_for_esu() {
 
 #[test]
 fn forced_sync_flush_preserves_partial_csi_and_is_idempotent() {
-    let mut terminal = Terminal::new();
+    let mut terminal = Terminal::new(16, 3);
     terminal.write(b"old\x1b[?2026h\r\x1b[2Knew\x1b[31");
     assert_line(&terminal, 0, "new");
-    assert!(terminal.parser.deadline().is_some());
-    assert!(terminal.parser.finish_sync(&mut terminal.core));
+    assert!(terminal.core.sync_deadline().is_some());
+    assert!(terminal.core.finish_sync());
     assert_line(&terminal, 0, "new");
-    assert!(terminal.parser.deadline().is_none());
-    assert!(!terminal.parser.finish_sync(&mut terminal.core));
+    assert!(terminal.core.sync_deadline().is_none());
+    assert!(!terminal.core.finish_sync());
     terminal.write(b"mX");
     assert_line(&terminal, 0, "newX");
-    assert_eq!(
-        terminal.core.row(0).cells[3].fg,
-        Color::Named(NamedColor::Red)
-    );
+    assert_eq!(terminal.core.row(0).cells[3].fg, Color::Indexed(1));
 }
 
 #[test]
@@ -365,4 +382,272 @@ fn rep_repeats_unicode_and_dec_graphics_across_chunk_boundaries() {
             assert_line(terminal, 0, "中 中 中 éé───");
         },
     );
+}
+
+#[test]
+fn wrapping_waits_for_the_next_printable_and_carriage_return_cancels_it() {
+    let mut terminal = Terminal::new(5, 2);
+    terminal.write("abcde");
+    assert_eq!(terminal.line(0), "abcde");
+    assert_eq!(terminal.line(1), "     ");
+    assert!(!terminal.core.row(0).wrapped);
+    terminal.write("\rX");
+    assert_eq!(terminal.line(0), "Xbcde");
+    assert_eq!(terminal.line(1), "     ");
+    terminal.write("\x1b[HabcdeF");
+    assert_eq!(terminal.line(0), "abcde");
+    assert_eq!(terminal.line(1), "F    ");
+    assert!(terminal.core.row(0).wrapped);
+}
+
+#[test]
+fn insert_delete_and_erase_use_the_current_background() {
+    let mut terminal = Terminal::new(8, 2);
+    terminal.write("\x1b[48;2;1;2;3m\x1b[2Jabcdef\x1b[1;3H\x1b[2@");
+    assert_eq!(terminal.line(0), "ab  cdef");
+    terminal.write("\x1b[3P");
+    assert_eq!(terminal.line(0), "abdef   ");
+    terminal.write("\x1b[1;3H\x1b[2X");
+    assert_eq!(terminal.line(0), "ab  f   ");
+    for column in [2, 3, 5, 6, 7] {
+        let bg = terminal.core.row(0).cells[column].bg;
+        assert_eq!(terminal.core.color(bg), Rgb { r: 1, g: 2, b: 3 });
+    }
+}
+
+#[test]
+fn sgr_truecolor_indexed_background_and_individual_style_resets_are_independent() {
+    let mut terminal = Terminal::new(8, 2);
+    terminal.write("\x1b[1;3;4;38;2;10;20;30;48;5;196mX\x1b[22;23;24mY\x1b[0mZ");
+    let row = terminal.core.row(0);
+    assert_eq!(
+        terminal.core.color(row.cells[0].fg),
+        Rgb {
+            r: 10,
+            g: 20,
+            b: 30
+        }
+    );
+    assert_eq!(
+        terminal.core.color(row.cells[0].bg),
+        Rgb { r: 255, g: 0, b: 0 }
+    );
+    assert!(
+        row.cells[0]
+            .flags
+            .contains(Flags::BOLD | Flags::ITALIC | Flags::UNDERLINE)
+    );
+    assert!(
+        !row.cells[1]
+            .flags
+            .intersects(Flags::BOLD | Flags::ITALIC | Flags::ALL_UNDERLINES)
+    );
+    assert_eq!(row.cells[1].fg, row.cells[0].fg);
+    assert_eq!(row.cells[1].bg, row.cells[0].bg);
+    assert_eq!(row.cells[2].fg, Color::Named(NamedColor::Foreground));
+    assert_eq!(row.cells[2].bg, Color::Named(NamedColor::Background));
+}
+
+#[test]
+fn tab_stops_can_be_set_and_cleared_without_wrapping() {
+    let mut terminal = Terminal::new(12, 2);
+    terminal.write("a\tb");
+    assert_eq!(terminal.line(0), "a       b   ");
+    terminal.write("\x1b[3g\x1b[1;4H\x1bH\x1b[2;1Hx\tY");
+    assert_eq!(terminal.line(1), "x  Y        ");
+    terminal.write("\x1b[1;4H\x1b[g\x1b[2;1Hz\tQ");
+    assert_eq!(terminal.line(1), "z  Y       Q");
+    assert!(!terminal.core.row(1).wrapped);
+}
+
+#[test]
+fn history_scroll_and_selection_use_absolute_content_coordinates() {
+    let mut terminal = Terminal::with_history(4, 3);
+    terminal.write("0000\r\n1111\r\n2222\r\n3333");
+    assert_eq!(terminal.core.history_size(), 1);
+    terminal.core.scroll_display(Scroll::Top);
+    assert_eq!(terminal.core.display_offset(), 1);
+    assert_eq!(terminal.line(0), "0000");
+    assert_eq!(terminal.line(1), "1111");
+    terminal
+        .core
+        .selection_start(point(-1, 0), Side::Left, SelectionType::Simple);
+    terminal.core.selection_update(point(0, 3), Side::Right);
+    let selection = terminal.core.selection_range();
+    assert_eq!(
+        selection.map(|range| (range.start, range.end)),
+        Some((point(-1, 0), point(0, 3)))
+    );
+    terminal.core.scroll_display(Scroll::Bottom);
+    assert_eq!(terminal.line(0), "1111");
+    assert_eq!(terminal.core.selection_range(), selection);
+}
+
+#[test]
+fn widening_reflows_soft_lines_without_changing_selection_or_next_write() {
+    let mut terminal = Terminal::new(5, 3);
+    terminal.write("abcdefghij");
+    terminal
+        .core
+        .selection_start(point(0, 0), Side::Left, SelectionType::Simple);
+    terminal.core.selection_update(point(1, 4), Side::Right);
+    assert_eq!(
+        terminal
+            .core
+            .selection_range()
+            .map(|range| (range.start, range.end)),
+        Some((point(0, 0), point(1, 4)))
+    );
+    terminal.core.resize(window_size(10, 3));
+    assert_eq!(terminal.line(0), "abcdefghij");
+    assert_eq!(
+        terminal
+            .core
+            .selection_range()
+            .map(|range| (range.start, range.end)),
+        Some((point(0, 0), point(0, 9)))
+    );
+    terminal.write("K");
+    assert_eq!(terminal.line(0), "abcdefghij");
+    assert_eq!(terminal.line(1), "K         ");
+}
+
+#[test]
+fn narrowing_preserves_the_logical_cursor_position() {
+    let mut terminal = Terminal::new(10, 3);
+    terminal.write("abcdefgh");
+    terminal.core.resize(window_size(4, 4));
+    terminal.write("X");
+    assert_eq!(terminal.line(0), "abcd");
+    assert_eq!(terminal.line(1), "efgh");
+    assert_eq!(terminal.line(2), "X   ");
+}
+
+#[test]
+fn alternate_1049_restores_the_shell_and_reenters_a_clean_screen() {
+    let mut terminal = Terminal::new(8, 3);
+    terminal
+        .write("main\x1b[?1049h\x1b[31;44;58:2::1:2:3m\x1b[Heditor界\u{301}\x1b(0\x1b7\x1b[?1049l");
+    assert_eq!(terminal.line(0), "main    ");
+    assert_eq!(terminal.core.cursor().0, point(0, 4));
+    terminal.write("\x1b[?1049h");
+    for y in 0..terminal.core.screen_lines() {
+        let row = terminal.core.row(y);
+        assert!(row.cells.iter().all(|cell| *cell == Cell::default()));
+        assert!(!row.wrapped);
+        assert!((0..row.cells.len()).all(|column| row.extra(column).is_none()));
+    }
+    assert_eq!(terminal.core.history_size(), 0);
+    assert_eq!(terminal.core.cursor().0, point(0, 0));
+    terminal.write("\x1b8q");
+    assert_eq!(
+        terminal.core.row(0).cells[0],
+        Cell {
+            c: 'q',
+            ..Cell::default()
+        }
+    );
+    assert!(terminal.core.row(0).extra(0).is_none());
+}
+
+#[test]
+fn alternate_47_persists_but_1047_clears_on_exit_and_1048_only_saves_cursor() {
+    let mut terminal = Terminal::new(8, 3);
+    terminal.write("main\x1b[?47h\x1b[Hsaved\x1b[?47l");
+    assert_eq!(terminal.line(0), "main    ");
+    terminal.write("\x1b[?47h");
+    assert_eq!(terminal.line(0), "saved   ");
+    terminal.write("\x1b[?1047l\x1b[?47h");
+    assert_eq!(terminal.line(0), "        ");
+    terminal.write("\x1b[?47l\x1b[2;3H\x1b[?1048h\x1b[HXX\x1b[?1048lY");
+    assert_eq!(terminal.line(0), "XXin    ");
+    assert_eq!(terminal.line(1), "  Y     ");
+}
+
+#[test]
+fn status_cursor_and_mode_queries_reply_with_current_state() {
+    let mut terminal = Terminal::new(10, 4);
+    terminal.write("\x1b[3;4H\x1b[5n\x1b[6n");
+    assert_eq!(terminal.replies(), b"\x1b[0n\x1b[3;4R");
+    terminal.write("\x1b[2;4r\x1b[?6h\x1b[1;2H\x1b[6n");
+    assert_eq!(terminal.replies(), b"\x1b[1;2R");
+    terminal.write("\x1b[?2004h\x1b[?2004$p\x1b[?2004l\x1b[?2004$p\x1b[?9999$p");
+    assert_eq!(
+        terminal.replies(),
+        b"\x1b[?2004;1$y\x1b[?2004;2$y\x1b[?9999;0$y"
+    );
+}
+
+#[test]
+fn device_identity_and_window_queries_are_consistent_with_the_backend() {
+    let mut terminal = Terminal::new(100, 30);
+    terminal.write("\x1b[c\x1b[>c");
+    assert_eq!(terminal.replies(), b"\x1b[?6c\x1b[>0;1;0c");
+    terminal.write("\x1b[14t\x1b[18t");
+    assert_eq!(terminal.replies(), b"\x1b[4;660;1000t\x1b[8;30;100t");
+}
+
+#[test]
+fn dynamic_colors_roundtrip_and_reset_to_the_configured_defaults() {
+    let mut terminal = Terminal::new(8, 3);
+    terminal.write("\x1b]10;?\x07\x1b]11;?\x1b\\");
+    assert_eq!(
+        terminal.replies(),
+        b"\x1b]10;rgb:d8d8/dede/e9e9\x07\x1b]11;rgb:1414/1616/1b1b\x1b\\"
+    );
+    terminal.write("\x1b]11;#010203\x07");
+    assert_eq!(
+        terminal.core.color(Color::Named(NamedColor::Background)),
+        Rgb { r: 1, g: 2, b: 3 }
+    );
+    terminal.write("\x1b]111\x07");
+    assert_eq!(
+        terminal.core.color(Color::Named(NamedColor::Background)),
+        Rgb {
+            r: 20,
+            g: 22,
+            b: 27
+        }
+    );
+    terminal.write("\x1b]4;1;#123;2;rgb:0000/8000/ffff\x07\x1b]4;1;?;2;?\x1b\\");
+    assert_eq!(
+        terminal.replies(),
+        b"\x1b]4;1;rgb:1010/2020/3030\x1b\\\x1b]4;2;rgb:0000/7f7f/ffff\x1b\\"
+    );
+}
+
+#[test]
+fn clipboard_and_title_events_decode_utf8_without_sending_clipboard_contents() {
+    let mut terminal = Terminal::new(8, 3);
+    terminal.write("\x1b]2;中文标题\x07\x1b]52;c;5Lit5paH\x07\x1b]52;p;cHJpbWFyeQ==\x1b\\");
+    let events = terminal.core.take_events();
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, Event::Title(Some(title)) if title == "中文标题"))
+    );
+    assert!(events.iter().any(
+        |event| matches!(event, Event::ClipboardStore { primary: false, text } if text == "中文")
+    ));
+    assert!(events.iter().any(
+        |event| matches!(event, Event::ClipboardStore { primary: true, text } if text == "primary")
+    ));
+    terminal.write("\x1b]52;c;?\x07");
+    assert_eq!(terminal.replies(), b"\x1b]52;c;\x07");
+}
+
+#[test]
+fn insert_delete_lines_and_dec_graphics_keep_a_tui_frame_intact() {
+    let mut terminal = Terminal::new(8, 4);
+    terminal.write("\x1b(0lqqk\x1b(B\x1b[2;1Hone\x1b[3;1Htwo\x1b[4;1Hthree");
+    assert_eq!(terminal.line(0), "┌──┐    ");
+    terminal.write("\x1b[2;4r\x1b[3;1H\x1b[L");
+    assert_eq!(terminal.line(0), "┌──┐    ");
+    assert_eq!(terminal.line(1), "one     ");
+    assert_eq!(terminal.line(2), "        ");
+    assert_eq!(terminal.line(3), "two     ");
+    terminal.write("\x1b[M");
+    assert_eq!(terminal.line(2), "two     ");
+    assert_eq!(terminal.line(3), "        ");
+    assert_eq!(terminal.core.history_size(), 0);
 }

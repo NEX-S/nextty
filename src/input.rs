@@ -1,5 +1,4 @@
 use crate::core::Mode;
-use std::borrow::Cow;
 pub const SHIFT: u32 = 1;
 pub const CONTROL: u32 = 2;
 pub const ALT: u32 = 4;
@@ -78,46 +77,6 @@ pub(crate) enum KeyResult {
     Copy(String),
     Paste,
     Quit,
-}
-
-#[derive(Default)]
-pub(crate) struct TextDecoder {
-    pending: Vec<u8>,
-}
-
-impl TextDecoder {
-    pub fn clear(&mut self) {
-        self.pending.clear();
-    }
-
-    pub fn decode<'a>(&mut self, bytes: &'a [u8]) -> Cow<'a, str> {
-        let mut valid = 0;
-        if self.pending.is_empty() {
-            match std::str::from_utf8(bytes) {
-                Ok(text) => return Cow::Borrowed(text),
-                Err(error) => valid = error.valid_up_to(),
-            }
-        }
-        self.pending.extend_from_slice(bytes);
-        while valid < self.pending.len() {
-            match std::str::from_utf8(&self.pending[valid..]) {
-                Ok(_) => valid = self.pending.len(),
-                Err(error) => {
-                    valid += error.valid_up_to();
-                    let Some(length) = error.error_len() else {
-                        break;
-                    };
-                    valid += length;
-                }
-            }
-        }
-        if valid == 0 {
-            return Cow::Owned(String::new());
-        }
-        let text = String::from_utf8_lossy(&self.pending[..valid]).into_owned();
-        self.pending.drain(..valid);
-        Cow::Owned(text)
-    }
 }
 
 pub(crate) fn character_key(ch: char) -> (u32, u32) {
@@ -226,24 +185,19 @@ pub fn key_bytes(
         _ => None,
     };
     if let Some(number) = number {
-        let modifier = if modifier == 1 {
-            String::new()
+        let sequence = if modifier == 1 {
+            format!("\x1b[{number}~")
         } else {
-            format!(";{modifier}")
+            format!("\x1b[{number};{modifier}~")
         };
-        return Some(format!("\x1b[{number}{modifier}~").into_bytes());
+        return Some(sequence.into_bytes());
     }
 
     let mut utf8 = [0; 4];
     let data: &[u8] = match symbol {
         keysym::RETURN | keysym::KP_ENTER => b"\r",
-        keysym::BACKSPACE => {
-            if control {
-                b"\x08"
-            } else {
-                b"\x7f"
-            }
-        }
+        keysym::BACKSPACE if control => b"\x08",
+        keysym::BACKSPACE => b"\x7f",
         keysym::ESCAPE => b"\x1b",
         keysym::LEFT_TAB => b"\x1b[Z",
         keysym::TAB if shift => b"\x1b[Z",
@@ -273,12 +227,7 @@ pub fn key_bytes(
         _ if !text.is_empty() => text.as_bytes(),
         _ => return None,
     };
-    let mut bytes = Vec::with_capacity(data.len() + usize::from(alt));
-    if alt {
-        bytes.push(0x1b);
-    }
-    bytes.extend_from_slice(data);
-    Some(bytes)
+    Some([&b"\x1b"[..usize::from(alt)], data].concat())
 }
 
 pub fn symbol_char(symbol: u32) -> Option<char> {
@@ -299,7 +248,32 @@ pub fn paste_bytes(text: String, bracketed: bool) -> Vec<u8> {
     }
 }
 
-pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> Option<Vec<u8>> {
+/// Pointer buttons by their xterm number.
+pub(crate) const LEFT: u8 = 0;
+pub(crate) const MIDDLE: u8 = 1;
+pub(crate) const RIGHT: u8 = 2;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PointerKind {
+    Press(u8),
+    Release(u8),
+    Motion,
+    /// Wheel notches, positive towards older lines.
+    Wheel(i32),
+}
+
+/// The xterm report of `button` (with 32 added for motion or 64 for the wheel) at cell `x`, `y`.
+pub fn mouse_bytes(
+    button: u8,
+    modifiers: u32,
+    (x, y): (usize, usize),
+    release: bool,
+    mode: Mode,
+) -> Option<Vec<u8>> {
+    let code = u16::from(button)
+        + 4 * u16::from(modifiers & SHIFT != 0)
+        + 8 * u16::from(modifiers & ALT != 0)
+        + 16 * u16::from(modifiers & CONTROL != 0);
     if mode.contains(Mode::SGR_MOUSE) {
         let end = if release { 'm' } else { 'M' };
         return Some(format!("\x1b[<{code};{};{}{end}", x + 1, y + 1).into_bytes());
@@ -321,20 +295,51 @@ pub fn mouse_bytes(code: u16, x: usize, y: usize, release: bool, mode: Mode) -> 
 #[cfg(all(test, feature = "gui"))]
 mod tests {
     use super::*;
+    use keysym::{LEFT, *};
 
     #[test]
-    fn direct_keyboard_text_preserves_utf8_and_modifier_encoding() {
-        for (symbol, modifiers, text, expected) in [
-            (u32::from('x'), 0, "x", "x"),
-            (u32::from('X'), SHIFT, "X", "X"),
-            (0x0100_4e2d, 0, "中", "中"),
-            (u32::from('x'), ALT, "x", "\x1bx"),
-            (u32::from('x'), CONTROL, "x", "\x18"),
+    fn keys_encode_as_xterm_sequences_and_plain_text_belongs_to_the_ime() {
+        let char = |ch: char| u32::from(ch);
+        for (symbol, modifiers, text, mode, expected) in [
+            (char('x'), 0, "x", Mode::NONE, Some("x")),
+            (0x0100_4e2d, 0, "中", Mode::NONE, Some("中")),
+            (char('x'), ALT, "x", Mode::NONE, Some("\x1bx")),
+            (char('a'), ALT, "你好", Mode::NONE, Some("\x1b你好")),
+            (char(' '), ALT, "", Mode::NONE, Some("\x1b ")),
+            (char('a'), 0, "", Mode::NONE, None),
+            (char('a'), SHIFT, "", Mode::NONE, None),
+            (char('c'), SUPER, "", Mode::NONE, None),
+            (UP, 0, "", Mode::NONE, Some("\x1b[A")),
+            (HOME, 0, "", Mode::APP_CURSOR, Some("\x1bOH")),
+            (KP_HOME + 2, 0, "", Mode::APP_CURSOR, Some("\x1bOA")),
+            (
+                LEFT,
+                CONTROL | ALT | SHIFT,
+                "",
+                Mode::APP_CURSOR,
+                Some("\x1b[1;8D"),
+            ),
+            (DELETE, CONTROL, "", Mode::NONE, Some("\x1b[3;5~")),
+            (F1, 0, "", Mode::NONE, Some("\x1bOP")),
+            (F1 + 11, SHIFT, "", Mode::NONE, Some("\x1b[24;2~")),
+            (char(' '), CONTROL, "", Mode::NONE, Some("\0")),
+            (char('x'), CONTROL, "x", Mode::NONE, Some("\x18")),
+            (char('['), CONTROL, "", Mode::NONE, Some("\x1b")),
+            (char('\\'), CONTROL, "", Mode::NONE, Some("\x1c")),
+            (char('6'), CONTROL, "", Mode::NONE, Some("\x1e")),
+            (char('/'), CONTROL, "", Mode::NONE, Some("\x1f")),
+            (char('8'), CONTROL, "", Mode::NONE, Some("\x7f")),
+            (char('c'), CONTROL | ALT, "", Mode::NONE, Some("\x1b\x03")),
+            (BACKSPACE, 0, "", Mode::NONE, Some("\x7f")),
+            (BACKSPACE, CONTROL, "", Mode::NONE, Some("\x08")),
+            (BACKSPACE, ALT, "", Mode::NONE, Some("\x1b\x7f")),
+            (TAB, SHIFT, "", Mode::NONE, Some("\x1b[Z")),
+            (LEFT_TAB, SHIFT, "", Mode::NONE, Some("\x1b[Z")),
+            (KP_ENTER, 0, "", Mode::NONE, Some("\r")),
         ] {
-            assert_eq!(
-                key_bytes(symbol, modifiers, text, || panic!("unexpected mode read")),
-                Some(expected.as_bytes().to_vec())
-            );
+            let bytes = key_bytes(symbol, modifiers, text, || mode);
+            let expected = expected.map(str::as_bytes);
+            assert_eq!(bytes.as_deref(), expected, "{symbol:#x} {modifiers}");
         }
     }
 
@@ -354,125 +359,13 @@ mod tests {
     #[test]
     fn sgr_mouse_and_legacy_boundaries() {
         assert_eq!(
-            mouse_bytes(16, 9, 3, true, Mode::SGR_MOUSE).unwrap(),
+            mouse_bytes(0, CONTROL, (9, 3), true, Mode::SGR_MOUSE).unwrap(),
             b"\x1b[<16;10;4m"
         );
         assert_eq!(
-            mouse_bytes(0, 0, 0, false, Mode::NONE).unwrap(),
+            mouse_bytes(0, 0, (0, 0), false, Mode::NONE).unwrap(),
             b"\x1b[M !!"
         );
-        assert!(mouse_bytes(0, 223, 0, false, Mode::NONE).is_none());
-    }
-
-    fn key(value: &str) -> (u32, u32) {
-        let mut modifiers = 0;
-        let mut parts = value.split('-').peekable();
-        let mut name = value;
-        while let Some(part) = parts.next() {
-            if parts.peek().is_none() {
-                name = part;
-                break;
-            }
-            modifiers |= match part {
-                "ctrl" => CONTROL,
-                "alt" => ALT,
-                "shift" => SHIFT,
-                "cmd" => SUPER,
-                _ => panic!("{part}"),
-            };
-        }
-        let symbol = match name {
-            "up" => keysym::UP,
-            "down" => keysym::DOWN,
-            "right" => keysym::RIGHT,
-            "left" => keysym::LEFT,
-            "home" => keysym::HOME,
-            "end" => keysym::END,
-            "insert" => keysym::INSERT,
-            "delete" => keysym::DELETE,
-            "pageup" => keysym::PAGE_UP,
-            "pagedown" => keysym::PAGE_DOWN,
-            "enter" => keysym::RETURN,
-            "backspace" => keysym::BACKSPACE,
-            "escape" => keysym::ESCAPE,
-            "tab" => keysym::TAB,
-            "space" => 0x20,
-            name if name.starts_with('f') && name.len() > 1 => {
-                keysym::F1 - 1 + name[1..].parse::<u32>().unwrap()
-            }
-            name => name.chars().next().unwrap() as u32,
-        };
-        (symbol, modifiers)
-    }
-    fn encode(value: &str, mode: Mode) -> Option<Vec<u8>> {
-        let (symbol, modifiers) = key(value);
-        key_bytes(symbol, modifiers, "", || mode)
-    }
-
-    #[test]
-    fn cursor_keys_follow_application_mode_and_xterm_modifiers() {
-        assert_eq!(encode("up", Mode::NONE), Some(b"\x1b[A".to_vec()));
-        assert_eq!(encode("home", Mode::APP_CURSOR), Some(b"\x1bOH".to_vec()));
-        assert_eq!(
-            key_bytes(keysym::KP_HOME + 2, 0, "", || Mode::APP_CURSOR),
-            Some(b"\x1bOA".to_vec())
-        );
-        assert_eq!(
-            encode("ctrl-alt-shift-left", Mode::APP_CURSOR),
-            Some(b"\x1b[1;8D".to_vec())
-        );
-        assert_eq!(
-            encode("ctrl-delete", Mode::NONE),
-            Some(b"\x1b[3;5~".to_vec())
-        );
-        assert_eq!(encode("f1", Mode::NONE), Some(b"\x1bOP".to_vec()));
-        assert_eq!(
-            encode("shift-f12", Mode::NONE),
-            Some(b"\x1b[24;2~".to_vec())
-        );
-    }
-    #[test]
-    fn control_keys_cover_shell_editing_and_terminal_controls() {
-        for (key, byte) in [
-            ("ctrl-space", 0),
-            ("ctrl-a", 1),
-            ("ctrl-c", 3),
-            ("ctrl-z", 26),
-            ("ctrl-[", 27),
-            ("ctrl-\\", 28),
-            ("ctrl-]", 29),
-            ("ctrl-6", 30),
-            ("ctrl-/", 31),
-            ("ctrl-8", 127),
-            ("backspace", 127),
-            ("ctrl-backspace", 8),
-            ("enter", 13),
-        ] {
-            assert_eq!(encode(key, Mode::NONE), Some(vec![byte]), "{key}");
-        }
-        assert_eq!(encode("shift-tab", Mode::NONE), Some(b"\x1b[Z".to_vec()));
-        assert_eq!(
-            key_bytes(keysym::LEFT_TAB, SHIFT, "", || panic!(
-                "unexpected mode read"
-            )),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(encode("alt-backspace", Mode::NONE), Some(vec![27, 127]));
-        assert_eq!(
-            key_bytes(keysym::KP_ENTER, 0, "", || panic!("unexpected mode read")),
-            Some(b"\r".to_vec())
-        );
-        assert_eq!(encode("ctrl-alt-c", Mode::NONE), Some(vec![27, 3]));
-    }
-    #[test]
-    fn alt_uses_actual_unicode_while_plain_text_belongs_to_ime() {
-        assert_eq!(
-            key_bytes('a' as u32, ALT, "你好", || Mode::NONE),
-            Some("\x1b你好".as_bytes().to_vec())
-        );
-        assert_eq!(encode("a", Mode::NONE), None);
-        assert_eq!(encode("shift-a", Mode::NONE), None);
-        assert_eq!(encode("cmd-c", Mode::NONE), None);
-        assert_eq!(encode("alt-space", Mode::NONE), Some(b"\x1b ".to_vec()));
+        assert!(mouse_bytes(0, 0, (223, 0), false, Mode::NONE).is_none());
     }
 }

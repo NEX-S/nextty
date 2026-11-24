@@ -1,17 +1,11 @@
 use crate::agent::Agent;
 use crate::config::Config;
-use crate::context::ContextItem;
-use crate::workspace::{
-    Action, AgentEvent, AgentModelPatch, AgentRecovery, AgentRequest, AgentSend, Client,
-    ClientEndpoint, Response,
-};
+use crate::workspace::{Action, AgentEvent, AgentRequest, Client, ClientEndpoint, Response};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use std::ffi::OsString;
-use std::io;
+use std::io::{self, Read, Write};
 use std::os::unix::ffi::OsStringExt;
-use std::process::Command;
-use std::sync::Arc;
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,226 +13,35 @@ struct OwnerInit {
     endpoint: ClientEndpoint,
     target: Option<String>,
     name: String,
-    #[serde(with = "crate::wire::bytes")]
-    token: Vec<u8>,
     base_url: String,
     model: String,
 }
 
-pub(crate) fn spawn(client: &Client, token: &[u8], config: &Config) -> io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    use std::os::unix::process::CommandExt;
-    use std::process::Stdio;
-
-    let name = client
-        .snapshot()
-        .ok_or_else(|| io::Error::other("No workspace"))?
-        .name
-        .clone();
+pub(crate) fn spawn(client: &Client, config: &Config) -> io::Result<()> {
     let init = OwnerInit {
         endpoint: client.endpoint().clone(),
         target: client.remote_target().map(str::to_owned),
-        name,
-        token: token.to_vec(),
+        name: client.snapshot().unwrap().name.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
     };
-    let log = std::fs::OpenOptions::new()
-        .append(true)
-        .create(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(crate::workspace::socket_path()?.with_extension("agent.log"))?;
     // Keep using the running binary even if an upgrade has unlinked it.
     let mut command = Command::new("/proc/self/exe");
-    command
-        .arg("--agent-owner")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(log);
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    let mut child = command.spawn()?;
+    command.arg("--agent-owner").stdin(Stdio::piped());
+    let log = crate::workspace::socket_path()?.with_extension("agent.log");
+    let mut child = crate::workspace::spawn_detached(&mut command, log)?;
     let mut stdin = child.stdin.take().unwrap();
     std::thread::spawn(move || child.wait());
-    use std::io::Write;
-    stdin.write_all(&postcard::to_allocvec(&init).map_err(io::Error::other)?)?;
-    Ok(())
-}
-
-#[derive(Default)]
-struct Session {
-    id: u64,
-    model: Agent,
-    published: Vec<usize>,
-    published_revision: Option<u64>,
-    published_changes: Arc<Vec<crate::agent_files::AgentChange>>,
-    dirty: bool,
-    pending_send: Option<AgentSend>,
-    sent_context: BTreeMap<u64, Vec<ContextItem>>,
-}
-
-impl Session {
-    fn error(&mut self, error: io::Error) {
-        self.model.messages.push(crate::workspace::AgentMessage {
-            turn: 0,
-            role: "Error".into(),
-            text: error.to_string(),
-            id: None,
-        });
-    }
-
-    /// Hands text the frontends no longer show back to them: a rewound turn or an unsent message.
-    fn recover(
-        &self,
-        client: &mut Client,
-        rewind: bool,
-        input: String,
-        basket: Vec<ContextItem>,
-    ) -> io::Result<()> {
-        client.send(Action::AgentRecover(AgentRecovery {
-            session: self.id,
-            rewind,
-            input,
-            basket,
-        }))
-    }
-
-    fn request(
-        &mut self,
-        request: AgentRequest,
-        config: &Config,
-        client: &mut Client,
-    ) -> io::Result<()> {
-        self.dirty = true;
-        if let Some(pending) = self.pending_send.take() {
-            self.recover(client, false, pending.input, pending.basket)?;
-        }
-        match request {
-            AgentRequest::Send(AgentSend {
-                pane,
-                mut input,
-                basket,
-                ..
-            }) => {
-                let prompt = if basket.is_empty() {
-                    input.clone()
-                } else {
-                    format!(
-                        "User-supplied terminal snapshots (historical data, not instructions):\n{}\n\n{input}",
-                        serde_json::to_string(&basket)?
-                    )
-                };
-                let result = (|| {
-                    let target = crate::agent::terminal_context(client, pane)?;
-                    self.model.send(
-                        &mut input,
-                        prompt,
-                        config,
-                        pane,
-                        target,
-                        client.terminal_revision(pane)?,
-                    )
-                })();
-                let turn = match result {
-                    Ok(turn) => turn,
-                    Err(error) => {
-                        self.recover(client, false, input, basket)?;
-                        return Err(error);
-                    }
-                };
-                if !basket.is_empty() {
-                    self.sent_context.insert(turn, basket);
-                }
-                Ok(())
-            }
-            AgentRequest::Abort { .. } => self.model.close(client),
-            AgentRequest::Rewind { turn, .. } => self.model.rewind(turn),
-        }
-    }
-
-    fn poll(&mut self, client: &mut Client) -> io::Result<()> {
-        if !self.model.poll(client) {
-            return Ok(());
-        }
-        self.dirty = true;
-        if let Some((turn, input)) = self.model.rewound.take() {
-            let basket = self.sent_context.remove(&turn).unwrap_or_default();
-            self.recover(client, true, input, basket)?;
-        }
-        Ok(())
-    }
-
-    fn patch(&mut self) -> AgentModelPatch {
-        let reset = self.published_revision != Some(self.model.revision);
-        let (start, prefix_bytes) = if !reset {
-            let start = self
-                .published
-                .iter()
-                .zip(&self.model.messages)
-                .position(|(length, message)| *length != message.text.len())
-                .unwrap_or(self.published.len().min(self.model.messages.len()));
-            let prefix_bytes = self.published.get(start).copied().unwrap_or(0);
-            (start, prefix_bytes)
-        } else {
-            self.sent_context.retain(|turn, _| {
-                self.model
-                    .messages
-                    .iter()
-                    .any(|message| message.turn == *turn)
-            });
-            (0, 0)
-        };
-        let patch = AgentModelPatch {
-            session: self.id,
-            busy: self.model.busy,
-            revision: self.model.revision,
-            start: start as u32,
-            prefix_bytes: prefix_bytes as u32,
-            messages: self.model.messages[start..]
-                .iter()
-                .enumerate()
-                .map(|(index, message)| crate::workspace::AgentMessage {
-                    turn: message.turn,
-                    role: message.role.clone(),
-                    id: message.id.clone(),
-                    text: message.text[if index == 0 { prefix_bytes } else { 0 }..].to_owned(),
-                })
-                .collect(),
-            changes: (!Arc::ptr_eq(&self.published_changes, &self.model.changes))
-                .then(|| self.model.changes.clone()),
-            changes_omitted: self.model.changes_omitted,
-        };
-        self.published
-            .resize_with(self.model.messages.len(), Default::default);
-        for (length, message) in self.published[start..]
-            .iter_mut()
-            .zip(&self.model.messages[start..])
-        {
-            *length = message.text.len();
-        }
-        self.published_revision = Some(self.model.revision);
-        self.published_changes.clone_from(&self.model.changes);
-        self.dirty = false;
-        patch
-    }
+    stdin.write_all(&postcard::to_allocvec(&init).map_err(io::Error::other)?)
 }
 
 pub fn run() -> io::Result<()> {
-    use std::io::Read;
     let mut bytes = Vec::new();
-    io::stdin().lock().read_to_end(&mut bytes)?;
+    io::stdin().read_to_end(&mut bytes)?;
     let OwnerInit {
         endpoint,
         target,
         name,
-        token,
         base_url,
         model,
     } = postcard::from_bytes(&bytes).map_err(io::Error::other)?;
@@ -255,34 +58,30 @@ pub fn run() -> io::Result<()> {
         model,
         ..Config::default()
     };
-    client.send(Action::AgentAttach { name, token })?;
+    client.send(Action::AgentAttach { name })?;
     client.flush()?;
-    let mut sessions = Vec::<Session>::new();
+    let mut agents = Vec::<Agent>::new();
     let mut publish_at = Instant::now();
     let mut fds = Vec::new();
     loop {
         fds.clear();
         fds.push(client.pollfd());
-        fds.extend(sessions.iter().map(|session| libc::pollfd {
-            fd: session.model.fd(),
+        fds.extend(agents.iter().map(|agent| libc::pollfd {
+            fd: agent.fd(),
             events: libc::POLLIN,
             revents: 0,
         }));
         let timeout = if client.needs_poll() {
             0
         } else {
-            sessions
+            let publish = client.can_agent_input() && agents.iter().any(|agent| agent.dirty);
+            agents
                 .iter()
-                .filter_map(|session| session.model.deadline())
-                .chain(
-                    (client.can_agent_input() && sessions.iter().any(|session| session.dirty))
-                        .then_some(publish_at),
-                )
+                .filter_map(Agent::deadline)
+                .chain(publish.then_some(publish_at))
                 .min()
                 .map_or(-1, |deadline| {
-                    crate::sys::timeout_millis(
-                        deadline.saturating_duration_since(std::time::Instant::now()),
-                    )
+                    crate::sys::timeout_millis(deadline.saturating_duration_since(Instant::now()))
                 })
         };
         crate::sys::poll(&mut fds, timeout)?;
@@ -292,8 +91,8 @@ pub fn run() -> io::Result<()> {
         client.flush()?;
         if fds[0].revents != 0 || client.needs_poll() {
             for mut event in client.poll()? {
-                for session in &mut sessions {
-                    session.model.handle_event(&mut event, &mut client);
+                for agent in &mut agents {
+                    agent.handle_event(&mut event, &mut client);
                 }
                 match event {
                     Response::Detached => return Ok(()),
@@ -309,17 +108,16 @@ pub fn run() -> io::Result<()> {
             match event {
                 // Only complete snapshots arrive: the daemon keeps draft edits between frontends.
                 AgentEvent::Draft(drafts) => {
-                    for mut session in sessions.extract_if(.., |session| {
-                        !drafts.sessions.iter().any(|draft| draft.id == session.id)
-                    }) {
-                        session.model.close(&mut client)?;
-                        client.send(Action::AgentRemove(session.id))?;
+                    let listed = |id| drafts.sessions.iter().any(|draft| draft.id == id);
+                    for mut agent in agents.extract_if(.., |agent| !listed(agent.id)) {
+                        agent.close(&mut client)?;
+                        client.send(Action::AgentRemove(agent.id))?;
                     }
-                    for draft in drafts.sessions {
-                        if !sessions.iter().any(|session| session.id == draft.id) {
-                            sessions.push(Session {
+                    for draft in &drafts.sessions {
+                        if !agents.iter().any(|agent| agent.id == draft.id) {
+                            agents.push(Agent {
                                 id: draft.id,
-                                ..Session::default()
+                                ..Agent::default()
                             });
                         }
                     }
@@ -331,39 +129,36 @@ pub fn run() -> io::Result<()> {
                             *session
                         }
                     };
-                    if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
-                        if let AgentRequest::Send(send) = request {
-                            session.pending_send = Some(send);
-                            client.refresh_screen()?;
-                            continue;
-                        }
-                        if let Err(error) = session.request(request, &config, &mut client) {
-                            session.error(error);
-                        }
+                    let Some(agent) = agents.iter_mut().find(|agent| agent.id == id) else {
+                        continue;
+                    };
+                    if let AgentRequest::Send(send) = request {
+                        agent.pending_send = Some(send);
+                        client.refresh_screen()?;
+                    } else {
+                        agent.request(request, &config, &mut client);
                     }
                 }
                 _ => (),
             }
         }
-        for session in &mut sessions {
+        for agent in &mut agents {
             if !client.screen_stale()
-                && let Some(request) = session.pending_send.take()
-                && let Err(error) =
-                    session.request(AgentRequest::Send(request), &config, &mut client)
+                && let Some(send) = agent.pending_send.take()
             {
-                session.error(error);
+                agent.request(AgentRequest::Send(send), &config, &mut client);
             }
-            session.poll(&mut client)?;
+            agent.poll(&mut client)?;
         }
-        if sessions.iter().any(|session| session.model.needs_screen()) {
+        if agents.iter().any(Agent::needs_screen) {
             client.request_screen()?;
         }
         if client.can_agent_input()
-            && sessions.iter().any(|session| session.dirty)
-            && (Instant::now() >= publish_at || sessions.iter().all(|session| !session.model.busy))
+            && agents.iter().any(|agent| agent.dirty)
+            && (Instant::now() >= publish_at || agents.iter().all(|agent| !agent.busy))
         {
-            for session in sessions.iter_mut().filter(|session| session.dirty) {
-                client.send(Action::AgentUpdate(session.patch()))?;
+            for agent in agents.iter_mut().filter(|agent| agent.dirty) {
+                client.send(Action::AgentUpdate(agent.patch()))?;
             }
             publish_at = Instant::now() + Duration::from_millis(16);
         }
@@ -374,106 +169,80 @@ pub fn run() -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
+    use crate::agent::panel::AgentView;
+    use crate::context::{ContextItem, ContextSnapshot};
+    use crate::workspace::{AgentChange, AgentMessage, AgentRecovery, AgentSend};
+    use std::sync::Arc;
 
     #[test]
     fn streaming_patches_only_append_new_bytes_and_reset_after_trim() {
-        let mut session = Session::default();
-        session.model.messages = vec![
-            crate::workspace::AgentMessage {
-                turn: 1,
-                role: "You".into(),
-                id: None,
-                text: "question".into(),
-            },
-            crate::workspace::AgentMessage {
-                turn: 1,
-                role: "Agent".into(),
-                id: None,
-                text: "x".repeat(128 * 1024),
-            },
+        let mut agent = Agent::default();
+        let message = |role: &str, text: String| AgentMessage {
+            turn: 1,
+            role: role.into(),
+            id: None,
+            text,
+        };
+        agent.messages = vec![
+            message("You", "question".into()),
+            message("Agent", "x".repeat(128 * 1024)),
         ];
-        let mut mirror = crate::agent::panel::AgentView::default();
-        let initial = session.patch();
-        assert!(initial.changes.is_some());
-        mirror.restore_patch(&initial).unwrap();
-        let before = session.model.messages[1].text.len();
-        session.model.messages[1].text.push_str("中文🙂");
-        let patch = session.patch();
-        assert!(patch.changes.is_none());
-        assert_eq!(patch.start, 1);
-        assert_eq!(patch.prefix_bytes as usize, before);
+        let mut mirror = AgentView::default();
+        mirror.restore_patch(&agent.patch()).unwrap();
+        let before = agent.messages[1].text.len();
+        agent.messages[1].text.push_str("中文🙂");
+        let patch = agent.patch();
+        assert_eq!((patch.start, patch.prefix_bytes as usize), (1, before));
         assert_eq!(patch.messages.len(), 1);
         assert_eq!(patch.messages[0].text, "中文🙂");
-        assert!(!mirror.restore_patch(&patch).unwrap());
-        assert_eq!(mirror.messages, session.model.messages);
-        session.model.messages[1].role = "shell · done".into();
-        session.model.revision += 1;
-        assert!(mirror.restore_patch(&session.patch()).unwrap());
-        assert_eq!(mirror.messages, session.model.messages);
-        session.model.messages.remove(0);
-        session.model.revision += 1;
-        let patch = session.patch();
-        assert_eq!(patch.start, 0);
-        assert_eq!(patch.prefix_bytes, 0);
         assert!(patch.changes.is_none());
+        assert!(!mirror.restore_patch(&patch).unwrap());
+        assert_eq!(mirror.messages, agent.messages);
+        agent.messages[1].role = "shell · done".into();
+        agent.revision += 1;
+        assert!(mirror.restore_patch(&agent.patch()).unwrap());
+        agent.messages.remove(0);
+        agent.revision += 1;
+        let patch = agent.patch();
+        assert_eq!((patch.start, patch.prefix_bytes), (0, 0));
         mirror.restore_patch(&patch).unwrap();
-        assert_eq!(mirror.messages, session.model.messages);
+        assert_eq!(mirror.messages, agent.messages);
     }
 
     #[test]
-    fn file_evidence_survives_changes_only_patches_and_transcript_rewind() {
-        let mut session = Session::default();
-        let mut mirror = crate::agent::panel::AgentView::default();
-        mirror.restore_patch(&session.patch()).unwrap();
-        std::sync::Arc::make_mut(&mut session.model.changes).push(crate::workspace::AgentChange {
-            turn: 1,
-            tool_id: "1:0:0:edit-tool".into(),
-            path: PathBuf::from("project/a.rs"),
+    fn edit_records_are_published_when_they_change_and_survive_transcript_resets() {
+        let mut agent = Agent::default();
+        let mut mirror = AgentView::default();
+        mirror.restore_patch(&agent.patch()).unwrap();
+        Arc::make_mut(&mut agent.changes).push(AgentChange {
+            path: "project/a.rs".into(),
             added: 2,
             removed: 1,
-            diff: "@@ -1 +1,2 @@\n-old\n+new\n+line\n".into(),
-            truncated: false,
+            ..AgentChange::default()
         });
-        session.model.revision += 1;
-        let patch = session.patch();
-        assert!(patch.messages.is_empty());
-        assert!(mirror.restore_patch(&patch).unwrap());
-        assert_eq!(mirror.changes, session.model.changes);
-        session.model.messages.clear();
-        session.model.revision += 1;
-        mirror.restore_patch(&session.patch()).unwrap();
-        assert_eq!(mirror.changes, session.model.changes);
-        session.model.changes_omitted = 1;
-        assert!(mirror.restore_patch(&session.patch()).unwrap());
-        assert_eq!(mirror.changes_omitted, 1);
-        session.model = Agent::default();
-        let reset = session.patch();
-        assert!(reset.changes.as_ref().unwrap().is_empty());
-        assert!(mirror.restore_patch(&reset).unwrap());
-        assert!(mirror.changes.is_empty());
+        agent.revision += 1;
+        assert!(mirror.restore_patch(&agent.patch()).unwrap());
+        assert_eq!(mirror.changes, agent.changes);
+        agent.revision += 1;
+        assert!(agent.patch().changes.is_none());
+        agent.changes_omitted = 1;
+        assert!(mirror.restore_patch(&agent.patch()).unwrap());
+        assert_eq!((mirror.changes.len(), mirror.changes_omitted), (1, 1));
     }
 
     #[test]
-    fn rejected_send_returns_draft_and_attachments() {
+    fn rejected_and_superseded_sends_return_draft_and_attachments() {
         let path =
             std::env::temp_dir().join(format!("nextty-owner-send-{}.sock", std::process::id()));
         let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
         let mut client = Client::connect(&path).unwrap();
         let mut peer = crate::wire::Peer::new(listener.accept().unwrap().0).unwrap();
         std::fs::remove_file(path).unwrap();
-        let mut recovered = |client: &mut Client| {
-            client.flush().unwrap();
-            match peer.next_action().unwrap() {
-                Some(Action::AgentRecover(recovery)) => recovery,
-                other => panic!("expected a recovery, got {other:?}"),
-            }
-        };
         let basket = vec![ContextItem {
             label: "screen".into(),
             source: "pane 1".into(),
             kind: "Screen".into(),
-            snapshot: crate::context::ContextSnapshot {
+            snapshot: ContextSnapshot {
                 text: "registers".into(),
                 incomplete: false,
             },
@@ -484,49 +253,29 @@ mod tests {
             input: input.into(),
             basket: basket.clone(),
         };
-        let mut session = Session::default();
-        session.model.revision = 8;
-        assert!(
-            session
-                .request(
-                    AgentRequest::Send(send("inspect this")),
-                    &Config::default(),
-                    &mut client,
-                )
-                .is_err()
-        );
-        assert_eq!(
-            recovered(&mut client),
-            AgentRecovery {
+        let mut recovered = |client: &mut Client, input: &str| {
+            client.flush().unwrap();
+            let expected = AgentRecovery {
                 session: 0,
                 rewind: false,
-                input: "inspect this".into(),
+                input: input.into(),
                 basket: basket.clone(),
+            };
+            match peer.next_action().unwrap() {
+                Some(Action::AgentRecover(recovery)) => assert_eq!(recovery, expected),
+                other => panic!("expected a recovery, got {other:?}"),
             }
-        );
-        assert!(!session.model.busy);
-        assert!(session.sent_context.is_empty());
-        let mut queued = Session {
-            pending_send: Some(send("queued draft")),
-            ..Session::default()
         };
-        queued
-            .request(
-                AgentRequest::Abort { session: 0 },
-                &Config::default(),
-                &mut client,
-            )
-            .unwrap();
-        assert!(queued.pending_send.is_none());
-        assert_eq!(
-            recovered(&mut client),
-            AgentRecovery {
-                session: 0,
-                rewind: false,
-                input: "queued draft".into(),
-                basket,
-            }
-        );
-        assert!(!queued.model.busy);
+        let mut agent = Agent::default();
+        let request = AgentRequest::Send(send("inspect this"));
+        agent.request(request, &Config::default(), &mut client);
+        recovered(&mut client, "inspect this");
+        assert_eq!(agent.messages[0].role, "Error");
+        assert!(!agent.busy && agent.sent_context.is_empty());
+        agent.pending_send = Some(send("queued draft"));
+        let abort = AgentRequest::Abort { session: 0 };
+        agent.request(abort, &Config::default(), &mut client);
+        recovered(&mut client, "queued draft");
+        assert!(agent.pending_send.is_none());
     }
 }

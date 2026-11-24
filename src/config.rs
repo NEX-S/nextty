@@ -4,11 +4,8 @@ use std::{
     path::PathBuf,
 };
 
-const DEFAULT_HISTORY_LIMIT: u64 = 1 << 30;
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TabStyle {
-    #[default]
     Angled,
     Flat,
 }
@@ -37,19 +34,22 @@ impl Default for Config {
             background_opacity: 1.,
             tab_bar_opacity: 0.7,
             tab_style: TabStyle::Angled,
-            history_limit_bytes: DEFAULT_HISTORY_LIMIT,
+            history_limit_bytes: 1 << 30,
             base_url: String::new(),
             model: String::new(),
         }
     }
 }
 
+/// `$variable`, else `fallback` in the home directory.
+fn xdg_directory(variable: &str, fallback: &str) -> Option<PathBuf> {
+    let path = std::env::var_os(variable).filter(|path| !path.is_empty());
+    path.map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from(std::env::var_os("HOME")?).join(fallback)))
+}
+
 pub(crate) fn cache_directory() -> Option<PathBuf> {
-    std::env::var_os("XDG_CACHE_HOME")
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .map(|root| root.join("nextty"))
+    xdg_directory("XDG_CACHE_HOME", ".cache").map(|root| root.join("nextty"))
 }
 
 impl Config {
@@ -57,14 +57,11 @@ impl Config {
         let explicit = path.is_some();
         let path = match path {
             Some(path) => path,
-            None => match std::env::var_os("XDG_CONFIG_HOME").filter(|p| !p.is_empty()) {
-                Some(root) => PathBuf::from(root),
-                None => PathBuf::from(std::env::var_os("HOME").ok_or_else(|| {
+            None => xdg_directory("XDG_CONFIG_HOME", ".config")
+                .ok_or_else(|| {
                     io::Error::other("HOME is not set; specify a configuration with --config PATH")
-                })?)
-                .join(".config"),
-            }
-            .join("nextty/config.toml"),
+                })?
+                .join("nextty/config.toml"),
         };
         let text = match std::fs::read_to_string(&path) {
             Ok(text) => text,
@@ -164,44 +161,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn defaults_and_partial_configuration() {
-        assert_eq!(Config::parse("").unwrap(), Config::default());
+    fn example_and_documented_syntax() {
+        let example = Config::parse(include_str!("../nextty.example.toml")).unwrap();
+        assert_eq!(example, Config::default());
         let config = Config::parse(
-            r##"font_family = "monospace"
-font_size_px = 20
-foreground = "#aBcDeF"
-background_opacity = 0.75
-base_url = "http://localhost:8080/anthropic"
-model = "deepseek-flash""##,
+            "font_family = 'mono space' # font\r\nforeground = \"#abcdef\" # color\n\n# comment\nbase_url = \"https://example.test/#fragment\"\nfont_size_px = 20\nhistory_limit_bytes = 1_000\n",
         )
         .unwrap();
-        assert_eq!(config.font_family, "monospace");
-        assert_eq!(config.font_size_px, 20.);
-        assert_eq!(config.foreground, 0xabcdef);
-        assert_eq!(config.background, Config::default().background);
-        assert_eq!(config.background_opacity, 0.75);
-        assert_eq!(config.tab_bar_opacity, 0.7);
-        assert_eq!(config.base_url, "http://localhost:8080/anthropic");
-        assert_eq!(config.model, "deepseek-flash");
-    }
-
-    #[test]
-    fn example_configuration_and_inline_comments() {
-        let config = Config::parse(include_str!("../nextty.example.toml")).unwrap();
-        assert_eq!(config.font_family, Config::default().font_family);
-        assert_eq!(config.history_limit_bytes, DEFAULT_HISTORY_LIMIT);
-        let config = Config::parse(
-            "font_family = 'mono space' # font\r\nforeground = \"#abcdef\" # color\nbase_url = \"https://example.test/#fragment\"\n",
-        ).unwrap();
         assert_eq!(config.font_family, "mono space");
         assert_eq!(config.foreground, 0xabcdef);
+        assert_eq!(config.background, Config::default().background);
         assert_eq!(config.base_url, "https://example.test/#fragment");
-        assert_eq!(
-            Config::parse("history_limit_bytes = 1_073_741_824")
-                .unwrap()
-                .history_limit_bytes,
-            1 << 30
-        );
+        assert_eq!(config.font_size_px, 20.);
+        assert_eq!(config.history_limit_bytes, 1000);
     }
 
     #[test]

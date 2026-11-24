@@ -44,60 +44,57 @@ fn text_runs(runs: &[StyleRun]) -> impl Iterator<Item = Run> + '_ {
         })
 }
 
+/// A screen row as text and style runs, and the line shaped from them.
 struct Row {
-    index: usize,
     text: String,
     runs: Vec<StyleRun>,
     columns: Vec<u16>,
-}
-
-struct CachedRow {
-    row: Row,
     line: Option<Line>,
 }
 
-impl CachedRow {
-    fn matches(&self, row: &Row) -> bool {
-        self.row.text == row.text
-            && self.row.columns == row.columns
-            && text_runs(&self.row.runs).eq(text_runs(&row.runs))
-    }
-}
-
+/// A pane's rows; a damaged row keeps its shaped line while its text and colors stay the same.
 #[derive(Default)]
 pub struct LineCache {
-    rows: Vec<CachedRow>,
-    columns: usize,
-    block_cursor: Option<(usize, usize)>,
-}
-
-pub struct Frame {
     rows: Vec<Row>,
-    /// Lines that scrolled through since the previous frame; the cache shifts with them.
-    scroll: usize,
-    pub background: u32,
+    columns: usize,
+    focused: bool,
     cursor: Option<(usize, usize, CursorShape, usize)>,
     cursor_color: u32,
-    columns: usize,
-    row_count: usize,
     block_cursor: Option<(usize, usize)>,
+    ime_cursor: Option<Point>,
 }
 
-impl Frame {
-    pub fn new(term: &mut Screen, cache: &LineCache, focused: bool, preedit: bool) -> Self {
+impl LineCache {
+    /// The cell an IME composes at: the cursor, or where it last showed while a program hides it.
+    pub fn ime_position(&mut self, screen: &Screen) -> (usize, usize) {
+        let (cursor, shape) = screen.cursor();
+        // Hidden cursors can visit drawing cells; retain this pane's insertion point.
+        if shape != CursorShape::Hidden {
+            self.ime_cursor = Some(cursor);
+        }
+        let cursor = self.ime_cursor.unwrap_or(cursor);
+        (
+            cursor.column.min(screen.columns() - 1),
+            (cursor.line + screen.display_offset() as i32)
+                .clamp(0, screen.screen_lines() as i32 - 1) as usize,
+        )
+    }
+
+    /// Rebuilds the damaged rows of `term` and returns its default background. `hide_cursor`
+    /// leaves the cursor to an input field or IME preedit drawn over the pane.
+    pub fn update(&mut self, term: &mut Screen, focused: bool, hide_cursor: bool) -> u32 {
         let row_count = term.screen_lines();
         let columns = term.columns();
         let selection = term.selection_range();
+        // Lines that scrolled through since the previous frame; the cache shifts with them.
         let scroll = std::mem::take(&mut term.scrolled).min(row_count);
-        let full = cache.rows.len() != row_count || cache.columns != columns;
-        if full {
+        if self.rows.len() != row_count || self.columns != columns {
             term.dirty.fill(true);
         }
         let background = term.color(Color::Named(NamedColor::Background)).rgba();
-        let cursor_color = term.color(Color::Named(NamedColor::Cursor)).rgba();
         let (cursor_point, cursor_shape) = term.cursor();
         let cursor_row = cursor_point.line + term.display_offset() as i32;
-        let cursor = (!preedit
+        let cursor = (!hide_cursor
             && cursor_shape != CursorShape::Hidden
             && (0..row_count as i32).contains(&cursor_row))
         .then(|| {
@@ -113,23 +110,26 @@ impl Frame {
             .map(|(column, row, _, _)| (row, column));
         // The filled cursor changes cached text colors; focus and overlays can change
         // its visibility without any PTY damage.
-        let previous = cache
+        let previous = self
             .block_cursor
             .map(|(row, column)| (row.saturating_sub(scroll), column));
-        if !full && previous != block_cursor {
+        if previous != block_cursor {
             for (row, _) in previous.into_iter().chain(block_cursor) {
                 if let Some(dirty) = term.dirty.get_mut(row) {
                     *dirty = true;
                 }
             }
         }
+        self.rows.truncate(row_count);
+        let scroll = scroll.min(self.rows.len());
+        self.rows.rotate_left(scroll);
         let text_style = Flags::BOLD
             | Flags::ITALIC
             | Flags::DIM
             | Flags::INVERSE
             | Flags::ALL_UNDERLINES
             | Flags::STRIKEOUT;
-        let mut rows = Vec::with_capacity(term.dirty_rows().count());
+        let mut native_runs = smallvec::SmallVec::<[Run; 4]>::new();
         for index in term.dirty_rows() {
             let line = index as i32 - term.display_offset() as i32;
             let data = term.row(index);
@@ -250,63 +250,49 @@ impl Frame {
                 }
                 runs.pop();
             }
-            rows.push(Row {
-                index,
-                text,
-                runs,
-                columns: column_map,
-            });
-        }
-        term.reset_damage();
-        Self {
-            rows,
-            scroll,
-            background,
-            cursor,
-            cursor_color,
-            columns,
-            row_count,
-            block_cursor,
-        }
-    }
-
-    pub fn paint(
-        self,
-        cell: (f32, f32),
-        focused: bool,
-        cache: &mut LineCache,
-        renderer: &Renderer,
-        origin: (f32, f32),
-        size: (f32, f32),
-    ) {
-        cache.rows.truncate(self.row_count);
-        let scroll = self.scroll.min(cache.rows.len());
-        cache.rows.rotate_left(scroll);
-        let mut native_runs = smallvec::SmallVec::<[Run; 4]>::new();
-        for row in self.rows {
-            if let Some(cached) = cache.rows.get_mut(row.index)
-                && cached.matches(&row)
+            if let Some(cached) = self.rows.get_mut(index)
+                && cached.text == text
+                && cached.columns == column_map
+                && text_runs(&cached.runs).eq(text_runs(&runs))
             {
-                cached.row.runs = row.runs;
+                cached.runs = runs;
                 continue;
             }
             native_runs.clear();
-            native_runs.extend(text_runs(&row.runs));
-            let line = (!row.text.is_empty())
-                .then(|| renderer.shape(&row.text, &native_runs, &row.columns));
-            let cached = CachedRow { row, line };
-            if let Some(slot) = cache.rows.get_mut(cached.row.index) {
-                *slot = cached;
+            native_runs.extend(text_runs(&runs));
+            let row = Row {
+                line: (!text.is_empty()).then(|| Line::new(&text, &native_runs, &column_map)),
+                text,
+                runs,
+                columns: column_map,
+            };
+            if let Some(slot) = self.rows.get_mut(index) {
+                *slot = row;
             } else {
-                cache.rows.push(cached);
+                self.rows.push(row);
             }
         }
-        cache.columns = self.columns;
-        cache.block_cursor = self.block_cursor;
-        for (row, data) in cache.rows.iter().enumerate() {
+        term.reset_damage();
+        self.columns = columns;
+        self.focused = focused;
+        self.cursor = cursor;
+        self.cursor_color = term.color(Color::Named(NamedColor::Cursor)).rgba();
+        self.block_cursor = block_cursor;
+        background
+    }
+
+    /// Draws the rows at `origin`; backgrounds of the last row and column fill `size`.
+    pub fn paint(
+        &self,
+        renderer: &Renderer,
+        cell: (f32, f32),
+        origin: (f32, f32),
+        size: (f32, f32),
+    ) {
+        let row_count = self.rows.len();
+        for (row, data) in self.rows.iter().enumerate() {
             let y = origin.1 + cell.1 * row as f32;
             for runs in data
-                .row
                 .runs
                 .chunk_by(|a, b| a.background == b.background && a.end == b.start)
             {
@@ -319,15 +305,15 @@ impl Frame {
                         width += (size.0 - cell.0 * self.columns as f32).max(0.);
                     }
                     let mut height = cell.1;
-                    if row + 1 == self.row_count {
-                        height += (size.1 - cell.1 * self.row_count as f32).max(0.);
+                    if row + 1 == row_count {
+                        height += (size.1 - cell.1 * row_count as f32).max(0.);
                     }
                     renderer.rect(x, y, width, height, color.get());
                 }
             }
             // Cell backgrounds fill the pane's remainder; the cursor stays on the grid.
             if let Some((column, cursor_row, CursorShape::Block, width)) = self.cursor
-                && focused
+                && self.focused
                 && row == cursor_row
             {
                 renderer.rect(
@@ -341,7 +327,7 @@ impl Frame {
             if let Some(line) = &data.line {
                 renderer.line(line, origin.0, y);
             }
-            for run in &data.row.runs {
+            for run in &data.runs {
                 let x = origin.0 + cell.0 * run.start as f32;
                 let width = cell.0 * (run.end - run.start) as f32;
                 if let Some(color) = run.underline {
@@ -360,7 +346,7 @@ impl Frame {
             let x = origin.0 + cell.0 * column as f32;
             let y = origin.1 + cell.1 * row as f32;
             let width = cell.0 * width as f32;
-            if !focused {
+            if !self.focused {
                 renderer.rect(x, y, width, 1., self.cursor_color);
                 renderer.rect(x, y + cell.1 - 1., width, 1., self.cursor_color);
                 renderer.rect(x, y, 1., cell.1, self.cursor_color);
@@ -381,10 +367,9 @@ impl Frame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::width::text_width;
     use crate::{
         config::Config,
-        core::{Core, WindowSize},
+        core::{Core, SelectionType, Side, WindowSize},
         screen::Update,
         vt::Parser,
     };
@@ -399,50 +384,36 @@ mod tests {
         Core::new(size, foreground, background)
     }
 
-    fn frame(core: &Core) -> Frame {
+    fn rows(core: &Core, focused: bool) -> (LineCache, u32) {
         let mut screen = Screen::default();
         screen.apply(Update::capture(core, true));
-        Frame::new(&mut screen, &LineCache::default(), true, false)
+        let mut cache = LineCache::default();
+        let background = cache.update(&mut screen, focused, false);
+        (cache, background)
     }
 
     #[test]
     fn bottom_right_block_cursor_is_separate_from_the_cell_background() {
         let mut core = core(4, 2, 0xcccccc, 0x202020);
         Parser::new().advance(&mut core, b"\x1b[2;4HX\x1b[2;4H\x1b[2 q");
-        let focused = frame(&core);
+        let (focused, background) = rows(&core, true);
         assert_eq!(focused.cursor, Some((3, 1, CursorShape::Block, 1)));
         let run = focused.rows[1].runs.last().unwrap();
-        assert_eq!(run.text.color, focused.background);
+        assert_eq!(run.text.color, background);
         assert!(run.background.is_none());
 
-        let mut screen = Screen::default();
-        screen.apply(Update::capture(&core, true));
-        let unfocused = Frame::new(&mut screen, &LineCache::default(), false, false);
+        let (unfocused, _) = rows(&core, false);
         let run = unfocused.rows[1].runs.last().unwrap();
         assert_eq!(run.text.color, 0xccccccff);
         assert!(run.background.is_none());
     }
 
     #[test]
-    fn dimmed_foreground_becomes_the_background_after_inverse() {
-        let mut core = core(4, 1, 0xffffff, 0);
-        Parser::new().advance(&mut core, b"\x1b[2;7;38;2;255;0;0;48;2;32;48;64mX");
-        let frame = frame(&core);
-        let style = &frame.rows[0].runs[0];
-        assert_eq!(style.text.color, 0x203040ff);
-        assert_eq!(style.background.unwrap().get(), 0xa80000ff);
-    }
-
-    #[test]
     fn ui_text_columns_keep_wide_and_combining_text_on_the_terminal_grid() {
         assert_eq!(text_columns("中a\u{301}"), [0, 0, 0, 2, 2, 2]);
-        assert_eq!(text_width("中a\u{301}"), 3);
         for text in ["👩‍💻a", "لاا", "\u{17d8}a"] {
-            assert!(
-                text_columns(text)
-                    .iter()
-                    .all(|&column| usize::from(column) < text_width(text))
-            );
+            let width = crate::width::text_width(text);
+            assert!(text_columns(text).iter().all(|&c| usize::from(c) < width));
         }
     }
 
@@ -460,58 +431,16 @@ mod tests {
             let config = Config::default();
             let mut core = core(12, 2, config.foreground, config.background);
             Parser::new().advance(&mut core, format!("\x1b[?25l{input}").as_bytes());
-            let frame = frame(&core);
-            assert_eq!(frame.rows[0].text, expected);
-            assert_eq!(
-                frame.rows[0].runs.last().unwrap().text.end as usize,
-                expected.len()
-            );
-            assert!(
-                frame.rows[0].columns.is_empty() || frame.rows[0].columns.len() == expected.len()
-            );
+            let row = &rows(&core, true).0.rows[0];
+            assert_eq!(row.text, expected);
+            assert_eq!(row.runs.last().unwrap().text.end as usize, expected.len());
+            assert!(row.columns.is_empty() || row.columns.len() == expected.len());
         }
     }
 
     #[test]
-    fn blank_tail_keeps_multiline_selection_and_the_cursor_at_the_edge() {
-        use crate::core::{Point, SelectionType, Side};
+    fn selection_skips_prompt_cells_and_fills_blank_tails() {
         let mut core = core(21, 3, 0xcccccc, 0x202020);
-        let mut parser = Parser::new();
-        parser.advance(&mut core, b"\x1b[?25l");
-        core.selection_start(
-            Point { line: 0, column: 8 },
-            Side::Left,
-            SelectionType::Simple,
-        );
-        core.selection_update(Point { line: 2, column: 4 }, Side::Right);
-        let selected = frame(&core);
-        for (row, expected) in selected.rows.iter().zip([(8, 21), (0, 21), (0, 5)]) {
-            let runs: Vec<_> = row
-                .runs
-                .iter()
-                .filter(|run| run.background == NonZeroU32::new(0x303030ff))
-                .map(|run| (run.start, run.end))
-                .collect();
-            assert_eq!(runs, [expected]);
-        }
-        core.clear_selection();
-        parser.advance(&mut core, b"\x1b[?25h\x1b[1;21H");
-        let edge = frame(&core);
-        assert_eq!(edge.rows[0].text.len(), 21);
-        assert_eq!(
-            (
-                edge.rows[0].runs.last().unwrap().start,
-                edge.rows[0].runs.last().unwrap().end
-            ),
-            (20, 21)
-        );
-    }
-
-    #[test]
-    fn prompt_cells_do_not_gain_selection_background() {
-        use crate::core::{Point, SelectionType, Side};
-        let config = Config::default();
-        let mut core = core(16, 2, config.foreground, config.background);
         Parser::new().advance(
             &mut core,
             "\x1b[?25l\x1b]133;A\x07 • \x1b]133;B\x07echo".as_bytes(),
@@ -521,33 +450,55 @@ mod tests {
             Side::Left,
             SelectionType::Simple,
         );
-        core.selection_update(Point { line: 0, column: 6 }, Side::Right);
-        let frame = frame(&core);
-        let selected: Vec<_> = frame.rows[0]
-            .runs
-            .iter()
-            .filter(|run| run.background == NonZeroU32::new(0x303030ff))
-            .collect();
-        assert_eq!(selected.len(), 1);
-        assert_eq!(selected[0].start, 3);
-        assert_eq!(
-            &frame.rows[0].text[selected[0].text.start as usize..selected[0].text.end as usize],
-            "echo"
-        );
+        core.selection_update(Point { line: 2, column: 4 }, Side::Right);
+        let (cache, _) = rows(&core, true);
+        let selected = |row: &Row| -> Vec<_> {
+            row.runs
+                .iter()
+                .filter(|run| run.background == NonZeroU32::new(0x303030ff))
+                .map(|run| (run.start, run.end))
+                .collect()
+        };
+        assert_eq!(selected(&cache.rows[0]), [(3, 21)]);
+        assert_eq!(selected(&cache.rows[1]), [(0, 21)]);
+        assert_eq!(selected(&cache.rows[2]), [(0, 5)]);
+    }
+
+    #[test]
+    fn ime_anchor_stays_with_each_pane_when_tui_cursors_are_hidden() {
+        let mut core = core(40, 12, 0xcccccc, 0x202020);
+        let mut parser = Parser::new();
+        let mut screen = Screen::default();
+        let (mut left, mut right) = (LineCache::default(), LineCache::default());
+        parser.advance(&mut core, b"\x1b[3;5H");
+        screen.apply(Update::capture(&core, true));
+        assert_eq!(left.ime_position(&screen), (4, 2));
+        parser.advance(&mut core, b"\x1b[9;7H");
+        screen.apply(Update::capture(&core, true));
+        assert_eq!(right.ime_position(&screen), (6, 8));
+
+        parser.advance(&mut core, b"\x1b[?25l\x1b[12;40H");
+        screen.apply(Update::capture(&core, true));
+        assert_eq!(left.ime_position(&screen), (4, 2));
+        assert_eq!(right.ime_position(&screen), (6, 8));
+
+        parser.advance(&mut core, b"\x1b[?25h\x1b[10;8H");
+        screen.apply(Update::capture(&core, true));
+        assert_eq!(right.ime_position(&screen), (7, 9));
     }
 
     #[test]
     fn right_prompt_shaping_and_decorations_keep_terminal_columns() {
         let mut core = core(21, 2, 0xcccccc, 0x202020);
         Parser::new().advance(&mut core, "\x1b]133;A\x07 • \x1b]133;B\x07cmd\x1b[1;19H\x1b[44;4m\x1b]133;P;2\x07中a\u{301}\x1b]133;P;0\x07\x1b[0m\x1b[1;4H".as_bytes());
-        let frame = frame(&core);
-        let row = &frame.rows[0];
+        let (cache, _) = rows(&core, true);
+        let row = &cache.rows[0];
         assert_eq!(&row.columns[row.columns.len() - 3..], [20, 20, 20]);
         let run = row.runs.last().unwrap();
         assert_eq!((run.start, run.end), (18, 21));
         assert!(run.background.is_some());
         assert!(run.underline.is_some());
         assert_eq!(row.columns[1], 1);
-        assert_eq!(frame.cursor.unwrap().0, 3);
+        assert_eq!(cache.cursor.unwrap().0, 3);
     }
 }

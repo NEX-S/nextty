@@ -1,165 +1,103 @@
 use super::*;
+use crate::config::TabStyle;
 use crate::core::Flags;
+use crate::ui::TabPart;
 use crate::width::fit_label;
 
 impl WorkspaceView {
     pub(super) fn chrome(&mut self, layout: GuiLayout) {
         self.painter.clip(0., 0., layout.width, layout.top);
-        let mut tabline_background = 0;
-        for shift in [16, 8, 0] {
-            tabline_background |= ((self.config.background >> shift & 255) * 9 / 10) << shift;
-        }
-        self.painter
-            .clear((tabline_background << 8) | (self.config.tab_bar_opacity * 255.).round() as u32);
+        let alpha = (self.config.tab_bar_opacity * 255.).round() as u32;
+        let row = crate::ui::tab_row_color(&self.config);
+        self.painter.clear((row << 8) | alpha);
         let Some(snapshot) = self.client.snapshot() else {
             return;
         };
-        let cell = self.cell;
-        let bar = self.tab_bar(snapshot, layout);
-        let hit = (self.pointer.1 < layout.top)
-            .then(|| bar.at(snapshot, self.cell().0))
-            .flatten();
-        let prompt = if snapshot.controller { MUTED } else { WARNING };
-        self.painter.text("›", cell.0, 0., prompt);
-        for &(index, column, columns) in &bar.tabs {
-            let tab = &snapshot.tabs[index];
-            let active = tab.id == snapshot.active_tab;
-            let x = f32::from(column) * cell.0;
-            let w = f32::from(columns) * cell.0;
-            let close_hovered = hit == Some(TabHit::Close(tab.id));
-            let hovered = hit == Some(TabHit::Select(index)) || close_hovered;
-            let background = if active {
-                self.config.background
-            } else {
-                mix_color(self.config.background, 0, 204)
-            };
-            match self.config.tab_style {
-                crate::config::TabStyle::Angled => {
-                    self.painter
-                        .tab((x, 0.), (w, cell.1), cell.0, opaque(background))
+        let (cell, style) = (self.cell, self.config.tab_style);
+        let columns = ((layout.width - self.control_width()) / cell.0) as u16;
+        let status = if self.client.is_remote() { "SSH" } else { "" };
+        let pointer = (self.pointer.1 < layout.top).then(|| self.cell().0);
+        let painter = &mut self.painter;
+        let config = &self.config;
+        self.ui.paint_tabs(
+            snapshot,
+            columns,
+            status,
+            pointer,
+            config,
+            |part| match part {
+                TabPart::Tab { x, width, color } => {
+                    let (x, width) = (f32::from(x) * cell.0, f32::from(width) * cell.0);
+                    match style {
+                        TabStyle::Angled => {
+                            painter.tab((x, 0.), (width, cell.1), cell.0, opaque(color))
+                        }
+                        TabStyle::Flat => painter.rect(x, 0., width, cell.1, opaque(color)),
+                    }
                 }
-                crate::config::TabStyle::Flat => {
-                    self.painter.rect(x, 0., w, cell.1, opaque(background))
+                TabPart::Text {
+                    x,
+                    width,
+                    text,
+                    color,
+                    ..
+                } => {
+                    let x = f32::from(x) * cell.0;
+                    painter.text(&fit_label(text, width), x, 0., opaque(color));
                 }
-            }
-            self.painter
-                .text("•", x + cell.0 * 2., 0., opaque(crate::ui::tab_color(tab)));
-            self.painter.text(
-                &fit_label(&tab.title, columns - 8),
-                x + cell.0 * 4.,
-                0.,
-                if active || hovered {
-                    opaque(self.config.foreground)
-                } else {
-                    MUTED
-                },
-            );
-            let close_x = x + w - cell.0 * 3.;
-            if close_hovered {
-                self.painter.rect(close_x, cell.1 - 1., cell.0, 1., DANGER);
-            }
-            let color = if close_hovered { DANGER } else { MUTED };
-            self.painter.text("×", close_x, 0., color);
-            if active && self.config.tab_style == crate::config::TabStyle::Flat {
-                self.painter.rect(x, cell.1 - 2., w, 1., ACCENT);
-            }
-        }
-        if let Some(plus) = bar.plus {
-            let x = f32::from(plus + 1) * cell.0;
-            let hovered = hit == Some(TabHit::New);
-            if hovered {
-                self.painter.rect(x, cell.1 - 1., cell.0, 1., ACCENT);
-            }
-            self.painter
-                .text("+", x, 0., if hovered { ACCENT } else { 0x606060ff });
-        }
-        if let Some(TabHit::Scroll(direction)) = hit
-            && let Some((column, columns)) = bar.overflow[usize::from(direction > 0)]
-        {
-            self.painter.rect(
-                f32::from(column) * cell.0,
-                cell.1 - 1.,
-                f32::from(columns) * cell.0,
-                1.,
-                INK,
-            );
-        }
-        let color = if snapshot.controller {
-            0xb8b8b8ff
-        } else {
-            WARNING
-        };
-        self.painter
-            .text(&bar.label, f32::from(bar.label_x) * cell.0, 0., color);
+                TabPart::Underline { x, width, color } => {
+                    let (x, width) = (f32::from(x) * cell.0, f32::from(width) * cell.0);
+                    painter.rect(x, cell.1 - 2., width, 1., opaque(color));
+                }
+            },
+        );
         self.painter.clip(0., 0., 0., 0.)
     }
 
     pub(super) fn control_width(&self) -> f32 {
         self.cell.0 * 18.
     }
-    fn header_button(
-        &mut self,
-        x: f32,
-        w: f32,
-        layout: GuiLayout,
-        (action, label): (GuiAction, &str),
-    ) {
-        let hit = GuiHit {
-            bounds: (x, 0., w, layout.top),
-            action,
-        };
-        let disabled = matches!(action, GuiAction::Tab(_))
-            && self
-                .client
-                .snapshot()
-                .is_none_or(|snapshot| !snapshot.controller || snapshot.tabs.len() < 2);
-        let color = if disabled {
-            0x505850ff
-        } else if action == GuiAction::Close && hit.contains(self.pointer) {
-            DANGER
-        } else {
-            INK
-        };
-        if !disabled {
-            self.control_feedback(hit);
-            self.control_hits.push(hit);
-        }
-        let y = (layout.top - self.cell.1) * 0.5;
-        self.painter
-            .text(label, x + (w - self.cell.0) * 0.5, y, color)
-    }
     pub(super) fn draw_window_controls(&mut self, layout: GuiLayout) {
         self.painter.clip(0., 0., layout.width, layout.top);
+        let one_tab = self
+            .client
+            .snapshot()
+            .is_none_or(|snapshot| !snapshot.controller || snapshot.tabs.len() < 2);
         let mut x = layout.width - self.control_width();
-        for (cells, button) in [
-            (3., (GuiAction::Tab(TabHit::Scroll(-1)), "‹")),
-            (3., (GuiAction::Tab(TabHit::Scroll(1)), "›")),
-            (4., (GuiAction::Minimize, "−")),
-            (4., (GuiAction::Maximize, "☐")),
-            (4., (GuiAction::Close, "×")),
+        for (cells, action, label) in [
+            (3., GuiAction::Tab(TabHit::Scroll(-1)), "‹"),
+            (3., GuiAction::Tab(TabHit::Scroll(1)), "›"),
+            (4., GuiAction::Minimize, "−"),
+            (4., GuiAction::Maximize, "☐"),
+            (4., GuiAction::Close, "×"),
         ] {
             let w = self.cell.0 * cells;
-            self.header_button(x, w, layout, button);
+            let hit = GuiHit {
+                bounds: (x, 0., w, layout.top),
+                action,
+            };
+            let disabled = matches!(action, GuiAction::Tab(_)) && one_tab;
+            let hovered = !disabled && hit.contains(self.pointer);
+            let color = match action {
+                _ if disabled => 0x505850ff,
+                GuiAction::Close if hovered => DANGER,
+                _ => INK,
+            };
+            if hovered {
+                let padding = self.cell.0.min((w - self.cell.0).max(0.) * 0.5);
+                let y = layout.top - 1.;
+                self.painter
+                    .rect(x + padding, y, w - padding * 2., 1., color);
+            }
+            if !disabled {
+                self.control_hits.push(hit);
+            }
+            let y = (layout.top - self.cell.1) * 0.5;
+            self.painter
+                .text(label, x + (w - self.cell.0) * 0.5, y, color);
             x += w;
         }
         self.painter.clip(0., 0., 0., 0.)
-    }
-    fn control_feedback(&self, hit: GuiHit) {
-        if hit.contains(self.pointer) {
-            let (x, y, w, h) = hit.bounds;
-            let underline = match hit.action {
-                GuiAction::Close => Some(DANGER),
-                GuiAction::Tab(_) | GuiAction::Minimize | GuiAction::Maximize => Some(INK),
-                _ => None,
-            };
-            if let Some(color) = underline {
-                let padding = self.cell.0.min((w - self.cell.0).max(0.) * 0.5);
-                self.painter
-                    .rect(x + padding, y + h - 1., w - padding * 2., 1., color);
-            } else {
-                self.painter.rect(x, y, w, h, opaque(crate::panel::HOVER));
-            }
-        }
     }
     pub(super) fn draw_scrollbars(&mut self) {
         self.painter.clip(0., 0., 0., 0.);
@@ -187,38 +125,27 @@ impl WorkspaceView {
                     .scrollbar_drag
                     .as_ref()
                     .is_some_and(|drag| drag.bar.target == bar.target);
+            let (x, y, w, h) = bar.bounds;
             let (top, height) = bar.thumb();
             if active {
-                self.painter.rect(
-                    bar.bounds.0,
-                    bar.bounds.1,
-                    bar.bounds.2,
-                    bar.bounds.3,
-                    0x343834ff,
-                );
+                self.painter.rect(x, y, w, h, 0x343834ff);
             }
-            self.painter.rect(
-                bar.bounds.0,
-                top,
-                bar.bounds.2,
-                height,
-                if active { 0xa2aaa0ff } else { 0x60685fff },
-            );
+            let thumb = if active { 0xa2aaa0ff } else { 0x60685fff };
+            self.painter.rect(x, top, w, height, thumb);
         }
     }
-    fn draw_resources(&mut self, layout: GuiLayout, summary_y: f32) {
+    fn draw_resources(&mut self, layout: GuiLayout, summary_y: f32, pointer: Option<(u16, u16)>) {
         let top = layout.footer + 6.;
         let columns = ((layout.width - PADDING * 2.) / self.cell.0) as u16;
         let rows = ((summary_y - 6. - top) / self.cell.1) as u16;
-        let view = self.ui.resources.view(columns, rows);
+        let view = self.ui.resources.view(columns, rows, pointer);
+        let focused = self.ui.focus == Focus::Monitor;
         let body_left = PADDING + f32::from(view.body_x) * self.cell.0;
-        let body_top = top;
-        let bottom = top + f32::from(rows) * self.cell.1;
         self.painter.clip(
             body_left,
-            body_top,
+            top,
             (layout.width - body_left - PADDING).max(0.),
-            (bottom - body_top).max(0.),
+            f32::from(rows) * self.cell.1,
         );
         for plot in view.plots {
             let x = PADDING + f32::from(plot.x) * self.cell.0;
@@ -265,28 +192,12 @@ impl WorkspaceView {
             let y = top + text.y as f32 * self.cell.1;
             let width = f32::from(text.width) * self.cell.0;
             self.painter.clip(x, y, width, self.cell.1);
-            let background = match text.emphasis(self.ui.focus == Focus::Monitor) {
-                crate::monitor::Emphasis::Selected => Some(crate::panel::SELECTED),
-                crate::monitor::Emphasis::Highlighted => Some(crate::panel::HOVER),
-                crate::monitor::Emphasis::None => None,
-            };
-            if let Some(background) = background {
+            if let Some(background) = text.background(focused) {
                 self.painter
                     .rect(x, y, width, self.cell.1, opaque(background));
             }
             self.painter
                 .text(&fit_label(&text.text, text.width), x, y, opaque(text.color));
-        }
-        for hit in view.hits {
-            self.control_hits.push(GuiHit {
-                bounds: (
-                    PADDING + f32::from(hit.x) * self.cell.0,
-                    top + hit.y as f32 * self.cell.1,
-                    f32::from(hit.width) * self.cell.0,
-                    self.cell.1,
-                ),
-                action: GuiAction::Monitor(hit.action),
-            });
         }
         self.painter.clip(
             0.,
@@ -306,66 +217,36 @@ impl WorkspaceView {
         self.painter
             .rect(0., layout.footer, layout.width, 1., BORDER);
         let summary_y = layout.height - self.cell.1 - 6.;
+        let (area, column, row, _) = self.locate(self.pointer);
         if self.ui.resources.open {
-            self.draw_resources(layout, summary_y);
+            let pointer = (area == Area::Monitor).then_some((column, row));
+            self.draw_resources(layout, summary_y, pointer);
             self.painter
                 .rect(0., summary_y - 6., layout.width, 1., BORDER);
         }
         let columns = (layout.width / self.cell.0) as u16;
         let origin = layout.width - f32::from(columns) * self.cell.0;
-        let view =
-            self.ui
-                .resources
-                .footer(columns, self.client.controller(), self.client.is_remote());
-        let left = view
-            .texts
-            .iter()
-            .map(|text| text.x)
-            .min()
-            .unwrap_or(columns);
-        for text in view.texts {
+        let pointer = (area == Area::Footer).then_some(column);
+        let (controller, remote) = (self.client.controller(), self.client.is_remote());
+        let focused = self.ui.focus == Focus::Monitor;
+        let footer = self
+            .ui
+            .resources
+            .footer(columns, controller, remote, pointer);
+        for text in &footer.texts {
             let x = origin + f32::from(text.x) * self.cell.0;
-            let bounds = (
-                x,
-                summary_y - 6.,
-                f32::from(text.width) * self.cell.0,
-                self.cell.1 + 12.,
-            );
-            if let Some(hit) = view.hits.iter().find(|hit| hit.x == text.x) {
-                let hit = GuiHit {
-                    bounds,
-                    action: GuiAction::Monitor(hit.action),
-                };
-                self.control_feedback(hit);
-                self.control_hits.push(hit);
-            }
-            if text.emphasis(self.ui.focus == Focus::Monitor) != crate::monitor::Emphasis::None {
-                self.painter.rect(
-                    x,
-                    summary_y,
-                    bounds.2,
-                    self.cell.1,
-                    opaque(crate::panel::SELECTED),
-                );
+            if let Some(background) = text.background(focused) {
+                let width = f32::from(text.width) * self.cell.0;
+                let background = opaque(background);
+                self.painter
+                    .rect(x, summary_y, width, self.cell.1, background);
             }
             self.painter
                 .text(&text.text, x, summary_y, opaque(text.color));
         }
-        let right = origin + f32::from(left) * self.cell.0;
-        let label = self
-            .client
-            .snapshot()
-            .map(|snapshot| self.ui.footer(snapshot, self.client.is_remote()))
-            .unwrap_or_default();
-        self.painter.text(
-            &crate::width::fit_middle(
-                &label,
-                ((right - PADDING - self.cell.0 * 2.) / self.cell.0) as u16,
-            ),
-            PADDING,
-            summary_y,
-            MUTED,
-        );
+        let (label, columns) = self.ui.footer_label(&self.client, &footer);
+        let label = crate::width::fit_middle(&label, columns);
+        self.painter.text(&label, PADDING, summary_y, MUTED);
         self.painter.clip(0., 0., 0., 0.)
     }
 
@@ -425,18 +306,77 @@ impl WorkspaceView {
     }
 
     pub(super) fn draw_files(&mut self, layout: GuiLayout) {
-        let rect = self.file_rect(layout);
-        let preview_rect = self.file_preview_layout(layout);
-        let Some(files) = &mut self.ui.files else {
-            return;
-        };
-        let focused = self.ui.focus == Focus::Files && files.focus() == FileFocus::List;
-        let grid = crate::file_panel::list(files, rect, &self.preedit, focused, &self.config);
-        let preview = (files.focus() == FileFocus::Preview)
-            .then(|| crate::file_panel::preview(files, preview_rect, &self.config));
-        self.draw_panel(&grid);
+        let list = self.file_rect(layout);
+        let preview = self.file_preview_layout(layout);
+        let (preedit, config) = (&self.preedit, &self.config);
+        let (list, preview) = self.ui.file_grids(list, preview, preedit, config);
+        self.draw_panel(&list);
         if let Some(preview) = preview {
             self.draw_panel(&preview);
         }
+    }
+
+    pub(super) fn draw_agent(&mut self, layout: GuiLayout) -> Result<()> {
+        if !self.ui.agent.open {
+            return Ok(());
+        }
+        let side = rect(
+            (layout.side / self.cell.0) as u16,
+            1,
+            ((layout.width - layout.side) / self.cell.0) as u16,
+            ((layout.footer - layout.top) / self.cell.1).max(1.) as u16,
+        );
+        let size = WindowSize {
+            num_cols: (layout.width / self.cell.0) as u16,
+            num_lines: (layout.height / self.cell.1) as u16,
+            cell_width: self.cell.0 as u16,
+            cell_height: self.cell.1 as u16,
+        };
+        let pointer = Some(self.cell());
+        let (config, preedit) = (&self.config, &self.preedit);
+        let panel = crate::agent::panel::draw(&mut self.ui, config, side, size, pointer, preedit)?;
+        if let Some(backdrop) = &panel.backdrop {
+            self.draw_panel(backdrop);
+        }
+        self.draw_panel(&panel.grid);
+        let agent = &self.ui.agent;
+        let session = agent.active();
+        let editor = session.editor_layout(
+            session.editor_columns(usize::from(agent.editor.cols)),
+            usize::from(agent.editor.rows),
+        );
+        let cell = self.cell;
+        let mut bar = |target, rect, total, offset| {
+            let bar = Scrollbar::in_rect(target, rect, cell, total, offset);
+            self.scrollbars.extend(bar);
+        };
+        let transcript = (session.lines.len(), session.model.scroll);
+        bar(
+            ScrollTarget::Transcript,
+            agent.chat,
+            transcript.0,
+            transcript.1,
+        );
+        let lines = editor.lines.len();
+        bar(ScrollTarget::Editor, agent.editor, lines, editor.first);
+        if let Some(rect) = panel.preview
+            && let Some(preview) = &session.context.preview
+        {
+            bar(
+                ScrollTarget::Preview,
+                rect,
+                preview.lines.len(),
+                preview.scroll,
+            );
+        }
+        if let Some((column, row)) = panel.cursor {
+            let x = f32::from(column) * self.cell.0;
+            let y = f32::from(row) * self.cell.1;
+            self.painter.rect(x, y, 2., self.cell.1, INK);
+            self.window
+                .cursor_rect(x as i32, y as i32, self.cell.0 as i32, self.cell.1 as i32);
+        }
+        self.ui.agent.spare_grid = Some(panel.grid);
+        Ok(())
     }
 }

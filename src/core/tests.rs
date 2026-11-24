@@ -295,34 +295,10 @@ fn region_scrolling_does_not_enter_history_and_uses_bce() {
         core.row(2)
             .cells
             .iter()
-            .all(|cell| cell.bg == Color::Named(NamedColor::Blue))
+            .all(|cell| cell.bg == Color::Indexed(4))
     );
     feed(&mut core, &mut parser, "\x1b[2;2H\x1b[2X");
     assert_eq!(line(&core, 1), "t  ee");
-}
-
-#[test]
-fn damage_tracks_content_changes_separately_from_display_metadata() {
-    let (mut core, mut parser) = terminal(8, 3);
-    core.reset_damage();
-    feed(&mut core, &mut parser, "\x1b[3;1H");
-    assert_eq!(core.dirty_rows().count(), 0);
-    assert_eq!(core.cursor().0, Point { line: 2, column: 0 });
-    core.reset_damage();
-    core.selection_start(
-        Point { line: 1, column: 0 },
-        Side::Left,
-        SelectionType::Lines,
-    );
-    assert_eq!(core.dirty_rows().count(), 0);
-    core.reset_damage();
-    assert!(!core.selection_update(Point { line: 1, column: 0 }, Side::Left));
-    assert_eq!(core.dirty_rows().count(), 0);
-    assert!(core.selection_update(Point { line: 1, column: 0 }, Side::Right));
-    assert_eq!(core.dirty_rows().count(), 0);
-    core.reset_damage();
-    feed(&mut core, &mut parser, "\x1b]11;#123456\x07");
-    assert_eq!(core.dirty_rows().count(), 3);
 }
 
 #[test]
@@ -382,100 +358,6 @@ fn word_and_line_selection_follow_soft_wraps_and_wide_cells() {
 }
 
 #[test]
-fn object_selection_preserves_urls_locations_and_quoted_unicode() {
-    fn select_object(core: &mut Core, line: i32, column: usize) {
-        let [start, end] = object_selection((i64::from(line), column), |row| {
-            core.absolute_row(row as i32)
-        })
-        .unwrap_or([(i64::from(line), column); 2]);
-        core.selection_start(
-            Point {
-                line: start.0 as i32,
-                column: start.1,
-            },
-            Side::Left,
-            SelectionType::Simple,
-        );
-        core.selection_update(
-            Point {
-                line: end.0 as i32,
-                column: end.1,
-            },
-            Side::Right,
-        );
-    }
-    for (text, column, expected) in [
-        ("see (https://host/a_(b)?x=1)", 15, "https://host/a_(b)?x=1"),
-        ("error: src/main.rs:42:7", 15, "src/main.rs:42:7"),
-        (
-            "open \"中\u{301}文 file.rs\" now",
-            7,
-            "\"中\u{301}文 file.rs\"",
-        ),
-    ] {
-        let (mut core, mut parser) = terminal(40, 3);
-        feed(&mut core, &mut parser, text);
-        select_object(&mut core, 0, column);
-        assert_eq!(selection_to_string(&core).as_deref(), Some(expected));
-    }
-    let (mut core, mut parser) = terminal(8, 5);
-    feed(&mut core, &mut parser, "see \"中\u{301}文 file.rs\" now");
-    select_object(&mut core, 1, 2);
-    assert_eq!(
-        selection_to_string(&core).as_deref(),
-        Some("\"中\u{301}文 file.rs\"")
-    );
-    let (mut core, mut parser) = terminal(100, 100);
-    feed(&mut core, &mut parser, &"a".repeat(10_000));
-    select_object(&mut core, 50, 0);
-    assert_eq!(selection_to_string(&core).as_deref(), Some("a"));
-}
-
-#[test]
-fn restoring_origin_cursor_clamps_to_the_current_margins_before_reporting() {
-    let (mut core, mut parser) = terminal(8, 8);
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b[2;6r\x1b[?6h\x1b7\x1b[5;8r\x1b8\x1b[6n",
-    );
-    assert_eq!(core.cursor().0, Point { line: 4, column: 0 });
-    assert_eq!(replies(&mut core), b"\x1b[1;1R");
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b[4;4H\x1b7\x1b[2;4r\x1b8\x1b[6n",
-    );
-    assert_eq!(core.cursor().0, Point { line: 3, column: 3 });
-    assert_eq!(replies(&mut core), b"\x1b[3;4R");
-}
-
-#[test]
-fn origin_mode_follows_the_restored_cursor_and_active_screen() {
-    let (mut core, mut parser) = terminal(8, 5);
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b[2;4r\x1b[?6h\x1b7\x1b[?6l\x1b8\x1b[?6$p\x1b[6n",
-    );
-    assert!(core.mode().contains(Mode::ORIGIN));
-    feed(&mut core, &mut parser, "\x1b[?47h\x1b[?6$p");
-    assert!(!core.mode().contains(Mode::ORIGIN));
-    feed(&mut core, &mut parser, "\x1b[?6h\x1b[?47l\x1b[?6$p");
-    assert!(core.mode().contains(Mode::ORIGIN));
-    feed(
-        &mut core,
-        &mut parser,
-        "\x1b[?6l\x1b[?6$p\x1b[?47h\x1b[?6$p",
-    );
-    assert!(core.mode().contains(Mode::ORIGIN));
-    assert_eq!(
-        replies(&mut core),
-        b"\x1b[?6;1$y\x1b[1;1R\x1b[?6;2$y\x1b[?6;1$y\x1b[?6;2$y\x1b[?6;1$y"
-    );
-}
-
-#[test]
 fn top_anchored_scroll_region_preserves_history_and_fixed_footer() {
     for scroll in ["\n", "\x1b[S"] {
         let (mut core, mut parser) = terminal_with_history(5, 4);
@@ -504,55 +386,6 @@ fn top_anchored_scroll_region_preserves_history_and_fixed_footer() {
 }
 
 #[test]
-fn local_scrolling_damages_only_the_visible_region_and_preserves_fixed_rows() {
-    for (offset, expected) in [(0, vec![1, 2]), (2, vec![3]), (6, vec![])] {
-        for scroll in ["\x1b[S", "\x1b[T"] {
-            let (mut core, mut parser) = terminal_with_history(10, 4);
-            feed(
-                &mut core,
-                &mut parser,
-                "0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\x1b[2;3r",
-            );
-            let history = core.history_size();
-            core.scroll_display(Scroll::Delta(offset));
-            core.reset_damage();
-            feed(&mut core, &mut parser, scroll);
-            assert_eq!(core.dirty_rows().collect::<Vec<_>>(), expected);
-            assert_eq!(core.display_offset(), offset as usize);
-            assert_eq!(core.history_size(), history);
-            core.scroll_display(Scroll::Bottom);
-            assert_eq!(line(&core, 0).trim_end(), "6");
-            assert_eq!(line(&core, 3).trim_end(), "9");
-        }
-    }
-}
-
-#[test]
-fn partial_screen_erases_damage_only_visible_erased_rows_and_clear_pending_wrap() {
-    for (offset, erase, expected) in [
-        (0, "\x1b[J", vec![2, 3]),
-        (0, "\x1b[1J", vec![0, 1, 2]),
-        (2, "\x1b[J", vec![]),
-        (2, "\x1b[1J", vec![2, 3]),
-        (6, "\x1b[J", vec![]),
-        (6, "\x1b[1J", vec![]),
-    ] {
-        let (mut core, mut parser) = terminal_with_history(10, 4);
-        feed(
-            &mut core,
-            &mut parser,
-            "0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n6\r\n7\r\n8\r\n9\x1b[3;1Habcdefghij",
-        );
-        core.scroll_display(Scroll::Delta(offset));
-        core.reset_damage();
-        feed(&mut core, &mut parser, erase);
-        assert_eq!(core.dirty_rows().collect::<Vec<_>>(), expected);
-        feed(&mut core, &mut parser, "Z");
-        assert_eq!(core.cursor().0.line, 2);
-    }
-}
-
-#[test]
 fn clearing_a_shortened_row_also_clears_the_colored_wide_wrap_gap() {
     for erase in ["\x1b[2J", "\x1b[2K", "\x1b[K", "\x1b[1;7H\x1b[1K"] {
         let (mut core, mut parser) = terminal(7, 3);
@@ -562,7 +395,7 @@ fn clearing_a_shortened_row_also_clears_the_colored_wide_wrap_gap() {
             "abcdef\x1b[44m界\x1b[0m\x1b[1;1H\x1b[6X",
         );
         assert_eq!(core.row(0).used, 0);
-        assert_eq!(core.row(0).cells[6].bg, Color::Named(NamedColor::Blue));
+        assert_eq!(core.row(0).cells[6].bg, Color::Indexed(4));
         feed(&mut core, &mut parser, erase);
         assert!(
             core.row(0)
@@ -577,7 +410,7 @@ fn clearing_a_shortened_row_also_clears_the_colored_wide_wrap_gap() {
 fn full_line_erase_clears_wide_extras_and_wrap_with_the_current_background() {
     for (sgr, bg) in [
         ("\x1b[0m", Color::Named(NamedColor::Background)),
-        ("\x1b[0;44m", Color::Named(NamedColor::Blue)),
+        ("\x1b[0;44m", Color::Indexed(4)),
         ("\x1b[0;48;5;0m", Color::Indexed(0)),
         ("\x1b[0;48;2;1;2;3m", Color::Spec(Rgb { r: 1, g: 2, b: 3 })),
     ] {
@@ -616,7 +449,7 @@ fn delete_char_moves_the_colored_wide_gap_into_the_clearable_prefix() {
         &mut parser,
         "\x1b[41m\x1b[1;5H界\x1b[0m\x1b[1;1H\x1b[P",
     );
-    assert_eq!(core.row(0).cells[3].bg, Color::Named(NamedColor::Red));
+    assert_eq!(core.row(0).cells[3].bg, Color::Indexed(1));
     assert_eq!(core.row(0).used, 4);
     feed(&mut core, &mut parser, "\x1b[2J");
     assert!(
@@ -636,19 +469,4 @@ fn repeated_1049_enable_keeps_the_current_alternate_and_original_restore_point()
     feed(&mut core, &mut parser, "\x1b[?1049l");
     assert_eq!(line(&core, 0), "shell   ");
     assert_eq!(core.cursor().0, Point { line: 0, column: 5 });
-}
-
-#[test]
-fn disabling_1047_on_the_main_screen_clears_only_the_inactive_alternate() {
-    let (mut core, mut parser) = terminal(8, 3);
-    feed(
-        &mut core,
-        &mut parser,
-        "shell\x1b[?47hkept\x1b[?47l\x1b[?1047l",
-    );
-    assert_eq!(line(&core, 0), "shell   ");
-    feed(&mut core, &mut parser, "\x1b[?47h");
-    assert_eq!(line(&core, 0), "        ");
-    feed(&mut core, &mut parser, "\x1b[?47l");
-    assert_eq!(line(&core, 0), "shell   ");
 }

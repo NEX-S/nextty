@@ -14,7 +14,6 @@ import os
 from pathlib import Path
 import pty
 import select
-import shutil
 import signal
 import socket
 import struct
@@ -73,6 +72,8 @@ def absorb(record, calls, event):
         record['usage'].update(event['message'].get('usage', {}))
     elif kind == 'message_delta':
         record['usage'].update(event.get('usage', {}))
+    elif kind == 'message_stop':
+        record['message_stop'] = True
     elif kind == 'content_block_start':
         block = event['content_block']
         if block['type'] == 'tool_use':
@@ -91,6 +92,83 @@ def absorb(record, calls, event):
         partial = ''.join(partial)
         if partial:
             block['input'] = json.loads(partial)
+
+
+def serve(lab, config, records, results, finished, evidence=None, truncate=lambda record: False):
+    """Forward nextty's model requests upstream, recording each exchange.
+
+    `truncate(record)` chooses requests whose stream is cut after the first content delta.
+    """
+    headers = model_headers()
+    upstream = (config.get('base_url') or 'https://api.anthropic.com').rstrip('/') + '/v1/messages'
+
+    class Proxy(http.server.BaseHTTPRequestHandler):
+        protocol_version = 'HTTP/1.1'
+
+        def log_message(self, *_):
+            pass
+
+        def do_POST(self):
+            payload, kind = prepare_model_request(
+                self.rfile.read(int(self.headers['Content-Length'])), config['model'], results)
+            index = len(records)
+            record = {'index': index, 'kind': kind, 'request_bytes': len(payload),
+                      'request_sha256': hashlib.sha256(payload).hexdigest(), 'usage': {},
+                      'tools': [], 'text': '', 'response_bytes': 0, 'at': time.monotonic()}
+            records.append(record)
+            if evidence:
+                (evidence / f'request-{index:03}.json').write_bytes(payload)
+            cut = truncate(record)
+            try:
+                request = urllib.request.Request(upstream, data=payload, headers=headers)
+                with urllib.request.urlopen(request, timeout=150) as response:
+                    record['http_status'] = response.status
+                    self.send_response(response.status)
+                    self.send_header('Content-Type', 'text/event-stream')
+                    self.send_header('Transfer-Encoding', 'chunked')
+                    self.send_header('Connection', 'close')
+                    self.end_headers()
+                    calls = {}
+                    for line, event in sse_lines(response):
+                        record['response_bytes'] += len(line)
+                        if event:
+                            absorb(record, calls, event)
+                        self.wfile.write(b'%x\r\n%s\r\n' % (len(line), line))
+                        self.wfile.flush()
+                        if cut and event and event['type'] == 'content_block_delta':
+                            record['truncated_at'] = time.monotonic()
+                            self.close_connection = True
+                            self.connection.shutdown(socket.SHUT_RDWR)
+                            return
+                    self.wfile.write(b'0\r\n\r\n')
+                if kind == 'review' and record.get('message_stop'):
+                    # The harness also accepts a review fenced as a JSON code block.
+                    verdict = record['text'].strip().removeprefix('```json').strip('`')
+                    record['verdict'] = json.loads(verdict)
+            except urllib.error.HTTPError as error:
+                record['error'] = repr(error)
+                record['http_status'] = error.code
+                payload = error.read()
+                record['response_bytes'] = len(payload)
+                self.send_response(error.code)
+                self.send_header('Content-Length', str(len(payload)))
+                self.send_header('Connection', 'close')
+                self.end_headers()
+                self.wfile.write(payload)
+                self.close_connection = True
+            except Exception as error:
+                record['error'] = repr(error)
+                self.close_connection = True
+            finally:
+                record['seconds'] = time.monotonic() - record['at']
+                if evidence:
+                    (evidence / f'response-{index:03}.json').write_text(json.dumps(record))
+                print(json.dumps({key: value for key, value in record.items() if key != 'text'}),
+                      file=sys.stderr, flush=True)
+                if record.get('verdict', {}).get('status') in ('complete', 'blocked'):
+                    finished.set()
+
+    lab.model.RequestHandlerClass = Proxy
 
 
 def exit_zero_observed(call, result, pane, command):
@@ -137,7 +215,6 @@ class Lab:
         self.process = self.master = None
         self.pids = {}
         self.tool_mode = tool_mode
-        self.errors = []
         self.model = http.server.ThreadingHTTPServer(('127.0.0.1', 0), http.server.BaseHTTPRequestHandler)
 
     def start(self):
@@ -158,8 +235,6 @@ class Lab:
     def wait(self, predicate, label, seconds=12):
         until = time.monotonic() + seconds
         while not predicate():
-            if self.errors:
-                raise RuntimeError(self.errors)
             if self.process.poll() is not None:
                 raise RuntimeError(f'frontend exited: {label}: {self.output[-1000:]!r}')
             if time.monotonic() >= until:
@@ -213,56 +288,7 @@ def run_case(binary, config, interactive):
     records = []
     results = {}
     finished = threading.Event()
-    headers = model_headers()
-
-    class Proxy(http.server.BaseHTTPRequestHandler):
-        def log_message(self, *_):
-            pass
-
-        def do_POST(self):
-            payload, kind = prepare_model_request(
-                self.rfile.read(int(self.headers['Content-Length'])), config['model'], results)
-            record = {'kind': kind, 'request_bytes': len(payload), 'usage': {},
-                      'tools': [], 'text': ''}
-            records.append(record)
-            request = urllib.request.Request(
-                (config.get('base_url') or 'https://api.anthropic.com').rstrip('/') + '/v1/messages',
-                data=payload, headers=headers)
-            start = time.monotonic()
-            try:
-                with urllib.request.urlopen(request, timeout=150) as response:
-                    self.send_response(response.status)
-                    self.send_header('Content-Type', 'text/event-stream')
-                    self.end_headers()
-                    calls = {}
-                    for line, event in sse_lines(response):
-                        if event:
-                            absorb(record, calls, event)
-                        self.wfile.write(line)
-                        self.wfile.flush()
-                if kind == 'review':
-                    record['verdict'] = json.loads(record['text'])
-            except urllib.error.HTTPError as error:
-                record['error'] = repr(error)
-                payload = error.read()
-                self.send_response(error.code)
-                self.send_header('Content-Length', str(len(payload)))
-                self.send_header('Connection', 'close')
-                self.end_headers()
-                self.wfile.write(payload)
-                self.close_connection = True
-            except Exception as error:
-                lab.errors.append(repr(error))
-                finished.set()
-                raise
-            finally:
-                record['seconds'] = time.monotonic() - start
-                print(json.dumps({key: value for key, value in record.items() if key != 'text'}),
-                      file=sys.stderr, flush=True)
-                if record.get('verdict', {}).get('status') in ('complete', 'blocked'):
-                    finished.set()
-
-    lab.model.RequestHandlerClass = Proxy
+    serve(lab, config, records, results, finished)
     try:
         lab.start()
         if interactive:
@@ -307,8 +333,6 @@ print("check passed {marker}")
         start = time.monotonic()
         os.write(lab.master, prompt.encode() + b'\r')
         lab.wait(finished.is_set, 'real model task completion', 900)
-        if lab.errors:
-            raise RuntimeError(lab.errors)
         lab.drain(.2)
         if not interactive:
             context = ('context pressure payload, unrelated to the verification marker\n' * 10000)[:512 * 1024]
@@ -319,8 +343,6 @@ print("check passed {marker}")
                      b'Then answer which verification marker check.py printed in the previous task, '
                      b'using conversation history. Do not use tools to retrieve the marker.\r')
             lab.wait(finished.is_set, 'verification marker recalled through compaction', 900)
-            if lab.errors:
-                raise RuntimeError(lab.errors)
             lab.drain(.2)
             followup = records[first:]
             answer = next((record['text'] for record in reversed(followup)
@@ -420,100 +442,20 @@ def run_soak(binary, config):
     records = []
     results = {}
     finished = threading.Event()
-    fault = None
     latencies = []
-    headers = model_headers()
 
-    class Proxy(http.server.BaseHTTPRequestHandler):
-        protocol_version = 'HTTP/1.1'
+    def faults():
+        return [record for record in records if 'truncated_at' in record]
 
-        def log_message(self, *_):
-            pass
+    def truncate(record):
+        ledger = lab.root / 'ledger.jsonl'
+        return (not faults() and record['kind'] == 'execute' and ledger.exists()
+                and len(ledger.read_text().splitlines()) >= 4)
 
-        def do_POST(self):
-            nonlocal fault
-            payload, kind = prepare_model_request(
-                self.rfile.read(int(self.headers['Content-Length'])), config['model'], results)
-            index = len(records)
-            record = {'index': index, 'kind': kind, 'usage': {}, 'tools': [], 'text': '',
-                      'response_bytes': 0, 'event_counts': {},
-                      'request_sha256': hashlib.sha256(payload).hexdigest(),
-                      'at': time.monotonic()}
-            records.append(record)
-            (evidence / f'request-{index:03}.json').write_bytes(payload)
-            ledger = lab.root / 'ledger.jsonl'
-            inject = fault is None and kind == 'execute' and ledger.exists() and len(ledger.read_text().splitlines()) >= 4
-            request = urllib.request.Request(
-                (config.get('base_url') or 'https://api.anthropic.com').rstrip('/') + '/v1/messages',
-                data=payload, headers=headers)
-            try:
-                with (
-                    urllib.request.urlopen(request, timeout=150) as response,
-                    (evidence / f'stream-{index:03}.sse').open('wb') as raw,
-                ):
-                    record['http_status'] = response.status
-                    record['headers_seconds'] = time.monotonic() - record['at']
-                    self.send_response(response.status)
-                    self.send_header('Content-Type', 'text/event-stream')
-                    self.send_header('Transfer-Encoding', 'chunked')
-                    self.send_header('Connection', 'close')
-                    self.end_headers()
-                    calls = {}
-                    for line, event in sse_lines(response):
-                        raw.write(line)
-                        raw.flush()
-                        if not record['response_bytes']:
-                            record['first_line_seconds'] = time.monotonic() - record['at']
-                        record['response_bytes'] += len(line)
-                        if event:
-                            counts = record['event_counts']
-                            counts[event['type']] = counts.get(event['type'], 0) + 1
-                            absorb(record, calls, event)
-                            if event['type'] == 'message_stop':
-                                record['message_stop'] = True
-                                record['message_stop_seconds'] = time.monotonic() - record['at']
-                        self.wfile.write(f'{len(line):x}\r\n'.encode() + line + b'\r\n')
-                        self.wfile.flush()
-                        if inject and event and event['type'] == 'content_block_delta':
-                            record['injected_truncation'] = True
-                            fault = {'request': index, 'at': time.monotonic(),
-                                     'stages': len(ledger.read_text().splitlines())}
-                            self.close_connection = True
-                            self.connection.shutdown(socket.SHUT_RDWR)
-                            break
-                    else:
-                        self.wfile.write(b'0\r\n\r\n')
-                        self.wfile.flush()
-                if kind == 'review' and record.get('message_stop'):
-                    record['verdict'] = json.loads(record['text'])
-            except urllib.error.HTTPError as error:
-                record['error'] = repr(error)
-                record['http_status'] = error.code
-                record['headers_seconds'] = time.monotonic() - record['at']
-                payload = error.read()
-                record['response_bytes'] = len(payload)
-                self.send_response(error.code)
-                self.send_header('Content-Length', str(len(payload)))
-                self.send_header('Connection', 'close')
-                self.end_headers()
-                self.wfile.write(payload)
-                self.close_connection = True
-            except Exception as error:
-                record['error'] = repr(error)
-                self.close_connection = True
-                self.connection.close()
-            finally:
-                record['seconds'] = time.monotonic() - record['at']
-                (evidence / f'response-{index:03}.json').write_text(json.dumps(record))
-                print(json.dumps(record), file=sys.stderr, flush=True)
-                if record.get('verdict', {}).get('status') in ('complete', 'blocked'):
-                    finished.set()
-
-    lab.model.RequestHandlerClass = Proxy
+    serve(lab, config, records, results, finished, evidence, truncate)
     try:
         lab.start()
-        shutil.copyfile(f'/proc/{lab.process.pid}/exe', evidence / 'nextty-tested')
-        with (evidence / 'nextty-tested').open('rb') as source:
+        with Path(f'/proc/{lab.process.pid}/exe').open('rb') as source:
             binary_sha256 = hashlib.file_digest(source, 'sha256').hexdigest()
         (lab.root / 'stages.py').write_text(SOAK_FIXTURE)
         os.write(lab.master, b'\x1ba')
@@ -542,7 +484,9 @@ def run_soak(binary, config):
                 event = json.loads((lab.root / 'input.jsonl').read_text().splitlines()[-1])
                 latencies.append((event['at'] - sent) / 1e6)
                 next_probe = now + 5
-            if fault and len(records) == fault['request'] + 1 and now - fault['at'] >= 30:
+            # Stop once the model has not retried within 30 seconds of the injected fault.
+            fault = (faults() or [None])[0]
+            if fault and len(records) == fault['index'] + 1 and now - fault['truncated_at'] >= 30:
                 break
         lab.drain(.2)
         ledger_path = lab.root / 'ledger.jsonl'
@@ -555,6 +499,8 @@ def run_soak(binary, config):
         command = json.loads(results[launch['id']]['content'])['command'] if launch else None
         command_results = [(call, json.loads(results[call['id']]['content'])) for call in calls
                            if call['id'] in results and not results[call['id']].get('is_error')]
+        fault = (faults() or [None])[0]
+        retried = fault is not None and len(records) > fault['index'] + 1
         outcome = {'all_stages': [entry['stage'] for entry in ledger] == list(range(1, 25)),
                    'tokens_correct': all(entry['token'] == entry['answer'] for entry in ledger),
                    'launched_once': launches == ['run'],
@@ -564,9 +510,9 @@ def run_soak(binary, config):
                        exit_zero_observed(call, result, launch['input']['pane'], command)
                        for call, result in command_results),
                    'network_fault_injected': fault is not None,
-                   'model_resumed_after_fault': fault is not None and len(records) > fault['request'] + 1,
-                   'same_request_retried': fault is not None and len(records) > fault['request'] + 1
-                   and records[fault['request']]['request_sha256'] == records[fault['request'] + 1]['request_sha256'],
+                   'model_resumed_after_fault': retried,
+                   'same_request_retried': retried and
+                   records[fault['index']]['request_sha256'] == records[fault['index'] + 1]['request_sha256'],
                    'foreground_responsive': bool(latencies),
                    'at_least_20_execution_rounds': sum(record['kind'] == 'execute' for record in records) >= 20,
                    'goal_review_complete': records[-1].get('verdict', {}).get('status') == 'complete'}
@@ -578,10 +524,6 @@ def run_soak(binary, config):
                   'foreground_input_ms': latencies, 'tool_calls': len(calls),
                   'requests': records, 'evidence': str(evidence)}
         (evidence / 'report.json').write_text(json.dumps(report, indent=2))
-        (evidence / 'frontend.bin').write_bytes(lab.output)
-        for name in ('ledger.jsonl', 'launches', 'finished'):
-            if (lab.root / name).exists():
-                shutil.copyfile(lab.root / name, evidence / name)
         return report
     finally:
         lab.close()

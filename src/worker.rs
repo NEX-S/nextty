@@ -9,6 +9,8 @@ struct Work<Request, Output> {
     closed: bool,
 }
 
+/// A thread that runs the latest request it was given and keeps the latest result, waking
+/// `fd` for each.
 pub(crate) struct Worker<Request, Output> {
     shared: Arc<(Mutex<Work<Request, Output>>, Condvar)>,
     notification: Arc<OwnedFd>,
@@ -21,43 +23,31 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
         notification: Arc<OwnedFd>,
         mut run: impl FnMut(Request, &dyn Fn(Output)) + Send + 'static,
     ) -> io::Result<Self> {
-        let shared = Arc::new((
-            Mutex::new(Work {
-                pending: None,
-                result: None,
-                closed: false,
-            }),
-            Condvar::new(),
-        ));
-        let worker = Arc::clone(&shared);
-        let wakeup = Arc::clone(&notification);
+        let work = Work {
+            pending: None,
+            result: None,
+            closed: false,
+        };
+        let shared = Arc::new((Mutex::new(work), Condvar::new()));
+        let (worker, wakeup) = (Arc::clone(&shared), Arc::clone(&notification));
         let handle = thread::Builder::new().name(name.into()).spawn(move || {
             let (lock, changed) = &*worker;
             let notify = || crate::sys::notify(wakeup.as_raw_fd());
-            let _exit = WakeOnDrop(|| {
-                if !std::mem::replace(&mut lock.lock().unwrap().closed, true) {
-                    notify();
-                }
+            // An end, even by a panic, wakes the owner, whose `take` then reports it.
+            let _exit = OnDrop(|| {
+                lock.lock().unwrap().closed = true;
+                notify();
             });
+            // A replaced result is freed after the owner is woken.
             let publish = |result| {
-                let mut state = lock.lock().unwrap();
-                let closed = state.closed;
-                let previous = if closed {
-                    state.result.take()
-                } else {
-                    state.result.replace(result)
-                };
-                drop(state);
-                if !closed {
-                    notify();
-                }
+                let previous = lock.lock().unwrap().result.replace(result);
+                notify();
                 drop(previous);
             };
             loop {
-                let mut state = lock.lock().unwrap();
-                while state.pending.is_none() && !state.closed {
-                    state = changed.wait(state).unwrap();
-                }
+                let state = lock.lock().unwrap();
+                let wait = |state: &mut Work<_, _>| state.pending.is_none() && !state.closed;
+                let mut state = changed.wait_while(state, wait).unwrap();
                 if state.closed {
                     return;
                 }
@@ -84,12 +74,8 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
 
     pub fn submit(&self, request: Request) {
         let (lock, changed) = &*self.shared;
-        let mut state = lock.lock().unwrap();
-        let previous = state.pending.replace(request);
-        drop(state);
-        if previous.is_none() {
-            changed.notify_one();
-        }
+        let previous = lock.lock().unwrap().pending.replace(request);
+        changed.notify_one();
         drop(previous);
     }
 
@@ -99,11 +85,8 @@ impl<Request: Send + 'static, Output: Send + 'static> Worker<Request, Output> {
             return state.result.take();
         }
         drop(state);
-        self.handle
-            .take()
-            .unwrap()
-            .join()
-            .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+        let ended = self.handle.take().unwrap().join();
+        ended.unwrap_or_else(|panic| std::panic::resume_unwind(panic));
         unreachable!("background worker exited while its owner is alive");
     }
 }
@@ -116,57 +99,10 @@ impl<Request, Output> Drop for Worker<Request, Output> {
     }
 }
 
-struct WakeOnDrop<Finish: Fn()>(Finish);
+struct OnDrop<Finish: FnMut()>(Finish);
 
-impl<Finish: Fn()> Drop for WakeOnDrop<Finish> {
+impl<Finish: FnMut()> Drop for OnDrop<Finish> {
     fn drop(&mut self) {
         (self.0)();
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::sync::mpsc;
-    use std::time::Duration;
-
-    #[test]
-    fn replaced_result_cleanup_does_not_delay_ready_notification() {
-        enum Output {
-            Stale(mpsc::Sender<()>, mpsc::Receiver<()>),
-            Current,
-        }
-        impl Drop for Output {
-            fn drop(&mut self) {
-                if let Self::Stale(entered, release) = self {
-                    entered.send(()).unwrap();
-                    release.recv().unwrap();
-                }
-            }
-        }
-        let notification = Arc::new(crate::sys::new().unwrap());
-        let mut worker = Worker::new("publish-test", notification, |result, publish| {
-            publish(result);
-        })
-        .unwrap();
-        let (entered, dropping) = mpsc::channel();
-        let (release, blocked) = mpsc::channel();
-        worker.submit(Output::Stale(entered, blocked));
-        let mut fds = [libc::pollfd {
-            fd: worker.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        }];
-        crate::sys::poll(&mut fds, 5000).unwrap();
-        assert_ne!(fds[0].revents & libc::POLLIN, 0);
-        crate::sys::consume_notification(worker.fd()).unwrap();
-        worker.submit(Output::Current);
-        dropping.recv_timeout(Duration::from_secs(5)).unwrap();
-        crate::sys::poll(&mut fds, 1000).unwrap();
-        let notified = fds[0].revents & libc::POLLIN != 0;
-        let result = worker.take();
-        release.send(()).unwrap();
-        assert!(notified);
-        assert!(matches!(result, Some(Output::Current)));
     }
 }

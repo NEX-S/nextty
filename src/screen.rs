@@ -4,14 +4,14 @@ use crate::core::{BlockMarker, Flags, WindowSize};
 use crate::core::{Core, Mode, Point, Row, SelectionRange};
 use crate::vt::{Color, CursorShape, PALETTE_SIZE, Rgb};
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Default)]
 pub struct Screen {
     pub(crate) columns: usize,
     pub(crate) rows: Vec<Row>,
     pub(crate) dirty: Vec<bool>,
     pub(crate) cursor: (Point, CursorShape),
     pub(crate) mode: Mode,
-    pub(crate) palette: [Rgb; PALETTE_SIZE],
+    pub(crate) palette: Vec<Rgb>,
     pub(crate) selection: Option<SelectionRange>,
     pub(crate) offset: usize,
     pub(crate) history: usize,
@@ -37,26 +37,6 @@ pub struct Update {
     pub selection: Option<SelectionRange>,
     pub offset: usize,
     pub history: usize,
-}
-
-impl Default for Screen {
-    fn default() -> Self {
-        Self {
-            columns: 0,
-            rows: Vec::new(),
-            dirty: Vec::new(),
-            cursor: (Point::default(), CursorShape::Hidden),
-            mode: Mode::NONE,
-            palette: [Rgb::default(); PALETTE_SIZE],
-            selection: None,
-            offset: 0,
-            history: 0,
-            scrolled: 0,
-
-            activity: 0,
-            output_activity: 0,
-        }
-    }
 }
 
 /// What one connection last received of a pane. Row revisions only grow, and the reactor calls
@@ -140,29 +120,10 @@ impl Screen {
             || self.history != update.history
             || update.rows.iter().any(|(index, row)| {
                 let previous = &self.rows[*index];
-                previous.used() != row.used()
-                    || previous.wrapped != row.wrapped
-                    || previous.cells[..previous.used()]
-                        .iter()
-                        .zip(&row.cells)
-                        .any(|(old, new)| {
-                            let flags = Flags::HIDDEN | Flags::WIDE_CHAR | Flags::WIDE_CHAR_SPACER;
-                            old.flags & flags != new.flags & flags
-                                || (!old.flags.contains(Flags::HIDDEN) && old.c != new.c)
-                        })
-                    || {
-                        let [old, new] = [previous, row].map(|row| {
-                            row.extras()
-                                .iter()
-                                .take_while(|(column, _)| *column < row.used())
-                                .filter(|(column, extra)| {
-                                    !extra.zerowidth.is_empty()
-                                        && !row.cells[*column].flags.contains(Flags::HIDDEN)
-                                })
-                                .map(|(column, extra)| (column, &extra.zerowidth))
-                        });
-                        !old.eq(new)
-                    }
+                previous.wrapped != row.wrapped
+                    || !previous
+                        .characters(0..previous.used())
+                        .eq(row.characters(0..row.used()))
             })
     }
 
@@ -188,7 +149,7 @@ impl Screen {
         if update
             .palette
             .as_deref()
-            .is_some_and(|palette| self.palette != *palette)
+            .is_some_and(|palette| self.palette != palette[..])
             || self.mode.contains(Mode::ALT_SCREEN) != update.mode.contains(Mode::ALT_SCREEN)
         {
             self.dirty.fill(true);
@@ -228,7 +189,7 @@ impl Screen {
         }
         self.mode = update.mode;
         if let Some(palette) = update.palette {
-            self.palette = *palette;
+            self.palette = palette.to_vec();
         }
         self.selection = update.selection;
         self.offset = update.offset;

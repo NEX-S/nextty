@@ -8,32 +8,21 @@ Snapshot {
                 (0, 4, "indexed:0", "indexed:9", ""),
                 (4, 34, "indexed:7", "indexed:8", ""),
                 (34, 52, "indexed:0", "indexed:9", ""),
-                (52, 139, "named:Foreground", "named:Background", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "\"x\" && echo -ne \"\\e[?1049l\" && echo -ne \"a\"                                                                                                ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "a%                                                                                                                                         ",
             styles: &[
-                (0, 1, "named:Foreground", "named:Background", ""),
                 (1, 2, "named:Foreground", "named:Background", "BOLD|INVERSE"),
-                (2, 139, "named:Foreground", "named:Background", ""),
             ],
-            extras: &[],
         },
         Row {
             text: " UL  /…/tests/ref/wrapline_alt_t…  fix_newline_flag  exit                                                                                  ",
@@ -41,219 +30,128 @@ Snapshot {
                 (0, 4, "indexed:0", "indexed:9", ""),
                 (4, 34, "indexed:7", "indexed:8", ""),
                 (34, 52, "indexed:0", "indexed:9", ""),
-                (52, 139, "named:Foreground", "named:Background", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
         Row {
             text: "                                                                                                                                           ",
-            styles: &[
-                (0, 139, "named:Foreground", "named:Background", ""),
-            ],
-            extras: &[],
+            styles: &[],
         },
     ],
+    extras: &[],
 }

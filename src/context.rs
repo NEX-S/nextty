@@ -1,4 +1,4 @@
-use crate::core::{Flags, Point, SelectionRange, object_selection};
+use crate::core::{Flags, Point, SelectionRange};
 use crate::screen::Screen;
 use serde::{Deserialize, Serialize};
 
@@ -24,29 +24,49 @@ pub struct ContextItem {
     pub snapshot: ContextSnapshot,
 }
 
-pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
-    let offset = screen.display_offset() as i64;
-    let row = screen.rows.get((i64::from(point.line) + offset) as usize)?;
-    row.cells.get(point.column)?;
-    point.column = row.leading_column(point.column);
-    let cell = &row.cells[point.column];
-    if cell.flags.contains(Flags::HIDDEN) {
+/// The link, file path or IP address under `point`, if there is one.
+pub(crate) fn object_at(screen: &Screen, point: Point) -> Option<Object> {
+    let offset = screen.display_offset() as i32;
+    let row = |line: i32| screen.rows.get(usize::try_from(line + offset).ok()?);
+    let current = row(point.line)?;
+    if point.column >= current.used() {
         return None;
     }
-    let [start, end] = object_selection((i64::from(point.line), point.column), |line| {
-        screen.rows.get((line + offset) as usize)
-    })?;
-    let wide_end = screen.rows[(end.0 + offset) as usize].cells[end.1]
+    let point = Point {
+        column: current.leading_column(point.column),
+        ..point
+    };
+    if current.cells[point.column].flags.contains(Flags::HIDDEN) {
+        return None;
+    }
+    // The characters of the soft-wrapped line around the point.
+    let mut line = point.line;
+    while row(line - 1).is_some_and(|row| row.wrapped) {
+        line -= 1;
+    }
+    let mut cells = Vec::new();
+    while let Some(current) = row(line) {
+        for (column, cell) in current.cells[..current.used()].iter().enumerate() {
+            if !cell.flags.contains(Flags::WIDE_CHAR_SPACER) {
+                cells.push((cell.c, Point { line, column }));
+            }
+        }
+        if !current.wrapped {
+            break;
+        }
+        line += 1;
+    }
+    let anchor = cells.iter().position(|&(_, at)| at == point)?;
+    let (start, end) = object_span(&cells, anchor)?;
+    let end = cells[end - 1].1;
+    let wide_end = row(end.line)?.cells[end.column]
         .flags
         .contains(Flags::WIDE_CHAR);
     let mut range = SelectionRange {
-        start: Point {
-            line: start.0 as i32,
-            column: start.1,
-        },
+        start: cells[start].1,
         end: Point {
-            line: end.0 as i32,
-            column: end.1 + usize::from(wide_end),
+            column: end.column + usize::from(wide_end),
+            ..end
         },
     };
     let mut text = snapshot(screen, Some(range)).text;
@@ -59,6 +79,88 @@ pub(crate) fn object_at(screen: &Screen, mut point: Point) -> Option<Object> {
         text = inner.to_string();
     }
     is_object(&text).then_some(Object { range, text })
+}
+
+/// The cells `start..end` of the quoted string or word around `anchor`, without surrounding
+/// punctuation.
+fn object_span(cells: &[(char, Point)], anchor: usize) -> Option<(usize, usize)> {
+    let mut quote = None;
+    let mut escaped = false;
+    for (index, &(ch, _)) in cells.iter().enumerate() {
+        if escaped {
+            escaped = false;
+        } else if ch == '\\' {
+            escaped = true;
+        } else if let Some((delimiter, start)) = quote {
+            if ch == delimiter {
+                if (start..=index).contains(&anchor) {
+                    return Some((start, index + 1));
+                }
+                quote = None;
+            }
+        } else if matches!(ch, '\'' | '"' | '`')
+            && (index == 0
+                || cells[index - 1].0.is_whitespace()
+                || matches!(cells[index - 1].0, '=' | '(' | '[' | '{' | ',' | ':'))
+        {
+            quote = Some((ch, index));
+        }
+    }
+    let boundary = |ch: char| {
+        ch.is_whitespace()
+            || matches!(ch, ',' | '|' | '"' | '\'' | '`' | '<' | '>')
+            || matches!(ch, '，' | '。' | '；' | '！' | '？' | '、' | '：')
+            || matches!(ch, '（' | '）' | '【' | '】' | '《' | '》')
+            || matches!(ch, '\u{2500}'..='\u{257f}')
+    };
+    if boundary(cells[anchor].0) {
+        return None;
+    }
+    let mut start = anchor;
+    let mut end = anchor + 1;
+    while start > 0 && !boundary(cells[start - 1].0) {
+        start -= 1;
+    }
+    while end < cells.len() && !boundary(cells[end].0) {
+        end += 1;
+    }
+    // A register such as %rsp is not a path.
+    if !cells[start..end].iter().any(|&(ch, _)| ch == '/')
+        && let Some(register) = (start..=anchor).rfind(|&index| cells[index].0 == '%')
+        && cells[register + 1..=anchor]
+            .iter()
+            .all(|(ch, _)| ch.is_ascii_alphanumeric())
+    {
+        return None;
+    }
+    while start < end && matches!(cells[start].0, '(' | '[' | '{' | '=') {
+        start += 1;
+    }
+    if let Some(equal) = (start..end).find(|&index| cells[index].0 == '=')
+        && equal > start
+        && cells[start..equal]
+            .iter()
+            .all(|&(ch, _)| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-'))
+    {
+        if anchor > equal {
+            start = equal + 1;
+        } else {
+            end = equal;
+        }
+    }
+    while end > start && matches!(cells[end - 1].0, '.' | ';') {
+        end -= 1;
+    }
+    for (open, close) in [('(', ')'), ('[', ']'), ('{', '}')] {
+        let mut balance = cells[start..end].iter().fold(0i32, |balance, &(ch, _)| {
+            balance + i32::from(ch == open) - i32::from(ch == close)
+        });
+        while end > start && balance < 0 && cells[end - 1].0 == close {
+            end -= 1;
+            balance += 1;
+        }
+    }
+    (start..end).contains(&anchor).then_some((start, end))
 }
 
 fn unquote(text: &str) -> Option<&str> {

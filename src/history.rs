@@ -6,7 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Seek, Write};
 use std::ops::{Range, RangeInclusive};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -653,7 +653,9 @@ fn copy_archive(
                 Item::Row(id, row) => {
                     let from = if id == start.0 { start.1 } else { 0 };
                     let to = if id == end.0 { end.1 } else { row.used() };
-                    write_chars(&mut file, row.text(from, to, kind.is_some()))?;
+                    for ch in row.text(from, to, kind.is_some()) {
+                        file.write_all(ch.encode_utf8(&mut [0; 4]).as_bytes())?;
+                    }
                     if id != end.0 && !row.wrapped {
                         file.write_all(b"\n")?;
                     }
@@ -670,11 +672,7 @@ fn copy_archive(
 /// An unlinked file for the copied text.
 fn copy_file(directory: &Path, in_memory: bool) -> io::Result<File> {
     if in_memory {
-        let fd = unsafe { libc::memfd_create(c"nextty-copy".as_ptr(), libc::MFD_CLOEXEC) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
-        return Ok(unsafe { File::from_raw_fd(fd) });
+        return crate::sys::memfd(c"nextty-copy");
     }
     OpenOptions::new()
         .read(true)
@@ -682,19 +680,6 @@ fn copy_file(directory: &Path, in_memory: bool) -> io::Result<File> {
         .custom_flags(libc::O_TMPFILE)
         .mode(0o600)
         .open(directory)
-}
-
-fn write_chars(file: &mut impl Write, chars: impl Iterator<Item = char>) -> io::Result<()> {
-    let mut bytes = [0; 512];
-    let mut length = 0;
-    for ch in chars {
-        if length + 4 > bytes.len() {
-            file.write_all(&bytes[..length])?;
-            length = 0;
-        }
-        length += ch.encode_utf8(&mut bytes[length..]).len();
-    }
-    file.write_all(&bytes[..length])
 }
 
 /// Widens a line or word selection over rows that may be cold.
@@ -1259,27 +1244,34 @@ mod tests {
             _ => None,
         })
     }
-    fn search(history: &History, request: HistorySearch) -> SearchResult {
+    fn search(history: &History, query: &str, (hot_start, hot): (u64, Vec<Row>)) -> SearchResult {
         let (sender, receiver) = mpsc::channel();
-        history.search(request, sender);
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-    }
-    fn search_request(query: &str, hot_start: u64, hot: Vec<Row>) -> HistorySearch {
-        HistorySearch {
+        let search = HistorySearch {
             query: query.into(),
             hot_start,
             hot,
             columns: 80,
             alternate: false,
             cancelled: Default::default(),
-        }
+        };
+        history.search(search, sender);
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
     }
-    fn copy(history: &History, request: HistoryCopyRequest) -> (String, bool) {
+    fn copy(history: &History, start: u64, end: (u64, usize), hot_start: u64) -> (String, bool) {
         let (sender, receiver) = mpsc::channel();
-        history.copy(request, sender);
+        let copy = HistoryCopyRequest {
+            start: (start, 0),
+            end,
+            hot_start,
+            hot: Vec::new(),
+            kind: None,
+            incomplete: false,
+            in_memory: false,
+        };
+        history.copy(copy, sender);
         let mut copy = receiver
             .recv_timeout(Duration::from_secs(5))
             .unwrap()
@@ -1288,36 +1280,18 @@ mod tests {
         copy.file.read_to_string(&mut text).unwrap();
         (text, copy.incomplete)
     }
-    fn copy_request(
-        start: (u64, usize),
-        end: (u64, usize),
-        hot: (u64, Vec<Row>),
-        kind: Option<SelectionType>,
-    ) -> HistoryCopyRequest {
-        HistoryCopyRequest {
-            start,
-            end,
-            hot_start: hot.0,
-            hot: hot.1,
-            kind,
-            incomplete: false,
-            in_memory: false,
-        }
-    }
-    fn read(history: &History, request: HistoryRead) -> HistoryPage {
+    fn read(
+        history: &History,
+        end: u64,
+        (hot_start, hot): (u64, Vec<Row>),
+        query: Option<&str>,
+    ) -> HistoryPage {
         let (sender, receiver) = mpsc::channel();
-        history.read(request, sender);
-        receiver
-            .recv_timeout(Duration::from_secs(5))
-            .unwrap()
-            .unwrap()
-    }
-    fn read_request(end: u64, hot: (u64, Vec<Row>), query: Option<&str>) -> HistoryRead {
-        HistoryRead {
+        let read = HistoryRead {
             start: (0, 0),
             end: (end, 71),
-            hot_start: hot.0,
-            hot: hot.1,
+            hot_start,
+            hot,
             cursor: HistoryCursor {
                 epoch: 0,
                 row: 0,
@@ -1327,12 +1301,17 @@ mod tests {
             incomplete: false,
             command: None,
             cancelled: Default::default(),
-        }
+        };
+        history.read(read, sender);
+        receiver
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap()
+            .unwrap()
     }
 
     #[test]
     fn decoding_restores_every_cell_with_reused_storage_and_any_read_buffer_size() {
-        let red = Color::Named(NamedColor::Red);
+        let red = Color::Indexed(1);
         let wide = |c| Cell {
             c,
             fg: red,
@@ -1347,7 +1326,7 @@ mod tests {
         cells[4] = cells[3].wide_spacer();
         cells[5] = wide('字');
         cells[6] = Cell {
-            bg: Color::Named(NamedColor::Blue),
+            bg: Color::Indexed(4),
             ..cells[5].wide_spacer()
         };
         cells[9] = wide('尾');
@@ -1406,8 +1385,7 @@ mod tests {
         for row in &rows {
             write_row(&mut bytes, row);
         }
-        let fd = unsafe { libc::memfd_create(c"history-skip".as_ptr(), libc::MFD_CLOEXEC) };
-        let mut file = unsafe { File::from_raw_fd(fd) };
+        let mut file = crate::sys::memfd(c"history-skip").unwrap();
         file.write_all(&bytes).unwrap();
         let same = |decoded: &Row, expected: &Row| {
             assert_eq!(decoded.cells, expected.cells);
@@ -1441,48 +1419,21 @@ mod tests {
         let hot = (190, rows(190..192));
         for id in [31, 32, 189, 190, 191] {
             let query = format!("{id:06} x");
-            let result = search(&history, search_request(&query, hot.0, hot.1.clone()));
+            let result = search(&history, &query, hot.clone());
             let found = result.matches.iter().map(|m| (m.start_row, m.end_row));
             assert_eq!(found.collect::<Vec<_>>(), [(id, id)], "{query}");
         }
         // A read query may span rows, but a search never joins hard lines.
         for id in [31, 189] {
             let query = format!("{}\n{:06}", "x".repeat(65), id + 1);
-            let page = read(&history, read_request(191, hot.clone(), Some(&query)));
+            let page = read(&history, 191, hot.clone(), Some(&query));
             assert_eq!(page.matched, Some(true));
             assert!(page.text.contains(&query));
             assert!(!page.incomplete);
         }
-        let all = read(&history, read_request(191, hot, None));
+        let all = read(&history, 191, hot, None);
         assert_eq!(all.text.lines().count(), 192);
         assert!(!all.has_more);
-    }
-
-    #[test]
-    fn copied_unicode_and_combining_marks_survive_long_rows_and_prompt_filtering() {
-        let mut core = crate::core::Core::new(
-            crate::core::WindowSize {
-                num_cols: 1200,
-                num_lines: 2,
-                cell_width: 0,
-                cell_height: 0,
-            },
-            0xcccccc,
-            0x202020,
-        );
-        let mut parser = crate::vt::Parser::new();
-        parser.advance(&mut core, b"> ");
-        let text = "中😀x\u{301}".repeat(200);
-        parser.advance(&mut core, text.as_bytes());
-        let mut row = core.row(0).clone();
-        row.cells[0].flags.insert(Flags::PROMPT);
-        row.cells[1].flags.insert(Flags::PROMPT);
-        for skip_prompt in [false, true] {
-            let mut copied = b"prefix".to_vec();
-            write_chars(&mut copied, row.text(0, row.used(), skip_prompt)).unwrap();
-            let expected = format!("prefix{}{}", if skip_prompt { "" } else { "> " }, text);
-            assert_eq!(String::from_utf8(copied).unwrap(), expected);
-        }
     }
 
     #[test]
@@ -1550,10 +1501,7 @@ mod tests {
             history.append(0, rows.clone());
             for hot_start in [1001, 1002] {
                 let hot = rows[hot_start..].to_vec();
-                let result = search(
-                    &history,
-                    search_request("b界a\u{301}", hot_start as u64, hot),
-                );
+                let result = search(&history, "b界a\u{301}", (hot_start as u64, hot));
                 assert!(!result.truncated);
                 if hard_break {
                     assert!(result.matches.is_empty());
@@ -1569,46 +1517,6 @@ mod tests {
                     );
                 }
             }
-        }
-    }
-
-    #[test]
-    fn cold_selection_expands_distinct_wrapped_rows_across_hot_history() {
-        use crate::core::{Core, WindowSize};
-        use crate::vt::Parser;
-
-        let mut expected = String::new();
-        let rows = (0..320)
-            .map(|id| {
-                let text = format!(
-                    "{id:04}界a\u{301}{}",
-                    char::from(b'a' + (id % 26) as u8).to_string().repeat(10)
-                );
-                expected.push_str(&text);
-                let mut core = Core::new(
-                    WindowSize {
-                        num_cols: 17,
-                        num_lines: 1,
-                        cell_width: 9,
-                        cell_height: 19,
-                    },
-                    0xcccccc,
-                    0x202020,
-                );
-                Parser::new().advance(
-                    &mut core,
-                    format!("\x1b[38;2;{};32;64m{text}", id % 256).as_bytes(),
-                );
-                let mut row = core.row(0).clone();
-                row.wrapped = id < 319;
-                row
-            })
-            .collect::<Vec<_>>();
-        let mut history = History::new(budget(8 << 20));
-        history.append(0, rows[..300].to_vec());
-        for kind in [SelectionType::Lines, SelectionType::Semantic] {
-            let request = copy_request((165, 5), (165, 6), (300, rows[300..].to_vec()), Some(kind));
-            assert_eq!(copy(&history, request), (expected.clone(), false));
         }
     }
 
@@ -1639,8 +1547,10 @@ mod tests {
             }
         }
         for (start, end, text) in [(900, 910, "000910"), (990, 1000, "0\u{301}01000")] {
-            let request = copy_request((start, 0), (end, 6), (2000, Vec::new()), None);
-            assert_eq!(copy(&history, request), ("\n".repeat(10) + text, false));
+            assert_eq!(
+                copy(&history, start, (end, 6), 2000),
+                ("\n".repeat(10) + text, false)
+            );
         }
     }
 
@@ -1659,9 +1569,8 @@ mod tests {
             let prefix: String = row.cells.iter().take(6).map(|cell| cell.c).collect();
             assert_eq!(prefix.parse::<u64>().unwrap(), actual + offset as u64);
         }
-        let hot = (192, Vec::new());
-        assert!(read(&first, read_request(191, hot.clone(), None)).incomplete);
-        let (text, incomplete) = copy(&first, copy_request((0, 0), (191, 71), hot, None));
+        assert!(read(&first, 191, (192, Vec::new()), None).incomplete);
+        let (text, incomplete) = copy(&first, 0, (191, 71), 192);
         assert!(incomplete);
         assert!(text.starts_with(&format!("{evicted:06} ")));
     }

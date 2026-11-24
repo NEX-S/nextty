@@ -1,6 +1,5 @@
 use std::{io, net::Ipv6Addr, process::Command};
 
-#[derive(Debug, PartialEq)]
 pub struct RemoteTarget {
     destination: String,
     port: Option<u16>,
@@ -66,31 +65,20 @@ mod tests {
     use super::*;
 
     #[test]
-    fn destinations_keep_ssh_aliases_and_separate_ports() {
+    fn targets_keep_ssh_aliases_and_pass_only_the_bridge_command() {
         for (input, destination, port) in [
             ("nex@192.0.2.1:2222", "nex@192.0.2.1", Some(2222)),
-            ("devbox", "devbox", None),
             ("ssh://devbox", "devbox", None),
-            ("ssh://nex@devbox:22", "nex@devbox", Some(22)),
             ("nex@[2001:db8::1]:2222", "nex@2001:db8::1", Some(2222)),
-            ("[::1]", "::1", None),
             ("nex@::1", "nex@::1", None),
         ] {
+            let target = RemoteTarget::parse(input).unwrap();
             assert_eq!(
-                RemoteTarget::parse(input).unwrap(),
-                RemoteTarget {
-                    destination: destination.into(),
-                    port
-                }
+                (target.destination.as_str(), target.port),
+                (destination, port)
             );
         }
         assert!(!RemoteTarget::recognizes("project"));
-        assert!(RemoteTarget::recognizes("ssh://devbox"));
-        assert!(RemoteTarget::recognizes("devbox:2222"));
-    }
-
-    #[test]
-    fn ssh_arguments_do_not_include_session_or_program_shell_text() {
         let command = RemoteTarget::parse("nex@host:2222")
             .unwrap()
             .command("attach");

@@ -1,25 +1,25 @@
 //! Asynchronous local resource samples and one hour of history.
 
-use std::{
-    collections::{HashMap, VecDeque},
-    ffi::CString,
-    fs, io,
-    ops::Range,
-    os::{
-        fd::RawFd,
-        unix::{ffi::OsStrExt, fs::MetadataExt},
-    },
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{Duration, Instant},
-};
+use std::collections::{HashMap, VecDeque};
+use std::ffi::CString;
+use std::ops::Range;
+use std::os::fd::RawFd;
+use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use std::{fs, io};
 
 const SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
 const GIB: f64 = 1073741824.;
 pub(crate) const MIB: f64 = 1048576.;
+/// The series of `Sample::values` and the history.
 const NAMES: [&str; 7] = ["CPU", "MEMORY", "READ", "WRITE", "SWAP", "IN", "OUT"];
 
+/// A process across samples: its pid and start time.
 type Identity = (u32, u64);
+/// CPU time in clock ticks and, when readable, bytes read and written.
+type ProcessCounters = (u64, Option<[u64; 2]>);
 
 pub struct SystemStats {
     worker: crate::worker::Worker<Request, (Sample, TrendPoint)>,
@@ -27,8 +27,8 @@ pub struct SystemStats {
     history: VecDeque<TrendPoint>,
     pub(crate) process_revision: u64,
     directory: Option<PathBuf>,
-    processes_enabled: bool,
-    process_detail: Option<Identity>,
+    processes: bool,
+    detail: Option<Identity>,
     next_sample: Option<Instant>,
     pub summary: [String; 4],
 }
@@ -37,45 +37,28 @@ pub struct ResourceTrend {
     pub name: &'static str,
     pub value: Option<f32>,
     pub summary: String,
+    /// Age in seconds and value, oldest first.
     pub points: Vec<(f32, Option<f32>)>,
     pub unit: &'static str,
 }
 
 pub struct Network {
     pub name: Arc<str>,
-    pub rx: Option<f32>,
-    pub tx: Option<f32>,
-    pub received: u64,
-    pub transmitted: u64,
-    pub rx_errors: u64,
-    pub tx_errors: u64,
-    pub rx_dropped: u64,
-    pub tx_dropped: u64,
+    /// Receive and transmit rates in MiB/s; the counters below are in the same order.
+    pub rates: [Option<f32>; 2],
+    bytes: [u64; 2],
+    errors: [u64; 2],
+    dropped: [u64; 2],
 }
 
-impl Network {
-    pub fn details(&self) -> [(&'static str, String); 3] {
-        [
-            (
-                "Total RX / TX",
-                format!(
-                    "{:.2} GiB / {:.2} GiB",
-                    self.received as f64 / GIB,
-                    self.transmitted as f64 / GIB
-                ),
-            ),
-            (
-                "Errors RX / TX",
-                format!("{} / {}", self.rx_errors, self.tx_errors),
-            ),
-            (
-                "Dropped RX / TX",
-                format!("{} / {}", self.rx_dropped, self.tx_dropped),
-            ),
-        ]
-    }
+pub struct Disk {
+    pub name: String,
+    /// Read and write rates in MiB/s.
+    pub rates: [Option<f32>; 2],
+    pub utilization: Option<f32>,
 }
 
+#[derive(Default)]
 pub struct Process {
     pub pid: u32,
     pub(crate) start: u64,
@@ -106,15 +89,16 @@ struct Request {
     detail: Option<Identity>,
 }
 
+/// The previous sample's counters, from which the next one computes rates.
 #[derive(Default)]
 struct Sampler {
-    previous_at: Option<Instant>,
-    previous_cpu: Option<CpuCounters>,
-    previous_cores: HashMap<String, CpuCounters>,
-    previous_swap: Option<[u64; 2]>,
-    previous_disk: HashMap<String, DiskCounters>,
-    previous_net: HashMap<Arc<str>, (u64, u64)>,
-    previous_processes: HashMap<Identity, ProcessCounters>,
+    at: Option<Instant>,
+    cpu: Option<[u64; 3]>,
+    cores: HashMap<String, [u64; 3]>,
+    swap: Option<[u64; 2]>,
+    disks: HashMap<String, [u64; 3]>,
+    networks: HashMap<Arc<str>, [u64; 2]>,
+    processes: HashMap<Identity, ProcessCounters>,
 }
 
 #[derive(Default)]
@@ -122,13 +106,11 @@ pub(crate) struct Sample {
     directory: Option<PathBuf>,
     branch: Option<String>,
     values: [Option<f32>; 7],
-    iowait: Option<f32>,
-    load: Option<String>,
-    tasks: Option<String>,
-    uptime: Option<u64>,
-    pressure: [Option<f32>; 3],
+    pub overview: [(&'static str, String); 2],
+    pub cpu_details: [(&'static str, String); 4],
+    pub memory_details: [(&'static str, String); 5],
+    io_pressure: Option<f32>,
     memory: Option<Usage>,
-    memory_parts: [Option<u64>; 3],
     pub cpu_cores: Vec<(String, Option<f32>)>,
     swap: Option<Usage>,
     disk: Option<Usage>,
@@ -145,35 +127,10 @@ struct Usage {
     inodes: Option<f64>,
 }
 
-#[derive(Clone, Copy)]
-struct CpuCounters {
-    total: u64,
-    idle: u64,
-    iowait: u64,
-}
-
-#[derive(Clone, Copy)]
-struct ProcessCounters {
-    ticks: u64,
-    io: Option<[u64; 2]>,
-}
-
-pub struct Disk {
-    pub name: String,
-    pub rates: [Option<f32>; 2],
-    pub utilization: Option<f64>,
-}
-
-#[derive(Clone, Copy)]
-struct DiskCounters {
-    bytes: [u64; 2],
-    busy_ms: u64,
-}
-
 pub(crate) fn dash<T>(value: Option<T>, format: impl FnOnce(T) -> String) -> String {
     value.map_or_else(|| "—".into(), format)
 }
-fn percent(value: Option<f32>) -> String {
+pub(crate) fn percent(value: Option<f32>) -> String {
     dash(value, |value| format!("{value:.0}%"))
 }
 fn capacity(usage: Option<Usage>) -> String {
@@ -196,26 +153,38 @@ fn mib(rate: f64) -> f32 {
     (rate / MIB) as f32
 }
 
+impl Network {
+    pub fn details(&self) -> [(&'static str, String); 3] {
+        let pair = |[rx, tx]: [String; 2]| format!("{rx} / {tx}");
+        [
+            ("Total RX / TX", pair(self.bytes.map(gib))),
+            ("Errors RX / TX", pair(self.errors.map(|n| n.to_string()))),
+            ("Dropped RX / TX", pair(self.dropped.map(|n| n.to_string()))),
+        ]
+    }
+}
+
 impl SystemStats {
     pub fn new() -> io::Result<Self> {
-        let notification = Arc::new(crate::sys::new()?);
         let mut sampler = Sampler::default();
         let worker = crate::worker::Worker::new(
             "nextty-stats",
-            notification,
-            move |request: Request, publish| publish(sampler.sample(request)),
+            Arc::new(crate::sys::new()?),
+            move |request, publish| publish(sampler.sample(request)),
         )?;
-        Ok(Self {
+        let mut stats = Self {
             worker,
             sample: Sample::default(),
             history: VecDeque::new(),
             process_revision: 0,
             directory: None,
-            processes_enabled: false,
-            process_detail: None,
+            processes: false,
+            detail: None,
             next_sample: None,
-            summary: [" —", " —", " —", " —"].map(str::to_owned),
-        })
+            summary: Default::default(),
+        };
+        stats.summary = stats.summarize();
+        Ok(stats)
     }
 
     pub fn fd(&self) -> RawFd {
@@ -228,8 +197,8 @@ impl SystemStats {
 
     /// Whether processes are scanned and which one's details are read; a change samples at once.
     pub fn set_sampling(&mut self, processes: bool, detail: Option<Identity>) {
-        if (self.processes_enabled, self.process_detail) != (processes, detail) {
-            (self.processes_enabled, self.process_detail) = (processes, detail);
+        if (self.processes, self.detail) != (processes, detail) {
+            (self.processes, self.detail) = (processes, detail);
             self.next_sample = Some(Instant::now());
         }
     }
@@ -239,19 +208,18 @@ impl SystemStats {
     pub fn refresh(&mut self, directory: Option<&Path>, expanded: bool) -> io::Result<bool> {
         crate::sys::consume_notification(self.fd())?;
         let mut changed = false;
-        let mut summary_stale = false;
+        let mut updated = false;
         if let Some((sample, point)) = self.worker.take() {
             changed = expanded || sample.branch != self.sample.branch;
-            summary_stale = true;
+            updated = true;
             record_history(&mut self.history, point);
             self.sample = sample;
             self.process_revision += 1;
         }
         if self.directory.as_deref() != directory {
             self.directory = directory.map(Path::to_path_buf);
-            self.next_sample = Some(Instant::now());
-            changed = true;
-            summary_stale = true;
+            self.next_sample = None;
+            (changed, updated) = (true, true);
         }
         let now = Instant::now();
         if self.next_sample.is_none_or(|deadline| now >= deadline) {
@@ -259,29 +227,34 @@ impl SystemStats {
             self.worker.submit(Request {
                 directory: self.directory.clone(),
                 expanded,
-                processes: self.processes_enabled,
-                detail: self.process_detail,
+                processes: self.processes,
+                detail: self.detail,
             });
         }
-        if summary_stale {
-            let values = self.sample.values;
-            let disk = self
-                .disk()
-                .filter(|u| u.used + u.available > 0)
-                .map(|u| u.used as f32 * 100. / (u.used + u.available) as f32);
-            let summary = [
-                (" ", values[0]),
-                (" ", values[1]),
-                (" ", disk),
-                (" ", values[4]),
-            ]
-            .map(|(label, value)| format!("{label}{}", percent(value)));
+        if updated {
+            let summary = self.summarize();
             changed |= summary != self.summary;
             self.summary = summary;
         }
         Ok(changed)
     }
 
+    fn summarize(&self) -> [String; 4] {
+        let values = self.sample.values;
+        let disk = self
+            .disk()
+            .filter(|u| u.used + u.available > 0)
+            .map(|u| u.used as f32 * 100. / (u.used + u.available) as f32);
+        [
+            ("\u{f2db}", values[0]),
+            ("\u{efc5}", values[1]),
+            ("\u{f0a0}", disk),
+            ("\u{f0ec}", values[4]),
+        ]
+        .map(|(icon, value)| format!("{icon} {}", percent(value)))
+    }
+
+    /// Usage of the filesystem holding the directory, unless the sample is for another one.
     fn disk(&self) -> Option<Usage> {
         self.sample
             .disk
@@ -299,21 +272,25 @@ impl SystemStats {
         self.sample.swap.is_some_and(|usage| usage.total == 0)
     }
 
-    /// History within `seconds`, oldest first, with each point's age in seconds.
-    fn recent(&self, seconds: u32) -> impl Iterator<Item = (f32, &TrendPoint)> {
+    /// The history within `seconds` as (age in seconds, value), oldest first.
+    fn points(
+        &self,
+        seconds: u32,
+        value: impl Fn(&TrendPoint) -> Option<f32>,
+    ) -> Vec<(f32, Option<f32>)> {
         let now = Instant::now();
-        let age = move |point: &TrendPoint| now.saturating_duration_since(point.at).as_secs_f32();
+        let age = |point: &TrendPoint| now.saturating_duration_since(point.at).as_secs_f32();
         let start = self
             .history
             .partition_point(|point| age(point) > seconds as f32);
         self.history
             .range(start..)
-            .map(move |point| (age(point), point))
+            .map(|point| (age(point), value(point)))
+            .collect()
     }
 
     pub fn system_trends(&self, seconds: u32, indices: Range<usize>) -> Vec<ResourceTrend> {
-        let mut result: Vec<_> = indices
-            .clone()
+        indices
             .map(|index| ResourceTrend {
                 name: NAMES[index],
                 value: self.sample.values[index],
@@ -326,83 +303,33 @@ impl SystemStats {
                     4 => capacity(self.sample.swap),
                     _ => String::new(),
                 },
-                points: Vec::new(),
-                unit: if matches!(index, 2 | 3 | 5 | 6) {
-                    "MiB/s"
-                } else {
+                points: self.points(seconds, |point| point.values[index]),
+                unit: if matches!(index, 0 | 1 | 4) {
                     "%"
+                } else {
+                    "MiB/s"
                 },
             })
-            .collect();
-        for (index, trend) in indices.zip(&mut result) {
-            trend.points.extend(
-                self.recent(seconds)
-                    .map(|(age, point)| (age, point.values[index])),
-            );
-        }
-        result
+            .collect()
     }
 
     pub fn network_trends(&self, seconds: u32, network: &Network) -> Vec<ResourceTrend> {
-        let mut result =
-            [("RX", network.rx), ("TX", network.tx)].map(|(name, rate)| ResourceTrend {
+        ["RX", "TX"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ResourceTrend {
                 name,
-                value: rate,
+                value: network.rates[index],
                 summary: network.name.to_string(),
-                points: Vec::new(),
+                points: self.points(seconds, |point| {
+                    let (_, rates) = point.networks.iter().find(|(n, _)| *n == network.name)?;
+                    rates[index]
+                }),
                 unit: "MiB/s",
-            });
-        for (age, point) in self.recent(seconds) {
-            let rates = point
-                .networks
-                .iter()
-                .find(|(name, _)| *name == network.name)
-                .map_or([None; 2], |(_, rates)| *rates);
-            for (trend, rate) in result.iter_mut().zip(rates) {
-                trend.points.push((age, rate));
-            }
-        }
-        result.into()
+            })
+            .collect()
     }
 
-    fn load(&self) -> (&'static str, String) {
-        (
-            "Load · 1/5/15 min",
-            self.sample.load.clone().unwrap_or_else(|| "—".into()),
-        )
-    }
-    pub fn overview(&self) -> [(&'static str, String); 2] {
-        [
-            self.load(),
-            (
-                "Uptime",
-                dash(self.sample.uptime, |s| {
-                    format!("{}d {:02}h {:02}m", s / 86400, s / 3600 % 24, s / 60 % 60)
-                }),
-            ),
-        ]
-    }
-    pub fn cpu_details(&self) -> [(&'static str, String); 4] {
-        [
-            self.load(),
-            ("I/O wait", percent(self.sample.iowait)),
-            ("CPU pressure · 10s", percent(self.sample.pressure[0])),
-            (
-                "Tasks · running/total",
-                self.sample.tasks.clone().unwrap_or_else(|| "—".into()),
-            ),
-        ]
-    }
-    pub fn memory_details(&self) -> [(&'static str, String); 5] {
-        let [free, cached, buffers] = self.sample.memory_parts.map(|part| dash(part, gib));
-        [
-            ("Available", dash(self.sample.memory, |u| gib(u.available))),
-            ("Free", free),
-            ("Cached", cached),
-            ("Buffers", buffers),
-            ("Memory pressure · 10s", percent(self.sample.pressure[1])),
-        ]
-    }
     pub fn disk_details(&self) -> [(&'static str, String); 4] {
         [
             (
@@ -410,15 +337,12 @@ impl SystemStats {
                 dash(self.directory.as_deref(), |p| p.display().to_string()),
             ),
             ("Used / total", capacity(self.disk())),
-            ("I/O pressure · 10s", percent(self.sample.pressure[2])),
+            ("I/O pressure · 10s", percent(self.sample.io_pressure)),
             (
                 "Available / inodes",
                 dash(self.disk(), |u| {
-                    format!(
-                        "{} / {}",
-                        gib(u.available),
-                        dash(u.inodes, |inodes| format!("{inodes:.1}%"))
-                    )
+                    let inodes = dash(u.inodes, |inodes| format!("{inodes:.1}%"));
+                    format!("{} / {inodes}", gib(u.available))
                 }),
             ),
         ]
@@ -435,110 +359,124 @@ impl Sampler {
         } = request;
         let now = Instant::now();
         let elapsed = self
-            .previous_at
+            .at
             .replace(now)
             .map(|at| now.duration_since(at).as_secs_f64());
+        let rate = |new: u64, old: u64| per_second(new, old, elapsed);
         let mut sample = Sample {
             branch: directory.as_deref().and_then(git_branch),
             disk: directory.as_deref().and_then(disk_usage),
             directory,
             ..Sample::default()
         };
-        let busy = |new: CpuCounters, old: CpuCounters| {
-            counter_percent(new.total, old.total, new.idle, old.idle).map(|idle| 100. - idle)
-        };
         let stat = read("/proc/stat").unwrap_or_default();
-        let mut lines = stat.lines();
-        let cpu = lines.next().and_then(cpu_counters).map(|(_, cpu)| cpu);
-        let mut cpu_percent = None;
-        if let Some((old, new)) = self.previous_cpu.zip(cpu) {
-            cpu_percent = busy(new, old);
-            sample.iowait = counter_percent(new.total, old.total, new.iowait, old.iowait);
-        }
-        self.previous_cpu = cpu;
-        let previous_cores = std::mem::take(&mut self.previous_cores);
+        let mut cpus = stat.lines().map_while(cpu_counters);
+        let cpu = cpus.next().map(|(_, cpu)| cpu);
+        let old_cpu = std::mem::replace(&mut self.cpu, cpu);
+        let busy = |new, old| share(new, old, 1).map(|idle| 100. - idle);
+        let cpu_percent = old_cpu.zip(cpu).and_then(|(old, new)| busy(new, old));
+        let iowait = old_cpu.zip(cpu).and_then(|(old, new)| share(new, old, 2));
+        let cores = std::mem::take(&mut self.cores);
+        let (mut load, mut tasks, mut uptime, mut pressure) = (None, None, None, [None; 3]);
         if expanded {
-            for (name, new) in lines.map_while(cpu_counters) {
-                let value = previous_cores.get(name).and_then(|old| busy(new, *old));
+            for (name, new) in cpus {
+                let value = cores.get(name).and_then(|old| busy(new, *old));
                 sample.cpu_cores.push((name.to_owned(), value));
-                self.previous_cores.insert(name.to_owned(), new);
+                self.cores.insert(name.to_owned(), new);
             }
             if let Some(text) = read("/proc/loadavg") {
                 let mut fields = text.split_ascii_whitespace();
-                sample.load = Some(fields.by_ref().take(3).collect::<Vec<_>>().join(" / "));
-                sample.tasks = fields.next().map(str::to_owned);
+                load = Some(fields.by_ref().take(3).collect::<Vec<_>>().join(" / "));
+                tasks = fields.next().map(str::to_owned);
             }
-            sample.uptime =
-                read("/proc/uptime").and_then(|text| text.split('.').next()?.parse().ok());
-            for (value, resource) in sample.pressure.iter_mut().zip(["cpu", "memory", "io"]) {
-                *value =
-                    read(format!("/proc/pressure/{resource}")).and_then(|text| pressure(&text));
-            }
+            uptime = read("/proc/uptime").and_then(|text| text.split('.').next()?.parse().ok());
+            pressure = ["cpu", "memory", "io"].map(|resource| {
+                let text = read(format!("/proc/pressure/{resource}"))?;
+                text.strip_prefix("some avg10=")?
+                    .split(' ')
+                    .next()?
+                    .parse()
+                    .ok()
+            });
         }
-        if let Some(text) = read("/proc/meminfo") {
-            sample_memory(&text, &mut sample);
-        }
-        let swap = if expanded {
-            read("/proc/vmstat").and_then(|text| counter_pair(&text, ["pswpin", "pswpout"]))
-        } else {
-            None
+        let meminfo = read("/proc/meminfo").unwrap_or_default();
+        let kib = |name| Some(field(&meminfo, name)? * 1024);
+        let usage = |total: Option<u64>, available: Option<u64>| {
+            let (total, available) = (total?, available?);
+            Some(Usage {
+                used: total.checked_sub(available)?,
+                total,
+                available,
+                inodes: None,
+            })
         };
-        let mut swap_rates = [None; 2];
-        if let Some((old, new)) = self.previous_swap.zip(swap) {
-            swap_rates = [0, 1]
-                .map(|i| per_second(new[i], old[i], elapsed).map(|v| mib(v * page_size() as f64)));
-        }
-        self.previous_swap = swap;
-        let previous_disk = std::mem::take(&mut self.previous_disk);
+        sample.memory = usage(kib("MemTotal:"), kib("MemAvailable:"));
+        sample.swap = usage(kib("SwapTotal:"), kib("SwapFree:"));
+        let load = ("Load · 1/5/15 min", dash(load, |load| load));
+        let uptime = dash(uptime, |s: u64| {
+            format!("{}d {:02}h {:02}m", s / 86400, s / 3600 % 24, s / 60 % 60)
+        });
+        sample.overview = [load.clone(), ("Uptime", uptime)];
+        sample.cpu_details = [
+            load,
+            ("I/O wait", percent(iowait)),
+            ("CPU pressure · 10s", percent(pressure[0])),
+            ("Tasks · running/total", dash(tasks, |tasks| tasks)),
+        ];
+        let [free, cached, buffers] =
+            ["MemFree:", "Cached:", "Buffers:"].map(|n| dash(kib(n), gib));
+        sample.memory_details = [
+            ("Available", dash(sample.memory, |u| gib(u.available))),
+            ("Free", free),
+            ("Cached", cached),
+            ("Buffers", buffers),
+            ("Memory pressure · 10s", percent(pressure[1])),
+        ];
+        sample.io_pressure = pressure[2];
+        let swap = expanded
+            .then(|| read("/proc/vmstat"))
+            .flatten()
+            .and_then(|text| Some([field(&text, "pswpin")?, field(&text, "pswpout")?]));
+        let swap_rates = [0, 1].map(|i| {
+            let (old, new) = self.swap.zip(swap)?;
+            Some(mib(rate(new[i], old[i])? * page_size() as f64))
+        });
+        self.swap = swap;
+        let disks = std::mem::take(&mut self.disks);
         if expanded {
             let text = read("/proc/diskstats").unwrap_or_default();
             for (name, new) in text.lines().filter_map(disk_counters) {
-                let old = previous_disk.get(name);
+                let disk_rate = |i: usize| rate(new[i], disks.get(name)?[i]);
                 sample.disks.push(Disk {
                     name: name.to_owned(),
-                    rates: [0, 1].map(|i| {
-                        old.and_then(|old| per_second(new.bytes[i], old.bytes[i], elapsed))
-                            .map(mib)
-                    }),
-                    utilization: old
-                        .and_then(|old| per_second(new.busy_ms, old.busy_ms, elapsed))
-                        .map(|v| (v / 10.).min(100.)),
+                    rates: [0, 1].map(|i| disk_rate(i).map(mib)),
+                    utilization: disk_rate(2).map(|busy_ms| (busy_ms / 10.).min(100.) as f32),
                 });
-                self.previous_disk.insert(name.to_owned(), new);
+                self.disks.insert(name.to_owned(), new);
             }
         }
-        let mut previous_net = std::mem::take(&mut self.previous_net);
-        sample.networks = parse_networks(&read("/proc/net/dev").unwrap_or_default());
-        sample
-            .networks
-            .retain(|net| Path::new(&format!("/sys/class/net/{}/device", net.name)).exists());
-        for net in &mut sample.networks {
-            if let Some((name, (rx, tx))) = previous_net.remove_entry(&net.name) {
-                // Reuse the allocation shared with the history.
-                net.name = name;
-                net.rx = per_second(net.received, rx, elapsed).map(mib);
-                net.tx = per_second(net.transmitted, tx, elapsed).map(mib);
+        let mut networks = std::mem::take(&mut self.networks);
+        sample.networks = read_networks(&read("/proc/net/dev").unwrap_or_default());
+        for network in &mut sample.networks {
+            if let Some((name, old)) = networks.remove_entry(&network.name) {
+                // Share the name's allocation with the history.
+                network.name = name;
+                network.rates = [0, 1].map(|i| rate(network.bytes[i], old[i]).map(mib));
             }
-            self.previous_net
-                .insert(net.name.clone(), (net.received, net.transmitted));
+            self.networks.insert(network.name.clone(), network.bytes);
         }
         sample.processes = if processes {
             self.sample_processes(elapsed, detail)
         } else {
-            self.previous_processes.clear();
+            self.processes.clear();
             Vec::new()
         };
-        let disk_rates = [0, 1].map(|i| {
-            (!sample.disks.is_empty())
-                .then(|| {
-                    sample
-                        .disks
-                        .iter()
-                        .map(|disk| disk.rates[i])
-                        .sum::<Option<f32>>()
-                })
-                .flatten()
-        });
+        let disks_rate = |i: usize| {
+            let rates = sample.disks.iter().map(|disk| disk.rates[i]);
+            rates
+                .sum::<Option<f32>>()
+                .filter(|_| !sample.disks.is_empty())
+        };
         let percent_of = |usage: Option<Usage>| {
             usage
                 .filter(|u| u.total > 0)
@@ -547,8 +485,8 @@ impl Sampler {
         sample.values = [
             cpu_percent,
             percent_of(sample.memory),
-            disk_rates[0],
-            disk_rates[1],
+            disks_rate(0),
+            disks_rate(1),
             percent_of(sample.swap),
             swap_rates[0],
             swap_rates[1],
@@ -559,32 +497,33 @@ impl Sampler {
             networks: sample
                 .networks
                 .iter()
-                .map(|net| (net.name.clone(), [net.rx, net.tx]))
+                .map(|network| (network.name.clone(), network.rates))
                 .collect(),
         };
         (sample, point)
     }
 
     fn sample_processes(&mut self, elapsed: Option<f64>, detail: Option<Identity>) -> Vec<Process> {
-        let previous = std::mem::take(&mut self.previous_processes);
+        let previous = std::mem::take(&mut self.processes);
         let mut processes = Vec::with_capacity(previous.len());
         for entry in fs::read_dir("/proc").into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
+            // Skips the other entries, among them `self`, which would repeat this process.
+            if !entry.file_name().as_bytes()[0].is_ascii_digit() {
                 continue;
             }
-            let Some((mut process, counters)) = read_process(&entry, detail) else {
+            let Some((mut process, (ticks, io))) = read_process(&entry, detail) else {
                 continue;
             };
             let identity = (process.pid, process.start);
-            if let Some(old) = previous.get(&identity) {
-                process.cpu = per_second(counters.ticks, old.ticks, elapsed)
+            if let Some(&(old_ticks, old_io)) = previous.get(&identity) {
+                process.cpu = per_second(ticks, old_ticks, elapsed)
                     .map(|v| (v * 100. / clock_ticks()) as f32);
-                if let Some((old, new)) = old.io.zip(counters.io) {
+                if let Some((old, new)) = old_io.zip(io) {
                     process.read = per_second(new[0], old[0], elapsed);
                     process.write = per_second(new[1], old[1], elapsed);
                 }
             }
-            self.previous_processes.insert(identity, counters);
+            self.processes.insert(identity, (ticks, io));
             processes.push(process);
         }
         processes.sort_unstable_by_key(|p| p.pid);
@@ -604,15 +543,25 @@ fn read(path: impl AsRef<Path>) -> Option<String> {
     fs::read_to_string(path).ok()
 }
 
-fn per_second(current: u64, previous: u64, elapsed: Option<f64>) -> Option<f64> {
-    let seconds = elapsed.filter(|v| *v > 0.)?;
-    Some(current.checked_sub(previous)? as f64 / seconds)
+/// The number after `name` on the line starting with it, as in /proc/meminfo or /proc/vmstat.
+fn field(text: &str, name: &str) -> Option<u64> {
+    text.lines().find_map(|line| {
+        let value = line.strip_prefix(name)?.split_ascii_whitespace().next()?;
+        value.parse().ok()
+    })
 }
-fn counter_percent(total: u64, old_total: u64, counter: u64, old_counter: u64) -> Option<f32> {
-    let total = total.checked_sub(old_total)?;
-    let counter = counter.checked_sub(old_counter)?;
-    (total > 0).then(|| counter as f32 * 100. / total as f32)
+
+fn per_second(new: u64, old: u64, elapsed: Option<f64>) -> Option<f64> {
+    Some(new.checked_sub(old)? as f64 / elapsed?)
 }
+
+/// The percentage of the CPU time between two [total, idle, iowait] counters spent in `index`.
+fn share(new: [u64; 3], old: [u64; 3], index: usize) -> Option<f32> {
+    let total = new[0].checked_sub(old[0])?;
+    let part = new[index].checked_sub(old[index])?;
+    (total > 0).then(|| part as f32 * 100. / total as f32)
+}
+
 fn record_history(history: &mut VecDeque<TrendPoint>, point: TrendPoint) {
     while history
         .front()
@@ -633,80 +582,57 @@ fn record_history(history: &mut VecDeque<TrendPoint>, point: TrendPoint) {
     }
     history.push_back(point);
 }
-fn cpu_counters(line: &str) -> Option<(&str, CpuCounters)> {
+
+/// A /proc/stat `cpu` line as its name and [total, idle, iowait] time.
+fn cpu_counters(line: &str) -> Option<(&str, [u64; 3])> {
     let mut fields = line.split_ascii_whitespace();
     let name = fields.next().filter(|name| name.starts_with("cpu"))?;
     let mut counters = [0u64; 8];
     for counter in &mut counters {
         *counter = fields.next()?.parse().ok()?;
     }
-    Some((
-        name,
-        CpuCounters {
-            total: counters.iter().sum(),
-            idle: counters[3] + counters[4],
-            iowait: counters[4],
-        },
-    ))
+    let total = counters.iter().sum();
+    Some((name, [total, counters[3] + counters[4], counters[4]]))
 }
-fn counters<const N: usize>(text: &str, names: [&str; N]) -> [Option<u64>; N] {
-    let mut result = [None; N];
-    for line in text.lines() {
-        let mut fields = line.split_ascii_whitespace();
-        if let Some(index) = fields
-            .next()
-            .and_then(|name| names.iter().position(|n| *n == name))
-        {
-            result[index] = fields.next().and_then(|value| value.parse().ok());
-        }
+
+/// A /proc/diskstats line of a physical disk as its name and [read bytes, written bytes, busy ms].
+fn disk_counters(line: &str) -> Option<(&str, [u64; 3])> {
+    let mut fields = line.split_ascii_whitespace().skip(2);
+    let name = fields.next()?;
+    if !Path::new(&format!("/sys/block/{name}/device")).exists() {
+        return None;
     }
-    result
+    let mut number = |skip| fields.nth(skip)?.parse::<u64>().ok();
+    Some((name, [number(2)? * 512, number(3)? * 512, number(2)?]))
 }
-fn counter_pair(text: &str, names: [&str; 2]) -> Option<[u64; 2]> {
-    let [a, b] = counters(text, names);
-    Some([a?, b?])
-}
-fn sample_memory(text: &str, sample: &mut Sample) {
-    let [
-        total,
-        available,
-        swap_total,
-        swap_free,
-        free,
-        cached,
-        buffers,
-    ] = counters(
-        text,
-        [
-            "MemTotal:",
-            "MemAvailable:",
-            "SwapTotal:",
-            "SwapFree:",
-            "MemFree:",
-            "Cached:",
-            "Buffers:",
-        ],
-    )
-    .map(|kib| Some(kib? * 1024));
-    let usage = |total: Option<u64>, available: Option<u64>| {
-        let (total, available) = (total?, available?);
-        Some(Usage {
-            used: total.checked_sub(available)?,
-            total,
-            available,
-            inodes: None,
+
+/// The physical interfaces of /proc/net/dev, sorted by name; each line holds the receive
+/// bytes, packets, errors, drops and four more counters, then the same for transmission.
+fn read_networks(text: &str) -> Vec<Network> {
+    let mut networks: Vec<_> = text
+        .lines()
+        .filter_map(|line| {
+            let (name, fields) = line.split_once(':')?;
+            let name = name.trim();
+            let v: Vec<u64> = fields
+                .split_ascii_whitespace()
+                .map(str::parse)
+                .collect::<Result<_, _>>()
+                .ok()?;
+            let physical = Path::new(&format!("/sys/class/net/{name}/device")).exists();
+            (physical && v.len() >= 12).then(|| Network {
+                name: name.into(),
+                rates: [None; 2],
+                bytes: [v[0], v[8]],
+                errors: [v[2], v[10]],
+                dropped: [v[3], v[11]],
+            })
         })
-    };
-    sample.memory = usage(total, available).filter(|usage| usage.total > 0);
-    sample.swap = usage(swap_total, swap_free);
-    sample.memory_parts = [free, cached, buffers];
+        .collect();
+    networks.sort_unstable_by(|a, b| a.name.cmp(&b.name));
+    networks
 }
-fn pressure(text: &str) -> Option<f32> {
-    text.lines()
-        .find(|line| line.starts_with("some "))?
-        .split_ascii_whitespace()
-        .find_map(|field| field.strip_prefix("avg10=")?.parse().ok())
-}
+
 fn git_branch(directory: &Path) -> Option<String> {
     let (parent, dot_git) = directory
         .ancestors()
@@ -720,55 +646,9 @@ fn git_branch(directory: &Path) -> Option<String> {
     };
     let head = read(git_dir.join("HEAD"))?;
     let head = head.trim();
-    Some(
-        head.strip_prefix("ref: refs/heads/")
-            .unwrap_or(head)
-            .to_owned(),
-    )
+    Some(head.strip_prefix("ref: refs/heads/").unwrap_or(head).into())
 }
 
-/// Parses /proc/net/dev; the fields are rx bytes, packets, errors, drops, ... then the same for tx.
-fn parse_networks(text: &str) -> Vec<Network> {
-    let mut result: Vec<_> = text
-        .lines()
-        .filter_map(|line| {
-            let (name, fields) = line.split_once(':')?;
-            let values: Vec<u64> = fields
-                .split_ascii_whitespace()
-                .map(str::parse)
-                .collect::<Result<_, _>>()
-                .ok()?;
-            (values.len() >= 12).then(|| Network {
-                name: name.trim().into(),
-                rx: None,
-                tx: None,
-                received: values[0],
-                transmitted: values[8],
-                rx_errors: values[2],
-                tx_errors: values[10],
-                rx_dropped: values[3],
-                tx_dropped: values[11],
-            })
-        })
-        .collect();
-    result.sort_unstable_by(|a, b| a.name.cmp(&b.name));
-    result
-}
-fn disk_counters(line: &str) -> Option<(&str, DiskCounters)> {
-    let mut values = line.split_ascii_whitespace().skip(2);
-    let name = values.next()?;
-    if !Path::new(&format!("/sys/block/{name}/device")).exists() {
-        return None;
-    }
-    let sectors = |value: &str| Some(value.parse::<u64>().ok()? * 512);
-    Some((
-        name,
-        DiskCounters {
-            bytes: [sectors(values.nth(2)?)?, sectors(values.nth(3)?)?],
-            busy_ms: values.nth(2)?.parse().ok()?,
-        },
-    ))
-}
 fn disk_usage(path: &Path) -> Option<Usage> {
     let path = CString::new(path.as_os_str().as_bytes()).ok()?;
     let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
@@ -785,58 +665,50 @@ fn disk_usage(path: &Path) -> Option<Usage> {
         }),
     })
 }
-fn process_stat(text: &str) -> Option<(Process, ProcessCounters)> {
+
+/// /proc/<pid>/stat as the process and its CPU time in clock ticks.
+fn process_stat(text: &str) -> Option<(Process, u64)> {
     // The name is in parentheses and may itself contain ") ".
     let (pid, rest) = text.split_once(" (")?;
-    let (name, rest) = rest.split_at(rest.rfind(") ")?);
-    let mut values = rest[2..].split_ascii_whitespace();
-    let state = values.next()?.chars().next()?;
-    let parent = values.next()?.parse().ok()?;
-    let ticks = values.nth(9)?.parse::<u64>().ok()? + values.next()?.parse::<u64>().ok()?;
-    let threads = values.nth(4)?.parse().ok()?;
-    let start = values.nth(1)?.parse().ok()?;
-    let rss = values.nth(1)?.parse::<u64>().ok()? * page_size();
-    Some((
-        Process {
-            pid: pid.parse().ok()?,
-            start,
-            name: name.into(),
-            uid: 0,
-            state,
-            cpu: None,
-            rss,
-            read: None,
-            write: None,
-            threads,
-            parent,
-            command: String::new(),
-            directory: None,
-        },
-        ProcessCounters { ticks, io: None },
-    ))
+    let (name, rest) = rest.rsplit_once(") ")?;
+    let fields: Vec<&str> = rest.split_ascii_whitespace().collect();
+    let number = |index: usize| fields.get(index)?.parse::<u64>().ok();
+    let process = Process {
+        pid: pid.parse().ok()?,
+        start: number(19)?,
+        name: name.into(),
+        state: fields.first()?.chars().next()?,
+        rss: number(21)? * page_size(),
+        threads: number(17)? as u32,
+        parent: number(1)? as u32,
+        ..Process::default()
+    };
+    Some((process, number(11)? + number(12)?))
 }
+
 /// Reads one `/proc/<pid>`; a matching `detail` also reads the command line and directory.
 fn read_process(
     entry: &fs::DirEntry,
     detail: Option<Identity>,
 ) -> Option<(Process, ProcessCounters)> {
     let dir = entry.path();
-    let (mut process, mut counters) = process_stat(&read(dir.join("stat"))?)?;
+    let (mut process, ticks) = process_stat(&read(dir.join("stat"))?)?;
     process.uid = entry.metadata().ok()?.uid();
-    counters.io =
-        read(dir.join("io")).and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
+    let io = read(dir.join("io"))
+        .and_then(|text| Some([field(&text, "read_bytes:")?, field(&text, "write_bytes:")?]));
     if detail == Some((process.pid, process.start)) {
-        let command = fs::read(dir.join("cmdline")).ok().map(|bytes| {
-            String::from_utf8_lossy(&bytes)
-                .trim_end_matches('\0')
-                .replace('\0', " ")
-        });
-        process.command = command
-            .filter(|command| !command.is_empty())
-            .unwrap_or_else(|| format!("[{}]", process.name));
+        let command = fs::read(dir.join("cmdline")).unwrap_or_default();
+        let command = String::from_utf8_lossy(&command)
+            .trim_end_matches('\0')
+            .replace('\0', " ");
+        process.command = if command.is_empty() {
+            format!("[{}]", process.name)
+        } else {
+            command
+        };
         process.directory = fs::read_link(dir.join("cwd")).ok();
     }
-    Some((process, counters))
+    Some((process, (ticks, io)))
 }
 
 #[cfg(test)]
@@ -844,51 +716,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn proc_text_parses_to_units_and_identity() {
-        let (_, cpu) = cpu_counters("cpu 10 20 30 100 5 6 7 8 9 10").unwrap();
-        assert_eq!((cpu.total, cpu.idle, cpu.iowait), (186, 105, 5));
-        assert_eq!(counter_percent(200, 100, 70, 20), Some(50.));
+    fn proc_text_parses_to_counters_and_rates() {
+        let (_, old) = cpu_counters("cpu 10 20 30 100 5 6 7 8 9 10").unwrap();
+        assert_eq!(old, [186, 105, 5]);
+        let (_, new) = cpu_counters("cpu 60 20 30 140 15 6 7 8").unwrap();
+        assert_eq!(
+            (share(new, old, 1), share(new, old, 2)),
+            (Some(50.), Some(10.))
+        );
         assert_eq!(per_second(1100, 100, Some(2.)), Some(500.));
         assert_eq!(per_second(10, 100, Some(1.)), None);
-        let mut sample = Sample::default();
-        sample_memory(
-            "MemTotal: 1000 kB\nMemAvailable: 666 kB\nSwapTotal: 400 kB\nSwapFree: 100 kB\n",
-            &mut sample,
-        );
-        let (memory, swap) = (sample.memory.unwrap(), sample.swap.unwrap());
-        assert_eq!((memory.used, memory.total), (334 * 1024, 1000 * 1024));
-        assert_eq!((swap.used, swap.total), (300 * 1024, 400 * 1024));
-        let net = parse_networks("Inter-| Receive\n eth0: 1024 1 2 3 0 0 0 0 2048 4 5 6 0 0 0 0\n");
-        assert_eq!(net.len(), 1);
-        assert_eq!(
-            (
-                net[0].received,
-                net[0].transmitted,
-                net[0].rx_errors,
-                net[0].tx_dropped
-            ),
-            (1024, 2048, 2, 6)
-        );
+        let meminfo = "MemTotal: 1000 kB\nSwapCached: 7 kB\nCached: 666 kB\n";
+        assert_eq!(field(meminfo, "Cached:"), Some(666));
         let text =
             "123 (name ) with spaces) R 1 0 0 0 0 0 0 0 0 0 40 10 0 0 20 0 3 0 900 100000 20 0 0";
-        let (process, counters) = process_stat(text).unwrap();
-        assert_eq!(
-            (process.pid, process.parent, process.threads, process.rss),
-            (123, 1, 3, 20 * page_size())
-        );
+        let (process, ticks) = process_stat(text).unwrap();
         assert_eq!(process.name, "name ) with spaces");
-        assert_eq!((process.start, counters.ticks), (900, 50));
         assert_eq!(
-            counter_pair(
-                "read_bytes: 42\nwrite_bytes: 84\n",
-                ["read_bytes:", "write_bytes:"]
-            ),
-            Some([42, 84])
+            (process.pid, process.parent, process.threads, process.start),
+            (123, 1, 3, 900)
         );
-        assert_eq!(
-            pressure("some avg10=0.25 avg60=0.1\nfull avg10=1.0"),
-            Some(0.25)
-        );
+        assert_eq!((process.rss, ticks), (20 * page_size(), 50));
     }
 
     #[test]
@@ -906,7 +754,6 @@ mod tests {
         assert_eq!(history.len(), 3601);
         assert_eq!(history.front().unwrap().values[0], Some(10.));
         record_history(&mut history, point(3615));
-        assert_eq!(history.front().unwrap().values[0], Some(15.));
         assert_eq!(history[history.len() - 2].values, [None; 7]);
     }
 
@@ -914,22 +761,13 @@ mod tests {
     fn trends_keep_the_window_and_follow_one_interface_across_samples() {
         let mut stats = SystemStats::new().unwrap();
         let eth0: Arc<str> = "eth0".into();
-        stats.sample.networks = parse_networks("eth0: 1 0 0 0 0 0 0 0 2 0 0 0");
         let now = Instant::now();
         let point = |age: u64| {
-            let selected = (Arc::clone(&eth0), [Some(age as f32 / 2.), Some(age as f32)]);
-            let other = ("eth1".into(), [Some(1000.), Some(2000.)]);
+            let selected = (eth0.clone(), [Some(age as f32), None]);
+            let other = ("eth1".into(), [Some(1000.), None]);
             TrendPoint {
                 at: now - Duration::from_secs(age),
-                values: [
-                    Some(age as f32),
-                    None,
-                    Some(age as f32 / 2.),
-                    Some(age as f32),
-                    None,
-                    None,
-                    None,
-                ],
+                values: [Some(age as f32); 7],
                 networks: match age {
                     20 => Vec::new(),
                     30 => vec![other, selected],
@@ -940,44 +778,16 @@ mod tests {
         stats.history = [900, 120, 30, 20, 10].into_iter().map(point).collect();
         let values =
             |trend: &ResourceTrend| trend.points.iter().map(|(_, v)| *v).collect::<Vec<_>>();
-        let system = stats.system_trends(60, 2..4);
-        assert_eq!(values(&system[0]), [Some(15.), Some(10.), Some(5.)]);
-        assert_eq!(values(&system[1]), [Some(30.), Some(20.), Some(10.)]);
-        let network = stats.network_trends(60, &stats.sample.networks[0]);
-        assert_eq!(values(&network[0]), [Some(15.), None, Some(5.)]);
-        assert_eq!(values(&network[1]), [Some(30.), None, Some(10.)]);
-    }
-
-    #[test]
-    fn sampling_reads_this_process_and_its_details() {
-        let mut sampler = Sampler::default();
-        let (sample, _) = sampler.sample(Request {
-            directory: None,
-            expanded: true,
-            processes: true,
-            detail: None,
-        });
-        let pid = std::process::id();
-        let identity = sample
-            .processes
-            .iter()
-            .find(|p| p.pid == pid)
-            .map(|p| (p.pid, p.start))
-            .unwrap();
-        let (sample, point) = sampler.sample(Request {
-            directory: Some("/".into()),
-            expanded: true,
-            processes: true,
-            detail: Some(identity),
-        });
-        assert!(!sample.cpu_cores.is_empty());
-        assert_eq!(point.values, sample.values);
-        assert!(sample.disk.is_some());
-        let process = sample.processes.iter().find(|p| p.pid == pid).unwrap();
-        assert!(process.cpu.is_some() && !process.command.is_empty());
-        assert_eq!(
-            process.directory.as_deref(),
-            Some(std::env::current_dir().unwrap().as_path())
-        );
+        let system = stats.system_trends(60, 2..3);
+        assert_eq!(values(&system[0]), [Some(30.), Some(20.), Some(10.)]);
+        let network = Network {
+            name: eth0.clone(),
+            rates: [None; 2],
+            bytes: [0; 2],
+            errors: [0; 2],
+            dropped: [0; 2],
+        };
+        let network = stats.network_trends(60, &network);
+        assert_eq!(values(&network[0]), [Some(30.), None, Some(10.)]);
     }
 }

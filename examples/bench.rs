@@ -6,68 +6,57 @@ use std::time::{Duration, Instant};
 
 use nextty::core::{Core, WindowSize};
 use nextty::history::HistoryBudget;
-use nextty::terminal::{self, Event, Shell};
+use nextty::terminal::{Event, Shell, Terminal};
 use nextty::vt::Parser;
 
-fn size() -> WindowSize {
-    WindowSize {
-        num_cols: 100,
-        num_lines: 30,
-        cell_width: 10,
-        cell_height: 22,
-    }
-}
-
-fn parser() {
-    // Exercise printable UTF-8, wide cells, SGR, cursor motion and scrolling.
-    let line = "\x1b[32mterminal benchmark\x1b[0m 中文 UTF-8 λ → 0123456789\r\n\x1b[2K";
-    let data = line.repeat(1024);
-    let iterations = (64 * 1024 * 1024) / data.len();
-    let bytes = iterations * data.len();
-    let rates: [f64; 5] = std::array::from_fn(|_| {
-        let mut term = Core::new(size(), 0xd8dee9, 0x14161b);
-        let mut parser = Parser::new();
-        parser.advance(&mut term, data.as_bytes());
-        let start = Instant::now();
-        for _ in 0..iterations {
-            parser.advance(&mut term, black_box(data.as_bytes()));
-        }
-        let elapsed = start.elapsed();
-        black_box(term.row(0));
-        bytes as f64 / 1048576. / elapsed.as_secs_f64()
-    });
-    println!("parser+grid only (no PTY, UI, font shaping or rendering)");
-    println!("  workload: {bytes} bytes/run, 100x30 grid, no history, 5 runs");
-    println!("  MiB/s: {rates:?}; median {:.2}", median(rates));
-}
+const SIZE: WindowSize = WindowSize {
+    num_cols: 100,
+    num_lines: 30,
+    cell_width: 10,
+    cell_height: 22,
+};
+const COLORS: (u32, u32) = (0xd8dee9, 0x14161b);
 
 fn median(mut rates: [f64; 5]) -> f64 {
     rates.sort_unstable_by(f64::total_cmp);
     rates[2]
 }
 
+fn parser() {
+    // Exercise printable UTF-8, wide cells, SGR, cursor motion and scrolling.
+    let line = "\x1b[32mterminal benchmark\x1b[0m 中文 UTF-8 λ → 0123456789\r\n\x1b[2K";
+    let data = line.repeat(1024);
+    let iterations = (64 << 20) / data.len();
+    let rates = std::array::from_fn(|_| {
+        let mut core = Core::new(SIZE, COLORS.0, COLORS.1);
+        let mut parser = Parser::new();
+        parser.advance(&mut core, data.as_bytes());
+        let start = Instant::now();
+        for _ in 0..iterations {
+            parser.advance(&mut core, black_box(data.as_bytes()));
+        }
+        black_box(core.row(0));
+        (iterations * data.len()) as f64 / 1048576. / start.elapsed().as_secs_f64()
+    });
+    println!(
+        "parser+grid, no PTY or history, 64 MiB: median {:.2} MiB/s of {rates:.1?}",
+        median(rates)
+    );
+}
+
 /// One iteration of the daemon's loop for a single pane: wait for what the terminal asks for.
-fn drive(terminal: &mut terminal::Terminal, budget: &HistoryBudget, timeout: Duration) {
-    let mut events = if terminal.reading() { libc::POLLIN } else { 0 };
-    if terminal.writing() {
-        events |= libc::POLLOUT;
-    }
+fn drive(terminal: &mut Terminal, budget: &HistoryBudget, timeout: Duration) {
+    let watch = |fd, events| libc::pollfd {
+        fd: if events == 0 { -1 } else { fd },
+        events,
+        revents: 0,
+    };
+    let events = if terminal.reading() { libc::POLLIN } else { 0 }
+        | if terminal.writing() { libc::POLLOUT } else { 0 };
     let mut fds = [
-        libc::pollfd {
-            fd: if events == 0 { -1 } else { terminal.pty_fd() },
-            events,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: terminal.pidfd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
-        libc::pollfd {
-            fd: budget.fd(),
-            events: libc::POLLIN,
-            revents: 0,
-        },
+        watch(terminal.pty_fd(), events),
+        watch(terminal.pidfd(), libc::POLLIN),
+        watch(budget.fd(), libc::POLLIN),
     ];
     let timeout = terminal.deadline().map_or(timeout, |deadline| {
         timeout.min(deadline.saturating_duration_since(Instant::now()))
@@ -81,51 +70,34 @@ fn drive(terminal: &mut terminal::Terminal, budget: &HistoryBudget, timeout: Dur
     terminal.step(fds[0].revents, fds[1].revents).unwrap();
 }
 
-fn wait_for(terminal: &mut terminal::Terminal, budget: &HistoryBudget, expected: char) {
+fn wait_for(terminal: &mut Terminal, budget: &HistoryBudget, expected: char) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while terminal.core.row(0).cells[0].c != expected {
         let remaining = deadline.saturating_duration_since(Instant::now());
-        assert!(
-            !remaining.is_zero(),
-            "timed out waiting for echo {expected:?}"
-        );
+        assert!(!remaining.is_zero(), "timed out waiting for {expected:?}");
         drive(terminal, budget, remaining);
         for event in terminal.events.drain(..) {
-            assert!(
-                !matches!(
-                    event,
-                    Event::Exit(_) | Event::Error(_) | Event::HistoryError(_)
-                ),
-                "{event:?}"
+            let failed = matches!(
+                event,
+                Event::Exit(_) | Event::Error(_) | Event::HistoryError(_)
             );
+            assert!(!failed, "{event:?}");
         }
     }
 }
 
-fn percentile(samples: &[f64], percent: f64) -> f64 {
-    samples[(percent * samples.len() as f64).ceil() as usize - 1]
-}
-
 fn pty() -> Result<()> {
-    let budget = HistoryBudget::new(
-        std::env::temp_dir().join(format!("nextty-bench-{}", std::process::id())),
-        1 << 30,
-    )?;
+    let directory = std::env::temp_dir().join(format!("nextty-bench-{}", std::process::id()));
+    let budget = HistoryBudget::new(directory, 1 << 30)?;
     let spawn = || {
-        let shell = Shell::new(
-            "/bin/sh".into(),
-            vec![
-                "-c".into(),
-                "stty raw -echo; printf '\\033[H!'; exec /bin/cat".into(),
-            ],
-        );
-        let (foreground, background) = (0xd8dee9, 0x14161b);
-        let mut terminal = terminal::Terminal::new_with_history(
+        let script = "stty raw -echo; printf '\\033[H!'; exec /bin/cat";
+        let shell = Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()]);
+        let mut terminal = Terminal::new_with_history(
             Some(shell),
             None,
-            size(),
-            foreground,
-            background,
+            SIZE,
+            COLORS.0,
+            COLORS.1,
             budget.clone(),
         )?;
         wait_for(&mut terminal, &budget, '!');
@@ -143,12 +115,10 @@ fn pty() -> Result<()> {
         wait_for(&mut terminal, &budget, '~');
         *rate = data.len() as f64 / 1048576. / start.elapsed().as_secs_f64();
     }
-    println!("PTY cat to parsed grid with production disk history (no GUI/display latency)");
     println!(
-        "  workload: {} bytes/run, 100x30 grid, 512 hot rows, 1 GiB budget, 5 runs",
-        data.len()
+        "PTY cat to parsed grid with disk history, 30 MiB: median {:.2} MiB/s of {rates:.1?}",
+        median(rates)
     );
-    println!("  MiB/s: {rates:?}; median {:.2}", median(rates));
 
     let mut terminal = spawn()?;
     let mut samples = Vec::with_capacity(2000);
@@ -162,16 +132,13 @@ fn pty() -> Result<()> {
         }
     }
     samples.sort_unstable_by(f64::total_cmp);
-    println!("raw PTY echo to parsed grid with production disk history (no GUI/display latency)");
-    println!("  path: Terminal::write → PTY → raw /bin/cat → event loop → grid observation");
-    println!("  observer: PTY-driven poll; 100 warmups, 2000 samples, two bytes/input");
+    let percentile = |percent: f64| samples[(percent * samples.len() as f64).ceil() as usize - 1];
     println!(
-        "  microseconds: p50 {:.2}, p95 {:.2}, p99 {:.2}, min {:.2}, max {:.2}",
-        percentile(&samples, 0.50),
-        percentile(&samples, 0.95),
-        percentile(&samples, 0.99),
-        samples[0],
-        samples[samples.len() - 1]
+        "PTY echo to parsed grid with disk history, 2000 samples: p50 {:.2} µs, p95 {:.2}, p99 {:.2}, max {:.2}",
+        percentile(0.50),
+        percentile(0.95),
+        percentile(0.99),
+        percentile(1.0),
     );
     Ok(())
 }

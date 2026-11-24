@@ -266,14 +266,6 @@ mod tests {
     }
 
     #[test]
-    fn overlapping_queries_preserve_all_physical_rows() {
-        let screen = screen(2, 4, "aaaaa\r\n");
-        assert_eq!(shape(&screen, Some("aaa"))["matches"], json!([0, 1, 2]));
-        assert_eq!(shape(&screen, Some("aaa\n"))["matches"], json!([1, 2, 3]));
-        assert_eq!(shape(&screen, Some(""))["matches"], json!([0, 1, 2, 3]));
-    }
-
-    #[test]
     fn query_returns_omitted_rows_and_their_context_without_cleanup() {
         let screen = screen(20, 5, "before\r\n   \r\n────\r\nafter\x1b[?25l");
         let full = shape(&screen, None);

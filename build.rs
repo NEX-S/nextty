@@ -30,17 +30,6 @@ fn pkg_config(mode: &str) -> String {
     String::from_utf8(output.stdout).expect("pkg-config flags")
 }
 
-fn sources(directory: &Path, result: &mut Vec<std::path::PathBuf>) {
-    for entry in fs::read_dir(directory).expect("read native sources") {
-        let path = entry.expect("native source entry").path();
-        if path.is_dir() {
-            sources(&path, result);
-        } else if path.extension().is_some_and(|ext| ext == "c") {
-            result.push(path);
-        }
-    }
-}
-
 fn main() {
     if env::var_os("CARGO_FEATURE_GUI").is_none() {
         println!("cargo:rerun-if-changed=build.rs");
@@ -58,8 +47,12 @@ fn main() {
             .arg(out.join(format!("terminal_{stage}_spv.h")))
             .arg(format!("native/terminal.{stage}")));
     }
-    let mut files = Vec::new();
-    sources(Path::new("native"), &mut files);
+    let mut files: Vec<_> = ["native", "native/protocols"]
+        .into_iter()
+        .flat_map(|directory| fs::read_dir(directory).expect("read native sources"))
+        .map(|entry| entry.expect("native source entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
+        .collect();
     files.sort_unstable();
     let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
     let debug = env::var("DEBUG").expect("Cargo DEBUG") == "true";

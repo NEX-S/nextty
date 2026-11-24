@@ -5,12 +5,14 @@ struct Snapshot {
     columns: u16,
     lines: u16,
     rows: &'static [Row],
+    /// Combining characters by row and column.
+    extras: &'static [(usize, usize, &'static str)],
 }
 
 struct Row {
     text: &'static str,
+    /// Columns `start..end` with foreground, background and flags; other cells have the defaults.
     styles: &'static [(usize, usize, &'static str, &'static str, &'static str)],
-    extras: &'static [(usize, &'static str)],
 }
 
 fn color(value: Color) -> String {
@@ -59,7 +61,7 @@ fn replay(recording: &[u8], expected: &Snapshot) {
         for chunk in recording.chunks(chunk_size) {
             parser.advance(&mut core, chunk);
         }
-        parser.finish_sync(&mut core);
+        core.finish_sync();
         for (y, expected) in expected.rows.iter().enumerate() {
             let row = core.row(y);
             let text: String = row
@@ -71,27 +73,34 @@ fn replay(recording: &[u8], expected: &Snapshot) {
                 })
                 .collect();
             assert_eq!(text, expected.text, "row {y}, chunk size {chunk_size}");
-            for (start, end, fg, bg, style) in expected.styles {
-                for x in *start..*end {
-                    let cell = &row.cells[x];
-                    assert_eq!(color(cell.fg), *fg, "foreground at {y}:{x}");
-                    assert_eq!(color(cell.bg), *bg, "background at {y}:{x}");
-                    assert_eq!(flags(cell.flags), *style, "style at {y}:{x}");
-                }
-            }
-            for x in 0..row.cells.len() {
-                let actual: String = row
-                    .extra(x)
-                    .map(|extra| extra.zerowidth.iter().collect())
-                    .unwrap_or_default();
-                let expected = expected
-                    .extras
+            for (x, cell) in row.cells.iter().enumerate() {
+                let (fg, bg, style) = expected
+                    .styles
                     .iter()
-                    .find(|(column, _)| *column == x)
-                    .map_or("", |(_, text)| *text);
-                assert_eq!(actual, expected, "combining characters at {y}:{x}");
+                    .find(|(start, end, ..)| (*start..*end).contains(&x))
+                    .map_or(("named:Foreground", "named:Background", ""), |style| {
+                        (style.2, style.3, style.4)
+                    });
+                assert_eq!(color(cell.fg), fg, "foreground at {y}:{x}");
+                assert_eq!(color(cell.bg), bg, "background at {y}:{x}");
+                assert_eq!(flags(cell.flags), style, "style at {y}:{x}");
             }
         }
+        let extras = (0..expected.rows.len()).flat_map(|y| {
+            let row = core.row(y);
+            let extras = row.extras().iter();
+            extras
+                .filter(|(_, extra)| !extra.zerowidth.is_empty())
+                .map(move |(x, extra)| (y, *x, extra.zerowidth.iter().collect::<String>()))
+        });
+        let expected_extras = expected
+            .extras
+            .iter()
+            .map(|(y, x, text)| (*y, *x, text.to_string()));
+        assert!(
+            extras.eq(expected_extras),
+            "combining characters, chunk size {chunk_size}"
+        );
     }
 }
 

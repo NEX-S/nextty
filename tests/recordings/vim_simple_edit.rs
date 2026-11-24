@@ -9,7 +9,6 @@ Snapshot {
                 (4, 18, "rgb:eaeaea", "rgb:000000", ""),
                 (18, 80, "named:Foreground", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "  2                                                                             ",
@@ -17,7 +16,6 @@ Snapshot {
                 (0, 4, "rgb:424242", "rgb:000000", ""),
                 (4, 80, "rgb:eaeaea", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "  3                                                                             ",
@@ -25,7 +23,6 @@ Snapshot {
                 (0, 4, "rgb:424242", "rgb:000000", ""),
                 (4, 80, "rgb:eaeaea", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "  4 Ok.                                                                         ",
@@ -33,140 +30,120 @@ Snapshot {
                 (0, 4, "rgb:424242", "rgb:000000", ""),
                 (4, 80, "rgb:eaeaea", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "~                                                                               ",
             styles: &[
                 (0, 80, "rgb:424242", "rgb:000000", ""),
             ],
-            extras: &[],
         },
         Row {
             text: "                                                              3,0-1         All ",
@@ -177,7 +154,7 @@ Snapshot {
                 (76, 79, "rgb:eaeaea", "rgb:000000", ""),
                 (79, 80, "named:Foreground", "rgb:000000", ""),
             ],
-            extras: &[],
         },
     ],
+    extras: &[],
 }
