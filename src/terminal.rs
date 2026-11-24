@@ -333,6 +333,13 @@ impl Terminal {
                 CoreEvent::HistoryError(error) => self.events.push_back(Event::HistoryError(error)),
             }
         }
+        let now = Instant::now();
+        if self.closing.is_some_and(|deadline| deadline <= now) {
+            self.child.kill()?;
+            self.finish()?;
+            step.done = true;
+            return Ok(step);
+        }
         if !self.read_open && self.read_pos == self.read_len {
             if self.child_exited {
                 self.finish()?;
@@ -342,17 +349,11 @@ impl Terminal {
             }
             return Ok(step);
         }
-        let now = Instant::now();
         if self
             .process_deadline
             .is_some_and(|deadline| deadline <= now)
         {
             self.start_process_sample()?;
-        }
-        if self.closing.is_some_and(|deadline| deadline <= now) {
-            self.child.kill()?;
-            self.finish()?;
-            step.done = true;
         }
         Ok(step)
     }
@@ -411,12 +412,12 @@ impl Terminal {
         // The ioctl cannot block; reading another process's /proc files can.
         let pgid = check(unsafe { libc::tcgetpgrp(master.as_raw_fd()) }).map(|pgid| pgid as u32);
         let current = self.process_metadata.clone();
-        let wake = self.core.history_budget();
+        let wake = self.core.history_waker()?;
         let (sender, receiver) = mpsc::channel();
         crate::sys::task(move || {
             let _ = sender.send(sample_process(pgid, &current));
-            if let Some(wake) = wake {
-                wake.notify();
+            if let Some(wake) = &wake {
+                crate::sys::notify(wake.as_raw_fd());
             }
         })?;
         self.process_results = Some(receiver);

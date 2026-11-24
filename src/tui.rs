@@ -27,14 +27,6 @@ const ENTER: &[u8] =
     b"\x1b[?1049h\x1b[?25l\x1b[?7l\x1b[?2004h\x1b[?1004h\x1b[?1000h\x1b[?1003h\x1b[?1006h\x1b[2J";
 const LEAVE: &[u8] = b"\x1b[?2026l\x18\x1b\\\x1b[0m\x1b[?1006l\x1b[?1003l\x1b[?1000l\x1b[?1004l\x1b[?2004l\x1b[?1l\x1b>\x1b[?7h\x1b[?25h\x1b[?1049l";
 
-fn check(result: i32) -> io::Result<i32> {
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(result)
-    }
-}
-
 struct TerminalGuard {
     input: RawFd,
     output: RawFd,
@@ -46,8 +38,8 @@ struct TerminalGuard {
 impl TerminalGuard {
     fn enter(input: RawFd, output: RawFd) -> io::Result<Self> {
         let mut termios = unsafe { std::mem::zeroed() };
-        check(unsafe { libc::tcgetattr(input, &mut termios) })?;
-        let output_flags = check(unsafe { libc::fcntl(output, libc::F_GETFL) })?;
+        crate::sys::check(unsafe { libc::tcgetattr(input, &mut termios) })?;
+        let output_flags = crate::sys::check(unsafe { libc::fcntl(output, libc::F_GETFL) })?;
         let mut signals = unsafe { std::mem::zeroed() };
         unsafe { libc::sigemptyset(&mut signals) };
         for signal in [
@@ -63,7 +55,7 @@ impl TerminalGuard {
         }
         unsafe { libc::pthread_sigmask(libc::SIG_BLOCK, &signals, std::ptr::null_mut()) };
         let signalfd = libc::SFD_CLOEXEC | libc::SFD_NONBLOCK;
-        let signals = check(unsafe { libc::signalfd(-1, &signals, signalfd) })?;
+        let signals = crate::sys::check(unsafe { libc::signalfd(-1, &signals, signalfd) })?;
         let guard = Self {
             input,
             output,
@@ -73,8 +65,10 @@ impl TerminalGuard {
         };
         let mut raw = termios;
         unsafe { libc::cfmakeraw(&mut raw) };
-        check(unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) })?;
-        check(unsafe { libc::fcntl(output, libc::F_SETFL, output_flags | libc::O_NONBLOCK) })?;
+        crate::sys::check(unsafe { libc::tcsetattr(input, libc::TCSANOW, &raw) })?;
+        crate::sys::check(unsafe {
+            libc::fcntl(output, libc::F_SETFL, output_flags | libc::O_NONBLOCK)
+        })?;
         Ok(guard)
     }
 
@@ -271,7 +265,7 @@ fn braille_trend(
 
 fn terminal_size(fd: RawFd) -> io::Result<WindowSize> {
     let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) })?;
+    crate::sys::check(unsafe { libc::ioctl(fd, libc::TIOCGWINSZ, &mut size) })?;
     if size.ws_col < 2 || size.ws_row < 2 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -710,7 +704,7 @@ impl Frontend {
                 self.ui.search.observe(&mut self.client)?;
                 self.screen_dirty = true;
             }
-            Response::Error(error) | Response::CopyError { error, .. } => self.message(error),
+            Response::Error(error) | Response::CopyError(error) => self.message(error),
             Response::Detached => self.running = false,
             Response::Clipboard {
                 file, incomplete, ..

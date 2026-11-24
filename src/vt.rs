@@ -495,7 +495,7 @@ impl Parser {
             }
             (0, b'H') => core.set_horizontal_tabstop(),
             (0, b'M') => core.reverse_index(),
-            (0, b'Z') => reply(core, "\x1b[?6c"),
+            (0, b'Z') => core.write_reply("\x1b[?6c"),
             (0, b'=' | b'>') => core.set_keypad_application_mode(final_byte == b'='),
             (0, b'c') => {
                 core.reset_state();
@@ -575,14 +575,11 @@ impl Parser {
                 }
             }
             (0, 0, b'm') => self.sgr(core),
-            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => reply(
-                core,
-                match p.prefix {
-                    0 => "\x1b[?6c",
-                    b'>' => "\x1b[>0;1;0c",
-                    _ => "\x1bP!|00000000\x1b\\",
-                },
-            ),
+            (0 | b'>' | b'=', 0, b'c') if p.value(0) == 0 => core.write_reply(match p.prefix {
+                0 => "\x1b[?6c",
+                b'>' => "\x1b[>0;1;0c",
+                _ => "\x1bP!|00000000\x1b\\",
+            }),
             (0, 0, b'n') => core.device_status(usize::from(p.value(0))),
             (0 | b'?', b'$', b'p') => core.report_mode(p.value(0), p.prefix == b'?'),
             (0, b' ', b'q') => core.set_cursor_shape(match p.value(0) {
@@ -596,8 +593,8 @@ impl Parser {
             }
             (0, 0, b's') => core.save_cursor_position(),
             (0, 0, b'u') => core.restore_cursor_position(),
-            (b'?', 0, b'u') => reply(core, "\x1b[?0u"),
-            (b'?', 0, b'm') if p.value(0) == 4 => reply(core, "\x1b[>4;0m"),
+            (b'?', 0, b'u') => core.write_reply("\x1b[?0u"),
+            (b'?', 0, b'm') if p.value(0) == 4 => core.write_reply("\x1b[>4;0m"),
             (0, 0, b't') => match p.value(0) {
                 14 => {
                     let size = core.window_size();
@@ -799,11 +796,6 @@ impl Parser {
 }
 
 // Rare sequences stay out of the shared CSI dispatch path.
-#[inline(never)]
-fn reply(core: &mut Core, text: &str) {
-    core.write_reply(format_args!("{text}"));
-}
-
 #[inline(never)]
 fn repeat(core: &mut Core, c: char, count: usize) {
     core.input_text(&c.to_string().repeat(count));

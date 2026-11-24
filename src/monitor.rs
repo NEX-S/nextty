@@ -5,9 +5,10 @@ use crate::width::{fit_label, scalar_width, text_width};
 use crate::workspace::{PaneId, Snapshot};
 use std::{io, time::Instant};
 
-pub(crate) use crate::panel::BACKGROUND;
-pub(crate) use crate::panel::{ACCENT as GREEN, INK, MUTED};
+use crate::panel::{ACCENT as GREEN, INK};
+pub(crate) use crate::panel::{BACKGROUND, MUTED};
 const PURPLE: u32 = 0xb3a2ca;
+const RANGES: [(u32, &str); 4] = [(60, "60s"), (300, "5m"), (900, "15m"), (3600, "1h")];
 
 pub(crate) fn series_color(name: &str) -> u32 {
     match name {
@@ -45,7 +46,7 @@ pub(crate) struct Text {
     pub text: String,
     pub color: u32,
     emphasis: Emphasis,
-    pub focused: bool,
+    focused: bool,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -243,14 +244,15 @@ impl Monitor {
                 .find(|block| block.has_output || block.status.is_some());
             let command_id = command.map(|block| block.id);
             let elapsed_ms = command.and_then(|block| block.elapsed_ms);
+            let exit = command.and_then(|block| block.status);
             let running = command.is_some_and(|block| !block.complete && block.status.is_none())
                 && pane.shell_prompt.is_none();
-            let state = match command {
-                Some(block) if block.status.is_some_and(|status| status != 0) => "Failed",
-                Some(block) if block.status == Some(0) => "Completed",
-                _ if running => "Running",
-                _ if pane.shell_prompt.is_some() => "Idle",
-                _ => "Unknown",
+            let state = match exit {
+                Some(0) => "Completed",
+                Some(_) => "Failed",
+                None if running => "Running",
+                None if pane.shell_prompt.is_some() => "Idle",
+                None => "Unknown",
             };
             // The elapsed time of a running command counts from when it was last observed.
             let sampled = previous
@@ -276,7 +278,7 @@ impl Monitor {
                     |cwd| cwd.to_string_lossy().into_owned(),
                 ),
                 state,
-                exit: command.and_then(|block| block.status),
+                exit,
                 command_id,
                 elapsed_ms,
                 sampled,
@@ -309,7 +311,7 @@ impl Monitor {
         if self.open {
             if width >= 25 {
                 let mut x = width - 25;
-                for (seconds, label) in [(60, "60s"), (300, "5m"), (900, "15m"), (3600, "1h")] {
+                for (seconds, label) in RANGES {
                     let cells = text_width(label) as u16 + 2;
                     view.button(
                         x,
@@ -423,11 +425,13 @@ impl Monitor {
     /// Scans processes and reads the selected one's details only while the process page is visible.
     fn sync_stats(&mut self) {
         let visible = self.open && self.tab == 6;
-        self.stats.set_processes_enabled(visible);
+        if visible {
+            self.rebuild_processes();
+        }
         let identity = self
             .selected
             .filter(|&id| visible && self.processes().any(|p| (p.pid, p.start) == id));
-        self.stats.set_process_detail(identity);
+        self.stats.set_sampling(visible, identity);
     }
     fn rebuild_processes(&mut self) {
         let revision = self.stats.process_revision;
@@ -471,7 +475,6 @@ impl Monitor {
             order.then_with(|| a.pid.cmp(&b.pid))
         });
         self.process_revision = Some(revision);
-        self.sync_stats();
     }
     fn processes(&self) -> impl Clone + ExactSizeIterator<Item = &Process> {
         self.process_order
@@ -481,13 +484,11 @@ impl Monitor {
     fn controls(&mut self) -> Vec<Action> {
         let mut controls: Vec<_> = (0..8).map(Action::Tab).collect();
         if self.width >= 24 {
-            controls.extend([60, 300, 900, 3600].map(Action::Range));
+            controls.extend(RANGES.map(|(seconds, _)| Action::Range(seconds)));
         }
         if self.tab == 6 {
             controls.push(Action::Search);
-            let body_width = self
-                .width
-                .saturating_sub(if self.width >= 80 { 15 } else { 11 });
+            let (_, body_width) = body_span(self.width);
             if body_width >= 26 {
                 controls.extend(
                     (0..process_columns(body_width, self.sort).len() as u8 - 2).map(Action::Sort),
@@ -653,7 +654,7 @@ impl Monitor {
         height: u16,
         mut series: Vec<ResourceTrend>,
     ) {
-        if width < 10 || series.is_empty() {
+        if width < 10 {
             return;
         }
         let first = &series[0];
@@ -806,9 +807,7 @@ impl Monitor {
         if self.tab == 6 {
             self.rebuild_processes();
         }
-        let side = if width >= 80 { 13 } else { 9 };
-        let x = side + 1;
-        let w = width.saturating_sub(x + 1);
+        let (x, w) = body_span(width);
         view.body_x = x;
         let labels = [
             ("Overview", "System"),
@@ -830,7 +829,7 @@ impl Monitor {
                 view.button(
                     1,
                     i32::from(y),
-                    side - 1,
+                    x - 2,
                     label,
                     Action::Tab(i as u8),
                     self.tab == i as u8,
@@ -1296,6 +1295,12 @@ impl Monitor {
     }
 }
 
+/// Column and width of the page body, right of the tab labels.
+fn body_span(width: u16) -> (u16, u16) {
+    let x = if width >= 80 { 14 } else { 10 };
+    (x, width.saturating_sub(x + 1))
+}
+
 /// Visible columns as (label, cells) in the order PID, COMMAND, CPU%, RSS, I/O; the last two are optional.
 fn process_columns(width: u16, sort: u8) -> Vec<(&'static str, u16)> {
     let inner = width.saturating_sub(2);
@@ -1369,15 +1374,6 @@ mod tests {
         monitor.key(u32::from('t'), "t", false);
         assert!(monitor.query.text.is_empty());
         monitor.toggle();
-        monitor.action(Action::Tab(3));
-        let view = monitor.view(80, 18);
-        assert!(
-            !view
-                .hits
-                .iter()
-                .any(|hit| matches!(hit.action, Action::Range(_)))
-        );
-        monitor.action(Action::Tab(0));
         let view = monitor.footer(80, true, false);
         assert!(
             view.hits
@@ -1393,6 +1389,19 @@ mod tests {
         monitor.key(u32::from('j'), "j", false);
         assert_eq!(monitor.focus, Action::Tab(1));
         assert_eq!(monitor.tab, 0);
+        let view = monitor.view(80, 18);
+        let hit = view
+            .hits
+            .iter()
+            .find(|hit| hit.action == Action::Tab(1))
+            .unwrap();
+        let text = view
+            .texts
+            .iter()
+            .find(|text| text.x == hit.x && text.y == hit.y)
+            .unwrap();
+        assert!(text.emphasis(true) == Emphasis::Highlighted);
+        assert!(text.emphasis(false) == Emphasis::None);
         monitor.key(u32::from('l'), "l", false);
         assert_eq!(monitor.tab, 1);
         monitor.key(u32::from('h'), "h", false);
@@ -1420,7 +1429,6 @@ mod tests {
         monitor.key(keysym::RETURN, "", false);
         assert!(!monitor.descending);
         let view = monitor.view(60, 12);
-        assert!(view.texts.iter().any(|text| text.focused));
         assert!(view.texts.iter().any(|text| text.text == " Procs "));
         assert!(!view.hits.iter().any(|hit| hit.action == Action::Sort(2)));
     }
@@ -1509,5 +1517,87 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn process(pid: u32, name: &str) -> Process {
+        Process {
+            pid,
+            start: 0,
+            name: name.into(),
+            uid: 1000,
+            state: 'S',
+            cpu: Some(0.),
+            rss: u64::from(pid),
+            read: None,
+            write: None,
+            threads: 1,
+            parent: 1,
+            command: String::new(),
+            directory: None,
+        }
+    }
+
+    fn pids(view: &View) -> Vec<u32> {
+        view.hits
+            .iter()
+            .filter_map(|hit| match hit.action {
+                Action::Process(pid) => Some(pid),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn process_view_keeps_the_selection_across_resorts_and_filters_unicode() {
+        let mut monitor = Monitor::new().unwrap();
+        monitor.stats.sample.processes = vec![
+            process(1, "init"),
+            process(2, "ΟΣ"),
+            process(3, "K-worker"),
+            process(4, "İdaemon"),
+        ];
+        monitor.toggle();
+        monitor.action(Action::Tab(6));
+        monitor.action(Action::Search);
+        for (query, pid) in [("1000", 1), ("ος", 2), ("k", 3), ("İ", 4), ("3", 3)] {
+            monitor.key(u32::from('u'), "", true);
+            monitor.insert_query(query);
+            assert!(pids(&monitor.view(80, 20)).contains(&pid), "{query}");
+        }
+        monitor.key(u32::from('u'), "", true);
+        monitor.action(Action::Sort(1));
+        assert_eq!(pids(&monitor.view(80, 20)), [4, 3, 2, 1]);
+        monitor.action(Action::Process(2));
+        // A new sample reorders the rows and replaces process 2 by a new process with the same pid.
+        let mut processes = std::mem::take(&mut monitor.stats.sample.processes);
+        processes[0].rss = 40;
+        processes[1].start = 1;
+        monitor.stats.sample.processes = processes;
+        monitor.stats.process_revision += 1;
+        let view = monitor.view(80, 20);
+        assert_eq!(pids(&view), [1, 4, 3, 2]);
+        assert!(
+            !view
+                .texts
+                .iter()
+                .any(|text| text.emphasis(false) == Emphasis::Selected)
+        );
+    }
+
+    #[test]
+    fn returning_to_the_processes_page_after_samples_without_processes_keeps_working() {
+        let mut monitor = Monitor::new().unwrap();
+        monitor.toggle();
+        monitor.action(Action::Tab(6));
+        monitor.stats.sample.processes = vec![process(1, "init"), process(2, "sh")];
+        monitor.stats.process_revision += 1;
+        monitor.action(Action::Process(1));
+        monitor.view(80, 20);
+        monitor.action(Action::Tab(1));
+        // Samples taken while the page is hidden carry no processes.
+        monitor.stats.sample.processes = Vec::new();
+        monitor.stats.process_revision += 1;
+        monitor.action(Action::Tab(6));
+        monitor.view(80, 20);
     }
 }

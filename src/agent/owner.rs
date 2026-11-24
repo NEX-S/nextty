@@ -11,6 +11,7 @@ use std::ffi::OsString;
 use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::process::Command;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,6 +78,7 @@ struct Session {
     model: Agent,
     published: Vec<usize>,
     published_revision: Option<u64>,
+    published_changes: Arc<Vec<crate::agent_files::AgentChange>>,
     dirty: bool,
     pending_send: Option<AgentSend>,
     sent_context: BTreeMap<u64, Vec<ContextItem>>,
@@ -90,7 +92,6 @@ impl Session {
             text: error.to_string(),
             id: None,
         });
-        self.model.revision += 1;
     }
 
     /// Hands text the frontends no longer show back to them: a rewound turn or an unsent message.
@@ -117,7 +118,6 @@ impl Session {
     ) -> io::Result<()> {
         self.dirty = true;
         if let Some(pending) = self.pending_send.take() {
-            self.model.revision += 1;
             self.recover(client, false, pending.input, pending.basket)?;
         }
         match request {
@@ -211,7 +211,8 @@ impl Session {
                     text: message.text[if index == 0 { prefix_bytes } else { 0 }..].to_owned(),
                 })
                 .collect(),
-            changes: reset.then(|| self.model.changes.clone()),
+            changes: (!Arc::ptr_eq(&self.published_changes, &self.model.changes))
+                .then(|| self.model.changes.clone()),
             changes_omitted: self.model.changes_omitted,
         };
         self.published
@@ -223,6 +224,7 @@ impl Session {
             *length = message.text.len();
         }
         self.published_revision = Some(self.model.revision);
+        self.published_changes.clone_from(&self.model.changes);
         self.dirty = false;
         patch
     }
@@ -305,20 +307,18 @@ pub fn run() -> io::Result<()> {
         }
         while let Some(event) = client.next_agent_event() {
             match event {
+                // Only complete snapshots arrive: the daemon keeps draft edits between frontends.
                 AgentEvent::Draft(drafts) => {
-                    let ids: Vec<u64> = drafts.sessions.iter().map(|session| session.id).collect();
-                    if drafts.complete {
-                        for mut session in
-                            sessions.extract_if(.., |session| !ids.contains(&session.id))
-                        {
-                            session.model.close(&mut client)?;
-                            client.send(Action::AgentRemove(session.id))?;
-                        }
+                    for mut session in sessions.extract_if(.., |session| {
+                        !drafts.sessions.iter().any(|draft| draft.id == session.id)
+                    }) {
+                        session.model.close(&mut client)?;
+                        client.send(Action::AgentRemove(session.id))?;
                     }
-                    for id in ids {
-                        if !sessions.iter().any(|session| session.id == id) {
+                    for draft in drafts.sessions {
+                        if !sessions.iter().any(|session| session.id == draft.id) {
                             sessions.push(Session {
-                                id,
+                                id: draft.id,
                                 ..Session::default()
                             });
                         }
@@ -416,7 +416,7 @@ mod tests {
         let patch = session.patch();
         assert_eq!(patch.start, 0);
         assert_eq!(patch.prefix_bytes, 0);
-        assert!(patch.changes.is_some());
+        assert!(patch.changes.is_none());
         mirror.restore_patch(&patch).unwrap();
         assert_eq!(mirror.messages, session.model.messages);
     }

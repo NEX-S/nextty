@@ -17,7 +17,7 @@ use crate::search::{Matcher, SearchResult};
 use crate::sys::notify;
 use crate::vt::{Color, NamedColor, Rgb};
 
-pub const HOT_ROWS: usize = 512;
+pub(crate) const HOT_ROWS: usize = 512;
 pub(crate) const BATCH: usize = 32;
 const SEGMENT_BYTES: u64 = 64 * 1024;
 const MAX_PENDING_APPENDS: usize = 8;
@@ -43,6 +43,11 @@ impl HistoryBudget {
     /// Wakes the reactor that owns this workspace's panes.
     pub(crate) fn notify(&self) {
         notify(self.notification.as_raw_fd());
+    }
+    /// A wakeup fd for a thread that may outlive the pane, without keeping the budget alive.
+    pub(crate) fn waker(&self) -> io::Result<OwnedFd> {
+        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.notification.as_raw_fd()) }
+            .try_clone_to_owned()
     }
 }
 impl Drop for HistoryBudget {
@@ -302,6 +307,20 @@ fn writer() -> &'static mpsc::Sender<Job> {
             .expect("cannot start history writer");
         sender
     })
+}
+
+/// Returns once the writer has run every job sent so far: dropped panes have then released
+/// their budgets, which removes their files. The daemon calls it before exiting.
+pub(crate) fn flush() {
+    if let Some(sender) = WRITER.get() {
+        let (done, finished) = mpsc::channel();
+        sender
+            .send(Box::new(move |_| {
+                let _ = done.send(());
+            }))
+            .expect("history writer stopped");
+        let _ = finished.recv();
+    }
 }
 
 /// A pane's handle on the writer thread. Nothing here blocks.
@@ -741,7 +760,7 @@ fn expand_selection(
     Ok(())
 }
 
-pub(crate) const READ_LIMIT: usize = 16 * 1024;
+const READ_LIMIT: usize = 16 * 1024;
 struct ReadLine {
     cursor: HistoryCursor,
     length: usize,

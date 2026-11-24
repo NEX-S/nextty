@@ -5,7 +5,7 @@ pub use crate::core::{BlockMarker, CommandBlock};
 use crate::core::{Core, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryCopy};
 pub use crate::history::{HistoryCursor, HistoryPage};
-use crate::screen::{Screen, Update};
+use crate::screen::{FrameState, Screen, Update};
 use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
 use crate::wire::Peer;
 pub use crate::wire::Response;
@@ -273,7 +273,7 @@ pub enum Action {
     },
     CopySelection {
         pane: PaneId,
-        request: u64,
+        primary: bool,
     },
     PromptJump {
         pane: PaneId,
@@ -282,7 +282,6 @@ pub enum Action {
     CopyBlock {
         pane: PaneId,
         block: u64,
-        request: u64,
     },
     ReadHistory {
         pane: PaneId,
@@ -1284,10 +1283,10 @@ struct Connection {
     /// A frontend showing the Agent panel.
     agent_open: bool,
     size: WindowSize,
-    frames: HashMap<PaneId, (WindowSize, u64, u64, Vec<u64>)>,
+    frames: HashMap<PaneId, FrameState>,
     last_snapshot: Option<Snapshot>,
     failed: bool,
-    copies: Vec<(u64, mpsc::Receiver<io::Result<HistoryCopy>>)>,
+    copies: Vec<(bool, mpsc::Receiver<io::Result<HistoryCopy>>)>,
     /// An action held back by PTY input backpressure.
     deferred: Option<Action>,
     /// Told `Detached`; waiting for the peer to close.
@@ -1406,12 +1405,15 @@ pub fn run_server(socket: &Path) -> io::Result<()> {
     listener.set_nonblocking(true)?;
     fs::create_dir_all(&history_directory)?;
     fs::set_permissions(&history_directory, fs::Permissions::from_mode(0o700))?;
-    server_loop(listener, &history_directory).and(fs::remove_file(socket))
+    let result = server_loop(listener, &history_directory);
+    // Terminated panes drop their archives on the writer thread; let that finish before exit.
+    crate::history::flush();
+    result.and(fs::remove_file(socket))
 }
 
 /// Finishes the terminals that have exited since they were told to close.
 fn reap(closing: &mut Vec<Terminal>) {
-    closing.retain_mut(|terminal| match terminal.step(libc::POLLIN, libc::POLLIN) {
+    closing.retain_mut(|terminal| match terminal.step(0, 0) {
         Ok(step) => !step.done,
         Err(error) => {
             eprintln!("terminal close: {error}");
@@ -1491,17 +1493,8 @@ fn expire_agent(workspace: &mut Workspace, clients: &mut [Connection]) {
 
 const AGENT_START_TIMEOUT: Duration = Duration::from_secs(10);
 
-fn timeout_until(timeout: i32, deadline: Instant) -> i32 {
-    let remaining = crate::sys::timeout_millis(deadline.saturating_duration_since(Instant::now()));
-    if timeout < 0 {
-        remaining
-    } else {
-        timeout.min(remaining)
-    }
-}
-
 fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<()> {
-    let mut closing = Vec::new();
+    let mut closing: Vec<Terminal> = Vec::new();
     let mut workspaces: HashMap<String, Workspace> = HashMap::new();
     let mut clients: Vec<Connection> = Vec::new();
     let mut next_client = 1u64;
@@ -1555,7 +1548,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
         for workspace in workspaces.values() {
             fds.push(crate::sys::watch(workspace.budget.fd(), libc::POLLIN));
             if let Some((_, started)) = &workspace.agent.starting {
-                timeout = timeout_until(timeout, *started + AGENT_START_TIMEOUT);
+                timeout = crate::sys::timeout_until(timeout, *started + AGENT_START_TIMEOUT);
             }
             for pane in workspace.panes.values() {
                 let terminal = &pane.terminal;
@@ -1564,8 +1557,13 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
                 fds.push(crate::sys::watch(terminal.pty_fd(), events));
                 fds.push(crate::sys::watch(terminal.pidfd(), libc::POLLIN));
                 if let Some(deadline) = terminal.deadline() {
-                    timeout = timeout_until(timeout, deadline);
+                    timeout = crate::sys::timeout_until(timeout, deadline);
                 }
+            }
+        }
+        for terminal in &closing {
+            if let Some(deadline) = terminal.deadline() {
+                timeout = crate::sys::timeout_until(timeout, deadline);
             }
         }
         crate::sys::poll(&mut fds, timeout)?;
@@ -1835,18 +1833,15 @@ fn complete_requests(
                 });
             }
         }
-        for (request, receiver) in std::mem::take(&mut client.copies) {
+        for (primary, receiver) in std::mem::take(&mut client.copies) {
             match worker_result(&receiver, "history copy worker disconnected") {
-                None => client.copies.push((request, receiver)),
+                None => client.copies.push((primary, receiver)),
                 Some(Ok(copy)) => client.respond(Response::Clipboard {
-                    request,
+                    primary,
                     file: copy.file,
                     incomplete: copy.incomplete,
                 }),
-                Some(Err(error)) => client.respond(Response::CopyError {
-                    request,
-                    error: error.to_string(),
-                }),
+                Some(Err(error)) => client.respond(Response::CopyError(error.to_string())),
             }
         }
         for read in std::mem::take(&mut client.reads) {
@@ -2058,21 +2053,10 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection], changed: boo
             let update = if client.agent && core.display_offset() != 0 {
                 Update::capture_live(core)
             } else {
-                let known = client.frames.get(&pane.id);
-                let known = known
-                    .map(|(size, full, palette, rows)| (*size, *full, *palette, rows.as_slice()));
-                Update::capture_since(core, known)
+                Update::capture_since(core, client.frames.get(&pane.id))
             };
             updates.push((pane.id, update));
-            client.frames.insert(
-                pane.id,
-                (
-                    core.window_size(),
-                    core.full_revision(),
-                    core.palette_revision(),
-                    core.row_versions(),
-                ),
-            );
+            client.frames.insert(pane.id, FrameState::new(core));
         }
         let send = client.last_snapshot.as_ref() != Some(&*snapshot);
         if send {
@@ -2425,8 +2409,7 @@ fn apply_action(
         }
         (
             Some(workspace),
-            action @ (Action::CopySelection { pane, request }
-            | Action::CopyBlock { pane, request, .. }),
+            action @ (Action::CopySelection { pane, .. } | Action::CopyBlock { pane, .. }),
         ) => match pane_ref(workspace, pane) {
             Ok(pane) => {
                 let core = &mut pane.terminal.core;
@@ -2434,12 +2417,10 @@ fn apply_action(
                     Action::CopyBlock { block, .. } => core.copy_block(block),
                     _ => core.copy_selection(),
                 };
-                clients[index].copies.push((request, receiver));
+                let primary = matches!(action, Action::CopySelection { primary: true, .. });
+                clients[index].copies.push((primary, receiver));
             }
-            Err(error) => clients[index].respond(Response::CopyError {
-                request,
-                error: error.into(),
-            }),
+            Err(error) => clients[index].respond(Response::CopyError(error.into())),
         },
         (
             Some(workspace),
@@ -2563,10 +2544,11 @@ fn apply_action(
                     }
                 }
             }
+            // The owner only tracks the session list, which complete snapshots carry.
             for client in clients.iter_mut().filter(|client| {
                 client.id != client_id
-                    && (client.agent || client.agent_open)
                     && client.viewing(&workspace.name)
+                    && (client.agent_open || client.agent && payload.complete)
             }) {
                 client.respond(Response::Agent(AgentEvent::Draft(payload.clone())));
             }

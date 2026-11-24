@@ -72,7 +72,10 @@ pub(crate) fn copy_action(client: &Client, pane: PaneId) -> Option<Action> {
         .get(&pane)
         .is_some_and(|screen| screen.selection_range().is_some())
     {
-        return Some(Action::CopySelection { pane, request: 0 });
+        return Some(Action::CopySelection {
+            pane,
+            primary: false,
+        });
     }
     client
         .snapshot()?
@@ -83,7 +86,6 @@ pub(crate) fn copy_action(client: &Client, pane: PaneId) -> Option<Action> {
         .map(|block| Action::CopyBlock {
             pane,
             block: block.id,
-            request: 0,
         })
 }
 

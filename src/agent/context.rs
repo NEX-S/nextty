@@ -46,7 +46,7 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
         let mut row_ranges = Vec::new();
         for (index, row) in screen.rows.iter().enumerate() {
             let start = text.len();
-            text.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
+            text.extend(row.text(0, row.used(), false));
             row_ranges.push(start..text.len());
             if row.wrapped {
                 wrapped_rows.push(index);
@@ -70,7 +70,7 @@ pub(crate) fn shape(screen: &Screen, query: Option<&str>) -> Value {
                 wrapped_rows.push(index);
             }
             rendered.clear();
-            rendered.extend(row.characters(0..row.used()).map(|(_, ch)| ch));
+            rendered.extend(row.text(0, row.used(), false));
             let text = rendered.trim_end_matches(' ');
             let reason = if cursor_visible && cursor_row == index as i64 {
                 None

@@ -64,6 +64,16 @@ pub fn timeout_millis(duration: Duration) -> i32 {
         .min(i32::MAX as u128) as i32
 }
 
+/// The sooner of a poll timeout (`-1` waits forever) and `deadline`.
+pub fn timeout_until(timeout: i32, deadline: Instant) -> i32 {
+    let remaining = timeout_millis(deadline.saturating_duration_since(Instant::now()));
+    if timeout < 0 {
+        remaining
+    } else {
+        timeout.min(remaining)
+    }
+}
+
 pub fn poll(fds: &mut [libc::pollfd], mut timeout: i32) -> io::Result<()> {
     let deadline = (timeout > 0).then(|| Instant::now() + Duration::from_millis(timeout as u64));
     loop {

@@ -73,6 +73,8 @@ pub struct LineCache {
 
 pub struct Frame {
     rows: Vec<Row>,
+    /// Lines that scrolled through since the previous frame; the cache shifts with them.
+    scroll: usize,
     pub background: u32,
     cursor: Option<(usize, usize, CursorShape, usize)>,
     cursor_color: u32,
@@ -86,6 +88,7 @@ impl Frame {
         let row_count = term.screen_lines();
         let columns = term.columns();
         let selection = term.selection_range();
+        let scroll = std::mem::take(&mut term.scrolled).min(row_count);
         let full = cache.rows.len() != row_count || cache.columns != columns;
         if full {
             term.dirty.fill(true);
@@ -110,8 +113,11 @@ impl Frame {
             .map(|(column, row, _, _)| (row, column));
         // The filled cursor changes cached text colors; focus and overlays can change
         // its visibility without any PTY damage.
-        if !full && cache.block_cursor != block_cursor {
-            for (row, _) in cache.block_cursor.into_iter().chain(block_cursor) {
+        let previous = cache
+            .block_cursor
+            .map(|(row, column)| (row.saturating_sub(scroll), column));
+        if !full && previous != block_cursor {
+            for (row, _) in previous.into_iter().chain(block_cursor) {
                 if let Some(dirty) = term.dirty.get_mut(row) {
                     *dirty = true;
                 }
@@ -254,6 +260,7 @@ impl Frame {
         term.reset_damage();
         Self {
             rows,
+            scroll,
             background,
             cursor,
             cursor_color,
@@ -273,6 +280,8 @@ impl Frame {
         size: (f32, f32),
     ) {
         cache.rows.truncate(self.row_count);
+        let scroll = self.scroll.min(cache.rows.len());
+        cache.rows.rotate_left(scroll);
         let mut native_runs = smallvec::SmallVec::<[Run; 4]>::new();
         for row in self.rows {
             if let Some(cached) = cache.rows.get_mut(row.index)
@@ -285,9 +294,8 @@ impl Frame {
             native_runs.extend(text_runs(&row.runs));
             let line = (!row.text.is_empty())
                 .then(|| renderer.shape(&row.text, &native_runs, &row.columns));
-            let index = row.index;
             let cached = CachedRow { row, line };
-            if let Some(slot) = cache.rows.get_mut(index) {
+            if let Some(slot) = cache.rows.get_mut(cached.row.index) {
                 *slot = cached;
             } else {
                 cache.rows.push(cached);

@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 const MAX_PENDING: usize = MAX_FRAME + 1024 * 1024;
 const COPY_CHUNK: usize = 65536;
-pub(crate) const VERSION: u8 = 25;
+pub(crate) const VERSION: u8 = 26;
 /// The remote bridge's first bytes: a frame whose payload is `VERSION`, independent of `Response`.
 pub(crate) const HELLO: [u8; 5] = [1, 0, 0, 0, VERSION];
 
@@ -34,10 +34,7 @@ pub enum Response<S = Option<Snapshot>, U = Vec<(u64, Update)>> {
         request: u64,
         result: Result<u64, String>,
     },
-    CopyError {
-        request: u64,
-        error: String,
-    },
+    CopyError(String),
     History {
         request: u64,
         result: Result<HistoryPage, String>,
@@ -58,7 +55,7 @@ pub enum Response<S = Option<Snapshot>, U = Vec<(u64, Update)>> {
     },
     Detached,
     ClipboardBegin {
-        request: u64,
+        primary: bool,
         incomplete: bool,
     },
     ClipboardChunk(#[serde(with = "bytes")] Vec<u8>),
@@ -67,7 +64,7 @@ pub enum Response<S = Option<Snapshot>, U = Vec<(u64, Update)>> {
     /// Last, because serde numbers the variants after a skipped one differently when decoding.
     #[serde(skip)]
     Clipboard {
-        request: u64,
+        primary: bool,
         file: File,
         incomplete: bool,
     },
@@ -144,7 +141,7 @@ pub(crate) struct Peer {
     read_error: Option<io::Error>,
 }
 struct IncomingCopy {
-    request: u64,
+    primary: bool,
     incomplete: bool,
     file: File,
 }
@@ -218,13 +215,13 @@ impl Peer {
     }
     pub fn send_response(&mut self, response: Response) -> io::Result<()> {
         if let Response::Clipboard {
-            request,
+            primary,
             file,
             incomplete,
         } = response
         {
             let begin: Response = Response::ClipboardBegin {
-                request,
+                primary,
                 incomplete,
             };
             self.queue(encode(&begin)?, false)?;
@@ -420,14 +417,14 @@ impl Peer {
             self.consumed += packet.len() + 4;
             let response = match response {
                 Response::ClipboardBegin {
-                    request,
+                    primary,
                     incomplete,
                 } => {
                     if self.copy.is_some() {
                         return Err(invalid("clipboard transfer is already active"));
                     }
                     self.copy = Some(IncomingCopy {
-                        request,
+                        primary,
                         incomplete,
                         file: clipboard_file()?,
                     });
@@ -448,7 +445,7 @@ impl Peer {
                         .ok_or_else(|| invalid("clipboard end has no start"))?;
                     copy.file.rewind()?;
                     Some(Response::Clipboard {
-                        request: copy.request,
+                        primary: copy.primary,
                         file: copy.file,
                         incomplete: copy.incomplete,
                     })
@@ -537,6 +534,7 @@ struct WireRow {
 #[derive(Serialize, Deserialize)]
 struct WireUpdate {
     size: (u16, u16),
+    scroll: u16,
     cursor: (Point, CursorShape),
     mode: u32,
     offset: u64,
@@ -551,6 +549,7 @@ impl Serialize for Update {
     fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
         WireUpdate {
             size: (self.columns as u16, self.lines as u16),
+            scroll: self.scroll,
             cursor: self.cursor,
             mode: self.mode.bits(),
             offset: self.offset as u64,
@@ -638,6 +637,7 @@ impl<'de> Deserialize<'de> for Update {
         Ok(Update {
             columns,
             lines: usize::from(wire.size.1),
+            scroll: wire.scroll,
             rows,
             cursor: wire.cursor,
             mode: Mode::from_bits(wire.mode),
@@ -908,7 +908,7 @@ mod tests {
         let (mut sender, mut receiver) = pair();
         sender
             .send_response(Response::Clipboard {
-                request: 1,
+                primary: false,
                 file: file(48),
                 incomplete: false,
             })
@@ -926,7 +926,7 @@ mod tests {
             [
                 Response::State(..),
                 Response::Clipboard {
-                    request: 1,
+                    primary: false,
                     incomplete: false,
                     ..
                 },
@@ -938,13 +938,13 @@ mod tests {
         let (mut sender, mut receiver) = pair();
         sender
             .send_response(Response::Clipboard {
-                request: 2,
+                primary: true,
                 file: file(600),
                 incomplete: true,
             })
             .unwrap();
         let Some(Response::Clipboard {
-            request: 2,
+            primary: true,
             file: mut copy,
             incomplete: true,
         }) = drain(&mut sender, &mut receiver, 1).pop()
@@ -963,7 +963,7 @@ mod tests {
         let (mut sender, mut receiver) = pair();
         let frames: [Response; 2] = [
             Response::ClipboardBegin {
-                request: 3,
+                primary: false,
                 incomplete: false,
             },
             Response::ClipboardChunk(b"partial".to_vec()),

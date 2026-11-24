@@ -82,7 +82,7 @@ pub(crate) fn list(
             search.y,
             search.cols,
             &["⌕ ", before, preedit, "▏", after].concat(),
-            0xb5d2a2,
+            crate::panel::ACCENT,
             config.background,
         );
     }
@@ -172,10 +172,8 @@ pub(crate) fn list(
 pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
     let background = mix_color(config.foreground, config.background, 9);
     let muted = mix_color(config.foreground, config.background, 176);
-    let title = files
-        .selected()
-        .map(|entry| entry.display_name())
-        .unwrap_or_default();
+    // The popup only opens for a selected file, and every rescan returns the focus to the list.
+    let title = files.selected().unwrap().display_name();
     let mut grid = Grid::popup(rect, config.foreground, config.background, &title);
     let body = crate::panel::popup_body(rect);
     let columns = body.cols;
@@ -187,10 +185,6 @@ pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
             error.as_str(),
             crate::panel::diff_colors(config.foreground).1,
         ))
-    } else if files.selected().is_none() {
-        Some(("Select a file", muted))
-    } else if files.selected().is_some_and(|entry| entry.is_dir) {
-        Some(("Directory", muted))
     } else if files.preview.lines.is_empty() {
         Some(("Empty file", muted))
     } else {

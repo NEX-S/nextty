@@ -22,7 +22,7 @@ const NAMES: [&str; 7] = ["CPU", "MEMORY", "READ", "WRITE", "SWAP", "IN", "OUT"]
 type Identity = (u32, u64);
 
 pub struct SystemStats {
-    worker: crate::worker::Worker<Request, Output>,
+    worker: crate::worker::Worker<Request, (Sample, TrendPoint)>,
     pub(crate) sample: Sample,
     history: VecDeque<TrendPoint>,
     pub(crate) process_revision: u64,
@@ -92,31 +92,18 @@ pub struct Process {
     pub directory: Option<PathBuf>,
 }
 
-struct ProcessDetails {
-    identity: Identity,
-    command: String,
-    directory: Option<PathBuf>,
-}
-
 struct TrendPoint {
     at: Instant,
     values: [Option<f32>; 7],
     networks: Vec<(Arc<str>, [Option<f32>; 2])>,
 }
 
-enum Request {
-    Sample {
-        directory: Option<PathBuf>,
-        expanded: bool,
-        processes: bool,
-        detail: Option<Identity>,
-    },
-    Detail(Identity),
-}
-
-enum Output {
-    Sample(Box<Sample>, TrendPoint),
-    Detail(ProcessDetails),
+struct Request {
+    directory: Option<PathBuf>,
+    expanded: bool,
+    processes: bool,
+    /// The process whose command line and directory are read with each sample.
+    detail: Option<Identity>,
 }
 
 #[derive(Default)]
@@ -213,26 +200,11 @@ impl SystemStats {
     pub fn new() -> io::Result<Self> {
         let notification = Arc::new(crate::sys::new()?);
         let mut sampler = Sampler::default();
-        let worker =
-            crate::worker::Worker::new("nextty-stats", notification, move |request, publish| {
-                match request {
-                    Request::Sample {
-                        directory,
-                        expanded,
-                        processes,
-                        detail,
-                    } => {
-                        let (sample, point) =
-                            sampler.sample(directory, expanded, processes, detail);
-                        publish(Output::Sample(Box::new(sample), point));
-                    }
-                    Request::Detail(identity) => {
-                        if let Some(detail) = process_details(identity) {
-                            publish(Output::Detail(detail));
-                        }
-                    }
-                }
-            })?;
+        let worker = crate::worker::Worker::new(
+            "nextty-stats",
+            notification,
+            move |request: Request, publish| publish(sampler.sample(request)),
+        )?;
         Ok(Self {
             worker,
             sample: Sample::default(),
@@ -254,19 +226,11 @@ impl SystemStats {
         self.next_sample
     }
 
-    pub fn set_processes_enabled(&mut self, enabled: bool) {
-        if self.processes_enabled != enabled {
-            self.processes_enabled = enabled;
+    /// Whether processes are scanned and which one's details are read; a change samples at once.
+    pub fn set_sampling(&mut self, processes: bool, detail: Option<Identity>) {
+        if (self.processes_enabled, self.process_detail) != (processes, detail) {
+            (self.processes_enabled, self.process_detail) = (processes, detail);
             self.next_sample = Some(Instant::now());
-        }
-    }
-
-    pub(crate) fn set_process_detail(&mut self, identity: Option<Identity>) {
-        if self.process_detail != identity {
-            self.process_detail = identity;
-            if let Some(identity) = identity {
-                self.worker.submit(Request::Detail(identity));
-            }
         }
     }
 
@@ -276,27 +240,12 @@ impl SystemStats {
         crate::sys::consume_notification(self.fd())?;
         let mut changed = false;
         let mut summary_stale = false;
-        match self.worker.take() {
-            Some(Output::Sample(sample, point)) => {
-                changed = expanded || sample.branch != self.sample.branch;
-                summary_stale = true;
-                record_history(&mut self.history, point);
-                self.sample = *sample;
-                self.process_revision += 1;
-            }
-            Some(Output::Detail(detail)) => {
-                changed = expanded;
-                if let Ok(index) = self
-                    .sample
-                    .processes
-                    .binary_search_by_key(&detail.identity, |p| (p.pid, p.start))
-                {
-                    let process = &mut self.sample.processes[index];
-                    process.command = detail.command;
-                    process.directory = detail.directory;
-                }
-            }
-            None => {}
+        if let Some((sample, point)) = self.worker.take() {
+            changed = expanded || sample.branch != self.sample.branch;
+            summary_stale = true;
+            record_history(&mut self.history, point);
+            self.sample = sample;
+            self.process_revision += 1;
         }
         if self.directory.as_deref() != directory {
             self.directory = directory.map(Path::to_path_buf);
@@ -307,7 +256,7 @@ impl SystemStats {
         let now = Instant::now();
         if self.next_sample.is_none_or(|deadline| now >= deadline) {
             self.next_sample = Some(now + SAMPLE_INTERVAL);
-            self.worker.submit(Request::Sample {
+            self.worker.submit(Request {
                 directory: self.directory.clone(),
                 expanded,
                 processes: self.processes_enabled,
@@ -385,10 +334,11 @@ impl SystemStats {
                 },
             })
             .collect();
-        for (age, point) in self.recent(seconds) {
-            for (index, trend) in indices.clone().zip(&mut result) {
-                trend.points.push((age, point.values[index]));
-            }
+        for (index, trend) in indices.zip(&mut result) {
+            trend.points.extend(
+                self.recent(seconds)
+                    .map(|(age, point)| (age, point.values[index])),
+            );
         }
         result
     }
@@ -476,13 +426,13 @@ impl SystemStats {
 }
 
 impl Sampler {
-    fn sample(
-        &mut self,
-        directory: Option<PathBuf>,
-        expanded: bool,
-        processes: bool,
-        detail: Option<Identity>,
-    ) -> (Sample, TrendPoint) {
+    fn sample(&mut self, request: Request) -> (Sample, TrendPoint) {
+        let Request {
+            directory,
+            expanded,
+            processes,
+            detail,
+        } = request;
         let now = Instant::now();
         let elapsed = self
             .previous_at
@@ -528,11 +478,11 @@ impl Sampler {
         if let Some(text) = read("/proc/meminfo") {
             sample_memory(&text, &mut sample);
         }
-        let swap = expanded
-            .then(|| {
-                read("/proc/vmstat").and_then(|text| counter_pair(&text, ["pswpin", "pswpout"]))
-            })
-            .flatten();
+        let swap = if expanded {
+            read("/proc/vmstat").and_then(|text| counter_pair(&text, ["pswpin", "pswpout"]))
+        } else {
+            None
+        };
         let mut swap_rates = [None; 2];
         if let Some((old, new)) = self.previous_swap.zip(swap) {
             swap_rates = [0, 1]
@@ -622,7 +572,7 @@ impl Sampler {
             if entry.file_name().to_string_lossy().parse::<u32>().is_err() {
                 continue;
             }
-            let Some((mut process, counters)) = read_process(&entry) else {
+            let Some((mut process, counters)) = read_process(&entry, detail) else {
                 continue;
             };
             let identity = (process.pid, process.start);
@@ -633,12 +583,6 @@ impl Sampler {
                     process.read = per_second(new[0], old[0], elapsed);
                     process.write = per_second(new[1], old[1], elapsed);
                 }
-            }
-            if detail == Some(identity)
-                && let Some(detail) = process_details(identity)
-            {
-                process.command = detail.command;
-                process.directory = detail.directory;
             }
             self.previous_processes.insert(identity, counters);
             processes.push(process);
@@ -713,7 +657,7 @@ fn counters<const N: usize>(text: &str, names: [&str; N]) -> [Option<u64>; N] {
             .next()
             .and_then(|name| names.iter().position(|n| *n == name))
         {
-            result[index] = result[index].or_else(|| fields.next()?.parse().ok());
+            result[index] = fields.next().and_then(|value| value.parse().ok());
         }
     }
     result
@@ -871,32 +815,28 @@ fn process_stat(text: &str) -> Option<(Process, ProcessCounters)> {
         ProcessCounters { ticks, io: None },
     ))
 }
-fn read_process(entry: &fs::DirEntry) -> Option<(Process, ProcessCounters)> {
-    let (mut process, mut counters) = process_stat(&read(entry.path().join("stat"))?)?;
+/// Reads one `/proc/<pid>`; a matching `detail` also reads the command line and directory.
+fn read_process(
+    entry: &fs::DirEntry,
+    detail: Option<Identity>,
+) -> Option<(Process, ProcessCounters)> {
+    let dir = entry.path();
+    let (mut process, mut counters) = process_stat(&read(dir.join("stat"))?)?;
     process.uid = entry.metadata().ok()?.uid();
-    counters.io = read(entry.path().join("io"))
-        .and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
-    Some((process, counters))
-}
-
-fn process_details(identity: Identity) -> Option<ProcessDetails> {
-    let dir = PathBuf::from(format!("/proc/{}", identity.0));
-    let (process, _) = process_stat(&read(dir.join("stat"))?)?;
-    if process.start != identity.1 {
-        return None;
-    }
-    let command = fs::read(dir.join("cmdline")).ok().map(|bytes| {
-        String::from_utf8_lossy(&bytes)
-            .trim_end_matches('\0')
-            .replace('\0', " ")
-    });
-    Some(ProcessDetails {
-        identity,
-        command: command
+    counters.io =
+        read(dir.join("io")).and_then(|text| counter_pair(&text, ["read_bytes:", "write_bytes:"]));
+    if detail == Some((process.pid, process.start)) {
+        let command = fs::read(dir.join("cmdline")).ok().map(|bytes| {
+            String::from_utf8_lossy(&bytes)
+                .trim_end_matches('\0')
+                .replace('\0', " ")
+        });
+        process.command = command
             .filter(|command| !command.is_empty())
-            .unwrap_or_else(|| format!("[{}]", process.name)),
-        directory: fs::read_link(dir.join("cwd")).ok(),
-    })
+            .unwrap_or_else(|| format!("[{}]", process.name));
+        process.directory = fs::read_link(dir.join("cwd")).ok();
+    }
+    Some((process, counters))
 }
 
 #[cfg(test)]
@@ -1011,7 +951,12 @@ mod tests {
     #[test]
     fn sampling_reads_this_process_and_its_details() {
         let mut sampler = Sampler::default();
-        let (sample, _) = sampler.sample(None, true, true, None);
+        let (sample, _) = sampler.sample(Request {
+            directory: None,
+            expanded: true,
+            processes: true,
+            detail: None,
+        });
         let pid = std::process::id();
         let identity = sample
             .processes
@@ -1019,7 +964,12 @@ mod tests {
             .find(|p| p.pid == pid)
             .map(|p| (p.pid, p.start))
             .unwrap();
-        let (sample, point) = sampler.sample(Some("/".into()), true, true, Some(identity));
+        let (sample, point) = sampler.sample(Request {
+            directory: Some("/".into()),
+            expanded: true,
+            processes: true,
+            detail: Some(identity),
+        });
         assert!(!sample.cpu_cores.is_empty());
         assert_eq!(point.values, sample.values);
         assert!(sample.disk.is_some());
@@ -1028,69 +978,6 @@ mod tests {
         assert_eq!(
             process.directory.as_deref(),
             Some(std::env::current_dir().unwrap().as_path())
-        );
-        assert!(process_details((pid, identity.1 + 1)).is_none());
-    }
-
-    #[test]
-    fn process_view_keeps_the_selection_across_resorts_and_filters_unicode() {
-        use crate::monitor::{Action, Emphasis, Monitor};
-        let process = |pid: u32, name: &str| Process {
-            pid,
-            start: 0,
-            name: name.into(),
-            uid: 1000,
-            state: 'S',
-            cpu: Some(0.),
-            rss: u64::from(pid),
-            read: None,
-            write: None,
-            threads: 1,
-            parent: 1,
-            command: String::new(),
-            directory: None,
-        };
-        let mut monitor = Monitor::new().unwrap();
-        monitor.stats.sample.processes = vec![
-            process(1, "init"),
-            process(2, "ΟΣ"),
-            process(3, "K-worker"),
-            process(4, "İdaemon"),
-        ];
-        monitor.toggle();
-        monitor.action(Action::Tab(6));
-        let pids = |view: &crate::monitor::View| {
-            view.hits
-                .iter()
-                .filter_map(|hit| match hit.action {
-                    Action::Process(pid) => Some(pid),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-        };
-        monitor.action(Action::Search);
-        for (query, pid) in [("1000", 1), ("ος", 2), ("k", 3), ("İ", 4), ("3", 3)] {
-            monitor.key(u32::from('u'), "", true);
-            monitor.insert_query(query);
-            assert!(pids(&monitor.view(80, 20)).contains(&pid), "{query}");
-        }
-        monitor.key(u32::from('u'), "", true);
-        monitor.action(Action::Sort(1));
-        assert_eq!(pids(&monitor.view(80, 20)), [4, 3, 2, 1]);
-        monitor.action(Action::Process(2));
-        // A new sample reorders the rows and replaces process 2 by a new process with the same pid.
-        let mut processes = std::mem::take(&mut monitor.stats.sample.processes);
-        processes[0].rss = 40;
-        processes[1].start = 1;
-        monitor.stats.sample.processes = processes;
-        monitor.stats.process_revision += 1;
-        let view = monitor.view(80, 20);
-        assert_eq!(pids(&view), [1, 4, 3, 2]);
-        assert!(
-            !view
-                .texts
-                .iter()
-                .any(|text| text.emphasis(false) == Emphasis::Selected)
         );
     }
 }

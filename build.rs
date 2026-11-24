@@ -1,8 +1,33 @@
 use std::{env, fs, path::Path, process::Command};
 
+const PACKAGES: [&str; 8] = [
+    "fontconfig",
+    "harfbuzz",
+    "fribidi",
+    "cairo-ft",
+    "libutf8proc",
+    "wayland-client",
+    "xkbcommon",
+    "vulkan",
+];
+
 fn run(command: &mut Command) {
     let status = command.status().expect("run native build tool");
     assert!(status.success(), "native build failed: {command:?}");
+}
+
+fn pkg_config(mode: &str) -> String {
+    let output = Command::new("pkg-config")
+        .arg(mode)
+        .args(PACKAGES)
+        .output()
+        .expect("pkg-config is required for native libraries");
+    assert!(
+        output.status.success(),
+        "native development packages missing: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("pkg-config flags")
 }
 
 fn sources(directory: &Path, result: &mut Vec<std::path::PathBuf>) {
@@ -22,27 +47,7 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=native");
-    let packages = [
-        "fontconfig",
-        "harfbuzz",
-        "fribidi",
-        "cairo-ft",
-        "libutf8proc",
-        "wayland-client",
-        "xkbcommon",
-        "vulkan",
-    ];
-    let output = Command::new("pkg-config")
-        .arg("--cflags")
-        .args(packages)
-        .output()
-        .expect("pkg-config is required for native libraries");
-    assert!(
-        output.status.success(),
-        "native development packages missing: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let flags = String::from_utf8(output.stdout).expect("pkg-config flags");
+    let flags = pkg_config("--cflags");
     let out = env::var_os("OUT_DIR").expect("Cargo OUT_DIR");
     let out = Path::new(&out);
     for (stage, name) in [("vert", "vertex"), ("frag", "fragment")] {
@@ -93,13 +98,7 @@ fn main() {
     run(&mut archive);
     println!("cargo:rustc-link-search=native={}", out.display());
     println!("cargo:rustc-link-lib=static=nextty_native");
-    let output = Command::new("pkg-config")
-        .arg("--libs")
-        .args(packages)
-        .output()
-        .expect("pkg-config link flags");
-    assert!(output.status.success(), "pkg-config link failed");
-    for flag in String::from_utf8(output.stdout).unwrap().split_whitespace() {
+    for flag in pkg_config("--libs").split_whitespace() {
         if let Some(library) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={library}");
         } else if let Some(directory) = flag.strip_prefix("-L") {

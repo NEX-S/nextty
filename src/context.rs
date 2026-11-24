@@ -106,24 +106,18 @@ pub(crate) fn snapshot(screen: &Screen, range: Option<SelectionRange>) -> Contex
     let last_line = range.end.line.min(last);
     for line in range.start.line.max(first)..=last_line {
         let row = &screen.rows[(line - first) as usize];
-        let mut from = if line == range.start.line {
+        let from = if line == range.start.line {
             range.start.column
         } else {
             0
-        }
-        .min(row.used());
-        if from < row.cells.len() {
-            from = row.leading_column(from);
-        }
+        };
         let to = if line == range.end.line {
             range.end.column + 1
         } else {
             row.used()
-        }
-        .min(row.used());
+        };
         for ch in row
-            .characters(from..to)
-            .map(|(_, ch)| ch)
+            .text(from, to, false)
             .chain((line < last_line && !row.wrapped).then_some('\n'))
         {
             if result.text.len() + ch.len_utf8() > SNAPSHOT_LIMIT {

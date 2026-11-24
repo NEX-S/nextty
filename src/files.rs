@@ -131,20 +131,20 @@ impl FileNav {
             "nextty-files",
             Arc::clone(&wakeup),
             |request: ScanRequest, cancelled, publish| {
-                let scan = match &request {
+                // Matching by value releases the expanded set before the result is published,
+                // so the frontend can mutate it without copying.
+                let scan = match request {
                     ScanRequest::Browse(directory, expanded) => {
                         let mut scan = Scan::default();
-                        browse(directory, expanded, cancelled, &mut scan);
+                        browse(&directory, &expanded, cancelled, &mut scan);
                         scan
                     }
                     ScanRequest::Search(directory, query) => {
-                        search(directory, query, cancelled, &|partial| {
+                        search(&directory, &query, cancelled, &|partial| {
                             publish((partial, false));
                         })
                     }
                 };
-                // The frontend may mutate the expanded set as soon as it receives this result.
-                drop(request);
                 publish((scan, true));
             },
         )?;
@@ -281,16 +281,13 @@ impl FileNav {
     }
 
     pub(crate) fn key_query(&mut self, symbol: u32, control: bool) {
-        if self.is_search() {
-            self.edit_query(|query| query.key(symbol, control));
-        }
+        self.edit_query(|query| query.key(symbol, control));
     }
 
     pub fn stop_search(&mut self) {
-        if self.query.take().is_some() {
-            self.restore_selection = self.directory_selection.get(&self.directory).cloned();
-            self.request_scan();
-        }
+        self.query = None;
+        self.restore_selection = self.directory_selection.get(&self.directory).cloned();
+        self.request_scan();
     }
 
     pub fn set_directory(&mut self, directory: PathBuf) -> io::Result<()> {
@@ -332,16 +329,18 @@ impl FileNav {
         };
         self.restore_selection = Some(std::mem::replace(&mut self.directory, parent));
         self.expanded = Arc::default();
-        self.query = None;
         self.request_scan();
     }
 
     pub fn enter_selected(&mut self) -> bool {
-        let Some(entry) = self.selected().filter(|entry| entry.is_dir) else {
+        let Some(path) = self
+            .selected()
+            .filter(|entry| entry.is_dir)
+            .map(|entry| entry.path.clone())
+        else {
             return false;
         };
-        let path = &entry.path;
-        if self.expanded.contains(path) && !self.is_search() {
+        if self.expanded.contains(&path) {
             if self
                 .scan
                 .entries
@@ -352,29 +351,19 @@ impl FileNav {
             }
             return true;
         }
-        let path = path.clone();
-        let expanded = Arc::make_mut(&mut self.expanded);
-        for directory in path
-            .ancestors()
-            .take_while(|directory| *directory != self.directory)
-        {
-            expanded.insert(directory.to_path_buf());
-        }
-        self.query = None;
+        // Every visible directory has its ancestors expanded already.
+        Arc::make_mut(&mut self.expanded).insert(path.clone());
         self.restore_selection = Some(path);
         self.request_scan();
         true
     }
 
     pub fn entry_label(&self, entry: &FileEntry) -> String {
-        let relative = entry.path.strip_prefix(&self.directory);
+        let relative = entry.path.strip_prefix(&self.directory).unwrap();
         if self.is_search() {
-            return relative
-                .unwrap_or(&entry.path)
-                .to_string_lossy()
-                .into_owned();
+            return relative.to_string_lossy().into_owned();
         }
-        let depth = relative.unwrap().components().count().saturating_sub(1);
+        let depth = relative.components().count().saturating_sub(1);
         let marker = if entry.is_dir {
             if self.expanded.contains(&entry.path) {
                 ""
@@ -451,7 +440,6 @@ impl FileNav {
 
     fn request_scan(&mut self) {
         self.scan = Scan::default();
-        self.preview = Preview::default();
         self.selection = 0;
         self.focus = FileFocus::List;
         self.update_preview();
@@ -460,15 +448,6 @@ impl FileNav {
             Some(query) => ScanRequest::Search(self.directory.clone(), query.text.clone()),
             None => ScanRequest::Browse(self.directory.clone(), self.expanded.clone()),
         });
-    }
-}
-
-impl Drop for FileNav {
-    // A remote filesystem syscall may not return promptly; cancelling lets the
-    // workers finish on their own without making the frontend wait for them.
-    fn drop(&mut self) {
-        self.scan_job.cancel();
-        self.preview_job.cancel();
     }
 }
 

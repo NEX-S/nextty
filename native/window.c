@@ -34,20 +34,15 @@ struct Queued {
     Queued *next;
     char text[];
 };
+/* A pipe end the UI loop serves without blocking: a selection being written, a paste being read,
+ * or a file being spliced (file >= 0) into a selection pipe. */
 typedef struct Transfer Transfer;
 struct Transfer {
     Transfer *next;
-    int fd, writing;
+    int fd, file, writing;
     char *bytes;
     size_t length, capacity, offset;
-    int64_t deadline;
-};
-typedef struct FileTransfer FileTransfer;
-struct FileTransfer {
-    FileTransfer *next;
-    int fd, file_fd;
-    off_t offset;
-    size_t length;
+    off_t file_offset;
     int64_t deadline;
 };
 typedef struct Source Source;
@@ -96,7 +91,6 @@ struct NtWindow {
     Source *pending_source[2];
     int paste_pending, paste_primary;
     Transfer *transfers;
-    FileTransfer *file_transfers;
     struct xkb_context *xkb_context;
     struct xkb_compose_state *compose;
     struct wl_display *display;
@@ -227,50 +221,6 @@ static void append_bytes(char **bytes, size_t *length, size_t *capacity, const v
     memcpy(*bytes + *length, data, n);
     *length += n;
 }
-static void file_transfer_free(FileTransfer *t) {
-    close(t->fd);
-    close(t->file_fd);
-    free(t);
-}
-static void queue_file(NtWindow *w, int fd, int file_fd) {
-    FileTransfer *t = calloc(1, sizeof *t);
-    struct stat st = {0};
-    fstat(file_fd, &st);
-    t->fd = fd;
-    t->file_fd = file_fd;
-    t->length = (size_t)st.st_size;
-    t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
-    t->next = w->file_transfers;
-    w->file_transfers = t;
-}
-static void process_file_transfers(NtWindow *w, const struct pollfd *fds) {
-    FileTransfer **link = &w->file_transfers;
-    while (*link) {
-        FileTransfer *t = *link;
-        int ready = (fds++)->revents;
-        int done = now_ms() >= t->deadline || (size_t)t->offset == t->length;
-        if (!done && ready) {
-            size_t count = t->length - (size_t)t->offset;
-            if (count > FILE_CHUNK_SIZE)
-                count = FILE_CHUNK_SIZE;
-            ssize_t n;
-            do n = splice(t->file_fd, &t->offset, t->fd, NULL, count, SPLICE_F_NONBLOCK);
-            while (n < 0 && errno == EINTR);
-            if (n > 0)
-                t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
-            else if (!n || errno != EAGAIN)
-                done = 1;
-            if ((size_t)t->offset == t->length)
-                done = 1;
-        }
-        if (!done) {
-            link = &t->next;
-            continue;
-        }
-        *link = t->next;
-        file_transfer_free(t);
-    }
-}
 static void finish_paste(NtWindow *w, const char *bytes, size_t length) {
     if (!w->paste_pending)
         return;
@@ -281,19 +231,22 @@ static void finish_paste(NtWindow *w, const char *bytes, size_t length) {
     }
     emit(w, (NtEvent){.kind = NT_PASTE, .text = bytes, .length = length});
 }
+/* Takes ownership of fd; file >= 0 is the file a writing transfer splices from. */
 static void add_transfer(NtWindow *w, int fd, int writing, const char *bytes, size_t length,
-                         int file_fd) {
+                         int file) {
     fcntl(fd, F_SETFD, FD_CLOEXEC);
     fcntl(fd, F_SETFL, fcntl(fd, F_GETFL) | O_NONBLOCK);
-    if (writing && file_fd >= 0) {
-        queue_file(w, fd, fcntl(file_fd, F_DUPFD_CLOEXEC, 0));
-        return;
-    }
     Transfer *t = calloc(1, sizeof *t);
     t->fd = fd;
     t->writing = writing;
+    t->file = -1;
     t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
-    if (writing && length) {
+    if (writing && file >= 0) {
+        struct stat st = {0};
+        fstat(file, &st);
+        t->file = fcntl(file, F_DUPFD_CLOEXEC, 0);
+        t->length = (size_t)st.st_size;
+    } else if (writing && length) {
         t->bytes = malloc(length);
         memcpy(t->bytes, bytes, length);
         t->length = length;
@@ -316,21 +269,22 @@ static void process_transfers(NtWindow *w, const struct pollfd *fds) {
         if (!done && ready) {
             /* A continuously ready clipboard pipe must leave time for input. */
             char buffer[32768];
-            size_t count = sizeof buffer;
+            size_t count = t->file >= 0 ? FILE_CHUNK_SIZE : sizeof buffer;
             if (t->writing && t->length - t->offset < count)
                 count = t->length - t->offset;
             ssize_t n;
             do {
-                n = t->writing ? write(t->fd, t->bytes + t->offset, count)
-                               : read(t->fd, buffer, count);
+                n = t->file >= 0 ? splice(t->file, &t->file_offset, t->fd, NULL, count, SPLICE_F_NONBLOCK)
+                    : t->writing ? write(t->fd, t->bytes + t->offset, count)
+                                 : read(t->fd, buffer, count);
             } while (n < 0 && errno == EINTR);
             if (n > 0) {
                 t->deadline = now_ms() + TRANSFER_TIMEOUT_MS;
-                if (t->writing) {
+                if (!t->writing)
+                    append_bytes(&t->bytes, &t->length, &t->capacity, buffer, (size_t)n);
+                else {
                     t->offset += (size_t)n;
                     done = t->offset == t->length;
-                } else {
-                    append_bytes(&t->bytes, &t->length, &t->capacity, buffer, (size_t)n);
                 }
             } else if (!n) {
                 done = 1;
@@ -345,6 +299,8 @@ static void process_transfers(NtWindow *w, const struct pollfd *fds) {
         }
         *link = t->next;
         close(t->fd);
+        if (t->file >= 0)
+            close(t->file);
         if (!t->writing)
             finish_paste(w, good ? t->bytes : NULL, t->length);
         free(t->bytes);
@@ -378,12 +334,10 @@ static void keyboard_text(NtWindow *w, uint32_t key, int composing) {
             emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
             return;
         case XKB_COMPOSE_COMPOSED: {
-            int size = xkb_compose_state_get_utf8(w->compose, NULL, 0);
-            char *s = malloc((size_t)size + 1);
-            xkb_compose_state_get_utf8(w->compose, s, (size_t)size + 1);
+            char composed[64];
+            int size = xkb_compose_state_get_utf8(w->compose, composed, sizeof composed);
             emit(w, (NtEvent){.kind = NT_PREEDIT, .text = ""});
-            emit(w, (NtEvent){.kind = NT_TEXT, .text = s, .length = (size_t)size});
-            free(s);
+            emit(w, (NtEvent){.kind = NT_TEXT, .text = composed, .length = (size_t)size});
             xkb_compose_state_reset(w->compose);
             return;
         }
@@ -646,8 +600,6 @@ static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_su
 static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char *text,
                          int32_t begin, int32_t end) {
     NtWindow *w = data;
-    (void)begin;
-    (void)end;
     free(w->pending_preedit);
     w->pending_preedit = strdup(text ? text : "");
 }
@@ -1033,9 +985,6 @@ static int poll_timeout(NtWindow *w, int timeout) {
     for (Transfer *t = w->transfers; t; t = t->next)
         if (t->deadline < deadline)
             deadline = t->deadline;
-    for (FileTransfer *t = w->file_transfers; t; t = t->next)
-        if (t->deadline < deadline)
-            deadline = t->deadline;
     if (deadline != INT64_MAX) {
         int64_t delay = deadline - now_ms();
         if (delay < 0)
@@ -1054,8 +1003,6 @@ static void poll_and_dispatch(NtWindow *w, struct pollfd *sources, size_t source
     size_t count = 2 + source_count;
     for (Transfer *t = w->transfers; t; t = t->next)
         count++;
-    for (FileTransfer *t = w->file_transfers; t; t = t->next)
-        count++;
     struct pollfd fds[count];
     fds[0] = (struct pollfd){.fd = wl_display_get_fd(w->display), .events = POLLIN};
     if (wl_display_flush(w->display) < 0) {
@@ -1068,18 +1015,14 @@ static void poll_and_dispatch(NtWindow *w, struct pollfd *sources, size_t source
     }
     fds[1] = (struct pollfd){.fd = w->frame_fd, .events = POLLIN};
     memcpy(fds + 2, sources, source_count * sizeof *sources);
-    struct pollfd *at = fds + 2 + source_count, *transfers = at;
+    struct pollfd *at = fds + 2 + source_count;
     for (Transfer *t = w->transfers; t; t = t->next)
         *at++ = (struct pollfd){.fd = t->fd, .events = t->writing ? POLLOUT : POLLIN};
-    struct pollfd *files = at;
-    for (FileTransfer *t = w->file_transfers; t; t = t->next)
-        *at++ = (struct pollfd){.fd = t->fd, .events = POLLOUT};
     int status = poll(fds, count, poll_timeout(w, timeout_ms));
     if (status < 0 && errno != EINTR)
         fail(w, "polling terminal events: %s", strerror(errno));
     /* Wayland callbacks may prepend transfers; process the polled list first. */
-    process_transfers(w, transfers);
-    process_file_transfers(w, files);
+    process_transfers(w, fds + 2 + source_count);
     if (status > 0 && (fds[0].revents & POLLIN)) {
         if (wl_display_read_events(w->display) < 0)
             wayland_error(w, "reading Wayland events");
@@ -1180,7 +1123,6 @@ void nt_window_cursor_rect(NtWindow *w, int x, int y, int width, int height) {
     }
 }
 static void set_selection(NtWindow *w, int primary, const char *bytes, size_t length, int fd) {
-    primary = !!primary;
     Source *source = malloc(sizeof *source + length);
     if (w->pending_source[primary])
         source_remove(w->pending_source[primary]);
@@ -1208,7 +1150,7 @@ void nt_window_paste(NtWindow *w, int primary) {
         return;
     }
     w->paste_pending = 1;
-    w->paste_primary = !!primary;
+    w->paste_primary = primary;
     start_paste(w);
 }
 

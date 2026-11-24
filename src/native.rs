@@ -3,10 +3,10 @@ pub(crate) mod trace;
 use std::io::{self, Result};
 use std::{
     ffi::{CStr, CString, c_char, c_int, c_void},
+    fs::File,
+    os::fd::IntoRawFd,
     ptr::NonNull,
 };
-
-use std::{fs::File, os::fd::IntoRawFd};
 
 pub use crate::input::{ALT, CONTROL, SHIFT, SUPER};
 pub const KEY: i32 = 1;

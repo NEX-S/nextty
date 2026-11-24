@@ -149,11 +149,12 @@ struct NtRenderer {
 static _Thread_local char creation_error[512];
 
 static int fail(NtRenderer *r, const char *format, ...) {
-    va_list args;
-    va_start(args, format);
-    if (!r || !r->error[0])
-        vsnprintf(r ? r->error : creation_error, sizeof creation_error, format, args);
-    va_end(args);
+    if (!r->error[0]) {
+        va_list args;
+        va_start(args, format);
+        vsnprintf(r->error, sizeof r->error, format, args);
+        va_end(args);
+    }
     return 0;
 }
 
@@ -231,14 +232,6 @@ static int reset_atlases(NtRenderer *r) {
     /* Draw before atlas reuse can overwrite a queued glyph. */
     if (!flush_quads(r)) return 0;
     clear_glyphs(r);
-    return 1;
-}
-
-static int set_scale(NtRenderer *r, double scale) {
-    if (r->scale == scale) return 1;
-    if (!reset_atlases(r)) return 0;
-    nt_fonts_scale(r->fonts, scale);
-    r->scale = scale;
     return 1;
 }
 
@@ -364,8 +357,8 @@ static int vk_upload_space(NtRenderer *r, VkDeviceSize size, NtVkUpload **buffer
     NtVkUpload *upload = spare;
     VkDeviceSize capacity = size > 256 * 1024 ? size : 256 * 1024;
     if (upload) {
-        /* Untouched this frame; replay has already waited for the previous fence. */
-        /* Leave the old capacity available for later batches in this frame. */
+        /* Replay has already waited for the previous fence, so an untouched buffer can be
+         * rebuilt larger while its old capacity stays available for later batches. */
         capacity = ((size + 15) & ~(VkDeviceSize)15) + upload->size;
         vk_destroy_upload(r, upload);
         *upload = (NtVkUpload){.next = upload->next};
@@ -501,11 +494,7 @@ static int vk_create_pipeline(NtRenderer *r) {
     VK_CHECK(vkCreateShaderModule(v->device, &module, NULL, &vertex));
     module.codeSize = sizeof nt_fragment_spv;
     module.pCode = nt_fragment_spv;
-    VkResult result = vkCreateShaderModule(v->device, &module, NULL, &fragment);
-    if (result != VK_SUCCESS) {
-        vkDestroyShaderModule(v->device, vertex, NULL);
-        return fail(r, "Creating Vulkan fragment shader: %d", result);
-    }
+    VK_CHECK(vkCreateShaderModule(v->device, &module, NULL, &fragment));
     VkPipelineShaderStageCreateInfo stages[2] = {
         {.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
          .stage = VK_SHADER_STAGE_VERTEX_BIT, .module = vertex, .pName = "main"},
@@ -570,17 +559,17 @@ static int vk_create_pipeline(NtRenderer *r) {
         .pRasterizationState = &raster, .pMultisampleState = &multisample,
         .pColorBlendState = &blend, .pDynamicState = &dynamic, .layout = v->pipeline_layout,
     };
-    result = vkCreateGraphicsPipelines(v->device, VK_NULL_HANDLE, 1, &pipeline, NULL, &v->pipeline);
+    VK_CHECK(vkCreateGraphicsPipelines(v->device, VK_NULL_HANDLE, 1, &pipeline, NULL, &v->pipeline));
     vkDestroyShaderModule(v->device, fragment, NULL);
     vkDestroyShaderModule(v->device, vertex, NULL);
-    return result == VK_SUCCESS || fail(r, "Creating Vulkan graphics pipeline: %d", result);
+    return 1;
 }
 
 static void vk_free_swapchain(NtRenderer *r) {
     NtVulkan *v = &r->vk;
     for (uint32_t i = 0; i < v->image_count; ++i) {
-        if (v->views && v->views[i]) vkDestroyImageView(v->device, v->views[i], NULL);
-        if (v->presented && v->presented[i]) vkDestroySemaphore(v->device, v->presented[i], NULL);
+        if (v->views[i]) vkDestroyImageView(v->device, v->views[i], NULL);
+        if (v->presented[i]) vkDestroySemaphore(v->device, v->presented[i], NULL);
     }
     free(v->images);
     free(v->views);
@@ -841,7 +830,12 @@ static int replay(NtRenderer *r) {
                      0, VK_ACCESS_COLOR_ATTACHMENT_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT);
     v->clip = (VkRect2D){{0, 0}, v->extent};
     r->quad_count = 0;
-    if (!set_scale(r, f->scale)) return 0;
+    /* A scale change reloads the fonts: drop cached glyphs before any quad references the atlas. */
+    if (r->scale != f->scale) {
+        clear_glyphs(r);
+        nt_fonts_scale(r->fonts, f->scale);
+        r->scale = f->scale;
+    }
     for (size_t i = 0; i < f->op_count; ++i) {
         const Op *op = &f->ops[i];
         switch (op->kind) {
@@ -956,20 +950,15 @@ static void gpu_free(NtRenderer *r) {
     if (v->instance) vkDestroyInstance(v->instance, NULL);
 }
 
-#undef VK_CHECK
-
 static void *submit(void *data) {
     NtRenderer *r = data;
     Swap *s = &r->swap;
-    /* Publish metrics first; GPU setup is the initial pending job. */
-    r->fonts = nt_fonts_new(s->family, r->font_size, r->error, sizeof r->error);
-    int initialized = r->fonts != NULL;
-    if (initialized) {
+    if ((r->fonts = nt_fonts_new(s->family, r->font_size, r->error, sizeof r->error))) {
         nt_fonts_metrics(r->fonts, &r->cell_width, &r->cell_height);
-        initialized = set_scale(r, r->frame.scale);
+        gpu_init(r);
     }
     pthread_mutex_lock(&s->lock);
-    s->initialized = initialized ? 1 : -1;
+    s->initialized = r->error[0] ? -1 : 1;
     pthread_cond_broadcast(&s->changed);
     for (;;) {
         while (s->state != SWAP_PENDING && !s->retired && !s->stopping)
@@ -988,11 +977,7 @@ static void *submit(void *data) {
         }
         if (s->stopping) break;
         pthread_mutex_unlock(&s->lock);
-        if (!r->vk.instance) {
-            if (initialized) gpu_init(r);
-        } else if (replay(r)) {
-            gpu_present(r);
-        }
+        if (replay(r)) gpu_present(r);
         pthread_mutex_lock(&s->lock);
         s->state = SWAP_DONE;
         uint64_t wake = 1;
@@ -1073,8 +1058,6 @@ NtRenderer *nt_renderer_new(NtWindow *window, const char *family, float font_siz
     r->atlas_size[0] = 512;
     r->atlas_size[1] = 1024;
     r->swap.family = family;
-    r->swap.state = SWAP_PENDING;
-    nt_window_size(window, NULL, NULL, &r->frame.scale);
     if (!start_submission(r)) {
         memcpy(creation_error, r->error, sizeof creation_error);
         nt_renderer_free(r);
@@ -1290,8 +1273,7 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
     reserve_quads(r, r->quad_count + line->count);
     double inverse_scale = 1. / r->scale;
     float stroke = fmaxf(1.f, roundf(r->font_size * r->scale / 16.f)) / r->scale;
-    float top = 0;
-    int top_ready = 0;
+    float bar_top = roundf((y + (r->cell_height - stroke) * 0.5f) * r->scale) / r->scale;
     for (size_t i = 0; i < line->count; ++i) {
         const NtFontGlyph *glyph = &line->glyphs[i];
         if (!(glyph->color & 255)) continue;
@@ -1334,11 +1316,7 @@ static int draw_line(NtRenderer *r, NtLine *line, float x, float y) {
                 float left = roundf((x + glyph->x + (r->cell_width - stroke) * 0.5f) * r->scale) / r->scale;
                 q = make_quad(left, y, stroke, r->cell_height, glyph->color, 0);
             } else {
-                if (!top_ready) {
-                    top = roundf((y + (r->cell_height - stroke) * 0.5f) * r->scale) / r->scale;
-                    top_ready = 1;
-                }
-                q = make_quad(x + glyph->x, top, r->cell_width, stroke, glyph->color, 0);
+                q = make_quad(x + glyph->x, bar_top, r->cell_width, stroke, glyph->color, 0);
             }
         } else {
             CachedGlyph *entry = cached_glyph(r, glyph);

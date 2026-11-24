@@ -6,7 +6,6 @@
 #include <fribidi.h>
 #include <hb-ft.h>
 #include <hb-ot.h>
-#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -423,7 +422,6 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         }
         i = end;
     }
-    static const hb_feature_t features[] = {{ HB_TAG('l','i','g','a'), 0, 0, UINT_MAX }, { HB_TAG('c','a','l','t'), 0, 0, UINT_MAX }};
     hb_language_t language = hb_language_get_default();
     double pen = 0, anchor = 0;
     size_t previous_column = SIZE_MAX;
@@ -439,7 +437,7 @@ int nt_fonts_shape(NtFonts *f, const char *text, size_t length, const NtRun *run
         hb_buffer_set_script(buffer, chars[start].script);
         hb_buffer_set_language(buffer, language);
         hb_buffer_add_codepoints(buffer, codes, (int)n, (unsigned)start, (int)(end - start));
-        hb_shape(font->hb, buffer, features, sizeof features / sizeof *features);
+        hb_shape(font->hb, buffer, NULL, 0);
         unsigned shaped;
         hb_glyph_info_t *info = hb_buffer_get_glyph_infos(buffer, &shaped);
         hb_glyph_position_t *positions = hb_buffer_get_glyph_positions(buffer, NULL);

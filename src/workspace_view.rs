@@ -414,13 +414,7 @@ impl WorkspaceView {
                 -1
             };
             if let Some(until) = self.ui.deadline() {
-                let remaining =
-                    crate::sys::timeout_millis(until.saturating_duration_since(Instant::now()));
-                timeout = if timeout < 0 {
-                    remaining
-                } else {
-                    timeout.min(remaining)
-                };
+                timeout = crate::sys::timeout_until(timeout, until);
             }
 
             if self.client.needs_poll() {
@@ -488,11 +482,10 @@ impl WorkspaceView {
                         }
                     }
                     Response::Clipboard {
-                        request,
+                        primary,
                         file,
                         incomplete,
                     } => {
-                        let primary = request & 1 != 0;
                         self.window.selection_file(primary, file);
                         self.message(if incomplete {
                             "Copied retained output; history is incomplete"
@@ -514,9 +507,7 @@ impl WorkspaceView {
                             truncated,
                         )?;
                     }
-                    Response::Error(error) | Response::CopyError { error, .. } => {
-                        self.message(error)
-                    }
+                    Response::Error(error) | Response::CopyError(error) => self.message(error),
                     Response::Detached => self.running = false,
                     Response::ClipboardStore { primary, text } => {
                         self.window.selection(primary, &text)
@@ -807,10 +798,7 @@ impl WorkspaceView {
     }
 
     fn copy(&mut self, pane: PaneId, primary: bool) -> Result<()> {
-        self.client.send(Action::CopySelection {
-            pane,
-            request: u64::from(primary),
-        })
+        self.client.send(Action::CopySelection { pane, primary })
     }
     fn paste(&mut self, pane: PaneId, primary: bool) {
         if !self.client.controller() {
@@ -1225,11 +1213,7 @@ impl WorkspaceView {
                 return Ok(());
             }
             if let Some((_, block)) = crate::ui::block_at(&self.client, pane, point) {
-                self.client.send(Action::CopyBlock {
-                    pane,
-                    block,
-                    request: 0,
-                })?;
+                self.client.send(Action::CopyBlock { pane, block })?;
                 return Ok(());
             }
             if modifiers & native::ALT != 0 || !self.client.mode(pane).intersects(Mode::MOUSE_MODE)

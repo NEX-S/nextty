@@ -301,17 +301,16 @@ fn draw_edit_row(
     );
 }
 
-impl AgentPainter<'_> {
-    fn recolor_text(&mut self, rect: Rect, color: u32) {
-        let grid = &mut self.frame.grid;
-        let row = &mut grid.rows[usize::from(rect.y - grid.rect.y)];
-        let start = usize::from(rect.x.saturating_sub(grid.rect.x));
-        let end = (start + usize::from(rect.cols)).min(row.cells.len());
-        for cell in &mut row.cells[start..end] {
-            cell.fg = rgb(color);
-        }
+fn recolor_text(grid: &mut Grid, rect: Rect, color: u32) {
+    let row = &mut grid.rows[usize::from(rect.y - grid.rect.y)];
+    let start = usize::from(rect.x.saturating_sub(grid.rect.x));
+    let end = (start + usize::from(rect.cols)).min(row.cells.len());
+    for cell in &mut row.cells[start..end] {
+        cell.fg = rgb(color);
     }
+}
 
+impl AgentPainter<'_> {
     fn draw_agent(&mut self, editor: Rect, editor_layout: EditorLines) -> io::Result<()> {
         let (side, p) = (self.side, self.palette);
         if side.cols < 12 || side.rows < 6 {
@@ -379,8 +378,7 @@ impl AgentPainter<'_> {
             .pointer
             .and_then(|(x, y)| crate::ui::agent_hit(&self.frame.hits, x, y));
         let focused = (self.ui.focus == Focus::Controls).then_some(self.ui.agent.keyboard);
-        let hits = std::mem::take(&mut self.frame.hits);
-        for &(rect, action) in &hits {
+        for &(rect, action) in &self.frame.hits {
             if hovered != Some(action) && focused != Some(action) {
                 continue;
             }
@@ -390,18 +388,17 @@ impl AgentPainter<'_> {
                 | AgentAction::Output
                 | AgentAction::Copy(_) => (),
                 AgentAction::NewSession | AgentAction::ClosePanel => {
-                    self.recolor_text(rect, p.foreground)
+                    recolor_text(&mut self.frame.grid, rect, p.foreground)
                 }
-                AgentAction::CloseSession(_) => self.recolor_text(rect, 0xef5350),
+                AgentAction::CloseSession(_) => recolor_text(&mut self.frame.grid, rect, 0xef5350),
                 _ => {
                     self.frame.grid.recolor(rect, p.user_bg);
                     if action == AgentAction::Stop {
-                        self.recolor_text(rect, p.error);
+                        recolor_text(&mut self.frame.grid, rect, p.error);
                     }
                 }
             }
         }
-        self.frame.hits = hits;
         Ok(())
     }
 
@@ -1047,7 +1044,7 @@ impl RenderedMarkdown {
 struct MarkdownJob {
     session: u64,
     request: u64,
-    messages: Vec<(usize, u64, Arc<str>, Option<RenderedMarkdown>)>,
+    messages: Vec<(usize, u64, Arc<str>)>,
 }
 
 struct MarkdownResult {
@@ -1065,17 +1062,13 @@ fn markdown_worker() -> io::Result<Worker<MarkdownJob, MarkdownResult>> {
             let messages = job
                 .messages
                 .into_iter()
-                .map(|(index, turn, source, cached)| {
-                    let old = cached
-                        .as_ref()
-                        .map(|rendered| (rendered.source.as_ref(), rendered.document.as_ref()));
-                    let document = Arc::new(Markdown::render(&source, old));
+                .map(|(index, turn, source)| {
                     (
                         index,
                         RenderedMarkdown {
                             turn,
+                            document: Arc::new(Markdown::render(&source)),
                             source,
-                            document,
                         },
                     )
                 })
@@ -1316,7 +1309,7 @@ impl AgentPanel {
         if !self.open || self.rendering_active() {
             return Ok(());
         }
-        let session = &mut self.sessions[self.current];
+        let session = &self.sessions[self.current];
         // Model updates and layout preparation keep only matching prefixes.
         let messages: Vec<_> = session
             .model
@@ -1330,14 +1323,7 @@ impl AgentPanel {
                         .as_ref()
                         .is_none_or(|rendered| rendered.source.len() != message.text.len())
             })
-            .map(|(index, message)| {
-                (
-                    index,
-                    message.turn,
-                    Arc::from(message.text.as_str()),
-                    session.rendered[index].clone(),
-                )
-            })
+            .map(|(index, message)| (index, message.turn, Arc::from(message.text.as_str())))
             .collect();
         if !messages.is_empty() {
             if self.markdown_worker.is_none() {
@@ -2132,9 +2118,8 @@ impl AgentSession {
             return Ok(());
         }
         let pane = client
-            .snapshot()
-            .ok_or_else(|| io::Error::other("No workspace"))?
-            .focused;
+            .focused()
+            .ok_or_else(|| io::Error::other("No workspace"))?;
         if !client.can_agent_input() {
             return Err(io::Error::other("Workspace is read-only"));
         }
@@ -2460,7 +2445,7 @@ impl Ui {
                 };
             }
             AgentAction::Selection | AgentAction::Screen => {
-                if let Some(pane) = client.snapshot().map(|s| s.focused) {
+                if let Some(pane) = client.focused() {
                     let session = self.agent.active_mut();
                     let count = session.context.basket.len();
                     session
@@ -3044,8 +3029,7 @@ mod tests {
             panel.active_mut().model.messages[1].text.push_str(delta);
             panel.wait_layout(12);
             let session = panel.active_mut();
-            let full =
-                crate::agent::markdown::Markdown::render(&session.model.messages[1].text, None);
+            let full = crate::agent::markdown::Markdown::render(&session.model.messages[1].text);
             assert_eq!(session.message_text(1), full.text);
             let streamed = rows(session);
             let scroll = session.model.scroll;

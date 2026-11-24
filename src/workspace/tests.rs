@@ -42,17 +42,14 @@ fn wait_error_containing(client: &mut Client, text: &str) {
         |event| matches!(event, Response::Error(error) if error.contains(text)),
     );
 }
-/// Waits for the one copy answering `request` and returns its text.
-fn wait_copy(client: &mut Client, request: u64) -> String {
+/// Waits for the next copy and returns its text.
+fn wait_copy(client: &mut Client) -> String {
     let mut text = None;
     wait(client, |_, events| {
         for event in events {
             if let Response::Clipboard {
-                request: answered,
-                file,
-                incomplete,
+                file, incomplete, ..
             } = event
-                && *answered == request
             {
                 assert!(!incomplete);
                 let mut copied = String::new();
@@ -397,10 +394,9 @@ impl TestServer {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
-        let directory = std::env::current_dir().unwrap().join(format!(
-            "target/workspace-server/test-{}-{stamp}",
-            std::process::id()
-        ));
+        // Sockets need a short path, whatever the checkout depth.
+        let directory =
+            std::env::temp_dir().join(format!("nextty-server-{}-{stamp}", std::process::id()));
         fs::create_dir_all(&directory).unwrap();
         fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).unwrap();
         let home = directory.join("home");
@@ -493,6 +489,21 @@ fn actions_queued_behind_closing_the_last_pane_do_not_crash_the_server() {
     let pane = client.snapshot().unwrap().focused;
     client.send(Action::ClosePane(pane)).unwrap();
     client.send(Action::Tab(1)).unwrap();
+    wait_detached(&mut client);
+    drop(client);
+    server.wait_for_exit();
+}
+
+#[test]
+fn closing_a_hup_ignoring_child_does_not_block_the_server() {
+    let mut server = TestServer::start();
+    let mut client = start(
+        &server,
+        "closing",
+        program("/bin/sh", &["-c", "trap '' HUP; while :; do :; done"]),
+    );
+    let pane = client.snapshot().unwrap().focused;
+    client.send(Action::ClosePane(pane)).unwrap();
     wait_detached(&mut client);
     drop(client);
     server.wait_for_exit();
@@ -635,14 +646,9 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         .send(Action::AgentRequest(next_request.clone()))
         .unwrap();
     frontend.flush().unwrap();
-    wait(&mut owner, |client, _| client.agent_events.len() == 2);
-    assert_eq!(
-        drain_agent(&mut owner),
-        [
-            AgentEvent::Draft(edited_view),
-            AgentEvent::Request(next_request)
-        ]
-    );
+    // Draft edits stay between frontends; the owner only receives the request.
+    wait(&mut owner, |client, _| !client.agent_events.is_empty());
+    assert_eq!(drain_agent(&mut owner), [AgentEvent::Request(next_request)]);
     wait_error(&mut agent_attach(&server, "persist", token.clone()));
 
     let message = |text: &str| AgentMessage {
@@ -708,6 +714,13 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
         client.agent_events.contains(&AgentEvent::Ready)
     });
     assert_eq!(drain_agent(&mut terminal_only), open_events);
+    // Frontends showing the panel share every draft edit.
+    terminal_only
+        .send(Action::AgentView(edited_view.clone()))
+        .unwrap();
+    terminal_only.flush().unwrap();
+    wait(&mut frontend, |client, _| !client.agent_events.is_empty());
+    assert_eq!(drain_agent(&mut frontend), [AgentEvent::Draft(edited_view)]);
     drop(terminal_only);
 
     wait_snapshot(&mut frontend, |snapshot| snapshot.controller);
@@ -1304,19 +1317,19 @@ fn starting_selection_in_a_second_pane_clears_the_first_and_copies_the_new_text(
     client
         .send(Action::CopySelection {
             pane: second,
-            request: 77,
+            primary: false,
         })
         .unwrap();
-    assert_eq!(wait_copy(&mut client, 77), "secondcopy");
+    assert_eq!(wait_copy(&mut client), "secondcopy");
     client
         .send(Action::CopySelection {
             pane: first,
-            request: 78,
+            primary: true,
         })
         .unwrap();
     wait_response(
         &mut client,
-        |event| matches!(event, Response::CopyError { request: 78, error } if error.contains("no selection")),
+        |event| matches!(event, Response::CopyError(error) if error.contains("no selection")),
     );
 }
 
@@ -1466,16 +1479,12 @@ fn command_copy_streams_full_output_across_cold_history() {
             num_cols: 64,
             ..CreateOptions::default().size
         }),
-        Action::CopyBlock {
-            pane,
-            block,
-            request: 1,
-        },
+        Action::CopyBlock { pane, block },
     ] {
         client.peer.send_action(&action).unwrap();
     }
     client.flush().unwrap();
-    let output = wait_copy(&mut client, 1);
+    let output = wait_copy(&mut client);
     assert!(output.starts_with("line-0000 中\n"));
     assert!(output.ends_with("line-0699 中\n"));
     assert_eq!(output.lines().count(), 700);
@@ -1936,31 +1945,28 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
         cursor: None,
         query: query.map(str::to_owned),
     };
-    let copy = |request, block| Action::CopyBlock {
+    let copy = |block| Action::CopyBlock {
         pane: pane.id,
-        request,
         block,
     };
     for action in [
         read(11, None, Some("same-shell")),
         read(12, Some(u64::MAX), None),
         read(13, Some(block), None),
-        copy(14, block),
-        copy(15, u64::MAX),
-        copy(16, block),
+        copy(block),
+        copy(u64::MAX),
     ] {
         client.peer.send_action(&action).unwrap();
     }
     client.flush().unwrap();
     let mut received = HashSet::new();
+    let mut copies = 0;
     let mut command_metadata = false;
     wait(&mut client, |_, events| {
         for event in events {
-            let request = match event {
+            match event {
                 Response::Clipboard {
-                    request,
-                    file,
-                    incomplete,
+                    file, incomplete, ..
                 } => {
                     assert!(!incomplete);
                     let mut output = String::new();
@@ -1969,19 +1975,18 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
                         .read_to_string(&mut output)
                         .unwrap();
                     assert!(output.contains("same-shell"));
-                    *request
+                    copies += 1;
                 }
-                Response::CopyError { request, error } => {
-                    assert_eq!(*request, 15);
+                Response::CopyError(error) => {
                     assert!(error.contains("no longer retained"));
-                    *request
+                    copies += 1;
                 }
                 Response::History {
                     request: 12,
                     result,
                 } => {
                     assert!(result.as_ref().unwrap_err().contains("no longer retained"));
-                    12
+                    received.insert(12);
                 }
                 Response::History { request, result } => {
                     let page = result.as_ref().unwrap();
@@ -1992,16 +1997,15 @@ fn agent_input_keeps_shell_state_rejects_conflicts_and_pairs_queued_history_resu
                         assert!(command.complete && command.has_output);
                         command_metadata = true;
                     }
-                    *request
+                    received.insert(*request);
                 }
                 Response::Error(error) => panic!("uncorrelated error: {error}"),
                 _ => continue,
             };
-            received.insert(request);
         }
-        received.len() == 6
+        received.len() == 3 && copies == 2
     });
-    assert_eq!(received, HashSet::from([11, 12, 13, 14, 15, 16]));
+    assert_eq!(received, HashSet::from([11, 12, 13]));
     assert!(command_metadata);
 }
 

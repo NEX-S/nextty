@@ -26,7 +26,6 @@ pub(crate) struct Markdown {
     pub text: String,
     // Each span starts at the previous end.
     spans: Vec<(usize, u8)>,
-    prefix: Option<(usize, usize, usize)>,
 }
 
 impl Markdown {
@@ -100,13 +99,13 @@ impl Markdown {
     fn table<'a>(
         &mut self,
         alignments: &[Alignment],
-        events: &mut impl Iterator<Item = (Event<'a>, Range<usize>)>,
+        events: &mut impl Iterator<Item = Event<'a>>,
         quote_depth: usize,
     ) {
         let mut rows: Vec<Vec<Self>> = Vec::new();
         let mut styles: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![0];
         let mut links = Vec::new();
-        for (event, _) in events {
+        for event in events {
             match event {
                 Event::End(TagEnd::Table) => break,
                 Event::Start(Tag::TableHead | Tag::TableRow) => rows.push(Vec::new()),
@@ -208,65 +207,21 @@ impl Markdown {
         self.newline(2);
     }
 
-    pub fn render(source: &str, previous: Option<(&str, &Self)>) -> Self {
-        // References and HTML can change earlier blocks when more source arrives.
-        let previous = previous.and_then(|(old, document)| {
-            document
-                .prefix
-                .filter(|&(end, _, _)| source.get(..end) == old.get(..end))
-                .map(|prefix| (document, prefix))
-        });
-        let tail = &source.as_bytes()[previous.map_or(0, |(_, (end, _, _))| end)..];
-        let reusable = memchr::memchr2(b'[', b'<', tail).is_none();
-        let (mut output, offset) = if let Some((previous, (source_end, text_end, spans_end))) =
-            previous.filter(|_| reusable)
-        {
-            let mut output = Self {
-                text: String::with_capacity(text_end + source.len() - source_end),
-                spans: previous.spans[..spans_end].to_vec(),
-                prefix: None,
-            };
-            output.text.push_str(&previous.text[..text_end]);
-            if let Some((end, _)) = output.spans.last_mut() {
-                *end = text_end;
-            }
-            (output, source_end)
-        } else {
-            (Self::default(), 0)
-        };
+    pub fn render(source: &str) -> Self {
+        let mut output = Self::default();
         let mut styles: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![0];
         let mut lists = Vec::new();
         let mut number_text = String::new();
         let mut links = Vec::new();
         let mut quote_depth = 0;
-        let mut pending_prefix = None;
-        let mut table_tail = false;
-        let mut events =
-            Parser::new_ext(&source[offset..], Options::ENABLE_TABLES).into_offset_iter();
-        while let Some((event, range)) = events.next() {
-            if styles.len() == 1 && !matches!(&event, Event::End(_)) {
-                let start = offset + range.start;
-                let start = source[..start]
-                    .rfind(['\r', '\n'])
-                    .map_or(0, |index| index + 1);
-                pending_prefix = Some((start, output.text.len(), output.spans.len()));
-            }
-            // An unfinished block marker can still merge into the preceding paragraph.
-            if !table_tail
-                && matches!(&event, Event::Text(_) | Event::Code(_))
-                && let Some(prefix) = pending_prefix.take()
-            {
-                output.prefix = Some(prefix);
-            }
+        let mut events = Parser::new_ext(source, Options::ENABLE_TABLES);
+        while let Some(event) = events.next() {
             let style = *styles.last().unwrap();
             match event {
                 Event::Start(tag) => {
                     let mut next = style;
                     match tag {
                         Tag::Table(alignments) => {
-                            // A partial following line can still become another table row.
-                            output.prefix = pending_prefix.take();
-                            table_tail = true;
                             output.table(&alignments, &mut events, quote_depth);
                             continue;
                         }
@@ -347,9 +302,6 @@ impl Markdown {
         }
         let end = output.text.trim_end_matches('\n').len();
         output.text.truncate(end);
-        output.prefix = output
-            .prefix
-            .filter(|&(source_end, text_end, _)| source_end != 0 && text_end <= end);
         output
     }
 }
@@ -359,73 +311,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn streaming_prefix_reuse_matches_full_rendering() {
-        let sources = [
-            "- a\n**",
-            "`a\n****`",
-            "\n😀\r\r**",
-            "first **bold**\n\nsecond *italic*\n\nlast `code` and 中\n",
-            "- first\n\n- second\n  continued\n\noutside\n\nlast\n",
-            "> quote\n>\n> next\n\nplain\n\nlast\n",
-            "intro\n\n```rust\nlet x = 1;\n\n```\n\nafter\n\nlast\n",
-            "intro\n\n~~~\n\n~~~\n\nlast\n",
-            "intro\n\n    indented\n\n    more\n\nlast\n",
-            "intro\n\nsetext\n---\n\nlast\n",
-            "intro\n\n---\n\nlast\n",
-            "[old][ref]\n\nplain\n\n[ref]: https://example.com\n",
-            "intro\n\n[old][ref]\n\n[ref]: https://example.com\n",
-            "intro\n\n<div>\nhtml\n</div>\n\nlast\n",
-            "intro\n\n| Name | Size |\n| :--- | ---: |\n| 中 | `12` |\n| **long name** | 3 |\n\nafter\n",
-            "| A | B |\n| :-: | -: |\n| one | [link][ref] |\n| two | |\n\n[ref]: https://example.com\n",
-            "> | A | B |\n> | - | - |\n> | 中文 | value |\n\nafter\n",
-            "- first\n  - nested **bold**\n  - nested `code`\n- last\n\n3. third\n4. fourth\n",
-        ];
-        for source in sources.into_iter().flat_map(|source| {
-            [
-                source.to_owned(),
-                source.replace('\n', "\r"),
-                source.replace('\n', "\r\n"),
-            ]
-        }) {
-            let mut previous = None;
-            for end in source
-                .char_indices()
-                .map(|(index, _)| index)
-                .chain(std::iter::once(source.len()))
-            {
-                let text = &source[..end];
-                let incremental = Markdown::render(
-                    text,
-                    previous
-                        .as_ref()
-                        .map(|(source, document)| (*source, document)),
-                );
-                let full = Markdown::render(text, None);
-                assert_eq!(incremental.text, full.text, "{text:?}");
-                assert_eq!(incremental.spans, full.spans, "{text:?}");
-                previous = Some((text, incremental));
-            }
-        }
-        let linked = "[x](https://example.com)\n\n";
-        let linked = Markdown::render(linked, None);
-        let source = "[x](https://example.com)\n\nplain\n\nnext";
-        let appended = Markdown::render(source, Some(("[x](https://example.com)\n\n", &linked)));
-        assert_eq!(appended.text, Markdown::render(source, None).text);
-        assert!(appended.prefix.is_some());
-        let old_source = "old paragraph\n\nlast";
-        let old = Markdown::render(old_source, None);
-        let changed = "new paragraph\n\nlast";
-        let reused = Markdown::render(changed, Some((old_source, &old)));
-        let full = Markdown::render(changed, None);
-        assert_eq!(reused.text, full.text);
-        assert_eq!(reused.spans, full.spans);
-    }
-
-    #[test]
     fn renders_nested_styles_and_preserves_code_and_links() {
         let document = Markdown::render(
             "## 标题\n\n**bold _italic_** and `a*b`\n\n> quote\n\n1. first\n2. second\n\n```rust\n  x < y\n\n  z\n```\n\n[docs](https://example.com)",
-            None,
         );
         assert_eq!(
             document.text,
@@ -444,7 +332,6 @@ mod tests {
     fn tables_align_unicode_columns_and_preserve_inline_styles() {
         let document = Markdown::render(
             "| 名称 | 值 | 说明 |\n| :--- | ---: | :---: |\n| **中文** | `12` | *ok* |\n| x | 3 | wide |",
-            None,
         );
         assert_eq!(
             document.text,
@@ -470,20 +357,17 @@ mod tests {
     #[test]
     fn long_table_cells_keep_text_without_padding_every_row_to_their_width() {
         let long = "x".repeat(4096);
-        let document = Markdown::render(
-            &format!("| A | B |\n| - | - |\n| {long} | value |\n| short | value |"),
-            None,
-        );
+        let document = Markdown::render(&format!(
+            "| A | B |\n| - | - |\n| {long} | value |\n| short | value |"
+        ));
         assert!(document.text.contains(&long));
         assert!(crate::width::text_width(document.text.lines().last().unwrap()) < 64);
     }
 
     #[test]
     fn nested_lists_use_dots_and_keep_ordered_start_numbers() {
-        let document = Markdown::render(
-            "- first\n  - child\n  - **second**\n- last\n\n3. third\n4. fourth",
-            None,
-        );
+        let document =
+            Markdown::render("- first\n  - child\n  - **second**\n- last\n\n3. third\n4. fourth");
         assert_eq!(
             document.text,
             "• first\n  • child\n  • second\n• last\n\n3. third\n4. fourth"
@@ -499,7 +383,7 @@ mod tests {
             ),
             ("```text\n中e\u{301}\u{85}A\tB\n```", "中e\u{301} A B"),
         ] {
-            let document = Markdown::render(source, None);
+            let document = Markdown::render(source);
             assert_eq!(document.text, expected);
             assert_eq!(
                 document.spans(0..document.text.len()).collect::<Vec<_>>(),
@@ -510,7 +394,7 @@ mod tests {
 
     #[test]
     fn streaming_unclosed_code_keeps_the_partial_line() {
-        let document = Markdown::render("answer\n\n```gdb\nx/4gx $sp\n0x123", None);
+        let document = Markdown::render("answer\n\n```gdb\nx/4gx $sp\n0x123");
         assert_eq!(document.text, "answer\n\nx/4gx $sp\n0x123");
         assert_eq!(
             document

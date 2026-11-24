@@ -11,6 +11,7 @@ use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
+use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
@@ -689,14 +690,14 @@ pub(crate) fn expand_selection<R: std::borrow::Borrow<Row>, E>(
     Ok(())
 }
 
-pub(crate) fn object_selection<R: std::borrow::Borrow<Row>>(
+pub(crate) fn object_selection<'a>(
     point: (i64, usize),
-    row: impl Fn(i64) -> Option<R>,
+    row: impl Fn(i64) -> Option<&'a Row>,
 ) -> Option<[(i64, usize); 2]> {
     // Bound work on one user gesture, even for output containing enormous soft-wrapped lines.
     const LIMIT: usize = 4096;
     let anchor_row = row(point.0)?;
-    if point.1 >= anchor_row.borrow().used() {
+    if point.1 >= anchor_row.used() {
         return None;
     }
     let mut first = point.0;
@@ -705,7 +706,6 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>>(
         let Some(previous) = row(first - 1) else {
             break;
         };
-        let previous = previous.borrow();
         if !previous.wrapped {
             break;
         }
@@ -719,7 +719,6 @@ pub(crate) fn object_selection<R: std::borrow::Borrow<Row>>(
         let Some(current) = row(line) else {
             break false;
         };
-        let current = current.borrow();
         let begin = if line == first {
             before.saturating_sub(LIMIT)
         } else {
@@ -997,6 +996,8 @@ pub struct Core {
     directory: Option<PathBuf>,
     input_generation: u64,
     prompt_dirty: bool,
+    // Lines that moved up through the live view; frontends shift their rows by the delta.
+    scrolls: u64,
 }
 
 impl Core {
@@ -1033,6 +1034,7 @@ impl Core {
             directory: None,
             input_generation: 0,
             prompt_dirty: false,
+            scrolls: 0,
         }
     }
 
@@ -1094,10 +1096,13 @@ impl Core {
     pub(crate) fn window_size(&self) -> WindowSize {
         self.size
     }
-    pub(crate) fn row_versions(&self) -> Vec<u64> {
-        (0..self.screen_lines())
-            .map(|index| self.row(index).revision)
-            .collect()
+    /// The revision shared by every row damaged since the last `reset_damage`.
+    pub(crate) fn revision(&self) -> u64 {
+        self.revision
+    }
+    /// Lines that scrolled up through the live view.
+    pub(crate) fn scrolls(&self) -> u64 {
+        self.scrolls
     }
     pub fn reset_damage(&mut self) {
         self.revision_pending = true;
@@ -1204,6 +1209,11 @@ impl Core {
         let count = count.min(bottom - top);
         let blank = self.blank();
         let history = !down && top == 0 && !self.mode.contains(Mode::ALT_SCREEN);
+        // A full-page scroll with the live view showing moves what the frontends display:
+        // they shift their rows by `scrolls`, so just the rows entering the screen need
+        // damage. Scrolled back, the view keeps its rows and nothing visible changes.
+        let full_page = history && bottom == self.screen_lines();
+        let live = full_page && self.active.offset == 0;
         for _ in 0..count {
             if history {
                 let mut recycled = self
@@ -1233,7 +1243,12 @@ impl Core {
             self.block_origin += count as u64;
             self.trim_blocks();
             self.spill_history();
-            self.damage_all();
+            if !full_page {
+                self.damage_all();
+            } else if live {
+                self.scrolls += count as u64;
+                self.damage_range(bottom - count, bottom);
+            }
         } else {
             if !self.mode.contains(Mode::ALT_SCREEN) {
                 self.shift_blocks(top, bottom, delta);
@@ -1489,17 +1504,14 @@ impl Core {
         self.request_history_page();
     }
 
-    #[inline]
-    pub(crate) fn write_reply(&mut self, reply: std::fmt::Arguments<'_>) {
+    // Rare sequences stay out of the shared parser dispatch path.
+    #[inline(never)]
+    pub(crate) fn write_reply(&mut self, reply: impl std::fmt::Display) {
+        let text = reply.to_string().into_bytes();
         if let Some(Event::Write(previous)) = self.events.last_mut() {
-            if let Some(text) = reply.as_str() {
-                previous.extend_from_slice(text.as_bytes());
-            } else {
-                io::Write::write_fmt(previous, reply).unwrap();
-            }
+            previous.extend_from_slice(&text);
         } else {
-            self.events
-                .push(Event::Write(std::fmt::format(reply).into_bytes()));
+            self.events.push(Event::Write(text));
         }
     }
     // Mode changes are rare next to text; inlined into the parser loop they enlarge it.
@@ -2193,10 +2205,11 @@ impl Core {
         let mut events = std::mem::take(&mut self.events);
 
         let history = self.history.take();
-        let revision = self.revision;
+        let (revision, scrolls) = (self.revision, self.scrolls);
         *self = Self::new(self.size, self.foreground, self.background);
-        // Frontends compare revisions, so a reset must not repeat an old one.
+        // Frontends compare revisions and scroll counts, so a reset must not repeat old ones.
         self.revision = revision;
+        self.scrolls = scrolls;
         self.damage_palette();
         self.history = history;
         self.clear_disk_history();
@@ -2249,10 +2262,8 @@ impl Core {
         ));
     }
     pub(crate) fn set_color(&mut self, index: usize, color: Option<Rgb>) {
-        if let Some(slot) = self.colors.get_mut(index)
-            && *slot != color
-        {
-            *slot = color;
+        if self.colors[index] != color {
+            self.colors[index] = color;
             self.damage_palette();
         }
     }
@@ -2323,10 +2334,12 @@ impl Core {
         });
         self.spill_history();
     }
-    pub(crate) fn history_budget(&self) -> Option<Arc<HistoryBudget>> {
+    /// A duplicate of the history writer's wakeup fd, for threads that outlive their request.
+    pub(crate) fn history_waker(&self) -> io::Result<Option<OwnedFd>> {
         self.history
             .as_ref()
-            .map(|history| history.io.budget().clone())
+            .map(|history| history.io.budget().waker())
+            .transpose()
     }
     pub(crate) fn history_read_ready(&self) -> bool {
         self.mode.contains(Mode::ALT_SCREEN)
@@ -2790,16 +2803,16 @@ impl Core {
             .min(self.history_size() as u64) as usize;
         self.set_display_offset(offset)
     }
-    fn search_base(&self) -> u64 {
+    /// Absolute id of screen line 0; the alternate screen has no history.
+    fn screen_base(&self) -> u64 {
         if self.mode.contains(Mode::ALT_SCREEN) {
             0
         } else {
-            self.history.as_ref().map_or(0, |history| history.hot_start)
-                + self.hot_history_size() as u64
+            self.block_origin
         }
     }
     pub(crate) fn search_anchor(&self) -> SearchAnchor {
-        let base = self.search_base();
+        let base = self.screen_base();
         SearchAnchor {
             base,
             top: base.saturating_sub(self.display_offset() as u64),
@@ -2812,7 +2825,7 @@ impl Core {
         if anchor.alternate != self.mode.contains(Mode::ALT_SCREEN) {
             return;
         }
-        let base = self.search_base();
+        let base = self.screen_base();
         let offset = base
             .saturating_sub(anchor.top)
             .min(self.history_size() as u64) as usize;
@@ -2859,7 +2872,7 @@ impl Core {
         let found = result.matches.get(index).ok_or_else(|| {
             io::Error::new(io::ErrorKind::NotFound, "search result no longer exists")
         })?;
-        let base = self.search_base();
+        let base = self.screen_base();
         let first = base.saturating_sub(self.history_size() as u64);
         if found.start_row < first || found.end_row >= base + self.screen_lines() as u64 {
             return Err(io::Error::new(
@@ -2921,9 +2934,7 @@ impl Core {
                     hot_start,
                     hot,
                     kind: None,
-                    incomplete: block.incomplete
-                        || block.prompt.row < history.first
-                        || start.row < history.first,
+                    incomplete: block.incomplete || block.prompt.row < history.first,
                     in_memory: history.failed,
                 },
                 sender.clone(),
@@ -2943,7 +2954,7 @@ impl Core {
             } else {
                 history.hot_start
             };
-            let base = hot_start + core.hot_history_size() as u64;
+            let base = core.screen_base();
             let start = (
                 base.saturating_add_signed(i64::from(range.start.line)),
                 range.start.column,
@@ -3082,11 +3093,8 @@ impl Core {
                 let _ = sender.send(Err(error));
             }
         });
-        if self.history_read_blocked() {
-            self.history.as_mut().unwrap().requests.push_back(task);
-        } else {
-            task(self);
-        }
+        self.history.as_mut().unwrap().requests.push_back(task);
+        self.flush_history_requests();
         receiver
     }
 

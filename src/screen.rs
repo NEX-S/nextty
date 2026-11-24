@@ -15,6 +15,9 @@ pub struct Screen {
     pub(crate) selection: Option<SelectionRange>,
     pub(crate) offset: usize,
     pub(crate) history: usize,
+    /// Lines that scrolled up through this screen since its last frame was drawn; the
+    /// desktop's shaped-line cache shifts with them.
+    pub(crate) scrolled: usize,
 
     pub(crate) activity: u64,
     pub(crate) output_activity: u64,
@@ -24,6 +27,9 @@ pub struct Screen {
 pub struct Update {
     pub columns: usize,
     pub lines: usize,
+    /// Lines that moved up through the live view since the previous frame; `rows` is in the
+    /// new coordinates.
+    pub scroll: u16,
     pub rows: Vec<(usize, Row)>,
     pub cursor: (Point, CursorShape),
     pub mode: Mode,
@@ -45,6 +51,7 @@ impl Default for Screen {
             selection: None,
             offset: 0,
             history: 0,
+            scrolled: 0,
 
             activity: 0,
             output_activity: 0,
@@ -52,23 +59,50 @@ impl Default for Screen {
     }
 }
 
+/// What one connection last received of a pane. Row revisions only grow, and the reactor calls
+/// `Core::reset_damage` after each frame, so the rows damaged since `revision` are exactly
+/// those the connection lacks.
+pub(crate) struct FrameState {
+    size: WindowSize,
+    full: u64,
+    palette: u64,
+    revision: u64,
+    scrolls: u64,
+}
+
+impl FrameState {
+    pub fn new(core: &Core) -> Self {
+        Self {
+            size: core.window_size(),
+            full: core.full_revision(),
+            palette: core.palette_revision(),
+            revision: core.revision(),
+            scrolls: core.scrolls(),
+        }
+    }
+}
+
 impl Update {
-    pub fn capture_since(core: &Core, previous: Option<(WindowSize, u64, u64, &[u64])>) -> Self {
-        let full = previous.is_none_or(|(size, full_revision, _, rows)| {
-            size != core.window_size()
-                || full_revision != core.full_revision()
-                || rows.len() != core.screen_lines()
-        });
+    /// Everything after a resize or full redraw; else the rows damaged since `previous` and
+    /// the lines that scrolled through.
+    pub(crate) fn capture_since(core: &Core, previous: Option<&FrameState>) -> Self {
+        let scrolled = previous.map_or(0, |known| core.scrolls().saturating_sub(known.scrolls));
+        let full = scrolled >= core.screen_lines() as u64
+            || previous.is_none_or(|known| {
+                known.size != core.window_size() || known.full != core.full_revision()
+            });
         let rows: Vec<_> = (0..core.screen_lines())
-            .filter(|index| full || core.row(*index).revision != previous.unwrap().3[*index])
+            .filter(|index| full || core.row(*index).revision > previous.unwrap().revision)
             .map(|index| (index, core.row(index).clone()))
             .collect();
-        Self::from_rows(
+        let mut update = Self::from_rows(
             core,
             rows,
             core.display_offset(),
-            full || previous.is_some_and(|(_, _, revision, _)| revision != core.palette_revision()),
-        )
+            full || previous.is_some_and(|known| known.palette != core.palette_revision()),
+        );
+        update.scroll = if full { 0 } else { scrolled as u16 };
+        update
     }
 
     pub fn capture_live(core: &Core) -> Self {
@@ -83,6 +117,7 @@ impl Update {
         Self {
             columns: core.columns(),
             lines: core.screen_lines(),
+            scroll: 0,
             rows,
             cursor: core.cursor(),
             mode: core.mode(),
@@ -138,16 +173,22 @@ impl Screen {
             self.dirty.resize(update.lines, true);
             self.columns = update.columns;
         } else {
+            let scroll = usize::from(update.scroll);
+            self.rows.rotate_left(scroll);
+            self.dirty.rotate_left(scroll);
+            self.scrolled += scroll;
             for (index, row) in update.rows {
                 self.rows[index] = row;
                 self.dirty[index] = true;
             }
+            if scroll != 0 {
+                self.dirty.fill(true);
+            }
         }
-        if self.offset != update.offset
-            || update
-                .palette
-                .as_deref()
-                .is_some_and(|palette| self.palette != *palette)
+        if update
+            .palette
+            .as_deref()
+            .is_some_and(|palette| self.palette != *palette)
             || self.mode.contains(Mode::ALT_SCREEN) != update.mode.contains(Mode::ALT_SCREEN)
         {
             self.dirty.fill(true);
@@ -194,7 +235,6 @@ impl Screen {
         self.history = update.history;
     }
 
-    // Prompts and partial boundary rows still need row_output's check.
     pub fn row_output<'a>(
         &self,
         pane: &'a crate::workspace::PaneView,
@@ -204,21 +244,19 @@ impl Screen {
         {
             return None;
         }
-        let line = row as i32 - self.offset as i32;
         let cells = &self.rows[row];
-        // Styled cells can extend beyond used; scan that tail only for matching output.
-        let mut prompt_cells = cells.cells.iter();
-        if prompt_cells
-            .by_ref()
-            .take(cells.used())
+        // Styled prompt padding can extend beyond used.
+        if cells
+            .cells
+            .iter()
             .any(|cell| cell.flags.contains(Flags::PROMPT))
         {
             return None;
         }
-        let block = output_block(&pane.blocks, line, cells.used())?;
-        (!prompt_cells.any(|cell| cell.flags.contains(Flags::PROMPT))).then_some(block)
+        output_block(&pane.blocks, row as i32 - self.offset as i32, cells.used())
     }
 
+    // A cheap damage hint; prompts and partial boundary rows still need row_output's check.
     pub(crate) fn output_changed(
         &self,
         old: &crate::workspace::PaneView,
@@ -228,18 +266,19 @@ impl Screen {
         if self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len() {
             return false;
         }
-        let line = row as i32 - self.offset as i32;
         let cells = &self.rows[row];
-        if cells.cells[0].flags.contains(Flags::PROMPT) {
+        if cells
+            .cells
+            .iter()
+            .any(|cell| cell.flags.contains(Flags::PROMPT))
+        {
             return false;
         }
         let output = |blocks: &[BlockMarker]| {
-            output_block(blocks, line, cells.used()).map(|block| (block.id, block.status))
+            output_block(blocks, row as i32 - self.offset as i32, cells.used())
+                .map(|block| (block.id, block.status))
         };
         output(&old.blocks) != output(&new.blocks)
-            && !cells.cells[1..]
-                .iter()
-                .any(|cell| cell.flags.contains(Flags::PROMPT))
     }
     pub fn columns(&self) -> usize {
         self.columns
@@ -310,6 +349,7 @@ fn output_block(blocks: &[BlockMarker], line: i32, used: usize) -> Option<&Block
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::Scroll;
     use crate::core::WindowSize;
     use crate::core::tests::terminal;
     use crate::panel::rect;
@@ -443,62 +483,99 @@ mod tests {
     #[test]
     fn capture_since_uses_only_rows_changed_for_that_client() {
         let (mut core, mut parser) = terminal(8, 3);
-        let initial = core.row_versions();
+        let initial = FrameState::new(&core);
         core.reset_damage();
         parser.advance(&mut core, b"a");
-        let update = Update::capture_since(
-            &core,
-            Some((
-                core.window_size(),
-                core.full_revision(),
-                core.palette_revision(),
-                &initial,
-            )),
-        );
+        let update = Update::capture_since(&core, Some(&initial));
         assert_eq!(update.rows.len(), 1);
         assert_eq!(update.rows[0].0, 0);
-        let current = core.row_versions();
-        assert!(
-            Update::capture_since(
-                &core,
-                Some((
-                    core.window_size(),
-                    core.full_revision(),
-                    core.palette_revision(),
-                    &current,
-                ))
-            )
-            .rows
-            .is_empty()
-        );
+        let current = FrameState::new(&core);
+        core.reset_damage();
+        assert!(Update::capture_since(&core, Some(&current)).rows.is_empty());
         parser.advance(&mut core, b"\x1b[2;1Hb");
-        let update = Update::capture_since(
-            &core,
-            Some((
-                core.window_size(),
-                core.full_revision(),
-                core.palette_revision(),
-                &current,
-            )),
-        );
+        let update = Update::capture_since(&core, Some(&current));
         assert_eq!(update.rows.len(), 1);
         assert_eq!(update.rows[0].0, 1);
-        let previous = core.window_size();
         core.resize(WindowSize {
             num_cols: 10,
-            ..previous
+            ..core.window_size()
         });
-        let update = Update::capture_since(
-            &core,
-            Some((
-                previous,
-                core.full_revision(),
-                core.palette_revision(),
-                &current,
-            )),
-        );
+        let update = Update::capture_since(&core, Some(&current));
         assert_eq!(update.rows.len(), 3);
         assert!(update.palette.is_some());
+    }
+
+    fn lines(screen: &Screen) -> Vec<String> {
+        (0..screen.screen_lines())
+            .map(|row| {
+                screen
+                    .row(row)
+                    .cells
+                    .iter()
+                    .map(|cell| cell.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn frames_shift_the_live_view_by_the_scrolled_lines_and_keep_a_scrolled_back_view() {
+        let mut core = crate::core::tests::disk_core(8, 5, 1 << 20);
+        let mut parser = crate::vt::Parser::new();
+        let mut screen = Screen::default();
+        screen.apply(Update::capture_since(&core, None));
+        let known = FrameState::new(&core);
+        parser.advance(&mut core, b"one\r\ntwo\r\nthree\r\nfour\r\nfive");
+        screen.apply(Update::capture_since(&core, Some(&known)));
+        screen.reset_damage();
+        let known = FrameState::new(&core);
+        core.reset_damage();
+        parser.advance(&mut core, b"\r\nsix");
+        let update = Update::capture_since(&core, Some(&known));
+        assert_eq!(update.scroll, 1);
+        assert_eq!(
+            update
+                .rows
+                .iter()
+                .map(|(index, _)| *index)
+                .collect::<Vec<_>>(),
+            [4]
+        );
+        screen.apply(update);
+        assert_eq!(lines(&screen), ["two", "three", "four", "five", "six"]);
+        assert_eq!(screen.scrolled, 1);
+        assert_eq!(screen.dirty, [true; 5]);
+
+        // Scrolled back one line, output under the view moves nothing that is shown.
+        core.scroll_display(Scroll::Delta(1));
+        crate::core::tests::settle(&mut core);
+        screen.apply(Update::capture_since(&core, Some(&known)));
+        screen.reset_damage();
+        let known = FrameState::new(&core);
+        core.reset_damage();
+        parser.advance(&mut core, b"\r\nseven");
+        let update = Update::capture_since(&core, Some(&known));
+        assert_eq!((update.scroll, update.offset), (0, 2));
+        assert!(update.rows.is_empty());
+        screen.apply(update);
+        assert_eq!(lines(&screen), ["one", "two", "three", "four", "five"]);
+        assert_eq!(screen.dirty, [false; 5]);
+
+        // Back at the live view the next line shifts again.
+        core.scroll_display(Scroll::Bottom);
+        screen.apply(Update::capture_since(&core, Some(&known)));
+        screen.reset_damage();
+        let known = FrameState::new(&core);
+        core.reset_damage();
+        parser.advance(&mut core, b"\r\nnine");
+        let update = Update::capture_since(&core, Some(&known));
+        assert_eq!(update.scroll, 1);
+        screen.apply(update);
+        assert_eq!(lines(&screen), ["four", "five", "six", "seven", "nine"]);
+        assert_eq!(screen.scrolled, 2);
+        assert_eq!(screen.dirty, [true; 5]);
     }
 
     #[test]

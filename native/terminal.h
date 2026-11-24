@@ -54,8 +54,9 @@ void nt_window_paste(NtWindow *, int primary);
 /* Dirty frame packets are limited to the current output refresh rate. The first
  * frame and updates after idle are ready immediately. Call only for dirty content.
  * Unknown refresh leaves scheduling to the graphics driver. A not-ready check
- * requests a one-shot timer to wake the event loop; it never marks content dirty. Wayland suspended state prevents drawing until resumed.
- * Frame callbacks and presentation feedback are diagnostics, never draw gates. */
+ * requests a one-shot timer to wake the event loop; it never marks content dirty.
+ * Wayland suspended state prevents drawing until resumed. Presentation feedback is
+ * a diagnostic, never a draw gate. */
 int nt_window_frame_ready(NtWindow *);
 void nt_window_prepare_frame(NtWindow *);
 /* Native Wayland display and surface handles. */

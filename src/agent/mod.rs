@@ -234,18 +234,10 @@ impl Agent {
 
 pub(crate) fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> {
     let mut context = terminal_observation(client, pane, None)?;
-    let snapshot = client.snapshot().unwrap();
-    let view = snapshot.pane(pane).unwrap();
-    context["target"] = json!({
-        "workspace": snapshot.name,
-        "connection": if client.is_remote() { "ssh" } else { "local" },
-        "ssh_target": client.remote_target(),
-        "writable": client.can_agent_input(),
-        "title": view.title,
-        "cwd": view.cwd,
-        "launch_argv": view.process.launch_argv,
-        "child_pid": view.process.child_pid,
-    });
+    let process = &client.snapshot().unwrap().pane(pane).unwrap().process;
+    context["writable"] = json!(client.can_agent_input());
+    context["launch_argv"] = json!(process.launch_argv);
+    context["child_pid"] = json!(process.child_pid);
     context["workspace"] = workspace_context(client)?;
     Ok(context)
 }
@@ -405,12 +397,10 @@ impl Agent {
 
     fn begin_ready(&mut self, request: ToolRequest, client: &mut Client) {
         if request.tool == Tool::Read && request.input["source"] == "workspace" {
-            let result = request
-                .check()
-                .and_then(|()| Ok(workspace_context(client)?.to_string()));
-            return request.respond(result);
+            request.respond(workspace_context(client).map(|context| context.to_string()));
+            return;
         }
-        let stage = request.check().and_then(|()| {
+        let stage = (|| {
             let pane = request.pane;
             match request.tool {
                 Tool::Shell | Tool::Input => {
@@ -423,7 +413,11 @@ impl Agent {
                     let text = request.input[field]
                         .as_str()
                         .ok_or_else(|| io::Error::other(format!("Missing string {field}")))?;
-                    let prompt = shell.then(|| view.shell_prompt.ok_or_else(|| io::Error::other("This pane has no untouched integrated shell prompt. Use input only to interact with its current foreground program. For independent shell commands, use open_terminal and the returned new pane ID."))).transpose()?;
+                    let prompt = if shell {
+                        Some(view.shell_prompt.ok_or_else(|| io::Error::other("This pane has no untouched integrated shell prompt. Use input only to interact with its current foreground program. For independent shell commands, use open_terminal and the returned new pane ID."))?)
+                    } else {
+                        None
+                    };
                     let bracketed = client.screens().get(&pane).is_some_and(|screen| {
                         screen.mode.contains(crate::core::Mode::BRACKETED_PASTE)
                     });
@@ -469,8 +463,9 @@ impl Agent {
                         "screen" | "history" => None,
                         _ => return Err(io::Error::other("Unknown terminal read source")),
                     };
-                    let seconds = serde_json::from_value::<Option<u64>>(request.input["wait"].clone())?
-                        .unwrap_or(0);
+                    let seconds =
+                        serde_json::from_value::<Option<u64>>(request.input["wait"].clone())?
+                            .unwrap_or(0);
                     if seconds > MAX_READ_WAIT {
                         return Err(io::Error::other(format!(
                             "read wait exceeds {MAX_READ_WAIT} seconds"
@@ -496,7 +491,7 @@ impl Agent {
                 }
                 _ => unreachable!(),
             }
-        });
+        })();
         self.start(request, stage)
     }
 
@@ -512,6 +507,7 @@ impl Agent {
             return;
         }
         let mut operation = self.operation.take().unwrap();
+        // Later sessions and the owner's own dispatch skip the consumed response.
         let event = std::mem::replace(event, Response::ScreenDirty);
         let pane = operation.request.pane;
         match event {
