@@ -8,7 +8,6 @@ use std::{
     os::fd::IntoRawFd,
 };
 
-pub use crate::input::{ALT, CONTROL, SHIFT, SUPER};
 pub const KEY: i32 = 1;
 pub const TEXT: i32 = 2;
 pub const PREEDIT: i32 = 3;

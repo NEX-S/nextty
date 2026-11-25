@@ -10,6 +10,7 @@ use std::io;
 use std::ops::Range;
 use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -17,8 +18,6 @@ use std::time::{Duration, Instant};
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMarker {
     pub id: u64,
-    pub line: i32,
-    pub complete: bool,
     pub status: Option<i32>,
     pub output: Option<(Point, Point)>,
 }
@@ -114,6 +113,15 @@ struct DiskHistory {
     failed: bool,
 }
 
+impl DiskHistory {
+    /// Drops the cached cold rows: their ids or text no longer match the layout.
+    fn forget_page(&mut self) {
+        self.page.clear();
+        self.requested = None;
+        self.layout_epoch += 1;
+    }
+}
+
 const SYNC_TIMEOUT: Duration = Duration::from_millis(150);
 
 const ANSI: [u32; 16] = [
@@ -203,13 +211,9 @@ impl Flags {
             | Self::DOTTED_UNDERLINE.0
             | Self::DASHED_UNDERLINE.0,
     );
-    pub const fn empty() -> Self {
-        Self(0)
-    }
 }
 
 impl Mode {
-    pub const NONE: Self = Self(0);
     pub const APP_CURSOR: Self = Self(1 << 0);
     pub const FOCUS_IN_OUT: Self = Self(1 << 1);
     pub const BRACKETED_PASTE: Self = Self(1 << 2);
@@ -222,12 +226,15 @@ impl Mode {
     pub const ALT_SCREEN: Self = Self(1 << 7);
     pub const ALTERNATE_SCROLL: Self = Self(1 << 8);
     pub const INSERT: Self = Self(1 << 9);
-    pub const ORIGIN: Self = Self(1 << 10);
     pub const LINE_WRAP: Self = Self(1 << 11);
     pub const SHOW_CURSOR: Self = Self(1 << 12);
     pub const LINE_FEED_NEW_LINE: Self = Self(1 << 13);
     pub const APP_KEYPAD: Self = Self(1 << 14);
     pub const SYNC_UPDATE: Self = Self(1 << 15);
+}
+
+fn tab_stop(column: usize) -> bool {
+    column != 0 && column.is_multiple_of(8)
 }
 
 fn ansi_mode(mode: u16) -> Option<Mode> {
@@ -297,7 +304,7 @@ impl Default for Cell {
             c: ' ',
             fg: Color::Named(NamedColor::Foreground),
             bg: Color::Named(NamedColor::Background),
-            flags: Flags::empty(),
+            flags: Flags::default(),
         }
     }
 }
@@ -536,10 +543,6 @@ impl Row {
 
     fn repair_wide(&mut self, start: usize, blank: Cell) {
         let end = self.non_default_len();
-        if start >= end {
-            self.used = self.used.max(end);
-            return;
-        }
         for x in start..end {
             let flags = self.cells[x].flags;
             let invalid = flags.contains(Flags::WIDE_CHAR)
@@ -685,13 +688,19 @@ struct Selection {
     kind: SelectionType,
 }
 
+/// What a terminal reports; its owner takes them from `Core::take_events`.
 #[derive(Debug)]
 pub enum Event {
+    /// A reply the program asked for, which the terminal writes back.
     Write(Vec<u8>),
     Title(Option<String>),
-    ClipboardStore { primary: bool, text: String },
-
+    ClipboardStore {
+        primary: bool,
+        text: String,
+    },
     HistoryError(io::Error),
+    Exit(ExitStatus),
+    Error(io::Error),
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -699,7 +708,7 @@ struct Cursor {
     point: Point,
     template: Cell,
     underline_color: Option<Color>,
-    charsets: [StandardCharset; 4],
+    charsets: [StandardCharset; 2],
     charset: usize,
     wrap_pending: bool,
     origin: bool,
@@ -806,8 +815,7 @@ pub struct Core {
     foreground: u32,
     background: u32,
     colors: [Option<Rgb>; PALETTE_SIZE],
-    palette_revision: u64,
-    events: Vec<Event>,
+    pub(crate) events: Vec<Event>,
     title: Option<String>,
     titles: Vec<Option<String>>,
     history: Option<DiskHistory>,
@@ -840,7 +848,7 @@ impl Core {
             mode: Mode::LINE_WRAP | Mode::SHOW_CURSOR | Mode::ALTERNATE_SCROLL,
             scroll_top: 0,
             scroll_bottom: lines,
-            tabs: (0..columns).map(|x| x != 0 && x % 8 == 0).collect(),
+            tabs: (0..columns).map(tab_stop).collect(),
             revision: 0,
             revision_pending: true,
             full_revision: 0,
@@ -849,7 +857,6 @@ impl Core {
             foreground,
             background,
             colors: [None; PALETTE_SIZE],
-            palette_revision: 0,
             events: Vec::new(),
             title: None,
             titles: Vec::new(),
@@ -857,7 +864,7 @@ impl Core {
             recycled: VecDeque::new(),
             blocks: VecDeque::new(),
             next_block: 1,
-            prompt_scope: Flags::empty(),
+            prompt_scope: Flags::default(),
             block_origin: 0,
             directory: None,
             input_generation: 0,
@@ -886,10 +893,21 @@ impl Core {
     pub fn display_offset(&self) -> usize {
         self.active.offset
     }
+    /// Id of the first row the viewport shows.
+    fn view_top(&self) -> u64 {
+        self.block_origin
+            .saturating_sub(self.display_offset() as u64)
+    }
+    /// Scrolls so that `row` is the viewport's first line.
+    fn scroll_to_row(&mut self, row: u64) -> bool {
+        let offset = self
+            .block_origin
+            .saturating_sub(row)
+            .min(self.history_size() as u64) as usize;
+        self.set_display_offset(offset)
+    }
     pub fn mode(&self) -> Mode {
-        let mut mode = self.mode;
-        mode.set(Mode::ORIGIN, self.active.cursor.origin);
-        mode
+        self.mode
     }
     pub fn row(&self, viewport_row: usize) -> &Row {
         let line = viewport_row as i32 - self.display_offset() as i32;
@@ -921,9 +939,6 @@ impl Core {
     pub fn take_events(&mut self) -> Vec<Event> {
         std::mem::take(&mut self.events)
     }
-    pub(crate) fn window_size(&self) -> WindowSize {
-        self.size
-    }
     /// The revision shared by every row damaged since the last `reset_damage`.
     pub(crate) fn revision(&self) -> u64 {
         self.revision
@@ -934,13 +949,6 @@ impl Core {
     }
     pub fn reset_damage(&mut self) {
         self.revision_pending = true;
-    }
-    fn damage_palette(&mut self) {
-        self.palette_revision = self.next_revision();
-        self.damage_all();
-    }
-    pub(crate) fn palette_revision(&self) -> u64 {
-        self.palette_revision
     }
     pub(crate) fn full_revision(&self) -> u64 {
         self.full_revision
@@ -1253,7 +1261,7 @@ impl Core {
         }
         let old_base = self.block_origin;
         let alt = self.mode.contains(Mode::ALT_SCREEN);
-        let main_selection = if alt { None } else { self.selection.take() };
+        let main_selection = self.selection.take();
         let (main, alternate) = if alt {
             (&mut self.inactive, &mut self.active)
         } else {
@@ -1306,23 +1314,17 @@ impl Core {
             main.offset = new_base.saturating_sub(top) as usize;
         }
         if let Some(history) = &mut self.history {
-            history.layout_epoch += 1;
-            history.page.clear();
-            history.requested = None;
+            history.forget_page();
             history.blank = Row::new(columns, Cell::default());
         }
         alternate.resize_alternate(columns, lines);
-        if alt {
-            self.selection = None;
-        }
         self.size = size;
         self.tabs.truncate(columns);
-        self.tabs
-            .extend((self.tabs.len()..columns).map(|column| column != 0 && column % 8 == 0));
+        self.tabs.extend((self.tabs.len()..columns).map(tab_stop));
         self.scroll_top = 0;
         self.scroll_bottom = lines;
         // A resized frontend screen is rebuilt and needs the palette again.
-        self.damage_palette();
+        self.damage_all();
         self.spill_history();
         self.request_history_page();
     }
@@ -1730,7 +1732,7 @@ impl Core {
         }
         let mut point = self.active.cursor.point;
         if width == 2 && point.column + 1 >= self.columns() {
-            if self.mode.contains(Mode::LINE_WRAP) && self.columns() > 1 {
+            if self.mode.contains(Mode::LINE_WRAP) {
                 let blank = self.blank();
                 let row = self.screen_row_mut(point.line as usize);
                 row.clear_range(point.column, point.column + 1, blank);
@@ -1849,13 +1851,6 @@ impl Core {
                 }
             }
         }
-        if blank.bg != Color::Named(NamedColor::Background) {
-            row.used = if right {
-                row.used.max(point.column + count)
-            } else {
-                columns
-            };
-        }
         row.repair_wide(point.column.saturating_sub(1), blank);
         row.wrapped = false;
         self.active.cursor.wrap_pending = false;
@@ -1949,31 +1944,37 @@ impl Core {
             input_generation: self.input_generation,
             ..Self::new(self.size, self.foreground, self.background)
         };
-        self.damage_palette();
+        self.damage_all();
         self.clear_disk_history();
         self.events.push(Event::Title(None));
     }
     fn report_mode(&mut self, mode: u16, private: bool) {
-        let flag = if private {
-            match mode {
-                6 => Some(Mode::ORIGIN),
-                47 | 1047 | 1049 => Some(Mode::ALT_SCREEN),
-                _ => private_mode(mode),
+        // Origin mode is the cursor's state rather than a screen mode.
+        let set = match mode {
+            6 if private => Some(self.active.cursor.origin),
+            _ => {
+                let flag = if private {
+                    match mode {
+                        47 | 1047 | 1049 => Some(Mode::ALT_SCREEN),
+                        _ => private_mode(mode),
+                    }
+                } else {
+                    ansi_mode(mode)
+                };
+                flag.map(|flag| self.mode.contains(flag))
             }
-        } else {
-            ansi_mode(mode)
         };
         self.write_reply(format_args!(
             "\x1b[{}{};{}$y",
             if private { "?" } else { "" },
             mode,
-            flag.map_or(0, |flag| if self.mode().contains(flag) { 1 } else { 2 })
+            set.map_or(0, |set| if set { 1 } else { 2 })
         ));
     }
     fn set_color(&mut self, index: usize, color: Option<Rgb>) {
         if self.colors[index] != color {
             self.colors[index] = color;
-            self.damage_palette();
+            self.damage_all();
         }
     }
     /// `?` queries a palette slot; anything else sets it.
@@ -2050,7 +2051,7 @@ impl Core {
                 self.goto(0, 0);
                 self.damage_all();
             }
-            (b'('..=b'+', b'0' | b'B') => {
+            (b'(' | b')', b'0' | b'B') => {
                 self.active.cursor.charsets[usize::from(intermediate - b'(')] =
                     if final_byte == b'0' {
                         StandardCharset::SpecialGraphics
@@ -2190,7 +2191,7 @@ impl Core {
                 _ => (),
             },
             (b'?', 0, b'W') if p.value(0) == 5 => {
-                self.tabs = (0..self.columns()).map(|x| x != 0 && x % 8 == 0).collect()
+                self.tabs = (0..self.columns()).map(tab_stop).collect()
             }
             _ => (),
         }
@@ -2224,7 +2225,7 @@ impl Core {
                 4 => {
                     let style = if colon { p.value(index + 1) } else { 1 };
                     if let Some(underline) = [
-                        Flags::empty(),
+                        Flags::default(),
                         Flags::UNDERLINE,
                         Flags::DOUBLE_UNDERLINE,
                         Flags::UNDERCURL,
@@ -2485,9 +2486,7 @@ impl Core {
         }
         let lines = self.screen_lines() as u64;
         let hot_start = self.hot_start();
-        let top = self
-            .block_origin
-            .saturating_sub(self.display_offset() as u64);
+        let top = self.view_top();
         let Some(history) = &mut self.history else {
             return;
         };
@@ -2576,9 +2575,7 @@ impl Core {
         history.failed = true;
         history.clearing = false;
         history.first = hot_start;
-        history.page.clear();
-        history.requested = None;
-        history.layout_epoch += 1;
+        history.forget_page();
         let lines = self.screen_lines();
         let main = if self.mode.contains(Mode::ALT_SCREEN) {
             &mut self.inactive
@@ -2598,10 +2595,8 @@ impl Core {
             return;
         };
         history.first = 0;
-        history.page.clear();
-        history.requested = None;
         history.epoch += 1;
-        history.layout_epoch += 1;
+        history.forget_page();
         if !history.failed {
             history.clearing = true;
             history.io.clear();
@@ -2694,7 +2689,7 @@ impl Core {
                 return;
             }
             (b"P", Some(b"0")) => {
-                self.prompt_scope = Flags::empty();
+                self.prompt_scope = Flags::default();
                 return;
             }
             (b"A", _) => {
@@ -2729,7 +2724,7 @@ impl Core {
                 self.next_block += 1;
             }
             (b"B" | b"C" | b"D", _) => {
-                self.prompt_scope = Flags::empty();
+                self.prompt_scope = Flags::default();
                 let Some(block) = self.blocks.back_mut() else {
                     return;
                 };
@@ -2814,11 +2809,8 @@ impl Core {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return Vec::new();
         }
-        let top = self
-            .block_origin
-            .saturating_sub(self.display_offset() as u64);
+        let top = self.view_top();
         let bottom = top + self.screen_lines() as u64;
-        let first = self.first_row();
         let begin = self
             .blocks
             .partition_point(|block| block.prompt.row < top)
@@ -2829,8 +2821,6 @@ impl Core {
             .filter(|block| block.end.is_none_or(|end| end.row >= top))
             .map(|block| BlockMarker {
                 id: block.id,
-                line: line_offset(block.prompt.row.max(top), self.block_origin),
-                complete: block.is_complete(first),
                 status: block.status,
                 output: block.output.map(|start| {
                     let end = block.end.unwrap_or_else(|| self.cursor_block_point());
@@ -2843,9 +2833,7 @@ impl Core {
         if self.mode.contains(Mode::ALT_SCREEN) {
             return false;
         }
-        let top = self
-            .block_origin
-            .saturating_sub(self.display_offset() as u64);
+        let top = self.view_top();
         let target = if previous {
             self.blocks
                 .partition_point(|block| block.prompt.row < top)
@@ -2860,11 +2848,7 @@ impl Core {
         let Some(target) = target else {
             return !previous && self.scroll_display(Scroll::Bottom);
         };
-        let offset = self
-            .block_origin
-            .saturating_sub(target)
-            .min(self.history_size() as u64) as usize;
-        self.set_display_offset(offset)
+        self.scroll_to_row(target)
     }
     /// Absolute id of screen line 0; the alternate screen has no history.
     fn screen_base(&self) -> u64 {
@@ -2878,7 +2862,7 @@ impl Core {
         let base = self.screen_base();
         SearchAnchor {
             base,
-            top: base.saturating_sub(self.display_offset() as u64),
+            top: self.view_top(),
             alternate: self.mode.contains(Mode::ALT_SCREEN),
             columns: self.columns(),
             selection: self.selection,
@@ -2889,10 +2873,7 @@ impl Core {
             return;
         }
         let base = self.screen_base();
-        let offset = base
-            .saturating_sub(anchor.top)
-            .min(self.history_size() as u64) as usize;
-        self.set_display_offset(offset);
+        self.scroll_to_row(anchor.top);
         self.selection = anchor.selection_at(base, self.columns());
         self.damage_all();
     }
@@ -2944,11 +2925,11 @@ impl Core {
                 "search result was evicted from history",
             ));
         }
-        let top = found
-            .start_row
-            .saturating_sub((self.screen_lines() / 2) as u64);
-        let offset = base.saturating_sub(top).min(self.history_size() as u64) as usize;
-        self.set_display_offset(offset);
+        self.scroll_to_row(
+            found
+                .start_row
+                .saturating_sub((self.screen_lines() / 2) as u64),
+        );
         self.selection = Some(Selection {
             start: Point {
                 line: line_offset(found.start_row, base),

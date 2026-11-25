@@ -7,7 +7,10 @@ use crate::input::{
     symbol_char,
 };
 use crate::monitor::{Monitor, View};
-use crate::panel::{ACCENT, Grid, INK, MUTED, mix_color, rect};
+use crate::panel::{
+    ACCENT, DANGER, FAILED, Grid, INK, MIX_MUTED, MIX_POPUP, MIX_SOFT, MUTED, WARNING, mix_color,
+    rect,
+};
 use crate::width::{fit_label, scalar_width, text_width};
 use crate::workspace::{
     Action, Axis, Client, Direction, PaneId, Rect, Response, Snapshot, SplitDrag, TabActivity,
@@ -15,13 +18,12 @@ use crate::workspace::{
 };
 use std::borrow::Cow;
 use std::io;
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 /// Lines one wheel notch scrolls.
 pub(crate) const WHEEL_LINES: i32 = 3;
 const DOUBLE_CLICK: Duration = Duration::from_millis(400);
-const WARNING: u32 = 0xfe9b30;
-const DANGER: u32 = 0xe87575;
 
 pub(crate) const READ_ONLY: &str = "READ ONLY — attach again to take control; Alt+q detach";
 
@@ -29,7 +31,7 @@ fn tab_color(tab: &TabView) -> u32 {
     match tab.activity {
         TabActivity::Running => WARNING,
         TabActivity::Finished | TabActivity::Idle | TabActivity::Unknown => ACCENT,
-        TabActivity::Failed => 0xef5350,
+        TabActivity::Failed => FAILED,
     }
 }
 
@@ -154,7 +156,9 @@ fn open_object(client: &Client, pane: PaneId, text: &str) -> io::Result<()> {
         command.current_dir(cwd);
     }
     let mut child = command.spawn()?;
-    std::thread::spawn(move || child.wait());
+    crate::sys::task(move || {
+        let _ = child.wait();
+    })?;
     Ok(())
 }
 
@@ -703,6 +707,16 @@ impl Ui {
         })
     }
 
+    /// Whether typed keys go to the file browser instead of the terminal.
+    pub(crate) fn browsing_files(&self) -> bool {
+        self.files_open && self.focus == Focus::Files
+    }
+
+    /// Whether typed keys go to the terminal rather than a dialog, panel or search.
+    pub fn terminal_input(&self) -> bool {
+        self.close_prompt.is_none() && self.input_target().is_none()
+    }
+
     pub fn file_preview_open(&self) -> bool {
         self.files_open
             && (self.files.as_ref()).is_some_and(|files| files.focus() == FileFocus::Preview)
@@ -717,7 +731,7 @@ impl Ui {
     pub fn input_target(&self) -> Option<PasteTarget> {
         let agent = PasteTarget::Agent(self.agent.active().id);
         let monitor = self.resources.open && self.focus == Focus::Monitor;
-        let files = self.files_open && self.focus == Focus::Files;
+        let files = self.browsing_files();
         [
             (self.file_preview_open(), PasteTarget::Files),
             (self.agent.active().context.preview.is_some(), agent),
@@ -733,11 +747,7 @@ impl Ui {
     pub fn paste_target(&self) -> Option<PasteTarget> {
         match self.input_target()? {
             PasteTarget::Monitor if !self.resources.searching => None,
-            PasteTarget::Agent(_)
-                if self.focus != Focus::Editor || self.agent.active().context.preview.is_some() =>
-            {
-                None
-            }
+            PasteTarget::Agent(_) if self.focus != Focus::Editor => None,
             target => Some(target),
         }
     }
@@ -799,7 +809,7 @@ impl Ui {
             }
             return Ok(KeyResult::Handled);
         }
-        if self.files_open && self.focus == Focus::Files {
+        if self.browsing_files() {
             return self.file_key(client, &key);
         }
         Ok(KeyResult::Unhandled)
@@ -1142,8 +1152,8 @@ impl Ui {
                 self.resources.set_workspace(snapshot);
             }
             let directory = if client.is_remote() {
-                Some(std::path::Path::new("/"))
-            } else if self.files_open && self.focus == Focus::Files {
+                Some(Path::new("/"))
+            } else if self.browsing_files() {
                 self.files.as_ref().map(FileNav::directory)
             } else {
                 snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
@@ -1189,8 +1199,7 @@ impl Ui {
         let Some(snapshot) = client.snapshot() else {
             return (Cow::Borrowed(""), columns);
         };
-        let remote = client.is_remote();
-        let directory = if self.files_open && self.focus == Focus::Files {
+        let directory = if self.browsing_files() {
             self.files.as_ref().map(FileNav::directory)
         } else {
             snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
@@ -1198,6 +1207,7 @@ impl Ui {
         let Some(directory) = directory else {
             return (Cow::Borrowed(""), columns);
         };
+        let remote = client.is_remote();
         let path = if !remote
             && let Some(relative) = std::env::var_os("HOME")
                 .as_deref()
@@ -1259,8 +1269,8 @@ impl Ui {
         let height = rows.saturating_sub(2).min(7);
         let rect = rect((columns - cols) / 2, (rows - height) / 2, cols, height);
         self.close_rect = rect;
-        let background = mix_color(config.foreground, config.background, 9);
-        let muted = mix_color(config.foreground, config.background, 176);
+        let background = mix_color(config.foreground, config.background, MIX_POPUP);
+        let muted = mix_color(config.foreground, config.background, MIX_MUTED);
         let mut grid = Grid::new(rect, config.foreground, background);
         let columns = rect.cols.saturating_sub(4);
         let (title, detail, effect) = if prompt.tab.is_some() {
@@ -1304,7 +1314,7 @@ impl Ui {
                 _ => muted,
             };
             let fill = if lit {
-                mix_color(config.foreground, config.background, 24)
+                mix_color(config.foreground, config.background, MIX_SOFT)
             } else {
                 background
             };
@@ -1585,10 +1595,10 @@ impl Search {
         request: u64,
         count: usize,
         truncated: bool,
-    ) -> io::Result<bool> {
+    ) -> io::Result<()> {
         self.observe(client)?;
         if !self.open || pane != self.pane || request != self.request {
-            return Ok(false);
+            return Ok(());
         }
         self.pending = false;
         self.index = count.saturating_sub(1);
@@ -1597,7 +1607,7 @@ impl Search {
         if self.controller && self.count != 0 {
             self.select(client)?;
         }
-        Ok(true)
+        Ok(())
     }
     fn key(
         &mut self,

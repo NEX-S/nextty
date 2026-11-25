@@ -1,12 +1,11 @@
 use crate::input::keysym;
-use crate::panel::{ACCENT as GREEN, INK};
+use crate::panel::{ACCENT as GREEN, INK, MUTED};
 use crate::system_stats::{MIB, Process, ResourceTrend, SystemStats, dash, percent};
 use crate::ui::TextField;
 use crate::width::{fit_label, scalar_width, text_width};
 use crate::workspace::{PaneId, Snapshot};
 use std::{io, time::Instant};
 
-pub(crate) use crate::panel::{BACKGROUND, MUTED};
 const RANGES: [(u32, &str); 4] = [(60, "60s"), (300, "5m"), (900, "15m"), (3600, "1h")];
 
 pub(crate) fn series_color(name: &str) -> u32 {
@@ -398,8 +397,11 @@ impl Monitor {
         }
         self.sync_stats();
     }
-    pub fn resize(&mut self, rows: u16, total: u16) {
+    /// Resizes to `rows` of `total` and returns whether the height changed.
+    pub fn resize(&mut self, rows: u16, total: u16) -> bool {
+        let height = self.height;
         self.height = rows.max(8).min(total.saturating_sub(6).max(1));
+        self.height != height
     }
     pub fn rows(&self, total: u16) -> u16 {
         if self.open {
@@ -567,9 +569,6 @@ impl Monitor {
         self.sync_stats();
     }
     pub fn key(&mut self, symbol: u32, text: &str, control: bool) {
-        if !self.open {
-            return;
-        }
         let delta: isize = match symbol {
             keysym::UP | 0x6b => -1,
             keysym::DOWN | 0x6a => 1,

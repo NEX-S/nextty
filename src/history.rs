@@ -46,8 +46,7 @@ impl HistoryBudget {
     }
     /// A wakeup fd for a thread that may outlive the pane, without keeping the budget alive.
     pub(crate) fn waker(&self) -> io::Result<OwnedFd> {
-        unsafe { std::os::fd::BorrowedFd::borrow_raw(self.notification.as_raw_fd()) }
-            .try_clone_to_owned()
+        self.notification.try_clone()
     }
 }
 impl Drop for HistoryBudget {
@@ -225,7 +224,7 @@ impl Writer {
                 .segments
                 .back()
                 .is_some_and(|last| last.bytes + size <= SEGMENT_BYTES);
-            if !(fits && pane.current.is_some()) {
+            if !fits {
                 let path = segment_path(&budget.directory, self.next_segment);
                 pane.current = Some(
                     OpenOptions::new()
@@ -1170,11 +1169,12 @@ fn decode(body: &[u8], cells: &mut [Cell], stored: usize, count: usize) -> Vec<(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::time::{Duration, Instant};
 
-    fn budget(capacity: u64) -> Arc<HistoryBudget> {
+    /// A budget under the build directory, for tests that go through the history writer.
+    pub(crate) fn budget(capacity: u64) -> Arc<HistoryBudget> {
         static NEXT: AtomicU64 = AtomicU64::new(1);
         let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
         fs::create_dir_all(&root).unwrap();
@@ -1587,8 +1587,7 @@ mod tests {
             cell_height: 0,
         };
         let shell = crate::terminal::Shell::new("python3".into(), vec!["-c".into(), script.into()]);
-        crate::terminal::Terminal::new_with_history(Some(shell), None, size, 0xffffff, 0, budget)
-            .unwrap()
+        crate::terminal::Terminal::new(Some(shell), None, size, 0xffffff, 0, budget).unwrap()
     }
 
     #[test]
@@ -1597,7 +1596,7 @@ mod tests {
         let mut terminal = terminal(script, 8, budget(16 << 20));
         while !matches!(
             crate::terminal::tests::next_event(&mut terminal, Duration::from_secs(5)).unwrap(),
-            crate::terminal::Event::Exit(_)
+            crate::core::Event::Exit(_)
         ) {}
         let core = &terminal.core;
         assert_eq!(core.history_size(), 19998);
@@ -1606,7 +1605,7 @@ mod tests {
 
     #[test]
     fn failed_history_write_keeps_pty_input_and_output_running() {
-        use crate::terminal::Event;
+        use crate::core::Event;
 
         let budget = budget(256 * 1024);
         let script = "import os; input(); os.write(1, b'x\\r\\n' * 12000); input(); os.write(1, b'\\r\\nALIVE'); input()";

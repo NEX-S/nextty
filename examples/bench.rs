@@ -4,9 +4,9 @@ use std::hint::black_box;
 use std::io::Result;
 use std::time::{Duration, Instant};
 
-use nextty::core::{Core, WindowSize};
+use nextty::core::{Core, Event, WindowSize};
 use nextty::history::HistoryBudget;
-use nextty::terminal::{Event, Shell, Terminal};
+use nextty::terminal::{Shell, Terminal};
 use nextty::vt::Parser;
 
 const SIZE: WindowSize = WindowSize {
@@ -76,7 +76,7 @@ fn wait_for(terminal: &mut Terminal, budget: &HistoryBudget, expected: char) {
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(!remaining.is_zero(), "timed out waiting for {expected:?}");
         drive(terminal, budget, remaining);
-        for event in terminal.events.drain(..) {
+        for event in terminal.core.take_events() {
             let failed = matches!(
                 event,
                 Event::Exit(_) | Event::Error(_) | Event::HistoryError(_)
@@ -92,14 +92,8 @@ fn pty() -> Result<()> {
     let spawn = || {
         let script = "stty raw -echo; printf '\\033[H!'; exec /bin/cat";
         let shell = Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()]);
-        let mut terminal = Terminal::new_with_history(
-            Some(shell),
-            None,
-            SIZE,
-            COLORS.0,
-            COLORS.1,
-            budget.clone(),
-        )?;
+        let mut terminal =
+            Terminal::new(Some(shell), None, SIZE, COLORS.0, COLORS.1, budget.clone())?;
         wait_for(&mut terminal, &budget, '!');
         Result::Ok(terminal)
     };

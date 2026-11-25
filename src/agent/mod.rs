@@ -119,13 +119,9 @@ impl Agent {
         if self.runtime.is_none() {
             self.runtime = Some(Harness::start(config, self.turn)?);
         }
-        let generation = target["input_generation"].as_u64();
+        let generation = pane_view(client, pane)?.input_generation;
         self.turn = self.runtime.as_ref().unwrap().send(prompt, pane, target)?;
-        if let Some(generation) = generation {
-            self.observed_input.insert(pane, generation);
-        } else {
-            self.observed_input.remove(&pane);
-        }
+        self.observed_input.insert(pane, generation);
         self.observed_activity.insert(pane, activity);
         if !basket.is_empty() {
             self.sent_context.insert(self.turn, basket.to_vec());
@@ -172,7 +168,6 @@ impl Agent {
     }
 
     fn poll(&mut self, client: &mut Client) -> io::Result<()> {
-        self.advance(client);
         let events = self.runtime.as_ref().map(Harness::poll).unwrap_or_default();
         for event in events {
             self.dirty |= !matches!(event, Event::Request(_));
@@ -267,7 +262,6 @@ impl Agent {
         let patch = AgentModelPatch {
             session: self.id,
             busy: self.busy,
-            revision: self.revision,
             start: start as u32,
             prefix_bytes: prefix_bytes as u32,
             messages: self.messages[start..]
@@ -343,12 +337,18 @@ impl Agent {
 
 fn terminal_context(client: &Client, pane: u64) -> io::Result<Value> {
     let mut context = terminal_observation(client, pane, None)?;
-    let process = &client.snapshot().unwrap().pane(pane).unwrap().process;
-    context["writable"] = json!(client.can_agent_input());
+    let process = &pane_view(client, pane)?.process;
     context["launch_argv"] = json!(process.launch_argv);
     context["child_pid"] = json!(process.child_pid);
     context["workspace"] = workspace_context(client)?;
     Ok(context)
+}
+
+fn pane_view(client: &Client, pane: u64) -> io::Result<&PaneView> {
+    client
+        .snapshot()
+        .and_then(|snapshot| snapshot.pane(pane))
+        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))
 }
 
 fn terminal_observation(client: &Client, pane: u64, query: Option<&str>) -> io::Result<Value> {
@@ -374,7 +374,6 @@ fn pane_context(view: &PaneView) -> Value {
         "input_generation":view.input_generation,"shell_prompt":view.shell_prompt,
         "process":{
             "foreground_pgid":view.process.foreground_pgid,
-            "foreground_pid":view.process.foreground_pid,
             "foreground_scope":"pty_process_group_leader",
             "foreground_executable":view.process.foreground_executable,
             "foreground_argv":view.process.foreground_argv,
@@ -514,10 +513,7 @@ impl Agent {
             match request.tool {
                 Tool::Shell | Tool::Input => {
                     let shell = request.tool == Tool::Shell;
-                    let view = client
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.pane(pane))
-                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    let view = pane_view(client, pane)?;
                     let field = if shell { "command" } else { "text" };
                     let text = request.input[field]
                         .as_str()
@@ -763,10 +759,11 @@ impl Agent {
         }
     }
 
-    // Waits for a fresh frame; a failure still reports the facts the stage already confirmed.
-    fn watch(&mut self, operation: Operation, client: &mut Client) {
-        match (operation.request.check()).and_then(|()| client.refresh_screen()) {
-            Ok(()) => self.operation = Some(operation),
+    /// Keeps an operation that still waits; a finished or failed one answers its tool.
+    fn settle(&mut self, operation: Operation, result: io::Result<Option<String>>) {
+        match result {
+            Ok(None) => self.operation = Some(operation),
+            Ok(Some(text)) => operation.request.respond(Ok(text)),
             Err(error) => {
                 let result = failed(&operation, error);
                 operation.request.respond(result);
@@ -774,10 +771,20 @@ impl Agent {
         }
     }
 
+    // Waits for a fresh frame; a failure still reports the facts the stage already confirmed.
+    fn watch(&mut self, operation: Operation, client: &mut Client) {
+        let result = operation
+            .request
+            .check()
+            .and_then(|()| client.refresh_screen())
+            .map(|()| None);
+        self.settle(operation, result);
+    }
+
     fn observe(&mut self, client: &Client, pane: u64, query: Option<&str>) -> io::Result<Value> {
         let context = terminal_observation(client, pane, query)?;
         self.observed_input
-            .insert(pane, context["input_generation"].as_u64().unwrap());
+            .insert(pane, pane_view(client, pane)?.input_generation);
         self.observed_activity
             .insert(pane, client.terminal_revision(pane)?);
         Ok(context)
@@ -817,10 +824,7 @@ impl Agent {
             }
             match &operation.stage {
                 Stage::NewTerminalOutput { until } => {
-                    let view = client
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.pane(pane))
-                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    let view = pane_view(client, pane)?;
                     if view.shell_prompt.is_some() || Instant::now() >= *until {
                         let mut context = self.observe(client, pane, None)?;
                         context["outcome"] = json!(if view.shell_prompt.is_some() {
@@ -840,10 +844,7 @@ impl Agent {
                     }
                 }
                 Stage::Command { command, until } => {
-                    let view = client
-                        .snapshot()
-                        .and_then(|snapshot| snapshot.pane(pane))
-                        .ok_or_else(|| io::Error::other("Target terminal no longer exists"))?;
+                    let view = pane_view(client, pane)?;
                     let marker = view
                         .command_blocks
                         .iter()
@@ -888,21 +889,13 @@ impl Agent {
             }
             Ok(None)
         })();
-        match result {
-            Ok(Some(text)) => operation.request.respond(Ok(text)),
-            Ok(None) => self.operation = Some(operation),
-            Err(error) => {
-                let result = failed(&operation, error);
-                operation.request.respond(result);
-            }
-        }
+        self.settle(operation, result);
     }
 }
 
 fn cancel_action(stage: &Stage) -> Option<Action> {
     match *stage {
-        Stage::Read { id, .. } => Some(Action::CancelHistory { request: id }),
-        Stage::File { id } => Some(Action::CancelAgentFile { request: id }),
+        Stage::Read { id, .. } | Stage::File { id } => Some(Action::Cancel { request: id }),
         _ => None,
     }
 }

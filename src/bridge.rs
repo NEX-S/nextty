@@ -31,13 +31,13 @@ pub fn run_bridge(command: &str) -> io::Result<()> {
         })?,
     };
     let mut upstream = daemon.try_clone()?;
-    std::thread::spawn(move || {
+    crate::sys::task(move || {
         if let Err(error) = pump(&mut io::stdin(), &mut upstream) {
             eprintln!("bridge: {error}");
         }
         // Ends the read below once SSH has gone away.
         let _ = upstream.shutdown(Shutdown::Both);
-    });
+    })?;
     pump(&mut &daemon, &mut output)
 }
 

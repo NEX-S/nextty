@@ -4,6 +4,15 @@ use crate::core::Flags;
 use crate::ui::TabPart;
 use crate::width::fit_label;
 
+/// The title-bar controls, left to right, with their width in cells.
+const CONTROLS: [(f32, GuiAction, &str); 5] = [
+    (3., GuiAction::Tab(TabHit::Scroll(-1)), "‹"),
+    (3., GuiAction::Tab(TabHit::Scroll(1)), "›"),
+    (4., GuiAction::Minimize, "−"),
+    (4., GuiAction::Maximize, "☐"),
+    (4., GuiAction::Close, "×"),
+];
+
 impl WorkspaceView {
     pub(super) fn chrome(&mut self, layout: GuiLayout) {
         self.painter.clip(0., 0., layout.width, layout.top);
@@ -55,7 +64,7 @@ impl WorkspaceView {
     }
 
     pub(super) fn control_width(&self) -> f32 {
-        self.cell.0 * 18.
+        self.cell.0 * CONTROLS.iter().map(|control| control.0).sum::<f32>()
     }
     pub(super) fn draw_window_controls(&mut self, layout: GuiLayout) {
         self.painter.clip(0., 0., layout.width, layout.top);
@@ -64,13 +73,7 @@ impl WorkspaceView {
             .snapshot()
             .is_none_or(|snapshot| !snapshot.controller || snapshot.tabs.len() < 2);
         let mut x = layout.width - self.control_width();
-        for (cells, action, label) in [
-            (3., GuiAction::Tab(TabHit::Scroll(-1)), "‹"),
-            (3., GuiAction::Tab(TabHit::Scroll(1)), "›"),
-            (4., GuiAction::Minimize, "−"),
-            (4., GuiAction::Maximize, "☐"),
-            (4., GuiAction::Close, "×"),
-        ] {
+        for (cells, action, label) in CONTROLS {
             let w = self.cell.0 * cells;
             let hit = GuiHit {
                 bounds: (x, 0., w, layout.top),
@@ -324,27 +327,19 @@ impl WorkspaceView {
             (layout.side / self.cell.0) as u16,
             1,
             ((layout.width - layout.side) / self.cell.0) as u16,
-            ((layout.footer - layout.top) / self.cell.1).max(1.) as u16,
+            layout.body_rows(self.cell),
         );
-        let size = WindowSize {
-            num_cols: (layout.width / self.cell.0) as u16,
-            num_lines: (layout.height / self.cell.1) as u16,
-            cell_width: self.cell.0 as u16,
-            cell_height: self.cell.1 as u16,
-        };
+        let canvas = layout.canvas(self.cell);
         let pointer = Some(self.cell());
         let (config, preedit) = (&self.config, &self.preedit);
-        let panel = crate::agent::panel::draw(&mut self.ui, config, side, size, pointer, preedit)?;
+        let panel =
+            crate::agent::panel::draw(&mut self.ui, config, side, canvas, pointer, preedit)?;
         if let Some(backdrop) = &panel.backdrop {
             self.draw_panel(backdrop);
         }
         self.draw_panel(&panel.grid);
         let agent = &self.ui.agent;
         let session = agent.active();
-        let editor = session.editor_layout(
-            session.editor_columns(usize::from(agent.editor.cols)),
-            usize::from(agent.editor.rows),
-        );
         let cell = self.cell;
         let mut bar = |target, rect, total, offset| {
             let bar = Scrollbar::in_rect(target, rect, cell, total, offset);
@@ -357,8 +352,8 @@ impl WorkspaceView {
             transcript.0,
             transcript.1,
         );
-        let lines = editor.lines.len();
-        bar(ScrollTarget::Editor, agent.editor, lines, editor.first);
+        let (lines, first) = panel.editor;
+        bar(ScrollTarget::Editor, agent.editor, lines, first);
         if let Some(rect) = panel.preview
             && let Some(preview) = &session.context.preview
         {

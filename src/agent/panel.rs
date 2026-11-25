@@ -1,9 +1,11 @@
 use crate::agent::markdown::{self, Markdown};
 use crate::config::Config;
 use crate::context::{self, ContextItem, ContextSnapshot};
-use crate::core::{Flags, Mode, Side, WindowSize};
+use crate::core::{Flags, Mode, Side};
 use crate::input::{LEFT, MIDDLE, PasteTarget, PointerKind, RIGHT, SHIFT, keysym};
-use crate::panel::{Grid, mix_color, rect, rgb};
+use crate::panel::{
+    ACCENT, DANGER, FAILED, Grid, MIX_MUTED, MIX_POPUP, MIX_SOFT, WARNING, mix_color, rect, rgb,
+};
 use crate::ui::{Effect, Focus, Pointer, Ui, WHEEL_LINES};
 use crate::width::{scalar_width, text_width};
 use crate::worker::Worker;
@@ -32,7 +34,6 @@ pub(crate) struct AgentView {
     pub changes: Arc<Vec<AgentChange>>,
     pub changes_omitted: u32,
     pub scroll: usize,
-    pub revision: u64,
     pub pending: Vec<AgentRequest>,
 }
 
@@ -68,7 +69,6 @@ impl AgentView {
         }
         self.changes_omitted = patch.changes_omitted;
         self.busy = busy;
-        self.revision = patch.revision;
         Ok(redraw)
     }
 
@@ -142,6 +142,9 @@ pub(crate) struct Panel {
     pub backdrop: Option<Grid>,
     pub preview: Option<Rect>,
     pub cursor: Option<(u16, u16)>,
+    /// The editor's lines and first visible row.
+    #[cfg_attr(not(feature = "gui"), expect(dead_code))]
+    pub editor: (usize, usize),
     hits: Vec<(Rect, AgentAction)>,
     chat: Rect,
     chat_rows: Vec<(usize, Rect)>,
@@ -181,25 +184,24 @@ pub(crate) fn draw(
     ui: &mut Ui,
     config: &Config,
     side: Rect,
-    size: WindowSize,
+    // The window without its tab row and footer; a preview floats over it.
+    canvas: Rect,
     pointer: Option<(u16, u16)>,
     preedit: &str,
 ) -> io::Result<Panel> {
     // A preview floats over the panel as it was drawn without it.
     let backdrop = match ui.agent.active_mut().context.preview.take() {
         Some(preview) => {
-            let base = draw(ui, config, side, size, None, "");
+            let base = draw(ui, config, side, canvas, None, "");
             ui.agent.active_mut().context.preview = Some(preview);
             Some(base?.grid)
         }
         None => None,
     };
     let (editor, editor_layout) = editor(ui, side);
-    let area = if backdrop.is_some() {
-        crate::file_panel::preview_rect(rect(0, 1, size.num_cols, size.num_lines.saturating_sub(2)))
-    } else {
-        side
-    };
+    let area = backdrop
+        .as_ref()
+        .map_or(side, |_| crate::file_panel::preview_rect(canvas));
     let (foreground, bg) = (config.foreground, config.background);
     let mut grid = ui
         .agent
@@ -226,15 +228,16 @@ pub(crate) fn draw(
             chat_rows,
             preview: None,
             cursor: None,
+            editor: (editor_layout.lines.len(), editor_layout.first),
             bg,
         },
         palette: Palette {
             bg,
             foreground,
-            muted: mix_color(foreground, bg, 180),
-            user_bg: mix_color(foreground, bg, 24),
+            muted: mix_color(foreground, bg, MIX_MUTED),
+            user_bg: mix_color(foreground, bg, MIX_SOFT),
             selection_bg: mix_color(foreground, bg, 70),
-            error: mix_color(0xe87575, foreground, 128),
+            error: mix_color(DANGER, foreground, 128),
         },
     };
     painter.draw_agent(editor, editor_layout)?;
@@ -338,7 +341,7 @@ impl AgentPainter<'_> {
                 c: '─',
                 fg: rgb(p.user_bg),
                 bg: rgb(p.bg),
-                flags: Flags::empty(),
+                flags: Flags::default(),
             });
             row.cells[0].c = '├';
             row.used = row.cells.len();
@@ -361,7 +364,7 @@ impl AgentPainter<'_> {
                 AgentAction::NewSession | AgentAction::ClosePanel | AgentAction::Rewind(_) => {
                     recolor_text(grid, rect, p.foreground)
                 }
-                AgentAction::CloseSession(_) => recolor_text(grid, rect, 0xef5350),
+                AgentAction::CloseSession(_) => recolor_text(grid, rect, FAILED),
                 _ => grid.recolor(rect, p.user_bg),
             }
         }
@@ -653,7 +656,7 @@ impl AgentPainter<'_> {
             ..
         } = preview;
         self.frame.grid = Grid::popup(area, p.foreground, p.bg, &item.label);
-        let bg = mix_color(p.foreground, p.bg, 9);
+        let bg = mix_color(p.foreground, p.bg, MIX_POPUP);
         let (added, removed) = crate::panel::diff_colors(p.foreground);
         let text = &item.snapshot.text;
         for (y, range) in (body.y..).zip(lines.iter().skip(*scroll).take(rows)) {
@@ -671,7 +674,7 @@ impl AgentPainter<'_> {
                 .text(body.x, y, body.cols, &text[range.clone()], color, bg);
         }
         let footer = area.y + area.rows.saturating_sub(2);
-        let muted = mix_color(p.foreground, bg, 176);
+        let muted = mix_color(p.foreground, bg, MIX_MUTED);
         self.frame
             .grid
             .text(body.x, footer, body.cols, " ⧉   Esc close", muted, bg);
@@ -699,11 +702,11 @@ impl AgentPainter<'_> {
                 .is_some_and(|(column, row)| row == side.y && (x..x + width).contains(&column));
             let session = &agent.sessions[index];
             let status = if session.model.busy {
-                0xfe9b30
+                WARNING
             } else if session.failed() {
-                0xef5350
+                FAILED
             } else {
-                0xb5d2a2
+                ACCENT
             };
             let (tab_bg, title, close) = match (active, hovered) {
                 (true, _) => (0x363636, 0xdddddd, 0xdddddd),
@@ -1081,7 +1084,7 @@ impl AgentPanel {
         let Some(worker) = &self.markdown_worker else {
             return Ok(false);
         };
-        Ok(crate::sys::consume_notification(worker.fd())? && self.open && worker.ready(|_| true))
+        Ok(crate::sys::consume_notification(worker.fd())? && self.open && worker.ready())
     }
 
     fn apply_markdown(&mut self) {
@@ -2682,7 +2685,6 @@ mod tests {
                 .map(|session| AgentModelPatch {
                     session: session.id,
                     busy: session.model.busy,
-                    revision: session.model.revision,
                     messages: session.model.messages.clone(),
                     ..AgentModelPatch::default()
                 })
@@ -2945,7 +2947,6 @@ mod tests {
 
         owner.active_mut().model.messages[0].text.push_str("**");
         owner.active_mut().model.messages[1].text = "done".into();
-        owner.active_mut().model.revision += 1;
         mirror.restore_models(owner.model_snapshot()).unwrap();
         mirror.wait_layout(30);
         let session = mirror.active_mut();
@@ -2961,7 +2962,6 @@ mod tests {
         assert_eq!(mirror.active().selected_text().as_deref(), Some("keep"));
 
         owner.active_mut().model.messages[0].text = "replaced".into();
-        owner.active_mut().model.revision += 1;
         mirror.restore_models(owner.model_snapshot()).unwrap();
         assert!(mirror.active().selected_text().is_none());
         mirror.wait_layout(30);

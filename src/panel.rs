@@ -12,6 +12,17 @@ pub(crate) const MUTED: u32 = 0x969696;
 pub(crate) const SELECTED: u32 = 0x303830;
 pub(crate) const HOVER: u32 = 0x343434;
 pub(crate) const ACCENT: u32 = 0xb5d2a2;
+pub(crate) const WARNING: u32 = 0xfe9b30;
+pub(crate) const DANGER: u32 = 0xe87575;
+pub(crate) const FAILED: u32 = 0xef5350;
+/// The hover highlight of a command's output.
+pub(crate) const BLOCK_HOVER: u32 = 0x262626;
+
+/// Weights of the foreground mixed into the background for receding text, gentle fills and
+/// popup backgrounds.
+pub(crate) const MIX_MUTED: u32 = 176;
+pub(crate) const MIX_SOFT: u32 = 24;
+pub(crate) const MIX_POPUP: u32 = 9;
 
 pub(crate) fn mix_color(foreground: u32, background: u32, weight: u32) -> u32 {
     [0, 8, 16].into_iter().fold(0, |rgb, shift| {
@@ -26,11 +37,16 @@ pub(crate) fn expand_icon(expanded: bool) -> &'static str {
     if expanded { "" } else { "" }
 }
 
+/// Whether the theme's text is dark, which flips its accent colors.
+pub(crate) fn dark_text(foreground: u32) -> bool {
+    (foreground >> 16 & 255) + (foreground >> 8 & 255) + (foreground & 255) < 384
+}
+
 pub(crate) fn diff_colors(foreground: u32) -> (u32, u32) {
-    if (foreground >> 16 & 255) + (foreground >> 8 & 255) + (foreground & 255) < 384 {
+    if dark_text(foreground) {
         (0x35552a, 0xa32e36)
     } else {
-        (0xb5d2a2, 0xe87575)
+        (ACCENT, DANGER)
     }
 }
 
@@ -114,15 +130,15 @@ impl Grid {
             rows: (0..rect.rows)
                 .map(|_| Row::new(usize::from(rect.cols), blank))
                 .collect(),
-            flags: Flags::empty(),
+            flags: Flags::default(),
             damage: None,
         }
     }
 
     pub fn popup(rect: Rect, foreground: u32, background: u32, title: &str) -> Self {
-        let background = mix_color(foreground, background, 9);
+        let background = mix_color(foreground, background, MIX_POPUP);
         let border = mix_color(foreground, background, 64);
-        let muted = mix_color(foreground, background, 176);
+        let muted = mix_color(foreground, background, MIX_MUTED);
         let mut grid = Self::new(rect, foreground, background);
         let edge = Cell {
             c: '─',
@@ -176,7 +192,7 @@ impl Grid {
             ..Cell::default()
         };
         self.rect = rect;
-        self.flags = Flags::empty();
+        self.flags = Flags::default();
         for row in &mut self.rows {
             row.cells.fill(blank);
             row.wrapped = false;
@@ -402,7 +418,7 @@ impl Grid {
                     self.rect.y + index as u16 + 1,
                     self.rect.x + row.used as u16 + 1
                 )?;
-                sgr(output, packed(blank.fg), packed(blank.bg), Flags::empty())?;
+                sgr(output, packed(blank.fg), packed(blank.bg), Flags::default())?;
                 output.extend_from_slice(b"\x1b[K");
             }
         }

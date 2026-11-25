@@ -10,19 +10,10 @@ use std::process::{Child, Command, ExitStatus};
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use crate::core::{Core, Event as CoreEvent, WindowSize};
+use crate::core::{Core, Event, WindowSize};
 use crate::sys::{check, owned_fd};
 
 pub(crate) const INPUT_CAPACITY: usize = 256 * 1024;
-
-#[derive(Debug)]
-pub enum Event {
-    Title(Option<String>),
-    ClipboardStore { primary: bool, text: String },
-    Exit(ExitStatus),
-    Error(io::Error),
-    HistoryError(io::Error),
-}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Shell {
@@ -42,7 +33,6 @@ pub struct ProcessMetadata {
     pub child_pid: u32,
     pub has_children: Option<bool>,
     pub foreground_pgid: Option<u32>,
-    pub foreground_pid: Option<u32>,
     // The shell's own directory; the foreground process may have changed its own.
     #[serde(with = "crate::wire::path::option")]
     pub child_cwd: Option<PathBuf>,
@@ -57,7 +47,6 @@ pub struct ProcessMetadata {
 
 pub struct Terminal {
     pub core: Core,
-    pub events: VecDeque<Event>,
     master: Option<OwnedFd>,
     // Bytes for the child, not yet accepted by the PTY. Dropped once the child's side is gone.
     input: VecDeque<u8>,
@@ -86,7 +75,7 @@ pub struct Step {
 }
 
 impl Terminal {
-    pub fn new_with_history(
+    pub fn new(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
         size: WindowSize,
@@ -146,7 +135,6 @@ impl Terminal {
         let pidfd = owned_fd(unsafe { libc::syscall(libc::SYS_pidfd_open, child_pid, 0) as i32 })?;
         Ok(Self {
             core,
-            events: VecDeque::new(),
             master: Some(master),
             input: VecDeque::new(),
             input_open: true,
@@ -278,7 +266,7 @@ impl Terminal {
     fn begin_shutdown(&mut self) {
         if self.closing.is_none() {
             if let Err(error) = hang_up(&self.child) {
-                self.events.push_back(Event::Error(error));
+                self.core.events.push(Event::Error(error));
             }
             self.closing = Some(Instant::now() + Duration::from_millis(100));
         }
@@ -326,12 +314,8 @@ impl Terminal {
         }
         for event in self.core.take_events() {
             match event {
-                CoreEvent::Write(data) => self.write(data)?,
-                CoreEvent::Title(title) => self.events.push_back(Event::Title(title)),
-                CoreEvent::ClipboardStore { primary, text } => self
-                    .events
-                    .push_back(Event::ClipboardStore { primary, text }),
-                CoreEvent::HistoryError(error) => self.events.push_back(Event::HistoryError(error)),
+                Event::Write(data) => self.write(data)?,
+                event => self.core.events.push(event),
             }
         }
         let now = Instant::now();
@@ -390,7 +374,7 @@ impl Terminal {
     fn finish(&mut self) -> io::Result<()> {
         self.master = None;
         let status = self.child.wait()?;
-        self.events.push_back(Event::Exit(status));
+        self.core.events.push(Event::Exit(status));
         Ok(())
     }
 
@@ -456,7 +440,6 @@ fn sample_process(pgid: io::Result<u32>, current: &ProcessMetadata) -> (ProcessM
             metadata.foreground_executable = note(&mut unavailable, "foreground executable", exe);
             let cmdline = std::fs::read(format!("/proc/{pgid}/cmdline"));
             if let Some(bytes) = note(&mut unavailable, "foreground argv", cmdline) {
-                metadata.foreground_pid = Some(pgid);
                 let argv = bytes.split_inclusive(|byte| *byte == 0);
                 metadata.foreground_argv = Some(
                     argv.map(|arg| {
@@ -597,9 +580,14 @@ pub(crate) mod tests {
 
     pub(crate) fn next_event(terminal: &mut Terminal, timeout: Duration) -> Option<Event> {
         let deadline = Instant::now() + timeout;
+        let mut events = VecDeque::new();
         loop {
-            if let Some(event) = terminal.events.pop_front() {
+            if let Some(event) = events.pop_front() {
                 return Some(event);
+            }
+            events.extend(terminal.core.take_events());
+            if !events.is_empty() {
+                continue;
             }
             crate::terminal::tests::drive(terminal);
             if Instant::now() >= deadline {
@@ -641,7 +629,8 @@ pub(crate) mod tests {
         Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()])
     }
 
-    pub fn new(
+    /// A terminal without a disk history.
+    pub fn plain(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
         size: WindowSize,
@@ -657,7 +646,7 @@ pub(crate) mod tests {
     }
 
     fn session(script: &str) -> Terminal {
-        new(Some(shell(script)), None, size(24, 80), 0xd8dee9, 0x14161b).unwrap()
+        plain(Some(shell(script)), None, size(24, 80), 0xd8dee9, 0x14161b).unwrap()
     }
 
     fn content(terminal: &Terminal) -> String {
@@ -726,7 +715,7 @@ pub(crate) mod tests {
             PathBuf::from("target"),
             std::env::current_dir().unwrap().join("target"),
         ] {
-            let mut terminal = new(
+            let mut terminal = plain(
                 Some(Shell::new(
                     "/usr/bin/python3".into(),
                     vec![
@@ -750,7 +739,7 @@ pub(crate) mod tests {
 
     #[test]
     fn foreground_metadata_tracks_a_real_shell_job_without_polling_idle_sessions() {
-        let mut terminal = new(
+        let mut terminal = plain(
             Some(Shell::new("/bin/sh".into(), vec!["-i".into()])),
             Some(std::env::temp_dir()),
             size(24, 80),
@@ -759,7 +748,7 @@ pub(crate) mod tests {
         )
         .unwrap();
         let initial = wait_metadata(&mut terminal, &|m| {
-            m.foreground_pid == Some(m.child_pid)
+            m.foreground_pgid == Some(m.child_pid)
                 && m.has_children == Some(false)
                 && m.unavailable.is_empty()
         });
@@ -771,14 +760,13 @@ pub(crate) mod tests {
                 .as_ref()
                 .is_some_and(|p| p.file_name().is_some_and(|n| n == "sleep"))
         });
-        assert_ne!(job.foreground_pid, Some(job.child_pid));
+        assert_ne!(job.foreground_pgid, Some(job.child_pid));
         assert_eq!(job.has_children, Some(true));
-        assert_eq!(job.foreground_pid, job.foreground_pgid);
         assert_eq!(job.foreground_argv.as_ref().unwrap(), &["/bin/sleep", "30"]);
         assert_eq!(job.foreground_cwd, Some(std::env::temp_dir()));
         assert!(job.unavailable.is_empty());
         terminal.write(b"\x03".as_slice()).unwrap();
-        wait_metadata(&mut terminal, &|m| m.foreground_pid == Some(m.child_pid));
+        wait_metadata(&mut terminal, &|m| m.foreground_pgid == Some(m.child_pid));
         assert!(terminal.process_deadline.is_none());
         let idle = terminal.process_metadata();
         drive(&mut terminal);
@@ -793,7 +781,7 @@ pub(crate) mod tests {
                 .as_ref()
                 .is_some_and(|args| args == &["/bin/sh", "-i", "-s"])
         });
-        assert_eq!(reexecuted.foreground_pid, initial.foreground_pid);
+        assert_eq!(reexecuted.foreground_pgid, initial.foreground_pgid);
         assert_eq!(
             reexecuted.foreground_executable,
             initial.foreground_executable
@@ -922,7 +910,7 @@ os.write(1,b'QUERIES-DONE')
 assert os.read(0,1)==b'x'
 os.write(1,b'\r\nINPUT:x')
 "#;
-        let mut terminal = new(
+        let mut terminal = plain(
             Some(Shell::new(
                 "python3".into(),
                 vec!["-c".into(), script.into()],

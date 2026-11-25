@@ -1,6 +1,6 @@
 use crate::config::Config;
 use crate::files::FileNav;
-use crate::panel::{ACCENT, Grid, mix_color, rect};
+use crate::panel::{ACCENT, DANGER, Grid, MIX_MUTED, MIX_POPUP, MIX_SOFT, mix_color, rect};
 use crate::workspace::Rect;
 
 /// The list rows below the search row, if any, and the first entry they show.
@@ -57,12 +57,12 @@ pub(crate) fn list(
 ) -> Grid {
     let layout = Layout::new(rect, files);
     let (foreground, background) = (config.foreground, config.background);
-    let muted = mix_color(foreground, background, 176);
+    let muted = mix_color(foreground, background, MIX_MUTED);
     let mut grid = Grid::new(rect, muted, background);
     if rect.cols == 0 {
         return grid;
     }
-    let divider = crate::panel::rgb(mix_color(foreground, background, 24));
+    let divider = crate::panel::rgb(mix_color(foreground, background, MIX_SOFT));
     for row in &mut grid.rows {
         let cell = row.cells.last_mut().unwrap();
         cell.c = '│';
@@ -85,7 +85,7 @@ pub(crate) fn list(
             continue;
         }
         let (text, marker, weight) = if focused {
-            (foreground, ACCENT, 24)
+            (foreground, ACCENT, MIX_SOFT)
         } else {
             (muted, muted, 12)
         };
@@ -99,7 +99,7 @@ pub(crate) fn list(
         grid.recolor(row, mix_color(foreground, background, weight));
     }
     let message = match &files.scan.error {
-        Some(error) => Some((error.to_string(), 0xe87575)),
+        Some(error) => Some((error.to_string(), DANGER)),
         None if !files.scan.entries.is_empty() => None,
         None if files.searching() => Some(("Loading…".into(), muted)),
         None if files.is_search() => Some(("No matches".into(), muted)),
@@ -117,8 +117,8 @@ pub(crate) fn list(
 }
 
 pub(crate) fn preview(files: &FileNav, rect: Rect, config: &Config) -> Grid {
-    let background = mix_color(config.foreground, config.background, 9);
-    let muted = mix_color(config.foreground, config.background, 176);
+    let background = mix_color(config.foreground, config.background, MIX_POPUP);
+    let muted = mix_color(config.foreground, config.background, MIX_MUTED);
     // The popup only opens for a selected file, and every rescan returns the focus to the list.
     let title = files.selected().unwrap().display_name();
     let mut grid = Grid::popup(rect, config.foreground, config.background, &title);

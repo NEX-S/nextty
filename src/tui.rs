@@ -1,6 +1,5 @@
 //! ANSI frontend for an existing workspace; the daemon owns PTYs and VT state.
 
-#[path = "tui_input.rs"]
 mod input;
 
 use crate::config::{Config, TabStyle};
@@ -278,6 +277,8 @@ fn terminal_size(fd: RawFd) -> io::Result<WindowSize> {
 struct Layout {
     /// The panes' size; they start below the tab row, right of the file panel.
     view: WindowSize,
+    /// The window without its tab row and footer; previews float over it.
+    canvas: Rect,
     /// Columns the file panel takes on the left.
     left: u16,
     files: Rect,
@@ -338,21 +339,21 @@ impl Frontend {
             ..self.size
         };
         let body = view.num_lines.saturating_sub(1);
+        let canvas = rect(0, 1, columns, rows.saturating_sub(2));
         Layout {
             view,
             left: panels.file_width,
+            canvas,
             files: rect(0, 1, panels.file_width, body),
-            preview: crate::file_panel::preview_rect(rect(0, 1, columns, rows.saturating_sub(2))),
+            preview: crate::file_panel::preview_rect(canvas),
             agent: rect(columns - agent, 1, agent, body),
         }
     }
 
     fn resize(&mut self) -> io::Result<()> {
         self.ui.search.close(&mut self.client)?;
+        self.client.send(Action::Resize(self.layout().view))?;
         self.dirty = true;
-        if self.client.controller() {
-            self.client.send(Action::Resize(self.layout().view))?;
-        }
         Ok(())
     }
 
@@ -422,7 +423,7 @@ impl Frontend {
     }
 
     fn draw_resources(&mut self, grid: &mut Grid) {
-        use crate::monitor::BACKGROUND;
+        use crate::panel::BACKGROUND;
         let (columns, rows) = (self.size.num_cols, self.size.num_lines);
         let top = self.layout().view.num_lines;
         let last = rows - 1;
@@ -525,13 +526,11 @@ impl Frontend {
         let moved = self.pointer.replace((column, row)) != Some((column, row));
         self.dirty |= moved || kind != PointerKind::Motion;
         if self.ui.resources.dragging && kind == PointerKind::Motion {
-            let (height, total) = (self.ui.resources.height, self.size.num_lines - 2);
             let rows = self.size.num_lines.saturating_sub(row + 2);
-            self.ui.resources.resize(rows, total);
-            return if self.ui.resources.height == height {
-                Ok(())
-            } else {
+            return if self.ui.resources.resize(rows, self.size.num_lines - 2) {
                 self.resize()
+            } else {
+                Ok(())
             };
         }
         let (area, column, row) = self.locate(column, row);
@@ -565,9 +564,8 @@ impl Frontend {
         output: &mut Vec<u8>,
         panel_cursor: Option<(u16, u16)>,
     ) -> io::Result<()> {
-        let in_panel = self.ui.close_prompt.is_some() || self.ui.input_target().is_some();
         let pane = (self.client.snapshot())
-            .filter(|snapshot| snapshot.controller && !in_panel)
+            .filter(|snapshot| snapshot.controller && self.ui.terminal_input())
             .and_then(Snapshot::focused_pane);
         let screen = pane.and_then(|pane| self.client.screens().get(&pane.id));
         // Keypad keys pass through raw; cursor keys are rewritten by `cursor_bytes` instead.
@@ -882,9 +880,16 @@ impl Frontend {
     }
 
     fn draw_agent(&mut self, frame: &mut Grid) -> io::Result<Option<(u16, u16)>> {
-        let side = self.layout().agent;
-        let (config, size, pointer) = (&self.config, self.size, self.pointer);
-        let panel = crate::agent::panel::draw(&mut self.ui, config, side, size, pointer, "")?;
+        let layout = self.layout();
+        let (config, pointer) = (&self.config, self.pointer);
+        let panel = crate::agent::panel::draw(
+            &mut self.ui,
+            config,
+            layout.agent,
+            layout.canvas,
+            pointer,
+            "",
+        )?;
         if let Some(backdrop) = &panel.backdrop {
             frame.blit(backdrop);
         }
@@ -916,10 +921,6 @@ fn draw_tabs(
 ) {
     let row = crate::ui::tab_row_color(config);
     frame.text(0, 0, columns, "", MUTED, row);
-    let (left, right) = match config.tab_style {
-        TabStyle::Angled => ("◢", "◣"),
-        TabStyle::Flat => (" ", " "),
-    };
     let status = if snapshot.controller {
         ""
     } else {
@@ -932,11 +933,14 @@ fn draw_tabs(
         pointer,
         config,
         |part| match part {
-            TabPart::Tab { x, width, color } => {
-                frame.text(x, 0, 1, left, color, row);
-                frame.text(x + 1, 0, width - 2, "", color, color);
-                frame.text(x + width - 1, 0, 1, right, color, row);
-            }
+            TabPart::Tab { x, width, color } => match config.tab_style {
+                TabStyle::Angled => {
+                    frame.text(x, 0, 1, "◢", color, row);
+                    frame.text(x + 1, 0, width - 2, "", color, color);
+                    frame.text(x + width - 1, 0, 1, "◣", color, row);
+                }
+                TabStyle::Flat => frame.text(x, 0, width, "", color, color),
+            },
             TabPart::Text {
                 x,
                 width,
@@ -1015,7 +1019,7 @@ fn paint_row(
             if selected {
                 cell.bg = rgb(0x373737);
             } else if highlight && default_background && !inverse {
-                cell.bg = rgb(0x262626);
+                cell.bg = rgb(crate::panel::BLOCK_HOVER);
             }
             let hide = column >= columns
                 || cell.flags.contains(Flags::HIDDEN)

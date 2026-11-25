@@ -2,12 +2,12 @@
 pub use crate::agent_files::{AgentChange, FileOperation, FileResult};
 use crate::context::ContextItem;
 pub use crate::core::{BlockMarker, CommandBlock};
-use crate::core::{Core, Mode, Point, Scroll, SelectionType, Side, WindowSize};
+use crate::core::{Core, Event, Mode, Point, Scroll, SelectionType, Side, WindowSize};
 use crate::history::{HistoryBudget, HistoryCopy};
 pub use crate::history::{HistoryCursor, HistoryPage};
 use crate::screen::{FrameState, Screen, Update};
 use crate::search::SearchResult;
-use crate::terminal::{Event, INPUT_CAPACITY, Shell, Terminal};
+use crate::terminal::{INPUT_CAPACITY, Shell, Terminal};
 use crate::wire::Peer;
 pub use crate::wire::Response;
 use serde::{Deserialize, Serialize};
@@ -125,8 +125,9 @@ pub enum AgentRequest {
     Rewind { session: u64, turn: u64 },
 }
 
-/// Sent once, by the owner, when a rewind or a send did not happen. A rewind replaces the
-/// editor and context; a failed send is merged into what was typed since.
+/// Sent once when a rewind or a send did not happen: by the owner, or by the daemon when the
+/// owner never started. A rewind replaces the editor and context; a failed send is merged into
+/// what was typed since.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AgentRecovery {
     pub session: u64,
@@ -139,7 +140,6 @@ pub struct AgentRecovery {
 pub struct AgentModelPatch {
     pub session: u64,
     pub busy: bool,
-    pub revision: u64,
     pub start: u32,
     pub prefix_bytes: u32,
     pub messages: Vec<AgentMessage>,
@@ -229,9 +229,6 @@ pub enum Action {
         path: PathBuf,
         operation: FileOperation,
     },
-    CancelAgentFile {
-        request: u64,
-    },
     AgentNewTab {
         pane: PaneId,
         request: u64,
@@ -287,7 +284,7 @@ pub enum Action {
         cursor: Option<HistoryCursor>,
         query: Option<String>,
     },
-    CancelHistory {
+    Cancel {
         request: u64,
     },
     Search {
@@ -426,6 +423,7 @@ pub(crate) enum ClientEndpoint {
         #[serde(with = "crate::wire::bytes")]
         program: Vec<u8>,
         args: Vec<Vec<u8>>,
+        target: String,
     },
 }
 pub struct Client {
@@ -438,10 +436,10 @@ pub struct Client {
     peer: Peer,
     snapshot: Option<Snapshot>,
     screens: HashMap<PaneId, Screen>,
-    ssh: Option<(Child, String)>,
+    ssh: Option<Child>,
 }
 impl Client {
-    fn new(peer: Peer, ssh: Option<(Child, String)>, endpoint: ClientEndpoint) -> Self {
+    fn new(peer: Peer, ssh: Option<Child>, endpoint: ClientEndpoint) -> Self {
         Self {
             peer,
             ssh,
@@ -471,6 +469,7 @@ impl Client {
                 .get_args()
                 .map(|arg| arg.as_bytes().to_vec())
                 .collect(),
+            target,
         };
         let (local, ssh) = UnixStream::pair()?;
         let peer = Peer::new(local)?;
@@ -479,7 +478,7 @@ impl Client {
         let child = command.spawn()?;
         // Closes this process's copies of the child's ends, so the child's exit ends the stream.
         drop(command);
-        let mut client = Self::new(peer, Some((child, target)), endpoint);
+        let mut client = Self::new(peer, Some(child), endpoint);
         loop {
             match client.peer.hello() {
                 Ok(Some(crate::wire::VERSION)) => return Ok(client),
@@ -497,7 +496,7 @@ impl Client {
     }
     /// Names SSH's exit status when the transport died, which is the useful part of a read error.
     fn ssh_error(&mut self, error: io::Error) -> io::Error {
-        if let Some((child, _)) = &mut self.ssh
+        if let Some(child) = &mut self.ssh
             && let Ok(Some(status)) = child.try_wait()
             && !status.success()
         {
@@ -506,10 +505,13 @@ impl Client {
         error
     }
     pub fn is_remote(&self) -> bool {
-        self.ssh.is_some()
+        matches!(self.endpoint, ClientEndpoint::Remote { .. })
     }
     pub fn remote_target(&self) -> Option<&str> {
-        self.ssh.as_ref().map(|(_, target)| target.as_str())
+        match &self.endpoint {
+            ClientEndpoint::Local(_) => None,
+            ClientEndpoint::Remote { target, .. } => Some(target),
+        }
     }
     pub(crate) fn fd(&self) -> RawFd {
         self.peer.fd()
@@ -525,9 +527,9 @@ impl Client {
                 | Action::AgentRecover(_)
                 | Action::AgentRemove(_)
                 | Action::ReadHistory { .. }
-                | Action::CancelHistory { .. }
+                | Action::Cancel { .. }
                 | Action::AgentFile { .. }
-                | Action::CancelAgentFile { .. }
+                | Action::AgentNewTab { .. }
                 | Action::List
                 | Action::CopyBlock { .. }
                 | Action::CopySelection { .. }
@@ -613,7 +615,9 @@ impl Client {
             .is_some_and(|snapshot| snapshot.controller)
     }
     pub(crate) fn mode(&self, pane: PaneId) -> Mode {
-        self.screens.get(&pane).map_or(Mode::NONE, Screen::mode)
+        self.screens
+            .get(&pane)
+            .map_or(Mode::default(), Screen::mode)
     }
     pub fn screens(&self) -> &HashMap<PaneId, Screen> {
         &self.screens
@@ -622,9 +626,6 @@ impl Client {
         &mut self,
     ) -> Option<(&Snapshot, &mut HashMap<PaneId, Screen>)> {
         Some((self.snapshot.as_ref()?, &mut self.screens))
-    }
-    pub fn screen_mut(&mut self, pane: PaneId) -> Option<&mut Screen> {
-        self.screens.get_mut(&pane)
     }
 
     pub fn poll(&mut self) -> io::Result<Vec<Response>> {
@@ -732,7 +733,7 @@ impl Client {
 
 impl Drop for Client {
     fn drop(&mut self) {
-        if let Some((child, _)) = &mut self.ssh {
+        if let Some(child) = &mut self.ssh {
             // Dropping a frontend ends its SSH bridge, never the detached workspace server.
             let _ = child.kill();
             let _ = child.wait();
@@ -1010,6 +1011,7 @@ impl Workspace {
         result
     }
     fn resize(&mut self, size: WindowSize) -> io::Result<()> {
+        self.dirty = true;
         let minimum = self
             .tabs
             .iter()
@@ -1043,7 +1045,7 @@ impl Workspace {
         program: Option<Shell>,
     ) -> io::Result<PaneId> {
         let id = NEXT_PANE.fetch_add(1, Ordering::Relaxed);
-        let terminal = Terminal::new_with_history(
+        let terminal = Terminal::new(
             program,
             directory,
             WindowSize {
@@ -1108,7 +1110,6 @@ impl Workspace {
                 .unwrap_or(self.active)
                 .min(self.tabs.len().saturating_sub(1));
         }
-        self.dirty = true;
         if self.tabs.is_empty() {
             Ok(())
         } else {
@@ -1117,7 +1118,7 @@ impl Workspace {
     }
     /// Tells applications that track focus which pane lost it and which gained it.
     fn report_focus(&mut self) -> io::Result<()> {
-        if self.tabs.is_empty() || self.reported_focus == self.focused() {
+        if self.reported_focus == self.focused() {
             return Ok(());
         }
         self.dirty = true;
@@ -1292,7 +1293,7 @@ impl Connection {
         self.workspace
             .as_ref()
             .and_then(|name| workspaces.get(name))
-            .filter(|workspace| workspace.controller == Some(self.id) || self.agent)
+            .filter(|workspace| workspace.controller == Some(self.id))
             .and_then(|workspace| workspace.panes.get(pane))
             .is_some_and(|pane| pane.terminal.input_pending_bytes() + data.len() > INPUT_CAPACITY)
     }
@@ -1533,8 +1534,10 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
                         (true, true)
                     }
                 };
-                for event in pane.terminal.events.drain(..) {
+                for event in pane.terminal.core.take_events() {
                     match event {
+                        // Replies were written back while parsing.
+                        Event::Write(_) => unreachable!(),
                         Event::Title(title) => {
                             pane.title = title.unwrap_or_else(|| "shell".into());
                             changed = true;
@@ -1983,11 +1986,9 @@ fn broadcast(workspace: &mut Workspace, clients: &mut [Connection], changed: boo
         }
         client.screen_dirty = false;
     }
+    // The owner also reads panes mid-update, so every broadcast starts a new damage revision.
     for pane in workspace.panes.values_mut() {
-        let core = &mut pane.terminal.core;
-        if !core.mode().contains(Mode::SYNC_UPDATE) {
-            core.reset_damage();
-        }
+        pane.terminal.core.reset_damage();
     }
 }
 
@@ -2009,11 +2010,10 @@ fn apply_action(
             client.screen_request = Some(request);
             client.screen_dirty |= !wait;
         }
-        Action::CancelAgentFile { request } => {
-            clients[index].cancel_files(|source| source.request == request);
-        }
-        Action::CancelHistory { request } => {
-            clients[index].reads.retain(|read| read.request != request);
+        Action::Cancel { request } => {
+            let client = &mut clients[index];
+            client.cancel_files(|source| source.request == request);
+            client.reads.retain(|read| read.request != request);
         }
         Action::AgentAttach { name } => {
             let workspace = workspaces.get_mut(&name).ok_or(NO_WORKSPACE)?;
@@ -2154,7 +2154,6 @@ fn workspace_action(
             clients[index].size = size;
             if controller && size != workspace.size {
                 workspace.resize(size)?;
-                workspace.dirty = true;
             }
         }
         Action::Input { pane, data } if controller => {
@@ -2228,7 +2227,6 @@ fn workspace_action(
             let root = &mut workspace.tabs[workspace.active].root;
             if root.resize_split(rect, first, second, position) {
                 workspace.resize(workspace.size)?;
-                workspace.dirty = true;
             }
         }
         Action::Split { axis } if controller => {
@@ -2408,7 +2406,6 @@ fn workspace_action(
             client.respond(Response::Agent(AgentEvent::Ready));
         }
         Action::AgentView(payload) if agent => {
-            clients[index].agent_open = true;
             let view = workspace.agent.view.get_or_insert_default();
             if payload.complete {
                 view.clone_from(&payload);
@@ -2437,7 +2434,6 @@ fn workspace_action(
             }
         }
         Action::AgentRequest(payload) if agent => {
-            clients[index].agent_open = true;
             let owner = clients
                 .iter_mut()
                 .find(|client| client.agent && !client.failed && client.viewing(&workspace.name));
@@ -2459,7 +2455,6 @@ fn workspace_action(
             }
             model.session = patch.session;
             model.busy = patch.busy;
-            model.revision = patch.revision;
             model.changes_omitted = patch.changes_omitted;
             for client in agent_subscribers(clients, &workspace.name) {
                 client.respond(Response::Agent(AgentEvent::Model(patch.clone())));

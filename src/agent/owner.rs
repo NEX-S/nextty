@@ -11,7 +11,6 @@ use std::time::{Duration, Instant};
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct OwnerInit {
     endpoint: ClientEndpoint,
-    target: Option<String>,
     name: String,
     base_url: String,
     model: String,
@@ -20,7 +19,6 @@ struct OwnerInit {
 pub(crate) fn spawn(client: &Client, config: &Config) -> io::Result<()> {
     let init = OwnerInit {
         endpoint: client.endpoint().clone(),
-        target: client.remote_target().map(str::to_owned),
         name: client.snapshot().unwrap().name.clone(),
         base_url: config.base_url.clone(),
         model: config.model.clone(),
@@ -31,7 +29,9 @@ pub(crate) fn spawn(client: &Client, config: &Config) -> io::Result<()> {
     let log = crate::workspace::socket_path()?.with_extension("agent.log");
     let mut child = crate::workspace::spawn_detached(&mut command, log)?;
     let mut stdin = child.stdin.take().unwrap();
-    std::thread::spawn(move || child.wait());
+    crate::sys::task(move || {
+        let _ = child.wait();
+    })?;
     stdin.write_all(&postcard::to_allocvec(&init).map_err(io::Error::other)?)
 }
 
@@ -40,17 +40,20 @@ pub fn run() -> io::Result<()> {
     io::stdin().read_to_end(&mut bytes)?;
     let OwnerInit {
         endpoint,
-        target,
         name,
         base_url,
         model,
     } = postcard::from_bytes(&bytes).map_err(io::Error::other)?;
     let mut client = match endpoint {
         ClientEndpoint::Local(path) => Client::connect(&path)?,
-        ClientEndpoint::Remote { program, args } => {
+        ClientEndpoint::Remote {
+            program,
+            args,
+            target,
+        } => {
             let mut command = Command::new(OsString::from_vec(program));
             command.args(args.into_iter().map(OsString::from_vec));
-            Client::connect_remote(command, target.unwrap())?
+            Client::connect_remote(command, target)?
         }
     };
     let config = Config {
@@ -74,7 +77,7 @@ pub fn run() -> io::Result<()> {
         let timeout = if client.needs_poll() {
             0
         } else {
-            let publish = client.can_agent_input() && agents.iter().any(|agent| agent.dirty);
+            let publish = agents.iter().any(|agent| agent.dirty);
             agents
                 .iter()
                 .filter_map(Agent::deadline)
@@ -88,7 +91,6 @@ pub fn run() -> io::Result<()> {
         for fd in fds[1..].iter().filter(|fd| fd.revents != 0) {
             crate::sys::consume_notification(fd.fd)?;
         }
-        client.flush()?;
         if fds[0].revents != 0 || client.needs_poll() {
             for mut event in client.poll()? {
                 for agent in &mut agents {
@@ -153,8 +155,7 @@ pub fn run() -> io::Result<()> {
         if agents.iter().any(Agent::needs_screen) {
             client.request_screen()?;
         }
-        if client.can_agent_input()
-            && agents.iter().any(|agent| agent.dirty)
+        if agents.iter().any(|agent| agent.dirty)
             && (Instant::now() >= publish_at || agents.iter().all(|agent| !agent.busy))
         {
             for agent in agents.iter_mut().filter(|agent| agent.dirty) {

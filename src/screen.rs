@@ -1,6 +1,6 @@
 //! Visible grid snapshots shared by desktop and workspace frontends.
 
-use crate::core::{BlockMarker, Flags, WindowSize};
+use crate::core::{BlockMarker, Flags};
 use crate::core::{Core, Mode, Point, Row, SelectionRange};
 use crate::vt::{Color, CursorShape, PALETTE_SIZE, Rgb};
 
@@ -41,11 +41,9 @@ pub struct Update {
 
 /// What one connection last received of a pane. Row revisions only grow, and the reactor calls
 /// `Core::reset_damage` after each frame, so the rows damaged since `revision` are exactly
-/// those the connection lacks.
+/// those the connection lacks. A full redraw, which carries the palette again, bumps `full`.
 pub(crate) struct FrameState {
-    size: WindowSize,
     full: u64,
-    palette: u64,
     revision: u64,
     scrolls: u64,
 }
@@ -53,9 +51,7 @@ pub(crate) struct FrameState {
 impl FrameState {
     pub fn new(core: &Core) -> Self {
         Self {
-            size: core.window_size(),
             full: core.full_revision(),
-            palette: core.palette_revision(),
             revision: core.revision(),
             scrolls: core.scrolls(),
         }
@@ -68,19 +64,12 @@ impl Update {
     pub(crate) fn capture_since(core: &Core, previous: Option<&FrameState>) -> Self {
         let scrolled = previous.map_or(0, |known| core.scrolls().saturating_sub(known.scrolls));
         let full = scrolled >= core.screen_lines() as u64
-            || previous.is_none_or(|known| {
-                known.size != core.window_size() || known.full != core.full_revision()
-            });
+            || previous.is_none_or(|known| known.full != core.full_revision());
         let rows: Vec<_> = (0..core.screen_lines())
             .filter(|index| full || core.row(*index).revision > previous.unwrap().revision)
             .map(|index| (index, core.row(index).clone()))
             .collect();
-        let mut update = Self::from_rows(
-            core,
-            rows,
-            core.display_offset(),
-            full || previous.is_some_and(|known| known.palette != core.palette_revision()),
-        );
+        let mut update = Self::from_rows(core, rows, core.display_offset(), full);
         update.scroll = if full { 0 } else { scrolled as u16 };
         update
     }
@@ -196,25 +185,27 @@ impl Screen {
         self.history = update.history;
     }
 
+    /// The screen line and used cells of a row that may show command output: `None` off the
+    /// main screen or when styled prompt padding covers any of its cells.
+    fn output_row(&self, row: usize) -> Option<(i32, usize)> {
+        if self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len() {
+            return None;
+        }
+        let cells = &self.rows[row];
+        (!cells
+            .cells
+            .iter()
+            .any(|cell| cell.flags.contains(Flags::PROMPT)))
+        .then(|| (row as i32 - self.offset as i32, cells.used()))
+    }
+
     pub fn row_output<'a>(
         &self,
         pane: &'a crate::workspace::PaneView,
         row: usize,
     ) -> Option<&'a crate::workspace::BlockMarker> {
-        if pane.blocks.is_empty() || self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len()
-        {
-            return None;
-        }
-        let cells = &self.rows[row];
-        // Styled prompt padding can extend beyond used.
-        if cells
-            .cells
-            .iter()
-            .any(|cell| cell.flags.contains(Flags::PROMPT))
-        {
-            return None;
-        }
-        output_block(&pane.blocks, row as i32 - self.offset as i32, cells.used())
+        let (line, used) = self.output_row(row)?;
+        output_block(&pane.blocks, line, used)
     }
 
     // A cheap damage hint; prompts and partial boundary rows still need row_output's check.
@@ -224,20 +215,11 @@ impl Screen {
         new: &crate::workspace::PaneView,
         row: usize,
     ) -> bool {
-        if self.mode.contains(Mode::ALT_SCREEN) || row >= self.rows.len() {
+        let Some((line, used)) = self.output_row(row) else {
             return false;
-        }
-        let cells = &self.rows[row];
-        if cells
-            .cells
-            .iter()
-            .any(|cell| cell.flags.contains(Flags::PROMPT))
-        {
-            return false;
-        }
+        };
         let output = |blocks: &[BlockMarker]| {
-            output_block(blocks, row as i32 - self.offset as i32, cells.used())
-                .map(|block| (block.id, block.status))
+            output_block(blocks, line, used).map(|block| (block.id, block.status))
         };
         output(&old.blocks) != output(&new.blocks)
     }
@@ -274,7 +256,7 @@ impl Screen {
     pub fn reset_damage(&mut self) {
         self.dirty.fill(false);
     }
-    pub fn damage_cursor(&mut self) {
+    fn damage_cursor(&mut self) {
         if self.cursor.1 == CursorShape::Hidden {
             return;
         }
@@ -322,12 +304,7 @@ mod tests {
                 .filter(|index| full || core.dirty_rows().any(|dirty| dirty == *index))
                 .map(|index| (index, core.row(index).clone()))
                 .collect();
-            Self::from_rows(
-                core,
-                rows,
-                core.display_offset(),
-                full || core.palette_dirty(),
-            )
+            Self::from_rows(core, rows, core.display_offset(), full)
         }
     }
 
@@ -575,7 +552,6 @@ mod tests {
             screen.rows[1].cells[column].flags.remove(Flags::PROMPT);
         }
         new.blocks[0].status = old.blocks[0].status;
-        new.blocks[0].complete = !old.blocks[0].complete;
         assert!(!screen.output_changed(&old, &new, 1));
     }
     #[test]
@@ -599,14 +575,15 @@ mod tests {
             "\x1b]110\x07",
             "\x1b]4;1;#abcdef\x07\x1b]10;#123456\x07\x1bc",
         ] {
-            core.reset_damage();
+            let known = FrameState::new(&core);
             parser.advance(&mut core, sequence.as_bytes());
-            let update = Update::capture(&core, false);
+            let update = Update::capture_since(&core, Some(&known));
             assert!(
                 update.palette.is_some(),
                 "missing palette after {sequence:?}"
             );
             screen.apply(update);
+            core.reset_damage();
             for index in 0..PALETTE_SIZE {
                 let color = if index < 256 {
                     Color::Indexed(index as u8)
@@ -616,8 +593,8 @@ mod tests {
                 assert_eq!(screen.color(color), core.color(color), "slot {index}");
             }
         }
-        core.reset_damage();
+        let known = FrameState::new(&core);
         parser.advance(&mut core, b"\x1b]4;1;?\x07xy");
-        assert!(Update::capture(&core, false).palette.is_none());
+        assert!(Update::capture_since(&core, Some(&known)).palette.is_none());
     }
 }

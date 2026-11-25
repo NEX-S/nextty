@@ -14,7 +14,7 @@ use std::os::unix::net::UnixStream;
 const MAX_FRAME: usize = 32 * 1024 * 1024;
 /// Input and copies travel in frames of at most this many bytes.
 const CHUNK: usize = 65536;
-pub(crate) const VERSION: u8 = 27;
+pub(crate) const VERSION: u8 = 28;
 /// The remote bridge's first bytes: a frame whose payload is `VERSION`, independent of `Response`.
 pub(crate) const HELLO: [u8; 5] = [1, 0, 0, 0, VERSION];
 

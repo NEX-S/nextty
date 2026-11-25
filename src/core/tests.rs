@@ -1,21 +1,18 @@
 use super::*;
-use crate::history::HistoryBudget;
 use crate::vt::Parser;
-use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 impl Core {
+    pub(crate) fn window_size(&self) -> WindowSize {
+        self.size
+    }
+
     /// Rows changed since `reset_damage`.
     pub(crate) fn dirty_rows(&self) -> impl Iterator<Item = usize> + '_ {
         let all = self.full_revision == self.revision;
         (0..self.screen_lines()).filter(move |&y| {
             !self.revision_pending && (all || self.row(y).revision == self.revision)
         })
-    }
-
-    pub(crate) fn palette_dirty(&self) -> bool {
-        !self.revision_pending && self.palette_revision == self.revision
     }
 }
 
@@ -62,21 +59,9 @@ pub(crate) fn terminal(columns: u16, lines: u16) -> (Core, Parser) {
     )
 }
 
-static NEXT_BUDGET: AtomicU64 = AtomicU64::new(1);
-
 /// A core whose scrolled-out rows go through the real history writer.
 pub(crate) fn disk_core(columns: u16, lines: u16, capacity: u64) -> Core {
-    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/workspace-history");
-    std::fs::create_dir_all(&root).unwrap();
-    let budget = HistoryBudget::new(
-        root.join(format!(
-            "test-{}-{}",
-            std::process::id(),
-            NEXT_BUDGET.fetch_add(1, Ordering::Relaxed)
-        )),
-        capacity,
-    )
-    .unwrap();
+    let budget = crate::history::tests::budget(capacity);
     let mut core = Core::new(
         WindowSize {
             num_cols: columns,

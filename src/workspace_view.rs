@@ -1,11 +1,12 @@
 mod render;
 
 use crate::input::{
-    KeyResult, LEFT, PasteTarget, PointerKind, key_bytes, keysym, paste_bytes, symbol_char,
+    ALT, CONTROL, KeyResult, LEFT, PasteTarget, PointerKind, SHIFT, SUPER, key_bytes, keysym,
+    paste_bytes, symbol_char,
 };
 use crate::native::{self, Event, Line, Renderer, Run, Window, trace::Trace};
 use crate::paint::{LineCache, text_columns};
-use crate::panel::{mix_color, rect};
+use crate::panel::{MIX_SOFT, mix_color, rect};
 use crate::{
     config::Config,
     context,
@@ -97,7 +98,7 @@ const CHROME: u32 = opaque(crate::panel::CHROME);
 const BORDER: u32 = opaque(crate::panel::BORDER);
 const INK: u32 = opaque(crate::panel::INK);
 const MUTED: u32 = opaque(crate::panel::MUTED);
-const DANGER: u32 = 0xe87575ff;
+const DANGER: u32 = opaque(crate::panel::DANGER);
 const PADDING: f32 = 16.;
 const TERMINAL_PADDING: f32 = 4.;
 
@@ -154,6 +155,27 @@ impl GuiLayout {
         }
     }
 
+    /// The top of the status bar, below the panes and the monitor.
+    fn status(self, cell: (f32, f32)) -> f32 {
+        self.height - cell.1 - 12.
+    }
+    /// Rows available to the monitor, counting the status bar it displaces.
+    fn monitor_rows(self, cell: (f32, f32)) -> u16 {
+        ((self.height - self.top - 12.) / cell.1) as u16
+    }
+    /// Rows between the tab row and the status bar.
+    fn body_rows(self, cell: (f32, f32)) -> u16 {
+        ((self.footer - self.top) / cell.1).max(1.) as u16
+    }
+    /// The window without its tab row and status bar; previews float over it.
+    fn canvas(self, cell: (f32, f32)) -> crate::workspace::Rect {
+        rect(
+            0,
+            1,
+            (self.width / cell.0) as u16,
+            (self.height / cell.1) as u16 - 2,
+        )
+    }
     fn divider_contains(self, point: (f32, f32)) -> bool {
         self.side < self.width
             && point.0 >= self.side
@@ -284,6 +306,8 @@ pub struct WorkspaceView {
     scrollbars: Vec<Scrollbar>,
     scrollbar_drag: Option<ScrollbarDrag>,
     maximized: bool,
+    /// The controller state the window title was last built for.
+    access: Option<bool>,
     hovered: Option<(PaneId, crate::context::Object)>,
     hovered_block: Option<(PaneId, u64)>,
     hover_cell: Option<(PaneId, Point)>,
@@ -327,6 +351,7 @@ impl WorkspaceView {
             scrollbars: Vec::new(),
             scrollbar_drag: None,
             maximized: false,
+            access: None,
             hovered: None,
             hovered_block: None,
             hover_cell: None,
@@ -372,7 +397,6 @@ impl WorkspaceView {
                 }
             }
             self.client.flush()?;
-            let previous = self.client.snapshot().map(|s| (s.focused, s.controller));
             let responses = if pollfds[0].revents
                 & (libc::POLLIN | libc::POLLHUP | libc::POLLERR | libc::POLLNVAL)
                 != 0
@@ -384,32 +408,7 @@ impl WorkspaceView {
             };
             for response in responses {
                 match self.ui.respond(&mut self.client, response)? {
-                    None => self.dirty = true,
-                    Some(Response::ScreenDirty) => {
-                        self.dirty = true;
-                        let current = self.client.snapshot().map(|s| (s.focused, s.controller));
-                        if previous != current {
-                            for (pane, _) in previous.into_iter().chain(current) {
-                                if let Some(screen) = self.client.screen_mut(pane) {
-                                    screen.damage_cursor();
-                                }
-                            }
-                            if let Some(snapshot) = self.client.snapshot() {
-                                let ssh = if self.client.is_remote() {
-                                    " · SSH"
-                                } else {
-                                    ""
-                                };
-                                let access = if snapshot.controller {
-                                    ""
-                                } else {
-                                    " · read-only"
-                                };
-                                let title = format!("nextty — {}{ssh}{access}", snapshot.name);
-                                self.window.title(&title)?;
-                            }
-                        }
-                    }
+                    None | Some(Response::ScreenDirty) => self.dirty = true,
                     Some(Response::Clipboard {
                         primary,
                         file,
@@ -451,13 +450,6 @@ impl WorkspaceView {
         self.window.selection(false, text)?;
         self.message("Copied");
         Ok(())
-    }
-    fn damage_cursor(&mut self) {
-        if let Some(pane) = self.client.focused()
-            && let Some(screen) = self.client.screen_mut(pane)
-        {
-            screen.damage_cursor();
-        }
     }
     fn input(&mut self, pane: PaneId, data: Vec<u8>) -> Result<()> {
         if !self.client.controller() {
@@ -527,7 +519,6 @@ impl WorkspaceView {
                 }
                 self.preedit = event.text;
                 self.dirty = true;
-                self.damage_cursor();
             }
             native::RESIZE => self.resize()?,
             native::EXPOSE => self.dirty = true,
@@ -540,7 +531,6 @@ impl WorkspaceView {
                     let report: &[u8] = if self.focused { b"\x1b[I" } else { b"\x1b[O" };
                     self.input(pane, report.to_vec())?;
                 }
-                self.damage_cursor();
                 self.dirty = true;
             }
             native::MOTION => self.motion((event.x as f32, event.y as f32), event.modifiers)?,
@@ -572,13 +562,12 @@ impl WorkspaceView {
     fn clear_preedit(&mut self) {
         if !self.preedit.is_empty() {
             self.preedit.clear();
-            self.damage_cursor();
             self.dirty = true;
         }
     }
 
     fn workspace_key(&mut self, symbol: u32, modifiers: u32) -> Result<bool> {
-        if modifiers & (native::ALT | native::CONTROL | native::SUPER) != native::ALT {
+        if modifiers & (ALT | CONTROL | SUPER) != ALT {
             return Ok(false);
         }
         if !self.composition_finished() {
@@ -603,7 +592,7 @@ impl WorkspaceView {
         let Some(pane) = self.client.focused() else {
             return Ok(());
         };
-        if modifiers == native::ALT && symbol_char(symbol) == Some('q') {
+        if modifiers == ALT && symbol_char(symbol) == Some('q') {
             self.running = false;
             return Ok(());
         }
@@ -611,7 +600,7 @@ impl WorkspaceView {
             return Ok(());
         }
 
-        let panel_text = if modifiers & (native::CONTROL | native::ALT | native::SUPER) == 0 {
+        let panel_text = if modifiers & (CONTROL | ALT | SUPER) == 0 {
             text
         } else {
             ""
@@ -636,7 +625,7 @@ impl WorkspaceView {
         if self.panel_key(symbol, modifiers, panel_text)? {
             return Ok(());
         }
-        if modifiers & (native::CONTROL | native::SHIFT) == native::CONTROL | native::SHIFT {
+        if modifiers & (CONTROL | SHIFT) == CONTROL | SHIFT {
             match symbol_char(symbol).map(|c| c.to_ascii_lowercase()) {
                 Some('c') => {
                     let primary = false;
@@ -650,7 +639,7 @@ impl WorkspaceView {
             }
         }
 
-        if modifiers & (native::SHIFT | native::CONTROL | native::ALT) == native::SHIFT {
+        if modifiers & (SHIFT | CONTROL | ALT) == SHIFT {
             let scroll = match symbol {
                 keysym::HOME => Some(Scroll::Top),
                 keysym::END => Some(Scroll::Bottom),
@@ -693,28 +682,11 @@ impl WorkspaceView {
     }
 
     fn paste(&mut self, pane: PaneId, primary: bool) {
-        if !self.client.controller() {
+        if !self.client.controller() || !self.composition_finished() {
             return;
         }
-        if !self.composition_finished() {
-            return;
-        }
-        let target = if self.ui.files_open && self.ui.focus == Focus::Files {
-            if let Some(files) = &mut self.ui.files {
-                files.focus_list();
-                if !files.is_search() {
-                    files.start_search();
-                }
-            }
-            self.dirty = true;
-            PasteTarget::Files
-        } else {
-            PasteTarget::Pane {
-                pane,
-                bracketed: self.client.mode(pane).contains(Mode::BRACKETED_PASTE),
-            }
-        };
-        self.request_paste(target, primary);
+        let bracketed = self.client.mode(pane).contains(Mode::BRACKETED_PASTE);
+        self.request_paste(PasteTarget::Pane { pane, bracketed }, primary);
     }
     fn request_paste(&mut self, target: PasteTarget, primary: bool) {
         if self.paste.is_some() {
@@ -770,7 +742,7 @@ impl WorkspaceView {
             self.ui.files_open,
         );
         if self.ui.resources.open {
-            let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
+            let total = layout.monitor_rows(self.cell);
             layout.footer -= f32::from(self.ui.resources.rows(total)) * self.cell.1 + 6.;
         }
         layout
@@ -800,7 +772,7 @@ impl WorkspaceView {
             Area::Tabs
         } else if self.ui.resources.open && (y - layout.footer).abs() <= 5. {
             Area::Divider
-        } else if y >= layout.height - self.cell.1 - 12. {
+        } else if y >= layout.status(self.cell) {
             Area::Footer
         } else if y >= layout.footer {
             Area::Monitor
@@ -1001,12 +973,10 @@ impl WorkspaceView {
             return self.drag_scrollbar(point.1);
         }
         if self.ui.resources.dragging {
-            let bottom = layout.height - self.cell.1 - 12.;
-            let total = ((layout.height - layout.top - 12.) / self.cell.1) as u16;
+            let bottom = layout.status(self.cell);
+            let total = layout.monitor_rows(self.cell);
             let rows = ((bottom - point.1) / self.cell.1).round() as u16;
-            let old = self.ui.resources.height;
-            self.ui.resources.resize(rows, total);
-            if self.ui.resources.height != old {
+            if self.ui.resources.resize(rows, total) {
                 self.resize()?;
             }
             return Ok(());
@@ -1077,6 +1047,23 @@ impl WorkspaceView {
             self.caches.clear();
             self.painter.lines.clear();
         }
+        if let Some(snapshot) = self.client.snapshot()
+            && self.access != Some(snapshot.controller)
+        {
+            self.access = Some(snapshot.controller);
+            let remote = if self.client.is_remote() {
+                " · SSH"
+            } else {
+                ""
+            };
+            let access = if snapshot.controller {
+                ""
+            } else {
+                " · read-only"
+            };
+            self.window
+                .title(&format!("nextty — {}{remote}{access}", snapshot.name))?;
+        }
         let alpha = (self.config.background_opacity * 255.).round() as u32;
         self.painter.begin((self.config.background << 8) | alpha);
         let layout = self.layout();
@@ -1084,9 +1071,7 @@ impl WorkspaceView {
         self.control_hits.clear();
         self.scrollbars.clear();
         self.chrome(layout);
-        let terminal_input = self.ui.close_prompt.is_none()
-            && !self.ui.search.open
-            && self.ui.focus == Focus::Terminal;
+        let terminal_input = self.ui.terminal_input();
         if let Some((snapshot, screens)) = self.client.snapshot_and_screens_mut() {
             let right = snapshot
                 .panes
@@ -1159,7 +1144,7 @@ impl WorkspaceView {
                                     origin.1 + row as f32 * self.cell.1,
                                     w,
                                     self.cell.1,
-                                    0x262626ff,
+                                    opaque(crate::panel::BLOCK_HOVER),
                                 );
                             }
                         }
@@ -1238,7 +1223,7 @@ impl WorkspaceView {
                         grid_y + top * self.cell.1,
                         1.,
                         (end_y - top) * self.cell.1,
-                        0x303030ff,
+                        BORDER,
                     );
                 }
                 if pane.rect.y > 1 {
@@ -1247,7 +1232,7 @@ impl WorkspaceView {
                         grid_y + top * self.cell.1,
                         (end_x - left) * self.cell.0,
                         1.,
-                        0x303030ff,
+                        BORDER,
                     );
                 }
             }
@@ -1259,7 +1244,7 @@ impl WorkspaceView {
         let divider = opaque(mix_color(
             self.config.foreground,
             self.config.background,
-            24,
+            MIX_SOFT,
         ));
         let height = layout.footer - layout.top;
         if self.ui.files_open {
@@ -1313,20 +1298,10 @@ impl WorkspaceView {
         self.dirty = true;
     }
     fn file_rect(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        rect(
-            0,
-            1,
-            layout.panels.file_width,
-            (((layout.footer - layout.top) / self.cell.1) as u16).max(1),
-        )
+        rect(0, 1, layout.panels.file_width, layout.body_rows(self.cell))
     }
 
     fn file_preview_layout(&self, layout: GuiLayout) -> crate::workspace::Rect {
-        crate::file_panel::preview_rect(rect(
-            0,
-            1,
-            (layout.width / self.cell.0) as u16,
-            ((layout.footer - layout.top) / self.cell.1) as u16,
-        ))
+        crate::file_panel::preview_rect(layout.canvas(self.cell))
     }
 }

@@ -314,7 +314,13 @@ fn cancelling_pending_wrap_updates_hover_output_without_moving_cursor() {
         state(client) == Some((cursor, true, 'G'))
     });
     let pane = client.snapshot().unwrap().focused;
-    client.screen_mut(pane).unwrap().reset_damage();
+    client
+        .snapshot_and_screens_mut()
+        .unwrap()
+        .1
+        .get_mut(&pane)
+        .unwrap()
+        .reset_damage();
     input(&mut client, pane, "x");
     wait(&mut client, |client, _| {
         state(client) == Some((cursor, false, 'G'))
@@ -359,7 +365,7 @@ fn dropping_remote_frontend_reaps_its_transport() {
         crate::wire::VERSION
     ));
     let client = Client::connect_remote(command, "test-host".into()).unwrap();
-    let pid = client.ssh.as_ref().unwrap().0.id();
+    let pid = client.ssh.as_ref().unwrap().id();
     drop(client);
     assert_eq!(unsafe { libc::kill(pid as i32, 0) }, -1);
     assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH));
@@ -535,10 +541,20 @@ fn server_survives_accept_fd_exhaustion() {
 fn drain_agent(client: &mut Client) -> Vec<AgentEvent> {
     client.agent_events.drain(..).collect()
 }
-/// Queues `request`, which asks the frontend to start the owner.
+/// Queues `request` as a frontend with its Agent panel open, which asks it to start the owner.
 fn agent_start(frontend: &mut Client, request: AgentRequest) {
+    frontend.send(Action::AgentOpen).unwrap();
+    wait(frontend, |client, _| {
+        client.agent_events.contains(&AgentEvent::Ready)
+    });
+    drain_agent(frontend);
     frontend.send(Action::AgentRequest(request)).unwrap();
-    wait(frontend, |client, _| !client.agent_events.is_empty());
+    wait(frontend, |client, _| {
+        client
+            .agent_events
+            .iter()
+            .any(|event| matches!(event, AgentEvent::Start))
+    });
     assert!(drain_agent(frontend).contains(&AgentEvent::Start));
 }
 fn agent_attach(server: &TestServer, name: &str) -> Client {
@@ -645,7 +661,6 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     };
     let initial = AgentModelPatch {
         session: 1,
-        revision: 1,
         changes: Some(
             vec![AgentChange {
                 turn: 1,
@@ -663,7 +678,6 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     };
     let tail = AgentModelPatch {
         session: 1,
-        revision: 1,
         prefix_bytes: 5,
         messages: vec![message("models")],
         ..AgentModelPatch::default()
@@ -765,6 +779,37 @@ fn agent_owner_restores_state_and_keeps_background_pty_without_control() {
     wait(&mut fresh, |client, _| !client.agent_events.is_empty());
     assert_eq!(drain_agent(&mut fresh), [AgentEvent::Ready]);
     terminate(&mut keeper, "keeper");
+}
+
+/// The owner reads panes that frontends hold back during a synchronized update, so every
+/// broadcast must start a new damage revision, also for rows damaged inside the same update.
+#[test]
+fn owner_sees_rows_damaged_after_its_frame_inside_a_synchronized_update() {
+    let server = TestServer::start();
+    let script = "import os,tty; tty.setraw(0); os.write(1, b'READY\\r\\n'); os.read(0,1); \
+os.write(1, b'\\x1b[?2026h\\r\\nONE'); os.read(0,1); os.write(1, b'\\r\\nTWO'); os.read(0,1)";
+    let mut frontend = start(&server, "sync", python(script));
+    let pane = frontend.snapshot().unwrap().focused;
+    wait(&mut frontend, |client, _| grid_contains(client, "READY"));
+    let mut owner = attach_agent_owner(&server, &mut frontend, "sync");
+    input(&mut frontend, pane, "a");
+    frontend.flush().unwrap();
+    // A tool forces a fresh frame before acting, also while frontends wait for the whole update.
+    let mut seen = false;
+    for _ in 0..200 {
+        owner.refresh_screen().unwrap();
+        owner.flush().unwrap();
+        std::thread::sleep(Duration::from_millis(2));
+        owner.poll().unwrap();
+        if grid_contains(&owner, "ONE") {
+            seen = true;
+            break;
+        }
+    }
+    assert!(seen, "the owner never saw the first row");
+    input(&mut frontend, pane, "b");
+    frontend.flush().unwrap();
+    wait(&mut owner, |client, _| grid_contains(client, "TWO"));
 }
 
 #[test]
@@ -1904,7 +1949,7 @@ fn agent_file_cancellation_preserves_fifo_results_and_committed_edits() {
     };
     for action in [
         file(1, edit(None, "cancelled")),
-        Action::CancelAgentFile { request: 1 },
+        Action::Cancel { request: 1 },
         file(2, read.clone()),
         file(3, edit(Some("original"), "committed")),
     ] {
@@ -1928,7 +1973,7 @@ fn agent_file_cancellation_preserves_fifo_results_and_committed_edits() {
         received.len() == 3
     });
     // Cancelling a finished edit does not undo it.
-    owner.send(Action::CancelAgentFile { request: 3 }).unwrap();
+    owner.send(Action::Cancel { request: 3 }).unwrap();
     owner.send(file(4, read)).unwrap();
     wait_response(
         &mut owner,

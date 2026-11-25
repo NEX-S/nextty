@@ -302,7 +302,7 @@ fn colon_sgr_keeps_color_subparameters_and_underline_style_separate() {
         assert_eq!(row.cells[2].fg, Color::Named(NamedColor::Foreground));
         assert_eq!(row.cells[2].bg, Color::Named(NamedColor::Background));
         assert_eq!(row.cells[2].flags, Flags::BOLD);
-        assert_eq!(row.cells[3].flags, Flags::empty());
+        assert_eq!(row.cells[3].flags, Flags::default());
     });
 }
 

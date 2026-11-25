@@ -163,7 +163,7 @@ impl Harness {
         if state.stopped {
             return Err(io::Error::other("Agent worker stopped"));
         }
-        if state.prompt.is_some() || state.active.is_some() || state.rewind.is_some() {
+        if state.active.is_some() || state.rewind.is_some() {
             return Err(io::Error::new(
                 io::ErrorKind::WouldBlock,
                 "Agent is still responding",
@@ -334,9 +334,6 @@ impl Session {
                 canceled,
                 |event| {
                     response.event(event, shared, visible)?;
-                    if response.stopped {
-                        response.complete()?;
-                    }
                     Ok(response.stopped)
                 },
             );
@@ -736,7 +733,6 @@ impl Session {
                     },
                 );
             }
-            check_cancel(&prompt.canceled)?;
             round += 1;
         }
     }

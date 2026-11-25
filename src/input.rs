@@ -301,15 +301,15 @@ mod tests {
     fn keys_encode_as_xterm_sequences_and_plain_text_belongs_to_the_ime() {
         let char = |ch: char| u32::from(ch);
         for (symbol, modifiers, text, mode, expected) in [
-            (char('x'), 0, "x", Mode::NONE, Some("x")),
-            (0x0100_4e2d, 0, "中", Mode::NONE, Some("中")),
-            (char('x'), ALT, "x", Mode::NONE, Some("\x1bx")),
-            (char('a'), ALT, "你好", Mode::NONE, Some("\x1b你好")),
-            (char(' '), ALT, "", Mode::NONE, Some("\x1b ")),
-            (char('a'), 0, "", Mode::NONE, None),
-            (char('a'), SHIFT, "", Mode::NONE, None),
-            (char('c'), SUPER, "", Mode::NONE, None),
-            (UP, 0, "", Mode::NONE, Some("\x1b[A")),
+            (char('x'), 0, "x", Mode::default(), Some("x")),
+            (0x0100_4e2d, 0, "中", Mode::default(), Some("中")),
+            (char('x'), ALT, "x", Mode::default(), Some("\x1bx")),
+            (char('a'), ALT, "你好", Mode::default(), Some("\x1b你好")),
+            (char(' '), ALT, "", Mode::default(), Some("\x1b ")),
+            (char('a'), 0, "", Mode::default(), None),
+            (char('a'), SHIFT, "", Mode::default(), None),
+            (char('c'), SUPER, "", Mode::default(), None),
+            (UP, 0, "", Mode::default(), Some("\x1b[A")),
             (HOME, 0, "", Mode::APP_CURSOR, Some("\x1bOH")),
             (KP_HOME + 2, 0, "", Mode::APP_CURSOR, Some("\x1bOA")),
             (
@@ -319,23 +319,29 @@ mod tests {
                 Mode::APP_CURSOR,
                 Some("\x1b[1;8D"),
             ),
-            (DELETE, CONTROL, "", Mode::NONE, Some("\x1b[3;5~")),
-            (F1, 0, "", Mode::NONE, Some("\x1bOP")),
-            (F1 + 11, SHIFT, "", Mode::NONE, Some("\x1b[24;2~")),
-            (char(' '), CONTROL, "", Mode::NONE, Some("\0")),
-            (char('x'), CONTROL, "x", Mode::NONE, Some("\x18")),
-            (char('['), CONTROL, "", Mode::NONE, Some("\x1b")),
-            (char('\\'), CONTROL, "", Mode::NONE, Some("\x1c")),
-            (char('6'), CONTROL, "", Mode::NONE, Some("\x1e")),
-            (char('/'), CONTROL, "", Mode::NONE, Some("\x1f")),
-            (char('8'), CONTROL, "", Mode::NONE, Some("\x7f")),
-            (char('c'), CONTROL | ALT, "", Mode::NONE, Some("\x1b\x03")),
-            (BACKSPACE, 0, "", Mode::NONE, Some("\x7f")),
-            (BACKSPACE, CONTROL, "", Mode::NONE, Some("\x08")),
-            (BACKSPACE, ALT, "", Mode::NONE, Some("\x1b\x7f")),
-            (TAB, SHIFT, "", Mode::NONE, Some("\x1b[Z")),
-            (LEFT_TAB, SHIFT, "", Mode::NONE, Some("\x1b[Z")),
-            (KP_ENTER, 0, "", Mode::NONE, Some("\r")),
+            (DELETE, CONTROL, "", Mode::default(), Some("\x1b[3;5~")),
+            (F1, 0, "", Mode::default(), Some("\x1bOP")),
+            (F1 + 11, SHIFT, "", Mode::default(), Some("\x1b[24;2~")),
+            (char(' '), CONTROL, "", Mode::default(), Some("\0")),
+            (char('x'), CONTROL, "x", Mode::default(), Some("\x18")),
+            (char('['), CONTROL, "", Mode::default(), Some("\x1b")),
+            (char('\\'), CONTROL, "", Mode::default(), Some("\x1c")),
+            (char('6'), CONTROL, "", Mode::default(), Some("\x1e")),
+            (char('/'), CONTROL, "", Mode::default(), Some("\x1f")),
+            (char('8'), CONTROL, "", Mode::default(), Some("\x7f")),
+            (
+                char('c'),
+                CONTROL | ALT,
+                "",
+                Mode::default(),
+                Some("\x1b\x03"),
+            ),
+            (BACKSPACE, 0, "", Mode::default(), Some("\x7f")),
+            (BACKSPACE, CONTROL, "", Mode::default(), Some("\x08")),
+            (BACKSPACE, ALT, "", Mode::default(), Some("\x1b\x7f")),
+            (TAB, SHIFT, "", Mode::default(), Some("\x1b[Z")),
+            (LEFT_TAB, SHIFT, "", Mode::default(), Some("\x1b[Z")),
+            (KP_ENTER, 0, "", Mode::default(), Some("\r")),
         ] {
             let bytes = key_bytes(symbol, modifiers, text, || mode);
             let expected = expected.map(str::as_bytes);
@@ -363,9 +369,9 @@ mod tests {
             b"\x1b[<16;10;4m"
         );
         assert_eq!(
-            mouse_bytes(0, 0, (0, 0), false, Mode::NONE).unwrap(),
+            mouse_bytes(0, 0, (0, 0), false, Mode::default()).unwrap(),
             b"\x1b[M !!"
         );
-        assert!(mouse_bytes(0, 0, (223, 0), false, Mode::NONE).is_none());
+        assert!(mouse_bytes(0, 0, (223, 0), false, Mode::default()).is_none());
     }
 }
