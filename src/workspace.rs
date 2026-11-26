@@ -1089,11 +1089,15 @@ impl Workspace {
     ) -> io::Result<()> {
         for &id in ids {
             for client in clients.iter_mut() {
-                client.cancel_files(|source| source.pane == id);
+                client.cancel_sources(|source| source.pane == id);
                 client.search.take_if(|search| search.pane == id);
             }
             let active_tab = self.tabs[self.active].id;
-            closing.extend(self.panes.remove(&id).map(|pane| pane.terminal.shutdown()));
+            closing.extend(
+                self.panes
+                    .remove(&id)
+                    .and_then(|pane| pane.terminal.shutdown()),
+            );
             self.tabs.retain_mut(|tab| {
                 if matches!(tab.root, Node::Pane(pane) if pane == id) {
                     return false;
@@ -1200,19 +1204,17 @@ enum SearchState {
     Ready(SearchResult),
 }
 struct PendingRead {
-    request: u64,
-    pane: PaneId,
+    source: RequestSource,
     receiver: mpsc::Receiver<io::Result<HistoryPage>>,
-    _cancel: Cancel,
 }
 
-struct FileSource {
+struct RequestSource {
     request: u64,
     pane: PaneId,
     cancelled: Cancel,
 }
 struct FileJob {
-    source: FileSource,
+    source: RequestSource,
     path: PathBuf,
     operation: FileOperation,
 }
@@ -1247,7 +1249,7 @@ struct Connection {
     search: Option<PaneSearch>,
     // Jobs run one at a time per connection, in request order.
     files: VecDeque<FileJob>,
-    file: Option<FileSource>,
+    file: Option<RequestSource>,
 }
 
 impl Connection {
@@ -1305,7 +1307,7 @@ impl Connection {
         self.reads.clear();
         self.copies.clear();
         self.search = None;
-        self.cancel_files(|_| true);
+        self.cancel_sources(|_| true);
         self.files.clear();
         self.respond(Response::Detached);
     }
@@ -1321,12 +1323,12 @@ impl Connection {
         }
     }
 
-    /// Cancelled jobs still answer in order, with an error, once their turn comes.
-    fn cancel_files(&self, matches: impl Fn(&FileSource) -> bool) {
+    fn cancel_sources(&self, matches: impl Fn(&RequestSource) -> bool) {
         for source in self
             .file
             .iter()
             .chain(self.files.iter().map(|job| &job.source))
+            .chain(self.reads.iter().map(|read| &read.source))
             .filter(|source| matches(source))
         {
             source.cancelled.0.store(true, Ordering::Relaxed);
@@ -1364,13 +1366,15 @@ fn terminate_workspace(
     for client in clients {
         if client.viewing(&workspace.name) {
             client.finish();
+        } else {
+            client.cancel_sources(|source| workspace.panes.contains_key(&source.pane));
         }
     }
     closing.extend(
         workspace
             .panes
             .into_values()
-            .map(|pane| pane.terminal.shutdown()),
+            .filter_map(|pane| pane.terminal.shutdown()),
     );
 }
 
@@ -1481,10 +1485,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
             }
             for pane in workspace.panes.values() {
                 let terminal = &pane.terminal;
-                let events = if terminal.reading() { libc::POLLIN } else { 0 }
-                    | if terminal.writing() { libc::POLLOUT } else { 0 };
-                fds.push(crate::sys::watch(terminal.pty_fd(), events));
-                fds.push(crate::sys::watch(terminal.pidfd(), libc::POLLIN));
+                fds.extend(terminal.pollfds());
                 if let Some(deadline) = terminal.deadline() {
                     timeout = crate::sys::timeout_until(timeout, deadline);
                 }
@@ -1654,7 +1655,7 @@ fn server_loop(listener: UnixListener, history_directory: &Path) -> io::Result<(
         for (_, workspace) in workspaces.extract_if(|_, workspace| workspace.tabs.is_empty()) {
             terminate_workspace(workspace, &mut clients, &mut closing);
         }
-        complete_requests(&mut clients, &workspaces, &files);
+        complete_requests(&mut clients, &files);
         if fds[0].revents & libc::POLLIN != 0 {
             loop {
                 match listener.accept() {
@@ -1733,11 +1734,7 @@ fn flush_clients(clients: &mut [Connection]) {
 
 /// Answers the requests whose background work has finished and starts each connection's next
 /// file job.
-fn complete_requests(
-    clients: &mut [Connection],
-    workspaces: &HashMap<String, Workspace>,
-    files: &FileResults,
-) {
+fn complete_requests(clients: &mut [Connection], files: &FileResults) {
     while let Ok((id, response)) = files.receiver.try_recv() {
         if let Some(client) = clients.iter_mut().find(|client| client.id == id) {
             client.file = None;
@@ -1746,6 +1743,7 @@ fn complete_requests(
             }
         }
     }
+    let mut responses = Vec::new();
     for client in clients.iter_mut().filter(|client| !client.failed) {
         if client.file.is_none()
             && let Some(FileJob {
@@ -1773,34 +1771,38 @@ fn complete_requests(
                 client.respond(Response::AgentFile { request, result });
             }
         }
-        for (primary, receiver) in std::mem::take(&mut client.copies) {
-            match worker_result(&receiver, "history copy worker disconnected") {
-                None => client.copies.push((primary, receiver)),
-                Some(Ok(copy)) => client.respond(Response::Clipboard {
-                    primary,
+        client.copies.retain(|(primary, receiver)| {
+            let Some(result) = worker_result(receiver, "history copy worker disconnected") else {
+                return true;
+            };
+            responses.push(match result {
+                Ok(copy) => Response::Clipboard {
+                    primary: *primary,
                     file: copy.file,
                     incomplete: copy.incomplete,
-                }),
-                Some(Err(error)) => client.respond(Response::Error(error.to_string())),
-            }
-        }
-        for read in std::mem::take(&mut client.reads) {
-            let result = if workspaces
-                .values()
-                .any(|workspace| workspace.panes.contains_key(&read.pane))
-            {
+                },
+                Err(error) => Response::Error(error.to_string()),
+            });
+            false
+        });
+        client.reads.retain(|read| {
+            let result = if read.source.cancelled.0.load(Ordering::Relaxed) {
+                Err("history source pane no longer exists".into())
+            } else if let Some(result) =
                 worker_result(&read.receiver, "history reader disconnected")
-                    .map(|result| result.map_err(|error| error.to_string()))
+            {
+                result.map_err(|error| error.to_string())
             } else {
-                Some(Err("history source pane no longer exists".into()))
+                return true;
             };
-            match result {
-                None => client.reads.push(read),
-                Some(result) => client.respond(Response::History {
-                    request: read.request,
-                    result,
-                }),
-            }
+            responses.push(Response::History {
+                request: read.source.request,
+                result,
+            });
+            false
+        });
+        for response in responses.drain(..) {
+            client.respond(response);
         }
         if let Some(search) = &mut client.search
             && let SearchState::Pending { receiver, .. } = &search.state
@@ -2012,8 +2014,8 @@ fn apply_action(
         }
         Action::Cancel { request } => {
             let client = &mut clients[index];
-            client.cancel_files(|source| source.request == request);
-            client.reads.retain(|read| read.request != request);
+            client.reads.retain(|read| read.source.request != request);
+            client.cancel_sources(|source| source.request == request);
         }
         Action::AgentAttach { name } => {
             let workspace = workspaces.get_mut(&name).ok_or(NO_WORKSPACE)?;
@@ -2195,7 +2197,7 @@ fn workspace_action(
             });
             match path {
                 Ok(path) => clients[index].files.push_back(FileJob {
-                    source: FileSource {
+                    source: RequestSource {
                         request,
                         pane,
                         cancelled: Cancel::default(),
@@ -2325,10 +2327,12 @@ fn workspace_action(
                 let core = &mut source.terminal.core;
                 let (receiver, cancelled) = core.read_history(block, cursor, query.as_deref());
                 clients[index].reads.push(PendingRead {
-                    request,
-                    pane,
+                    source: RequestSource {
+                        request,
+                        pane,
+                        cancelled: Cancel(cancelled),
+                    },
                     receiver,
-                    _cancel: Cancel(cancelled),
                 });
             }
             Err(error) => clients[index].respond(Response::History {

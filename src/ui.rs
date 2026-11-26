@@ -1158,10 +1158,11 @@ impl Ui {
             } else {
                 snapshot.focused_pane().and_then(|pane| pane.cwd.as_deref())
             };
-            changed |= self
-                .resources
-                .stats
-                .refresh(directory, self.resources.open)?;
+            changed |= self.resources.stats.refresh(
+                directory,
+                self.resources.open,
+                ready(self.resources.stats.fd()),
+            )?;
         }
         if self.files_open
             && let Some(files) = &mut self.files

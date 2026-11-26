@@ -26,7 +26,7 @@ const MAX_PENDING_APPENDS: usize = 8;
 pub struct HistoryBudget {
     directory: PathBuf,
     capacity: u64,
-    notification: OwnedFd,
+    pub(crate) notification: Arc<OwnedFd>,
 }
 impl HistoryBudget {
     pub fn new(directory: PathBuf, capacity: u64) -> io::Result<Arc<Self>> {
@@ -34,7 +34,7 @@ impl HistoryBudget {
         Ok(Arc::new(Self {
             directory,
             capacity,
-            notification: crate::sys::new()?,
+            notification: Arc::new(crate::sys::new()?),
         }))
     }
     pub fn fd(&self) -> RawFd {
@@ -43,10 +43,6 @@ impl HistoryBudget {
     /// Wakes the reactor that owns this workspace's panes.
     pub(crate) fn notify(&self) {
         notify(self.notification.as_raw_fd());
-    }
-    /// A wakeup fd for a thread that may outlive the pane, without keeping the budget alive.
-    pub(crate) fn waker(&self) -> io::Result<OwnedFd> {
-        self.notification.try_clone()
     }
 }
 impl Drop for HistoryBudget {
@@ -325,7 +321,6 @@ pub(crate) fn flush() {
 /// A pane's handle on the writer thread. Nothing here blocks.
 pub(crate) struct History {
     id: u64,
-    budget: Arc<HistoryBudget>,
     replies: mpsc::Receiver<Reply>,
     pending: usize,
 }
@@ -335,7 +330,6 @@ impl History {
         let (replies, receiver) = mpsc::channel();
         let history = Self {
             id,
-            budget: budget.clone(),
             replies: receiver,
             pending: 0,
         };
@@ -362,9 +356,6 @@ impl History {
     fn with_pane(&self, job: impl FnOnce(&mut Pane) + Send + 'static) {
         let id = self.id;
         self.send(move |writer| job(writer.panes.get_mut(&id).unwrap()));
-    }
-    pub fn budget(&self) -> &Arc<HistoryBudget> {
-        &self.budget
     }
     pub fn poll(&mut self) -> impl Iterator<Item = Reply> + '_ {
         let pending = &mut self.pending;

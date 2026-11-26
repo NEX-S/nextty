@@ -1,4 +1,4 @@
-use std::{env, fs, path::Path, process::Command};
+use std::{env, path::Path, process::Command};
 
 const PACKAGES: [&str; 8] = [
     "fontconfig",
@@ -12,7 +12,9 @@ const PACKAGES: [&str; 8] = [
 ];
 
 fn run(command: &mut Command) {
-    let status = command.status().expect("run native build tool");
+    let status = command
+        .status()
+        .unwrap_or_else(|error| panic!("{command:?}: {error}"));
     assert!(status.success(), "native build failed: {command:?}");
 }
 
@@ -47,50 +49,42 @@ fn main() {
             .arg(out.join(format!("terminal_{stage}_spv.h")))
             .arg(format!("native/terminal.{stage}")));
     }
-    let mut files: Vec<_> = ["native", "native/protocols"]
-        .into_iter()
-        .flat_map(|directory| fs::read_dir(directory).expect("read native sources"))
-        .map(|entry| entry.expect("native source entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "c"))
-        .collect();
-    files.sort_unstable();
-    let compiler = env::var_os("CC").unwrap_or_else(|| "cc".into());
-    let debug = env::var("DEBUG").expect("Cargo DEBUG") == "true";
-    let archive_path = out.join("libnextty_native.a");
-    let mut archive = Command::new("ar");
-    archive.arg("crs").arg(&archive_path);
-    for (index, file) in files.iter().enumerate() {
-        let object = out.join(format!("native-{index}.o"));
-        let mut cc = Command::new(&compiler);
-        cc.args([
-            "-std=c11",
-            "-O2",
-            "-fPIC",
-            "-Wall",
-            "-Wextra",
-            "-Wno-unused-parameter",
-            "-Werror",
-            "-Inative",
-        ])
-        .args(debug.then_some("-g"))
-        .arg("-I")
-        .arg(out)
-        .args(flags.split_whitespace())
-        .arg("-c")
-        .arg(file)
-        .arg("-o")
-        .arg(&object);
-        run(&mut cc);
-        archive.arg(object);
+    let mut native = cc::Build::new();
+    native
+        .std("c11")
+        .opt_level(2)
+        .warnings_into_errors(true)
+        .flag("-Wno-unused-parameter")
+        .include(out)
+        .files(["native/window.c", "native/font.c", "native/render.c"]);
+    for flag in flags.split_whitespace() {
+        native.flag(flag);
     }
-    if let Err(error) = fs::remove_file(&archive_path)
-        && error.kind() != std::io::ErrorKind::NotFound
-    {
-        panic!("remove {}: {error}", archive_path.display());
+    for protocol in [
+        "cursor-shape",
+        "fractional-scale",
+        "presentation-time",
+        "primary-selection",
+        "tablet-v2",
+        "text-input",
+        "viewporter",
+        "xdg-shell",
+    ] {
+        let xml = format!("native/protocols/{protocol}.xml");
+        let source = out.join(format!("{protocol}-protocol.c"));
+        run(Command::new("wayland-scanner")
+            .arg("private-code")
+            .arg(&xml)
+            .arg(&source));
+        native.file(source);
+        if protocol != "tablet-v2" {
+            run(Command::new("wayland-scanner")
+                .arg("client-header")
+                .arg(xml)
+                .arg(out.join(format!("{protocol}-client.h"))));
+        }
     }
-    run(&mut archive);
-    println!("cargo:rustc-link-search=native={}", out.display());
-    println!("cargo:rustc-link-lib=static=nextty_native");
+    native.compile("nextty_native");
     for flag in pkg_config("--libs").split_whitespace() {
         if let Some(library) = flag.strip_prefix("-l") {
             println!("cargo:rustc-link-lib={library}");
@@ -101,5 +95,4 @@ fn main() {
         }
     }
     println!("cargo:rustc-link-lib=m");
-    println!("cargo:rerun-if-env-changed=CC");
 }

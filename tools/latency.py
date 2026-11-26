@@ -283,6 +283,8 @@ def gui_fixture(directory, count):
             marker = 0x20000 + index
             output(f'\x1b7\x1b[H\x1b[48;2;{marker >> 16};{marker >> 8 & 255};{marker & 255}m \x1b[0m\x1b8'.encode())
             emit({'index': index, 'marker': marker})
+        # Do not overwrite the final key marker before the compositor presents it.
+        time.sleep(.1)
         marker = 0x10000
         for phase in ('sparse', 'scrolling'):
             height = struct.unpack('HHHH', fcntl.ioctl(0, termios.TIOCGWINSZ, b'\0' * 8))[0]

@@ -11,6 +11,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::core::{Core, Event, WindowSize};
+use crate::history::HistoryBudget;
 use crate::sys::{check, owned_fd};
 
 pub(crate) const INPUT_CAPACITY: usize = 256 * 1024;
@@ -55,6 +56,7 @@ pub struct Terminal {
     child: Child,
     pidfd: OwnedFd,
     process_metadata: Arc<ProcessMetadata>,
+    wake: Arc<OwnedFd>,
     process_results: Option<mpsc::Receiver<(ProcessMetadata, bool)>>,
     // Bytes read from the PTY; `read_pos..read_len` are not parsed yet.
     read_buffer: [u8; 8192],
@@ -81,19 +83,11 @@ impl Terminal {
         size: WindowSize,
         foreground: u32,
         background: u32,
-        history: Arc<crate::history::HistoryBudget>,
+        history: Arc<HistoryBudget>,
     ) -> Result<Self> {
         let mut core = Core::new(size, foreground, background);
+        let wake = history.notification.clone();
         core.enable_history(history);
-        Self::spawn(shell, working_directory, size, core)
-    }
-
-    fn spawn(
-        shell: Option<Shell>,
-        working_directory: Option<PathBuf>,
-        size: WindowSize,
-        core: Core,
-    ) -> Result<Self> {
         let (master, slave) = open_pty(winsize(size))?;
         let integrate = shell.is_none();
         let mut command = match shell {
@@ -141,6 +135,7 @@ impl Terminal {
             parser: crate::vt::Parser::new(),
             child,
             pidfd,
+            wake,
             process_metadata: Arc::new(ProcessMetadata {
                 launch_argv,
                 child_pid,
@@ -162,11 +157,20 @@ impl Terminal {
         })
     }
 
-    pub fn pty_fd(&self) -> RawFd {
-        self.master.as_ref().map_or(-1, AsRawFd::as_raw_fd)
-    }
-    pub fn pidfd(&self) -> RawFd {
-        self.pidfd.as_raw_fd()
+    pub fn pollfds(&self) -> [libc::pollfd; 2] {
+        let pty = self.master.as_ref().map_or(-1, AsRawFd::as_raw_fd);
+        let events = if self.reading() { libc::POLLIN } else { 0 }
+            | if self.input.is_empty() {
+                0
+            } else {
+                libc::POLLOUT
+            };
+        // A pidfd stays readable after exit, including while history backpressure pauses the PTY.
+        let exit = if self.child_exited { 0 } else { libc::POLLIN };
+        [
+            crate::sys::watch(pty, events),
+            crate::sys::watch(self.pidfd.as_raw_fd(), exit),
+        ]
     }
     pub fn deadline(&self) -> Option<Instant> {
         self.core
@@ -180,11 +184,8 @@ impl Terminal {
             )
             .min()
     }
-    pub fn reading(&self) -> bool {
+    fn reading(&self) -> bool {
         self.read_open && self.read_pos == self.read_len && self.core.history_read_ready()
-    }
-    pub fn writing(&self) -> bool {
-        !self.input.is_empty()
     }
     pub fn input_pending_bytes(&self) -> usize {
         self.input.len()
@@ -259,9 +260,11 @@ impl Terminal {
         self.core.resize(size);
         Ok(())
     }
-    pub fn shutdown(mut self) -> Self {
+    pub fn shutdown(mut self) -> Option<Self> {
+        // finish() has already reaped this child; its numeric process group may be reused.
+        self.master.as_ref()?;
         self.begin_shutdown();
-        self
+        Some(self)
     }
     fn begin_shutdown(&mut self) {
         if self.closing.is_none() {
@@ -397,11 +400,10 @@ impl Terminal {
         // The ioctl cannot block; reading another process's /proc files can.
         let pgid = check(unsafe { libc::tcgetpgrp(master.as_raw_fd()) }).map(|pgid| pgid as u32);
         let current = self.process_metadata.clone();
-        let wake = self.core.history_waker()?;
+        let wake = self.wake.clone();
         let (sender, receiver) = mpsc::channel();
         crate::sys::task(move || {
-            let _ = sender.send(sample_process(pgid, &current));
-            if let Some(wake) = &wake {
+            if sender.send(sample_process(pgid, &current)).is_ok() {
                 crate::sys::notify(wake.as_raw_fd());
             }
         })?;
@@ -562,18 +564,7 @@ pub(crate) mod tests {
     use super::*;
 
     pub(crate) fn drive(terminal: &mut Terminal) {
-        let mut fds = [
-            libc::pollfd {
-                fd: terminal.pty_fd(),
-                events: libc::POLLIN | if terminal.writing() { libc::POLLOUT } else { 0 },
-                revents: 0,
-            },
-            libc::pollfd {
-                fd: terminal.pidfd(),
-                events: libc::POLLIN,
-                revents: 0,
-            },
-        ];
+        let mut fds = terminal.pollfds();
         crate::sys::poll(&mut fds, 0).unwrap();
         terminal.step(fds[0].revents, fds[1].revents).unwrap();
     }
@@ -629,24 +620,25 @@ pub(crate) mod tests {
         Shell::new("/bin/sh".into(), vec!["-c".into(), script.into()])
     }
 
-    /// A terminal without a disk history.
-    pub fn plain(
+    pub fn test_terminal(
         shell: Option<Shell>,
         working_directory: Option<PathBuf>,
         size: WindowSize,
         foreground: u32,
         background: u32,
     ) -> Result<Terminal> {
-        Terminal::spawn(
+        Terminal::new(
             shell,
             working_directory,
             size,
-            Core::new(size, foreground, background),
+            foreground,
+            background,
+            crate::history::tests::budget(8 << 20),
         )
     }
 
     fn session(script: &str) -> Terminal {
-        plain(Some(shell(script)), None, size(24, 80), 0xd8dee9, 0x14161b).unwrap()
+        test_terminal(Some(shell(script)), None, size(24, 80), 0xd8dee9, 0x14161b).unwrap()
     }
 
     fn content(terminal: &Terminal) -> String {
@@ -715,7 +707,7 @@ pub(crate) mod tests {
             PathBuf::from("target"),
             std::env::current_dir().unwrap().join("target"),
         ] {
-            let mut terminal = plain(
+            let mut terminal = test_terminal(
                 Some(Shell::new(
                     "/usr/bin/python3".into(),
                     vec![
@@ -739,7 +731,7 @@ pub(crate) mod tests {
 
     #[test]
     fn foreground_metadata_tracks_a_real_shell_job_without_polling_idle_sessions() {
-        let mut terminal = plain(
+        let mut terminal = test_terminal(
             Some(Shell::new("/bin/sh".into(), vec!["-i".into()])),
             Some(std::env::temp_dir()),
             size(24, 80),
@@ -910,7 +902,7 @@ os.write(1,b'QUERIES-DONE')
 assert os.read(0,1)==b'x'
 os.write(1,b'\r\nINPUT:x')
 "#;
-        let mut terminal = plain(
+        let mut terminal = test_terminal(
             Some(Shell::new(
                 "python3".into(),
                 vec!["-c".into(), script.into()],

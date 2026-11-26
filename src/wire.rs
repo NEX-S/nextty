@@ -110,7 +110,7 @@ pub(crate) mod path {
     }
 }
 
-/// One frame, or a copy whose next frame is read from its file when the socket has room.
+/// Queued frames, or a copy whose next frame is read when the socket has room.
 struct Packet {
     bytes: Vec<u8>,
     copy: Option<File>,
@@ -203,6 +203,16 @@ impl Peer {
         self.check_backlog()
     }
     fn queue(&mut self, bytes: Vec<u8>, state: bool) {
+        // A screen request and the input that follows it can share a socket write.
+        if !state
+            && let Some(last) = self.output.back_mut()
+            && !last.state
+            && last.copy.is_none()
+            && last.bytes.len() + bytes.len() <= CHUNK
+        {
+            last.bytes.extend_from_slice(&bytes);
+            return;
+        }
         self.output.push_back(Packet {
             bytes,
             copy: None,

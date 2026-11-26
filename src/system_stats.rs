@@ -205,11 +205,18 @@ impl SystemStats {
 
     /// Applies finished background work and starts the next sample when due;
     /// returns whether anything visible changed.
-    pub fn refresh(&mut self, directory: Option<&Path>, expanded: bool) -> io::Result<bool> {
-        crate::sys::consume_notification(self.fd())?;
+    pub fn refresh(
+        &mut self,
+        directory: Option<&Path>,
+        expanded: bool,
+        ready: bool,
+    ) -> io::Result<bool> {
         let mut changed = false;
         let mut updated = false;
-        if let Some((sample, point)) = self.worker.take() {
+        if ready
+            && crate::sys::consume_notification(self.fd())?
+            && let Some((sample, point)) = self.worker.take()
+        {
             changed = expanded || sample.branch != self.sample.branch;
             updated = true;
             record_history(&mut self.history, point);

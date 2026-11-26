@@ -40,7 +40,7 @@ cargo build --release --locked
 font_family = "monospace"
 ```
 
-构建时由 `glslangValidator` 将着色器编译为 SPIR-V。Wayland 协议桩代码已提交到仓库，正常构建无需 `wayland-scanner`。GUI 构建链接系统 Fontconfig、HarfBuzz、FriBidi、Cairo/FreeType、utf8proc、Wayland、xkbcommon 和 Vulkan；所有构建都链接系统 libcurl。
+桌面构建使用 `glslangValidator` 将着色器编译为 SPIR-V，并用 `wayland-scanner`（Fedora 的 `wayland-devel` 包）从仓库中的 XML 生成协议绑定。GUI 构建链接系统 Fontconfig、HarfBuzz、FriBidi、Cairo/FreeType、utf8proc、Wayland、xkbcommon 和 Vulkan；所有构建都链接系统 libcurl。
 
 ### 前端构建
 

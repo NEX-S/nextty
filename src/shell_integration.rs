@@ -174,7 +174,7 @@ mod tests {
             cell_width: 8,
             cell_height: 16,
         };
-        let mut terminal = crate::terminal::tests::plain(
+        let mut terminal = crate::terminal::tests::test_terminal(
             Some(Shell::new("zsh".into(), vec!["-dfi".into()])),
             Some(PathBuf::from("/")),
             size,

@@ -8,7 +8,6 @@ use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
-use std::os::fd::OwnedFd;
 use std::path::{Path, PathBuf};
 use std::process::ExitStatus;
 use std::sync::atomic::AtomicBool;
@@ -2433,13 +2432,6 @@ impl Core {
             clearing: false,
             failed: false,
         });
-    }
-    /// A duplicate of the history writer's wakeup fd, for threads that outlive their request.
-    pub(crate) fn history_waker(&self) -> io::Result<Option<OwnedFd>> {
-        self.history
-            .as_ref()
-            .map(|history| history.io.budget().waker())
-            .transpose()
     }
     /// Parsing waits while the rows leaving the hot area are ahead of the history writer.
     pub(crate) fn history_read_ready(&self) -> bool {

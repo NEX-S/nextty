@@ -46,17 +46,15 @@ fn parser() {
 
 /// One iteration of the daemon's loop for a single pane: wait for what the terminal asks for.
 fn drive(terminal: &mut Terminal, budget: &HistoryBudget, timeout: Duration) {
-    let watch = |fd, events| libc::pollfd {
-        fd: if events == 0 { -1 } else { fd },
-        events,
-        revents: 0,
-    };
-    let events = if terminal.reading() { libc::POLLIN } else { 0 }
-        | if terminal.writing() { libc::POLLOUT } else { 0 };
+    let [pty, process] = terminal.pollfds();
     let mut fds = [
-        watch(terminal.pty_fd(), events),
-        watch(terminal.pidfd(), libc::POLLIN),
-        watch(budget.fd(), libc::POLLIN),
+        pty,
+        process,
+        libc::pollfd {
+            fd: budget.fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        },
     ];
     let timeout = terminal.deadline().map_or(timeout, |deadline| {
         timeout.min(deadline.saturating_duration_since(Instant::now()))
